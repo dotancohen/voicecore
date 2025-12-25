@@ -1,4 +1,4 @@
-//! Android-specific bindings for Voice Core.
+//! Android-specific bindings for VoiceCore.
 //!
 //! This module provides a simplified API for the Android application,
 //! exposed via UniFFI bindings.

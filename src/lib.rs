@@ -1,4 +1,4 @@
-//! Voice Core - Rust implementation of the Voice note-taking application core.
+//! VoiceCore - Rust implementation of the Voice note-taking application core.
 //!
 //! This library provides the core functionality for Voice:
 //! - Data models (Note, Tag, NoteTag)

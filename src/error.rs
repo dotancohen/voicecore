@@ -1,4 +1,4 @@
-//! Error types for Voice Core.
+//! Error types for VoiceCore.
 //!
 //! This module defines all error types used throughout the library.
 
