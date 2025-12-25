@@ -136,9 +136,16 @@ fn generate_device_id() -> String {
 }
 
 fn get_default_device_name() -> String {
-    match hostname::get() {
-        Ok(name) => format!("Voice on {}", name.to_string_lossy()),
-        Err(_) => "Voice Device".to_string(),
+    #[cfg(feature = "desktop")]
+    {
+        match hostname::get() {
+            Ok(name) => format!("Voice on {}", name.to_string_lossy()),
+            Err(_) => "Voice Device".to_string(),
+        }
+    }
+    #[cfg(not(feature = "desktop"))]
+    {
+        "Voice Mobile".to_string()
     }
 }
 
@@ -167,12 +174,26 @@ pub struct Config {
 
 impl Config {
     /// Create a new configuration manager
+    ///
+    /// On mobile platforms (without the `desktop` feature), `config_dir` is required.
     pub fn new(config_dir: Option<PathBuf>) -> VoiceResult<Self> {
-        let config_dir = config_dir.unwrap_or_else(|| {
-            dirs::config_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("voice")
-        });
+        let config_dir = match config_dir {
+            Some(dir) => dir,
+            None => {
+                #[cfg(feature = "desktop")]
+                {
+                    dirs::config_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("voice")
+                }
+                #[cfg(not(feature = "desktop"))]
+                {
+                    return Err(VoiceError::Config(
+                        "config_dir is required on mobile platforms".to_string(),
+                    ));
+                }
+            }
+        };
 
         fs::create_dir_all(&config_dir)?;
         let config_file = config_dir.join("config.json");

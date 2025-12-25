@@ -9,11 +9,20 @@ description = "Core library for Voice note-taking application"
 
 [lib]
 name = "voice_core"
-crate-type = ["rlib"]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["server", "desktop"]
+# Server components (axum, tower) - not needed on mobile
+server = ["dep:axum", "dep:tower", "dep:tower-http"]
+# Desktop features (hostname detection, config dir detection)
+desktop = ["dep:hostname", "dep:dirs"]
+# UniFFI bindings for mobile (Android/iOS)
+uniffi = ["dep:uniffi"]
 
 [dependencies]
-# Async runtime
-tokio = { version = "1.42", features = ["full"] }
+# Async runtime - use lighter features for mobile
+tokio = { version = "1.42", features = ["rt", "sync", "time", "macros"] }
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled", "blob"] }
@@ -25,16 +34,16 @@ serde_json = "1.0"
 # UUID
 uuid = { version = "1.11", features = ["v7", "serde"] }
 
-# HTTP client
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+# HTTP client - base config (TLS features added per-platform below)
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
-# HTTP server
-axum = { version = "0.7", features = ["json"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+# HTTP server (optional - server feature)
+axum = { version = "0.7", features = ["json"], optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 
-# TLS
-rustls = "0.23"
+# TLS - base config (crypto backend added per-platform below)
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2.0"
 sha2 = "0.10"
 rcgen = "0.13"
@@ -54,11 +63,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 diffy = "0.4"
 similar = "2.6"
 
-# Hostname
-hostname = "0.4"
+# Hostname (optional - desktop feature)
+hostname = { version = "0.4", optional = true }
 
-# Directory paths
-dirs = "5.0"
+# Directory paths (optional - desktop feature)
+dirs = { version = "5.0", optional = true }
 
 # Base64
 base64 = "0.22"
@@ -66,5 +75,30 @@ base64 = "0.22"
 # URL encoding
 urlencoding = "2.1"
 
+# UniFFI for mobile bindings (optional)
+uniffi = { version = "0.28", features = ["cli"], optional = true }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi"]
+
 [dev-dependencies]
 tempfile = "3.14"
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+# =============================================================================
+# Platform-specific TLS backends
+# =============================================================================
+
+# Desktop (Linux, macOS, Windows): use aws-lc (default, better performance)
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+
+# Android: use ring (better cross-compilation support)
+[target.'cfg(target_os = "android")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
