@@ -78,7 +78,7 @@ cargo doc --open
 ### Basic Note Operations
 
 ```rust
-use voice_core::{Database, Config};
+use voicecore::{Database, Config};
 
 // Initialize with default config directory (~/.config/voice)
 let config = Config::new(None)?;
@@ -139,7 +139,7 @@ let results = db.search_notes(None, Some(vec!["Europe/France/Paris"]))?;
 ### Synchronization
 
 ```rust
-use voice_core::{SyncClient, SyncServer};
+use voicecore::{SyncClient, SyncServer};
 use std::sync::{Arc, Mutex};
 
 // Initialize sync client
@@ -160,7 +160,7 @@ server.start("0.0.0.0", 8384).await?;
 ### Conflict Resolution
 
 ```rust
-use voice_core::{ResolutionChoice};
+use voicecore::{ResolutionChoice};
 
 // List pending conflicts
 let conflicts = db.get_note_content_conflicts()?;
