@@ -69,6 +69,32 @@ pub struct NoteData {
     pub deleted_at: Option<String>,
 }
 
+/// An audio file from the database
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AudioFileData {
+    pub id: String,
+    pub imported_at: String,
+    pub filename: String,
+    pub file_created_at: Option<String>,
+    pub summary: Option<String>,
+    pub device_id: String,
+    pub modified_at: Option<String>,
+    pub deleted_at: Option<String>,
+}
+
+/// A note-attachment association from the database
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NoteAttachmentData {
+    pub id: String,
+    pub note_id: String,
+    pub attachment_id: String,
+    pub attachment_type: String,
+    pub created_at: String,
+    pub device_id: String,
+    pub modified_at: Option<String>,
+    pub deleted_at: Option<String>,
+}
+
 /// Sync operation result
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SyncResultData {
@@ -279,5 +305,116 @@ impl VoiceClient {
     pub fn get_device_name(&self) -> String {
         let cfg = self.config.lock().unwrap();
         cfg.device_name().to_string()
+    }
+
+    /// Set the audio file directory for storing downloaded audio files
+    pub fn set_audiofile_directory(&self, path: String) -> Result<(), VoiceCoreError> {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.set_audiofile_directory(&path)?;
+        Ok(())
+    }
+
+    /// Get the audio file directory
+    pub fn get_audiofile_directory(&self) -> Option<String> {
+        let cfg = self.config.lock().unwrap();
+        cfg.audiofile_directory().map(|s| s.to_string())
+    }
+
+    /// Get all attachments for a note
+    pub fn get_attachments_for_note(&self, note_id: String) -> Result<Vec<NoteAttachmentData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let attachments = db.get_attachments_for_note(&note_id)?;
+
+        Ok(attachments
+            .into_iter()
+            .map(|a| NoteAttachmentData {
+                id: a.id,
+                note_id: a.note_id,
+                attachment_id: a.attachment_id,
+                attachment_type: a.attachment_type,
+                created_at: a.created_at,
+                device_id: a.device_id,
+                modified_at: a.modified_at,
+                deleted_at: a.deleted_at,
+            })
+            .collect())
+    }
+
+    /// Get all audio files for a note (via note_attachments)
+    pub fn get_audio_files_for_note(&self, note_id: String) -> Result<Vec<AudioFileData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let audio_files = db.get_audio_files_for_note(&note_id)?;
+
+        Ok(audio_files
+            .into_iter()
+            .map(|a| AudioFileData {
+                id: a.id,
+                imported_at: a.imported_at,
+                filename: a.filename,
+                file_created_at: a.file_created_at,
+                summary: a.summary,
+                device_id: a.device_id,
+                modified_at: a.modified_at,
+                deleted_at: a.deleted_at,
+            })
+            .collect())
+    }
+
+    /// Get a single audio file by ID
+    pub fn get_audio_file(&self, audio_file_id: String) -> Result<Option<AudioFileData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let audio_file = db.get_audio_file(&audio_file_id)?;
+
+        Ok(audio_file.map(|a| AudioFileData {
+            id: a.id,
+            imported_at: a.imported_at,
+            filename: a.filename,
+            file_created_at: a.file_created_at,
+            summary: a.summary,
+            device_id: a.device_id,
+            modified_at: a.modified_at,
+            deleted_at: a.deleted_at,
+        }))
+    }
+
+    /// Get the file path for an audio file (if audiofile_directory is configured)
+    pub fn get_audio_file_path(&self, audio_file_id: String) -> Result<Option<String>, VoiceCoreError> {
+        // Get audio file to determine extension
+        let audio_file = {
+            let db = self.db.lock().unwrap();
+            db.get_audio_file(&audio_file_id)?
+        };
+
+        let audio_file = match audio_file {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+
+        // Get audiofile directory
+        let audiofile_dir = {
+            let cfg = self.config.lock().unwrap();
+            cfg.audiofile_directory().map(|s| s.to_string())
+        };
+
+        let audiofile_dir = match audiofile_dir {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        // Determine extension from filename
+        let ext = audio_file
+            .filename
+            .rsplit('.')
+            .next()
+            .unwrap_or("bin");
+
+        let path = std::path::Path::new(&audiofile_dir).join(format!("{}.{}", audio_file_id, ext));
+
+        // Only return path if file exists
+        if path.exists() {
+            Ok(Some(path.to_string_lossy().to_string()))
+        } else {
+            Ok(None)
+        }
     }
 }
