@@ -105,6 +105,14 @@ impl Database {
     /// Create a new database connection
     pub fn new<P: AsRef<Path>>(db_path: P) -> VoiceResult<Self> {
         let conn = Connection::open(db_path)?;
+
+        // Enable WAL mode for better concurrent access
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+        // Checkpoint any pending WAL frames to ensure we see the latest data
+        // from other connections that may have written and closed
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+
         let mut db = Self { conn };
         db.init_database()?;
         Ok(db)

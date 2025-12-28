@@ -199,6 +199,12 @@ async fn apply_changes(
         }
     };
 
+    // Update sync_peers to track when we last synced with this peer
+    // This allows the handshake to return accurate last_sync_timestamp
+    if let Ok(db) = state.db.lock() {
+        let _ = db.update_peer_sync_time(&request.device_id, Some(&request.device_name));
+    }
+
     let response = ApplyResponse {
         applied,
         conflicts,
@@ -847,11 +853,25 @@ fn apply_note_change(
 
             // Check if local changed since last sync
             let local_time = local_modified_at.or(local_deleted_at);
-            let local_changed = last_sync_at.is_none()
-                || local_time.map_or(false, |lt| lt > last_sync_at.unwrap_or(""));
 
-            // Determine timestamp of incoming change
-            let incoming_time = modified_at.or(deleted_at);
+            // Determine timestamp of incoming change (moved up for use in local_changed calc)
+            // Include created_at as fallback for notes that were created but never modified
+            let incoming_time = modified_at.or(deleted_at).or(Some(created_at));
+
+            let local_changed = if let Some(last) = last_sync_at {
+                // Have sync history - check if local changed since then
+                local_time.map_or(false, |lt| lt > last)
+            } else {
+                // No sync history with this peer for this entity
+                // Compare timestamps directly: if incoming is strictly newer than local,
+                // assume it's an update based on what we have (not a conflict).
+                // Only flag as "local changed" if local is newer or equal to incoming.
+                match (local_time, incoming_time) {
+                    (Some(lt), Some(it)) => lt >= it,  // Local "changed" if >= incoming
+                    (Some(_), None) => true,           // Local has time, incoming doesn't
+                    (None, _) => false,                // No local time means no local change
+                }
+            };
 
             // If incoming change is before or at last_sync, skip
             if let (Some(last), Some(incoming)) = (last_sync_at, incoming_time) {
@@ -975,8 +995,18 @@ fn apply_tag_change(
                 .and_then(|v| v.as_str());
 
             // Check if local changed since last sync
-            let local_changed = last_sync_at.is_none()
-                || local_modified_at.map_or(false, |lt| lt > last_sync_at.unwrap_or(""));
+            let local_changed = if let Some(last) = last_sync_at {
+                // Have sync history - check if local changed since then
+                local_modified_at.map_or(false, |lt| lt > last)
+            } else {
+                // No sync history - compare timestamps directly
+                // Only "local changed" if local is newer or equal to incoming
+                match (local_modified_at, modified_at) {
+                    (Some(lt), Some(it)) => lt >= it,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                }
+            };
 
             // Check timestamp - skip if incoming is before last_sync
             if let (Some(last), Some(incoming)) = (last_sync_at, modified_at) {
@@ -1046,8 +1076,18 @@ fn apply_tag_change(
                 .and_then(|v| v.as_str());
 
             // Check if local changed since last sync
-            let local_changed = last_sync_at.is_none()
-                || local_modified_at.map_or(false, |lt| lt > last_sync_at.unwrap_or(""));
+            let local_changed = if let Some(last) = last_sync_at {
+                // Have sync history - check if local changed since then
+                local_modified_at.map_or(false, |lt| lt > last)
+            } else {
+                // No sync history - compare timestamps directly
+                // Only "local changed" if local is newer or equal to incoming delete
+                match (local_modified_at, Some(deleted_at)) {
+                    (Some(lt), Some(it)) => lt >= it,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                }
+            };
 
             if local_changed {
                 // Local modified the tag, but remote wants to delete
@@ -1112,20 +1152,33 @@ fn apply_note_tag_change(
 
     let existing = db.get_note_tag_raw(note_id, tag_id)?;
 
+    // Extract incoming timestamps first (needed for local_changed calculation)
+    let created_at = data["created_at"].as_str().unwrap_or("");
+    let modified_at = data["modified_at"].as_str();
+    let deleted_at = data["deleted_at"].as_str();
+
     // Determine if local changed since last_sync
     let local_changed = if let Some(ref ex) = existing {
         let local_time = ex.get("modified_at")
             .and_then(|v| v.as_str())
             .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
             .or_else(|| ex.get("created_at").and_then(|v| v.as_str()));
-        last_sync_at.is_none() || local_time.map_or(false, |lt| lt > last_sync_at.unwrap_or(""))
+        let incoming_time = modified_at.or(deleted_at);
+
+        if let Some(last) = last_sync_at {
+            // Have sync history - check if local changed since then
+            local_time.map_or(false, |lt| lt > last)
+        } else {
+            // No sync history - compare timestamps directly
+            match (local_time, incoming_time) {
+                (Some(lt), Some(it)) => lt >= it,
+                (Some(_), None) => true,
+                (None, _) => false,
+            }
+        }
     } else {
         false
     };
-
-    let created_at = data["created_at"].as_str().unwrap_or("");
-    let modified_at = data["modified_at"].as_str();
-    let deleted_at = data["deleted_at"].as_str();
 
     match change.operation.as_str() {
         "create" => {
@@ -1227,17 +1280,7 @@ fn apply_note_attachment_change(
 
     let existing = db.get_note_attachment_raw(attachment_assoc_id)?;
 
-    // Determine if local changed since last_sync
-    let local_changed = if let Some(ref ex) = existing {
-        let local_time = ex.get("modified_at")
-            .and_then(|v| v.as_str())
-            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
-            .or_else(|| ex.get("created_at").and_then(|v| v.as_str()));
-        last_sync_at.is_none() || local_time.map_or(false, |lt| lt > last_sync_at.unwrap_or(""))
-    } else {
-        false
-    };
-
+    // Extract incoming timestamps first (needed for local_changed calculation)
     let id = data["id"].as_str().unwrap_or("");
     let note_id = data["note_id"].as_str().unwrap_or("");
     let attachment_id = data["attachment_id"].as_str().unwrap_or("");
@@ -1245,6 +1288,29 @@ fn apply_note_attachment_change(
     let created_at = data["created_at"].as_str().unwrap_or("");
     let modified_at = data["modified_at"].as_str();
     let deleted_at = data["deleted_at"].as_str();
+
+    // Determine if local changed since last_sync
+    let local_changed = if let Some(ref ex) = existing {
+        let local_time = ex.get("modified_at")
+            .and_then(|v| v.as_str())
+            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
+            .or_else(|| ex.get("created_at").and_then(|v| v.as_str()));
+        let incoming_time = modified_at.or(deleted_at);
+
+        if let Some(last) = last_sync_at {
+            // Have sync history - check if local changed since then
+            local_time.map_or(false, |lt| lt > last)
+        } else {
+            // No sync history - compare timestamps directly
+            match (local_time, incoming_time) {
+                (Some(lt), Some(it)) => lt >= it,
+                (Some(_), None) => true,
+                (None, _) => false,
+            }
+        }
+    } else {
+        false
+    };
 
     match change.operation.as_str() {
         "create" => {
@@ -1343,17 +1409,7 @@ fn apply_audio_file_change(
 
     let existing = db.get_audio_file_raw(audio_file_id)?;
 
-    // Determine if local changed since last_sync
-    let local_changed = if let Some(ref ex) = existing {
-        let local_time = ex.get("modified_at")
-            .and_then(|v| v.as_str())
-            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
-            .or_else(|| ex.get("imported_at").and_then(|v| v.as_str()));
-        last_sync_at.is_none() || local_time.map_or(false, |lt| lt > last_sync_at.unwrap_or(""))
-    } else {
-        false
-    };
-
+    // Extract incoming timestamps first (needed for local_changed calculation)
     let id = data["id"].as_str().unwrap_or("");
     let imported_at = data["imported_at"].as_str().unwrap_or("");
     let filename = data["filename"].as_str().unwrap_or("");
@@ -1361,6 +1417,29 @@ fn apply_audio_file_change(
     let summary = data["summary"].as_str();
     let modified_at = data["modified_at"].as_str();
     let deleted_at = data["deleted_at"].as_str();
+
+    // Determine if local changed since last_sync
+    let local_changed = if let Some(ref ex) = existing {
+        let local_time = ex.get("modified_at")
+            .and_then(|v| v.as_str())
+            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
+            .or_else(|| ex.get("imported_at").and_then(|v| v.as_str()));
+        let incoming_time = modified_at.or(deleted_at);
+
+        if let Some(last) = last_sync_at {
+            // Have sync history - check if local changed since then
+            local_time.map_or(false, |lt| lt > last)
+        } else {
+            // No sync history - compare timestamps directly
+            match (local_time, incoming_time) {
+                (Some(lt), Some(it)) => lt >= it,
+                (Some(_), None) => true,
+                (None, _) => false,
+            }
+        }
+    } else {
+        false
+    };
 
     match change.operation.as_str() {
         "create" => {
