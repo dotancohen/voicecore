@@ -1,11 +1,15 @@
 //! Data models for Voice.
 //!
-//! This module defines the core entities: Note, Tag, and NoteTag.
+//! This module defines the core entities: Note, Tag, NoteTag, NoteAttachment, and AudioFile.
 //! All IDs are UUID7 stored as 16 bytes internally, converted to hex strings for JSON.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use uuid::Uuid;
+
+/// Supported audio file formats for import.
+pub const AUDIO_FILE_FORMATS: &[&str] = &["mp3", "wav", "flac", "ogg", "opus", "m4a"];
 
 /// Represents a note in the system.
 ///
@@ -158,6 +162,176 @@ impl NoteTag {
     }
 }
 
+/// Types of attachments that can be associated with notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachmentType {
+    /// Audio file attachment
+    AudioFile,
+    /// Summary attachment (future)
+    Summary,
+}
+
+impl AttachmentType {
+    /// Convert to database string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AttachmentType::AudioFile => "audio_file",
+            AttachmentType::Summary => "summary",
+        }
+    }
+
+    /// Parse from database string representation
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "audio_file" => Some(AttachmentType::AudioFile),
+            "summary" => Some(AttachmentType::Summary),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AttachmentType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Represents the association between a note and an attachment.
+///
+/// This is a junction table that links notes to their attachments (audio files, summaries, etc.).
+/// An attachment can potentially be linked to multiple notes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteAttachment {
+    /// Unique identifier for this association (UUID7)
+    pub id: Uuid,
+    /// UUID7 of the note
+    pub note_id: Uuid,
+    /// UUID7 of the attachment (audio_file, summary, etc.)
+    pub attachment_id: Uuid,
+    /// Type of the attachment
+    pub attachment_type: AttachmentType,
+    /// When the association was created
+    pub created_at: DateTime<Utc>,
+    /// UUID7 of the device that created this association
+    pub device_id: Uuid,
+    /// When the association was modified (for sync tracking)
+    pub modified_at: Option<DateTime<Utc>>,
+    /// When the association was removed (None if active)
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+impl NoteAttachment {
+    /// Create a new note-attachment association
+    pub fn new(
+        note_id: Uuid,
+        attachment_id: Uuid,
+        attachment_type: AttachmentType,
+        device_id: Uuid,
+    ) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            note_id,
+            attachment_id,
+            attachment_type,
+            created_at: Utc::now(),
+            device_id,
+            modified_at: None,
+            deleted_at: None,
+        }
+    }
+
+    /// Get the association ID as a hex string
+    pub fn id_hex(&self) -> String {
+        self.id.simple().to_string()
+    }
+
+    /// Get the note ID as a hex string
+    pub fn note_id_hex(&self) -> String {
+        self.note_id.simple().to_string()
+    }
+
+    /// Get the attachment ID as a hex string
+    pub fn attachment_id_hex(&self) -> String {
+        self.attachment_id.simple().to_string()
+    }
+
+    /// Get the device ID as a hex string
+    pub fn device_id_hex(&self) -> String {
+        self.device_id.simple().to_string()
+    }
+
+    /// Check if the association is deleted
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+}
+
+/// Represents an audio file entity.
+///
+/// Audio files are stored on disk and can be attached to notes via NoteAttachment.
+/// The actual file is stored at `{audiofile_directory}/{id}.{extension}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioFile {
+    /// Unique identifier for the audio file (UUID7)
+    pub id: Uuid,
+    /// When the file was imported into the system
+    pub imported_at: DateTime<Utc>,
+    /// Original filename from import
+    pub filename: String,
+    /// When the file was originally created (from filesystem metadata)
+    pub file_created_at: Option<DateTime<Utc>>,
+    /// Quick text summary of the audio content
+    pub summary: Option<String>,
+    /// UUID7 of the device that created/last modified this record
+    pub device_id: Uuid,
+    /// When the record was last modified
+    pub modified_at: Option<DateTime<Utc>>,
+    /// When the file was soft-deleted (None if active)
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+impl AudioFile {
+    /// Create a new audio file record
+    pub fn new(filename: String, file_created_at: Option<DateTime<Utc>>, device_id: Uuid) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            imported_at: Utc::now(),
+            filename,
+            file_created_at,
+            summary: None,
+            device_id,
+            modified_at: None,
+            deleted_at: None,
+        }
+    }
+
+    /// Get the audio file ID as a hex string
+    pub fn id_hex(&self) -> String {
+        self.id.simple().to_string()
+    }
+
+    /// Get the device ID as a hex string
+    pub fn device_id_hex(&self) -> String {
+        self.device_id.simple().to_string()
+    }
+
+    /// Get the file extension from the filename
+    pub fn extension(&self) -> Option<&str> {
+        self.filename.rsplit('.').next()
+    }
+
+    /// Get the stored filename (uuid.extension)
+    pub fn stored_filename(&self) -> String {
+        let ext = self.extension().unwrap_or("bin");
+        format!("{}.{}", self.id_hex(), ext)
+    }
+
+    /// Check if the audio file is deleted
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +388,93 @@ mod tests {
         let hex = note.id_hex();
         assert_eq!(hex.len(), 32); // UUID without hyphens
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_attachment_type_conversion() {
+        assert_eq!(AttachmentType::AudioFile.as_str(), "audio_file");
+        assert_eq!(AttachmentType::Summary.as_str(), "summary");
+
+        assert_eq!(
+            AttachmentType::from_str("audio_file"),
+            Some(AttachmentType::AudioFile)
+        );
+        assert_eq!(
+            AttachmentType::from_str("summary"),
+            Some(AttachmentType::Summary)
+        );
+        assert_eq!(AttachmentType::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn test_note_attachment_creation() {
+        let device_id = Uuid::now_v7();
+        let note_id = Uuid::now_v7();
+        let attachment_id = Uuid::now_v7();
+
+        let note_attachment = NoteAttachment::new(
+            note_id,
+            attachment_id,
+            AttachmentType::AudioFile,
+            device_id,
+        );
+
+        assert!(!note_attachment.id.is_nil());
+        assert_eq!(note_attachment.note_id, note_id);
+        assert_eq!(note_attachment.attachment_id, attachment_id);
+        assert_eq!(note_attachment.attachment_type, AttachmentType::AudioFile);
+        assert!(note_attachment.modified_at.is_none());
+        assert!(note_attachment.deleted_at.is_none());
+        assert!(!note_attachment.is_deleted());
+    }
+
+    #[test]
+    fn test_audio_file_creation() {
+        let device_id = Uuid::now_v7();
+        let audio_file = AudioFile::new(
+            "recording.mp3".to_string(),
+            None,
+            device_id,
+        );
+
+        assert!(!audio_file.id.is_nil());
+        assert_eq!(audio_file.filename, "recording.mp3");
+        assert!(audio_file.file_created_at.is_none());
+        assert!(audio_file.summary.is_none());
+        assert!(audio_file.modified_at.is_none());
+        assert!(audio_file.deleted_at.is_none());
+        assert!(!audio_file.is_deleted());
+    }
+
+    #[test]
+    fn test_audio_file_extension() {
+        let device_id = Uuid::now_v7();
+
+        let mp3 = AudioFile::new("test.mp3".to_string(), None, device_id);
+        assert_eq!(mp3.extension(), Some("mp3"));
+
+        let flac = AudioFile::new("my.recording.flac".to_string(), None, device_id);
+        assert_eq!(flac.extension(), Some("flac"));
+    }
+
+    #[test]
+    fn test_audio_file_stored_filename() {
+        let device_id = Uuid::now_v7();
+        let audio_file = AudioFile::new("original.wav".to_string(), None, device_id);
+
+        let stored = audio_file.stored_filename();
+        assert!(stored.ends_with(".wav"));
+        assert_eq!(stored.len(), 32 + 1 + 3); // uuid + dot + ext
+    }
+
+    #[test]
+    fn test_audio_file_formats_constant() {
+        assert!(AUDIO_FILE_FORMATS.contains(&"mp3"));
+        assert!(AUDIO_FILE_FORMATS.contains(&"wav"));
+        assert!(AUDIO_FILE_FORMATS.contains(&"flac"));
+        assert!(AUDIO_FILE_FORMATS.contains(&"ogg"));
+        assert!(AUDIO_FILE_FORMATS.contains(&"opus"));
+        assert!(AUDIO_FILE_FORMATS.contains(&"m4a"));
+        assert!(!AUDIO_FILE_FORMATS.contains(&"txt"));
     }
 }

@@ -1,7 +1,7 @@
 //! VoiceCore - Rust implementation of the Voice note-taking application core.
 //!
 //! This library provides the core functionality for Voice:
-//! - Data models (Note, Tag, NoteTag)
+//! - Data models (Note, Tag, NoteTag, NoteAttachment, AudioFile)
 //! - Database operations (SQLite)
 //! - Sync protocol (client and server)
 //! - Conflict resolution
@@ -41,7 +41,9 @@ uniffi::setup_scaffolding!();
 pub use config::Config;
 pub use database::Database;
 pub use error::{ValidationError, VoiceError, VoiceResult};
-pub use models::{Note, NoteTag, Tag};
+pub use models::{
+    AttachmentType, AudioFile, Note, NoteAttachment, NoteTag, Tag, AUDIO_FILE_FORMATS,
+};
 
 // Re-export Android types when uniffi feature is enabled
 #[cfg(feature = "uniffi")]

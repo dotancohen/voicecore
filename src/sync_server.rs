@@ -11,7 +11,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
-    extract::{Query, State},
+    body::Bytes,
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -232,6 +233,100 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         protocol_version: "1.0".to_string(),
         status: "ok".to_string(),
     })
+}
+
+/// Download an audio file
+async fn download_audio_file(
+    State(state): State<AppState>,
+    Path(audio_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Validate audio_id is a valid UUID
+    let _uuid = Uuid::parse_str(&audio_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
+
+    // Get audiofile_directory from config
+    let audiofile_dir = {
+        let config = state.config.lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Config lock error".to_string()))?;
+        config.audiofile_directory().map(|s| s.to_string())
+    };
+
+    let audiofile_dir = audiofile_dir
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "audiofile_directory not configured".to_string()))?;
+
+    // Look for file with any extension
+    let dir_path = std::path::Path::new(&audiofile_dir);
+    let pattern = format!("{}.*", audio_id);
+
+    // Find the file
+    let mut found_file: Option<std::path::PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(dir_path) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if name.starts_with(&audio_id) && name.contains('.') {
+                found_file = Some(entry.path());
+                break;
+            }
+        }
+    }
+
+    let file_path = found_file
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Audio file not found: {}", audio_id)))?;
+
+    // Read file contents
+    let contents = std::fs::read(&file_path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read file: {}", e)))?;
+
+    Ok((StatusCode::OK, contents))
+}
+
+/// Upload an audio file
+async fn upload_audio_file(
+    State(state): State<AppState>,
+    Path(audio_id): Path<String>,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Validate audio_id is a valid UUID
+    let _uuid = Uuid::parse_str(&audio_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
+
+    // Get audiofile_directory from config
+    let audiofile_dir = {
+        let config = state.config.lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Config lock error".to_string()))?;
+        config.audiofile_directory().map(|s| s.to_string())
+    };
+
+    let audiofile_dir = audiofile_dir
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "audiofile_directory not configured".to_string()))?;
+
+    // Get the extension from the database
+    let extension = {
+        let db = state.db.lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
+
+        let audio_file = db.get_audio_file(&audio_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Audio file record not found: {}", audio_id)))?;
+
+        // Extract extension from filename
+        audio_file.filename.rsplit('.').next()
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| "bin".to_string())
+    };
+
+    // Create audiofile_directory if it doesn't exist
+    let dir_path = std::path::Path::new(&audiofile_dir);
+    std::fs::create_dir_all(dir_path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create directory: {}", e)))?;
+
+    // Write file
+    let file_path = dir_path.join(format!("{}.{}", audio_id, extension));
+    std::fs::write(&file_path, body.as_ref())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)))?;
+
+    Ok((StatusCode::OK, "OK"))
 }
 
 // Helper functions
@@ -478,6 +573,172 @@ fn get_changes_since(
         }
     }
 
+    // Get note_attachment changes
+    let remaining = limit - changes.len() as i64;
+    if remaining > 0 {
+        let note_attachments_query = if since.is_some() {
+            "SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at \
+             FROM note_attachments \
+             WHERE created_at > ? OR deleted_at > ? OR modified_at > ? \
+             ORDER BY COALESCE(modified_at, deleted_at, created_at) LIMIT ?"
+        } else {
+            "SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at \
+             FROM note_attachments \
+             ORDER BY COALESCE(modified_at, deleted_at, created_at) LIMIT ?"
+        };
+
+        let mut stmt = conn.prepare(note_attachments_query)?;
+        let note_attachment_rows: Vec<_> = if let Some(ts) = since {
+            stmt.query_map(rusqlite::params![ts, ts, ts, remaining], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let note_id_bytes: Vec<u8> = row.get(1)?;
+                let attachment_id_bytes: Vec<u8> = row.get(2)?;
+                let attachment_type: String = row.get(3)?;
+                let created_at: String = row.get(4)?;
+                let modified_at: Option<String> = row.get(5)?;
+                let deleted_at: Option<String> = row.get(6)?;
+                Ok((id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at))
+            })?
+            .collect()
+        } else {
+            stmt.query_map(rusqlite::params![remaining], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let note_id_bytes: Vec<u8> = row.get(1)?;
+                let attachment_id_bytes: Vec<u8> = row.get(2)?;
+                let attachment_type: String = row.get(3)?;
+                let created_at: String = row.get(4)?;
+                let modified_at: Option<String> = row.get(5)?;
+                let deleted_at: Option<String> = row.get(6)?;
+                Ok((id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at))
+            })?
+            .collect()
+        };
+
+        for row in note_attachment_rows {
+            let (id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at) = row?;
+            let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
+            let note_id_hex = crate::validation::uuid_bytes_to_hex(&note_id_bytes)?;
+            let attachment_id_hex = crate::validation::uuid_bytes_to_hex(&attachment_id_bytes)?;
+
+            let operation = if deleted_at.is_some() {
+                "delete"
+            } else if modified_at.is_some() {
+                "update"
+            } else {
+                "create"
+            };
+
+            let timestamp = modified_at
+                .clone()
+                .or_else(|| deleted_at.clone())
+                .unwrap_or_else(|| created_at.clone());
+
+            if latest_timestamp.is_none() || latest_timestamp.as_ref() < Some(&timestamp) {
+                latest_timestamp = Some(timestamp.clone());
+            }
+
+            changes.push(SyncChange {
+                entity_type: "note_attachment".to_string(),
+                entity_id: id_hex.clone(),
+                operation: operation.to_string(),
+                data: serde_json::json!({
+                    "id": id_hex,
+                    "note_id": note_id_hex,
+                    "attachment_id": attachment_id_hex,
+                    "attachment_type": attachment_type,
+                    "created_at": created_at,
+                    "modified_at": modified_at,
+                    "deleted_at": deleted_at,
+                }),
+                timestamp,
+                device_id: String::new(),
+                device_name: None,
+            });
+        }
+    }
+
+    // Get audio_file changes
+    let remaining = limit - changes.len() as i64;
+    if remaining > 0 {
+        let audio_files_query = if since.is_some() {
+            "SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at \
+             FROM audio_files \
+             WHERE imported_at > ? OR deleted_at > ? OR modified_at > ? \
+             ORDER BY COALESCE(modified_at, deleted_at, imported_at) LIMIT ?"
+        } else {
+            "SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at \
+             FROM audio_files \
+             ORDER BY COALESCE(modified_at, deleted_at, imported_at) LIMIT ?"
+        };
+
+        let mut stmt = conn.prepare(audio_files_query)?;
+        let audio_file_rows: Vec<_> = if let Some(ts) = since {
+            stmt.query_map(rusqlite::params![ts, ts, ts, remaining], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let imported_at: String = row.get(1)?;
+                let filename: String = row.get(2)?;
+                let file_created_at: Option<String> = row.get(3)?;
+                let summary: Option<String> = row.get(4)?;
+                let modified_at: Option<String> = row.get(5)?;
+                let deleted_at: Option<String> = row.get(6)?;
+                Ok((id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at))
+            })?
+            .collect()
+        } else {
+            stmt.query_map(rusqlite::params![remaining], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let imported_at: String = row.get(1)?;
+                let filename: String = row.get(2)?;
+                let file_created_at: Option<String> = row.get(3)?;
+                let summary: Option<String> = row.get(4)?;
+                let modified_at: Option<String> = row.get(5)?;
+                let deleted_at: Option<String> = row.get(6)?;
+                Ok((id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at))
+            })?
+            .collect()
+        };
+
+        for row in audio_file_rows {
+            let (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at) = row?;
+            let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
+
+            let operation = if deleted_at.is_some() {
+                "delete"
+            } else if modified_at.is_some() {
+                "update"
+            } else {
+                "create"
+            };
+
+            let timestamp = modified_at
+                .clone()
+                .or_else(|| deleted_at.clone())
+                .unwrap_or_else(|| imported_at.clone());
+
+            if latest_timestamp.is_none() || latest_timestamp.as_ref() < Some(&timestamp) {
+                latest_timestamp = Some(timestamp.clone());
+            }
+
+            changes.push(SyncChange {
+                entity_type: "audio_file".to_string(),
+                entity_id: id_hex.clone(),
+                operation: operation.to_string(),
+                data: serde_json::json!({
+                    "id": id_hex,
+                    "imported_at": imported_at,
+                    "filename": filename,
+                    "file_created_at": file_created_at,
+                    "summary": summary,
+                    "modified_at": modified_at,
+                    "deleted_at": deleted_at,
+                }),
+                timestamp,
+                device_id: String::new(),
+                device_name: None,
+            });
+        }
+    }
+
     Ok((changes, latest_timestamp))
 }
 
@@ -500,6 +761,8 @@ fn apply_sync_changes(
             "note" => apply_note_change(&db, change, last_sync_at.as_deref()),
             "tag" => apply_tag_change(&db, change, last_sync_at.as_deref()),
             "note_tag" => apply_note_tag_change(&db, change, last_sync_at.as_deref()),
+            "note_attachment" => apply_note_attachment_change(&db, change, last_sync_at.as_deref()),
+            "audio_file" => apply_audio_file_change(&db, change, last_sync_at.as_deref()),
             _ => {
                 errors.push(format!("Unknown entity type: {}", change.entity_type));
                 continue;
@@ -935,6 +1198,214 @@ fn apply_note_tag_change(
     }
 }
 
+fn apply_note_attachment_change(
+    db: &Database,
+    change: &SyncChange,
+    last_sync_at: Option<&str>,
+) -> VoiceResult<ApplyResult> {
+    let attachment_assoc_id = &change.entity_id;
+    let data = &change.data;
+
+    // Validate datetime format for all incoming timestamps
+    validate_datetime_optional(data["created_at"].as_str(), "note_attachment.created_at")?;
+    validate_datetime_optional(data["modified_at"].as_str(), "note_attachment.modified_at")?;
+    validate_datetime_optional(data["deleted_at"].as_str(), "note_attachment.deleted_at")?;
+
+    // Determine the timestamp of this incoming change
+    let incoming_time = if change.operation == "delete" {
+        data["deleted_at"].as_str().or_else(|| data["modified_at"].as_str())
+    } else {
+        data["modified_at"].as_str().or_else(|| data["created_at"].as_str())
+    };
+
+    // If this change happened before or at last_sync, skip it
+    if let (Some(last), Some(incoming)) = (last_sync_at, incoming_time) {
+        if incoming <= last {
+            return Ok(ApplyResult::Skipped);
+        }
+    }
+
+    let existing = db.get_note_attachment_raw(attachment_assoc_id)?;
+
+    // Determine if local changed since last_sync
+    let local_changed = if let Some(ref ex) = existing {
+        let local_time = ex.get("modified_at")
+            .and_then(|v| v.as_str())
+            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
+            .or_else(|| ex.get("created_at").and_then(|v| v.as_str()));
+        last_sync_at.is_none() || local_time.map_or(false, |lt| lt > last_sync_at.unwrap_or(""))
+    } else {
+        false
+    };
+
+    let id = data["id"].as_str().unwrap_or("");
+    let note_id = data["note_id"].as_str().unwrap_or("");
+    let attachment_id = data["attachment_id"].as_str().unwrap_or("");
+    let attachment_type = data["attachment_type"].as_str().unwrap_or("");
+    let created_at = data["created_at"].as_str().unwrap_or("");
+    let modified_at = data["modified_at"].as_str();
+    let deleted_at = data["deleted_at"].as_str();
+
+    match change.operation.as_str() {
+        "create" => {
+            if let Some(ref ex) = existing {
+                if ex.get("deleted_at").and_then(|v| v.as_str()).is_none() {
+                    // Already active
+                    return Ok(ApplyResult::Skipped);
+                }
+                // Local is deleted, remote wants active - reactivate
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, None)?;
+                return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
+            }
+            // New association
+            db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, None)?;
+            Ok(ApplyResult::Applied)
+        }
+        "delete" => {
+            if existing.is_none() {
+                // Create as deleted for sync consistency
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+                return Ok(ApplyResult::Applied);
+            }
+            let ex = existing.unwrap();
+            if ex.get("deleted_at").and_then(|v| v.as_str()).is_some() {
+                return Ok(ApplyResult::Skipped); // Already deleted
+            }
+            // Local is active, remote wants to delete
+            if local_changed {
+                // Both changed - favor preservation (keep active)
+                return Ok(ApplyResult::Conflict);
+            }
+            // Apply the delete
+            db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+            Ok(ApplyResult::Applied)
+        }
+        "update" => {
+            if existing.is_none() {
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+                return Ok(ApplyResult::Applied);
+            }
+
+            let ex = existing.unwrap();
+            let remote_deleted = deleted_at.is_some();
+            let local_deleted = ex.get("deleted_at").and_then(|v| v.as_str()).is_some();
+
+            if !remote_deleted && local_deleted {
+                // Remote reactivated, local still deleted - reactivate
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, None)?;
+                return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
+            }
+
+            if remote_deleted && !local_deleted {
+                // Remote wants to delete, local is active
+                if local_changed {
+                    return Ok(ApplyResult::Conflict); // Keep active
+                }
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+                return Ok(ApplyResult::Applied);
+            }
+
+            // Both have same deleted state - update timestamps
+            db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+            Ok(ApplyResult::Applied)
+        }
+        _ => Ok(ApplyResult::Skipped),
+    }
+}
+
+fn apply_audio_file_change(
+    db: &Database,
+    change: &SyncChange,
+    last_sync_at: Option<&str>,
+) -> VoiceResult<ApplyResult> {
+    let audio_file_id = &change.entity_id;
+    let data = &change.data;
+
+    // Validate datetime format for all incoming timestamps
+    validate_datetime_optional(data["imported_at"].as_str(), "audio_file.imported_at")?;
+    validate_datetime_optional(data["file_created_at"].as_str(), "audio_file.file_created_at")?;
+    validate_datetime_optional(data["modified_at"].as_str(), "audio_file.modified_at")?;
+    validate_datetime_optional(data["deleted_at"].as_str(), "audio_file.deleted_at")?;
+
+    // Determine the timestamp of this incoming change
+    let incoming_time = if change.operation == "delete" {
+        data["deleted_at"].as_str().or_else(|| data["modified_at"].as_str())
+    } else {
+        data["modified_at"].as_str().or_else(|| data["imported_at"].as_str())
+    };
+
+    // If this change happened before or at last_sync, skip it
+    if let (Some(last), Some(incoming)) = (last_sync_at, incoming_time) {
+        if incoming <= last {
+            return Ok(ApplyResult::Skipped);
+        }
+    }
+
+    let existing = db.get_audio_file_raw(audio_file_id)?;
+
+    // Determine if local changed since last_sync
+    let local_changed = if let Some(ref ex) = existing {
+        let local_time = ex.get("modified_at")
+            .and_then(|v| v.as_str())
+            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
+            .or_else(|| ex.get("imported_at").and_then(|v| v.as_str()));
+        last_sync_at.is_none() || local_time.map_or(false, |lt| lt > last_sync_at.unwrap_or(""))
+    } else {
+        false
+    };
+
+    let id = data["id"].as_str().unwrap_or("");
+    let imported_at = data["imported_at"].as_str().unwrap_or("");
+    let filename = data["filename"].as_str().unwrap_or("");
+    let file_created_at = data["file_created_at"].as_str();
+    let summary = data["summary"].as_str();
+    let modified_at = data["modified_at"].as_str();
+    let deleted_at = data["deleted_at"].as_str();
+
+    match change.operation.as_str() {
+        "create" => {
+            if existing.is_some() {
+                return Ok(ApplyResult::Skipped);
+            }
+            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+            Ok(ApplyResult::Applied)
+        }
+        "update" | "delete" => {
+            if existing.is_none() {
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+                return Ok(ApplyResult::Applied);
+            }
+
+            let existing = existing.unwrap();
+            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_str()).is_some();
+            let remote_deleted = deleted_at.is_some();
+
+            // Audio files are simpler - no content conflicts (metadata + binary)
+            // If both deleted, apply
+            if local_deleted && remote_deleted {
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+                return Ok(ApplyResult::Applied);
+            }
+
+            // If local edited but remote deletes, create conflict (preserve local)
+            if !local_deleted && remote_deleted && local_changed {
+                return Ok(ApplyResult::Conflict);
+            }
+
+            // If local deleted but remote has updates (reactivation or edit)
+            if local_deleted && !remote_deleted {
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+                return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
+            }
+
+            // Otherwise apply the update
+            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+            Ok(ApplyResult::Applied)
+        }
+        _ => Ok(ApplyResult::Skipped),
+    }
+}
+
 fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value> {
     let db = db.lock().unwrap();
     let conn = db.connection();
@@ -1021,10 +1492,74 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
         }));
     }
 
+    // Get all note_attachments
+    let mut note_attachments = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at FROM note_attachments",
+    )?;
+    let note_attachment_rows = stmt.query_map([], |row| {
+        let id_bytes: Vec<u8> = row.get(0)?;
+        let note_id_bytes: Vec<u8> = row.get(1)?;
+        let attachment_id_bytes: Vec<u8> = row.get(2)?;
+        let attachment_type: String = row.get(3)?;
+        let created_at: String = row.get(4)?;
+        let modified_at: Option<String> = row.get(5)?;
+        let deleted_at: Option<String> = row.get(6)?;
+        Ok((id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at))
+    })?;
+
+    for row in note_attachment_rows {
+        let (id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at) = row?;
+        let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
+        let note_id_hex = crate::validation::uuid_bytes_to_hex(&note_id_bytes)?;
+        let attachment_id_hex = crate::validation::uuid_bytes_to_hex(&attachment_id_bytes)?;
+        note_attachments.push(serde_json::json!({
+            "id": id_hex,
+            "note_id": note_id_hex,
+            "attachment_id": attachment_id_hex,
+            "attachment_type": attachment_type,
+            "created_at": created_at,
+            "modified_at": modified_at,
+            "deleted_at": deleted_at,
+        }));
+    }
+
+    // Get all audio_files
+    let mut audio_files = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at FROM audio_files",
+    )?;
+    let audio_file_rows = stmt.query_map([], |row| {
+        let id_bytes: Vec<u8> = row.get(0)?;
+        let imported_at: String = row.get(1)?;
+        let filename: String = row.get(2)?;
+        let file_created_at: Option<String> = row.get(3)?;
+        let summary: Option<String> = row.get(4)?;
+        let modified_at: Option<String> = row.get(5)?;
+        let deleted_at: Option<String> = row.get(6)?;
+        Ok((id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at))
+    })?;
+
+    for row in audio_file_rows {
+        let (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at) = row?;
+        let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
+        audio_files.push(serde_json::json!({
+            "id": id_hex,
+            "imported_at": imported_at,
+            "filename": filename,
+            "file_created_at": file_created_at,
+            "summary": summary,
+            "modified_at": modified_at,
+            "deleted_at": deleted_at,
+        }));
+    }
+
     Ok(serde_json::json!({
         "notes": notes,
         "tags": tags,
         "note_tags": note_tags,
+        "note_attachments": note_attachments,
+        "audio_files": audio_files,
     }))
 }
 
@@ -1051,6 +1586,8 @@ pub fn create_router(
         .route("/sync/apply", post(apply_changes))
         .route("/sync/full", get(get_full_sync))
         .route("/sync/status", get(status))
+        .route("/sync/audio/:audio_id/file", get(download_audio_file))
+        .route("/sync/audio/:audio_id/file", post(upload_audio_file))
         .with_state(state)
 }
 

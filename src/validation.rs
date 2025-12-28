@@ -6,6 +6,7 @@
 use uuid::Uuid;
 
 use crate::error::{VoiceError, VoiceResult};
+use crate::models::AUDIO_FILE_FORMATS;
 
 // Limits (matching Python implementation)
 pub const MAX_TAG_NAME_LENGTH: usize = 100;
@@ -207,6 +208,45 @@ pub fn validate_tag_id(tag_id: &str) -> VoiceResult<Uuid> {
 /// Validate a device ID.
 pub fn validate_device_id(device_id: &str) -> VoiceResult<Uuid> {
     validate_entity_id(device_id, "device_id")
+}
+
+/// Validate an audio file ID.
+pub fn validate_audio_file_id(audio_file_id: &str) -> VoiceResult<Uuid> {
+    validate_entity_id(audio_file_id, "audio_file_id")
+}
+
+/// Validate a note attachment association ID.
+pub fn validate_attachment_id(attachment_id: &str) -> VoiceResult<Uuid> {
+    validate_entity_id(attachment_id, "attachment_id")
+}
+
+/// Validate that a filename has a supported audio file extension.
+///
+/// Supported formats: mp3, wav, flac, ogg, opus, m4a
+pub fn validate_audio_extension(filename: &str) -> VoiceResult<()> {
+    let extension = filename
+        .rsplit('.')
+        .next()
+        .map(|ext| ext.to_lowercase());
+
+    match extension {
+        Some(ext) if AUDIO_FILE_FORMATS.contains(&ext.as_str()) => Ok(()),
+        Some(ext) => Err(VoiceError::validation(
+            "filename",
+            format!(
+                "unsupported audio format '{}', supported formats: {}",
+                ext,
+                AUDIO_FILE_FORMATS.join(", ")
+            ),
+        )),
+        None => Err(VoiceError::validation(
+            "filename",
+            format!(
+                "missing file extension, supported formats: {}",
+                AUDIO_FILE_FORMATS.join(", ")
+            ),
+        )),
+    }
 }
 
 /// Validate a list of tag IDs.
@@ -590,5 +630,64 @@ mod tests {
         assert!(validate_datetime_optional(None, "test").is_ok());
         assert!(validate_datetime_optional(Some("2025-01-01 00:00:00"), "test").is_ok());
         assert!(validate_datetime_optional(Some("2025-1-1 0:0:0"), "test").is_err());
+    }
+
+    #[test]
+    fn test_validate_audio_file_id_valid() {
+        let uuid = Uuid::now_v7();
+        let hex = uuid.simple().to_string();
+        let result = validate_audio_file_id(&hex);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), uuid);
+    }
+
+    #[test]
+    fn test_validate_audio_file_id_invalid() {
+        let result = validate_audio_file_id("not-a-uuid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_attachment_id_valid() {
+        let uuid = Uuid::now_v7();
+        let hex = uuid.simple().to_string();
+        let result = validate_attachment_id(&hex);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), uuid);
+    }
+
+    #[test]
+    fn test_validate_attachment_id_invalid() {
+        let result = validate_attachment_id("not-a-uuid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_audio_extension_valid() {
+        assert!(validate_audio_extension("recording.mp3").is_ok());
+        assert!(validate_audio_extension("audio.wav").is_ok());
+        assert!(validate_audio_extension("music.flac").is_ok());
+        assert!(validate_audio_extension("voice.ogg").is_ok());
+        assert!(validate_audio_extension("memo.opus").is_ok());
+        assert!(validate_audio_extension("song.m4a").is_ok());
+        // Case insensitive
+        assert!(validate_audio_extension("recording.MP3").is_ok());
+        assert!(validate_audio_extension("audio.WAV").is_ok());
+        assert!(validate_audio_extension("music.FlAc").is_ok());
+        // Multiple dots in filename
+        assert!(validate_audio_extension("my.audio.file.mp3").is_ok());
+    }
+
+    #[test]
+    fn test_validate_audio_extension_invalid() {
+        assert!(validate_audio_extension("document.pdf").is_err());
+        assert!(validate_audio_extension("image.png").is_err());
+        assert!(validate_audio_extension("video.mp4").is_err());
+        assert!(validate_audio_extension("text.txt").is_err());
+    }
+
+    #[test]
+    fn test_validate_audio_extension_no_extension() {
+        assert!(validate_audio_extension("filename").is_err());
     }
 }

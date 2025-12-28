@@ -54,6 +54,32 @@ pub struct TagRow {
     pub modified_at: Option<String>,
 }
 
+/// NoteAttachment data returned from database queries (junction table)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteAttachmentRow {
+    pub id: String,
+    pub note_id: String,
+    pub attachment_id: String,
+    pub attachment_type: String,
+    pub created_at: String,
+    pub device_id: String,
+    pub modified_at: Option<String>,
+    pub deleted_at: Option<String>,
+}
+
+/// AudioFile data returned from database queries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioFileRow {
+    pub id: String,
+    pub imported_at: String,
+    pub filename: String,
+    pub file_created_at: Option<String>,
+    pub summary: Option<String>,
+    pub device_id: String,
+    pub modified_at: Option<String>,
+    pub deleted_at: Option<String>,
+}
+
 /// Convert UUID bytes to hex string
 fn uuid_bytes_to_hex(bytes: &[u8]) -> Option<String> {
     if bytes.len() == 16 {
@@ -257,6 +283,31 @@ impl Database {
                 FOREIGN KEY (peer_id) REFERENCES sync_peers(peer_id)
             );
 
+            -- Create note_attachments junction table (polymorphic association)
+            CREATE TABLE IF NOT EXISTS note_attachments (
+                id BLOB PRIMARY KEY,
+                note_id BLOB NOT NULL,
+                attachment_id BLOB NOT NULL,
+                attachment_type TEXT NOT NULL,
+                created_at DATETIME NOT NULL,
+                device_id BLOB NOT NULL,
+                modified_at DATETIME,
+                deleted_at DATETIME,
+                FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE
+            );
+
+            -- Create audio_files table
+            CREATE TABLE IF NOT EXISTS audio_files (
+                id BLOB PRIMARY KEY,
+                imported_at DATETIME NOT NULL,
+                filename TEXT NOT NULL,
+                file_created_at DATETIME,
+                summary TEXT,
+                device_id BLOB NOT NULL,
+                modified_at DATETIME,
+                deleted_at DATETIME
+            );
+
             -- Create indexes
             CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at);
             CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at);
@@ -269,6 +320,13 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_note_tags_created_at ON note_tags(created_at);
             CREATE INDEX IF NOT EXISTS idx_note_tags_deleted_at ON note_tags(deleted_at);
             CREATE INDEX IF NOT EXISTS idx_note_tags_modified_at ON note_tags(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_note_id ON note_attachments(note_id);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_attachment_id ON note_attachments(attachment_id);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_type ON note_attachments(attachment_type);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_modified_at ON note_attachments(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_deleted_at ON note_attachments(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_audio_files_modified_at ON audio_files(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_audio_files_deleted_at ON audio_files(deleted_at);
             "#,
         )?;
         Ok(())
@@ -1099,6 +1157,176 @@ impl Database {
                 let mut data = serde_json::Map::new();
                 data.insert("note_id".to_string(), serde_json::Value::String(note_id_hex));
                 data.insert("tag_id".to_string(), serde_json::Value::String(tag_id_hex));
+                data.insert("created_at".to_string(), serde_json::Value::String(created_at));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                change.insert("data".to_string(), serde_json::Value::Object(data));
+
+                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                    latest_timestamp = Some(timestamp);
+                }
+                changes.push(change);
+            }
+        }
+
+        // Get audio_file changes
+        let remaining = limit - changes.len() as i64;
+        if remaining > 0 {
+            let audio_rows: Vec<(Vec<u8>, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = if let Some(since_ts) = since {
+                let mut stmt = self.conn.prepare(
+                    r#"
+                    SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
+                    FROM audio_files
+                    WHERE modified_at >= ? OR (modified_at IS NULL AND imported_at >= ?)
+                    ORDER BY COALESCE(modified_at, imported_at)
+                    LIMIT ?
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![since_ts, since_ts, remaining], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut stmt = self.conn.prepare(
+                    r#"
+                    SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
+                    FROM audio_files
+                    ORDER BY COALESCE(modified_at, imported_at)
+                    LIMIT ?
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![remaining], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at) in audio_rows {
+                let timestamp = modified_at.clone().unwrap_or_else(|| imported_at.clone());
+                let operation = if deleted_at.is_some() {
+                    "delete"
+                } else if modified_at.is_some() {
+                    "update"
+                } else {
+                    "create"
+                };
+
+                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
+                let mut change = HashMap::new();
+                change.insert("entity_type".to_string(), serde_json::Value::String("audio_file".to_string()));
+                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
+                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
+                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+
+                let mut data = serde_json::Map::new();
+                data.insert("id".to_string(), serde_json::Value::String(id_hex));
+                data.insert("imported_at".to_string(), serde_json::Value::String(imported_at));
+                data.insert("filename".to_string(), serde_json::Value::String(filename));
+                data.insert("file_created_at".to_string(), file_created_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("summary".to_string(), summary.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                change.insert("data".to_string(), serde_json::Value::Object(data));
+
+                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                    latest_timestamp = Some(timestamp);
+                }
+                changes.push(change);
+            }
+        }
+
+        // Get note_attachment changes
+        let remaining = limit - changes.len() as i64;
+        if remaining > 0 {
+            let na_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, String, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
+                let mut stmt = self.conn.prepare(
+                    r#"
+                    SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
+                    FROM note_attachments
+                    WHERE created_at >= ? OR deleted_at >= ? OR modified_at >= ?
+                    ORDER BY COALESCE(modified_at, deleted_at, created_at)
+                    LIMIT ?
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut stmt = self.conn.prepare(
+                    r#"
+                    SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
+                    FROM note_attachments
+                    ORDER BY COALESCE(modified_at, deleted_at, created_at)
+                    LIMIT ?
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![remaining], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            for (id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at) in na_rows {
+                let timestamp = modified_at.clone()
+                    .or_else(|| deleted_at.clone())
+                    .unwrap_or_else(|| created_at.clone());
+
+                let operation = if deleted_at.is_some() {
+                    "delete"
+                } else if modified_at.is_some() {
+                    "update"
+                } else {
+                    "create"
+                };
+
+                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
+                let note_id_hex = uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default();
+                let attachment_id_hex = uuid_bytes_to_hex(&attachment_id_bytes).unwrap_or_default();
+
+                let mut change = HashMap::new();
+                change.insert("entity_type".to_string(), serde_json::Value::String("note_attachment".to_string()));
+                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
+                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
+                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+
+                let mut data = serde_json::Map::new();
+                data.insert("id".to_string(), serde_json::Value::String(id_hex));
+                data.insert("note_id".to_string(), serde_json::Value::String(note_id_hex));
+                data.insert("attachment_id".to_string(), serde_json::Value::String(attachment_id_hex));
+                data.insert("attachment_type".to_string(), serde_json::Value::String(attachment_type));
                 data.insert("created_at".to_string(), serde_json::Value::String(created_at));
                 data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
                 data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
@@ -2193,6 +2421,450 @@ impl Database {
             created_at: created_at.map(|s| parse_sqlite_datetime(&s)),
             modified_at: modified_at.map(|s| parse_sqlite_datetime(&s)),
         })
+    }
+
+    // ========================================================================
+    // NoteAttachment operations
+    // ========================================================================
+
+    /// Attach an attachment to a note
+    pub fn attach_to_note(
+        &self,
+        note_id: &str,
+        attachment_id: &str,
+        attachment_type: &str,
+    ) -> VoiceResult<String> {
+        let note_uuid = validate_note_id(note_id)?;
+        let attachment_uuid = Uuid::parse_str(attachment_id)
+            .map_err(|e| VoiceError::validation("attachment_id", e.to_string()))?;
+        let association_id = Uuid::now_v7();
+
+        let device_id = get_local_device_id();
+
+        self.conn.execute(
+            r#"
+            INSERT INTO note_attachments (id, note_id, attachment_id, attachment_type, created_at, device_id)
+            VALUES (?, ?, ?, ?, datetime('now'), ?)
+            "#,
+            params![
+                association_id.as_bytes().to_vec(),
+                note_uuid.as_bytes().to_vec(),
+                attachment_uuid.as_bytes().to_vec(),
+                attachment_type,
+                device_id.as_bytes().to_vec(),
+            ],
+        )?;
+
+        Ok(association_id.simple().to_string())
+    }
+
+    /// Detach an attachment from a note (soft delete)
+    pub fn detach_from_note(&self, association_id: &str) -> VoiceResult<bool> {
+        let uuid = Uuid::parse_str(association_id)
+            .map_err(|e| VoiceError::validation("association_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+        let device_id = get_local_device_id();
+
+        let updated = self.conn.execute(
+            r#"
+            UPDATE note_attachments
+            SET deleted_at = datetime('now'), modified_at = datetime('now'), device_id = ?
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![device_id.as_bytes().to_vec(), uuid_bytes],
+        )?;
+
+        Ok(updated > 0)
+    }
+
+    /// Get all attachments for a note
+    pub fn get_attachments_for_note(&self, note_id: &str) -> VoiceResult<Vec<NoteAttachmentRow>> {
+        let uuid = validate_note_id(note_id)?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, note_id, attachment_id, attachment_type, created_at, device_id, modified_at, deleted_at
+            FROM note_attachments
+            WHERE note_id = ? AND deleted_at IS NULL
+            ORDER BY created_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([uuid_bytes], |row| self.row_to_note_attachment(row))?;
+        let mut attachments = Vec::new();
+        for attachment in rows {
+            attachments.push(attachment?);
+        }
+        Ok(attachments)
+    }
+
+    /// Get a specific attachment association
+    pub fn get_attachment(&self, association_id: &str) -> VoiceResult<Option<NoteAttachmentRow>> {
+        let uuid = Uuid::parse_str(association_id)
+            .map_err(|e| VoiceError::validation("association_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, note_id, attachment_id, attachment_type, created_at, device_id, modified_at, deleted_at
+            FROM note_attachments
+            WHERE id = ?
+            "#,
+        )?;
+
+        let mut rows = stmt.query_map([uuid_bytes], |row| self.row_to_note_attachment(row))?;
+        match rows.next() {
+            Some(Ok(attachment)) => Ok(Some(attachment)),
+            Some(Err(e)) => Err(VoiceError::Database(e)),
+            None => Ok(None),
+        }
+    }
+
+    fn row_to_note_attachment(&self, row: &Row) -> rusqlite::Result<NoteAttachmentRow> {
+        let id_bytes: Vec<u8> = row.get(0)?;
+        let note_id_bytes: Vec<u8> = row.get(1)?;
+        let attachment_id_bytes: Vec<u8> = row.get(2)?;
+        let attachment_type: String = row.get(3)?;
+        let created_at: String = row.get(4)?;
+        let device_id_bytes: Vec<u8> = row.get(5)?;
+        let modified_at: Option<String> = row.get(6)?;
+        let deleted_at: Option<String> = row.get(7)?;
+
+        Ok(NoteAttachmentRow {
+            id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
+            note_id: uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default(),
+            attachment_id: uuid_bytes_to_hex(&attachment_id_bytes).unwrap_or_default(),
+            attachment_type,
+            created_at: parse_sqlite_datetime(&created_at),
+            device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
+            modified_at: modified_at.map(|s| parse_sqlite_datetime(&s)),
+            deleted_at: deleted_at.map(|s| parse_sqlite_datetime(&s)),
+        })
+    }
+
+    // ========================================================================
+    // AudioFile operations
+    // ========================================================================
+
+    /// Create a new audio file record
+    pub fn create_audio_file(
+        &self,
+        filename: &str,
+        file_created_at: Option<&str>,
+    ) -> VoiceResult<String> {
+        let audio_file_id = Uuid::now_v7();
+        let uuid_bytes = audio_file_id.as_bytes().to_vec();
+        let device_id = get_local_device_id();
+
+        self.conn.execute(
+            r#"
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, device_id)
+            VALUES (?, datetime('now'), ?, ?, ?)
+            "#,
+            params![
+                uuid_bytes,
+                filename,
+                file_created_at,
+                device_id.as_bytes().to_vec(),
+            ],
+        )?;
+
+        Ok(audio_file_id.simple().to_string())
+    }
+
+    /// Get an audio file by ID
+    pub fn get_audio_file(&self, audio_file_id: &str) -> VoiceResult<Option<AudioFileRow>> {
+        let uuid = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at
+            FROM audio_files
+            WHERE id = ?
+            "#,
+        )?;
+
+        let mut rows = stmt.query_map([uuid_bytes], |row| self.row_to_audio_file(row))?;
+        match rows.next() {
+            Some(Ok(audio_file)) => Ok(Some(audio_file)),
+            Some(Err(e)) => Err(VoiceError::Database(e)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get all audio files for a note (via note_attachments)
+    pub fn get_audio_files_for_note(&self, note_id: &str) -> VoiceResult<Vec<AudioFileRow>> {
+        let uuid = validate_note_id(note_id)?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT af.id, af.imported_at, af.filename, af.file_created_at, af.summary,
+                   af.device_id, af.modified_at, af.deleted_at
+            FROM audio_files af
+            INNER JOIN note_attachments na ON af.id = na.attachment_id
+            WHERE na.note_id = ?
+              AND na.attachment_type = 'audio_file'
+              AND na.deleted_at IS NULL
+              AND af.deleted_at IS NULL
+            ORDER BY af.imported_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([uuid_bytes], |row| self.row_to_audio_file(row))?;
+        let mut audio_files = Vec::new();
+        for audio_file in rows {
+            audio_files.push(audio_file?);
+        }
+        Ok(audio_files)
+    }
+
+    /// Update an audio file's summary
+    pub fn update_audio_file_summary(
+        &self,
+        audio_file_id: &str,
+        summary: &str,
+    ) -> VoiceResult<bool> {
+        let uuid = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+        let device_id = get_local_device_id();
+
+        let updated = self.conn.execute(
+            r#"
+            UPDATE audio_files
+            SET summary = ?, modified_at = datetime('now'), device_id = ?
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![summary, device_id.as_bytes().to_vec(), uuid_bytes],
+        )?;
+
+        Ok(updated > 0)
+    }
+
+    /// Soft-delete an audio file
+    pub fn delete_audio_file(&self, audio_file_id: &str) -> VoiceResult<bool> {
+        let uuid = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+        let device_id = get_local_device_id();
+
+        let updated = self.conn.execute(
+            r#"
+            UPDATE audio_files
+            SET deleted_at = datetime('now'), modified_at = datetime('now'), device_id = ?
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![device_id.as_bytes().to_vec(), uuid_bytes],
+        )?;
+
+        Ok(updated > 0)
+    }
+
+    fn row_to_audio_file(&self, row: &Row) -> rusqlite::Result<AudioFileRow> {
+        let id_bytes: Vec<u8> = row.get(0)?;
+        let imported_at: String = row.get(1)?;
+        let filename: String = row.get(2)?;
+        let file_created_at: Option<String> = row.get(3)?;
+        let summary: Option<String> = row.get(4)?;
+        let device_id_bytes: Vec<u8> = row.get(5)?;
+        let modified_at: Option<String> = row.get(6)?;
+        let deleted_at: Option<String> = row.get(7)?;
+
+        Ok(AudioFileRow {
+            id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
+            imported_at: parse_sqlite_datetime(&imported_at),
+            filename,
+            file_created_at: file_created_at.map(|s| parse_sqlite_datetime(&s)),
+            summary,
+            device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
+            modified_at: modified_at.map(|s| parse_sqlite_datetime(&s)),
+            deleted_at: deleted_at.map(|s| parse_sqlite_datetime(&s)),
+        })
+    }
+
+    // ========================================================================
+    // Sync operations for NoteAttachment
+    // ========================================================================
+
+    /// Get raw note attachment data for sync (returns serde_json::Value)
+    pub fn get_note_attachment_raw(&self, association_id: &str) -> VoiceResult<Option<serde_json::Value>> {
+        let uuid = Uuid::parse_str(association_id)
+            .map_err(|e| VoiceError::validation("association_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, note_id, attachment_id, attachment_type, created_at, device_id, modified_at, deleted_at
+            FROM note_attachments
+            WHERE id = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row([uuid_bytes], |row| {
+            let id_bytes: Vec<u8> = row.get(0)?;
+            let note_id_bytes: Vec<u8> = row.get(1)?;
+            let attachment_id_bytes: Vec<u8> = row.get(2)?;
+            let attachment_type: String = row.get(3)?;
+            let created_at: String = row.get(4)?;
+            let device_id_bytes: Vec<u8> = row.get(5)?;
+            let modified_at: Option<String> = row.get(6)?;
+            let deleted_at: Option<String> = row.get(7)?;
+
+            Ok(serde_json::json!({
+                "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
+                "note_id": uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default(),
+                "attachment_id": uuid_bytes_to_hex(&attachment_id_bytes).unwrap_or_default(),
+                "attachment_type": attachment_type,
+                "created_at": created_at,
+                "device_id": uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
+                "modified_at": modified_at,
+                "deleted_at": deleted_at,
+            }))
+        });
+
+        match result {
+            Ok(val) => Ok(Some(val)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(VoiceError::Database(e)),
+        }
+    }
+
+    /// Apply a note attachment from sync
+    pub fn apply_sync_note_attachment(
+        &self,
+        id: &str,
+        note_id: &str,
+        attachment_id: &str,
+        attachment_type: &str,
+        created_at: &str,
+        modified_at: Option<&str>,
+        deleted_at: Option<&str>,
+    ) -> VoiceResult<()> {
+        let id_uuid = Uuid::parse_str(id)
+            .map_err(|e| VoiceError::validation("id", e.to_string()))?;
+        let note_uuid = validate_note_id(note_id)?;
+        let attachment_uuid = Uuid::parse_str(attachment_id)
+            .map_err(|e| VoiceError::validation("attachment_id", e.to_string()))?;
+        let device_id = get_local_device_id();
+
+        self.conn.execute(
+            r#"
+            INSERT INTO note_attachments (id, note_id, attachment_id, attachment_type, created_at, device_id, modified_at, deleted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                note_id = excluded.note_id,
+                attachment_id = excluded.attachment_id,
+                attachment_type = excluded.attachment_type,
+                modified_at = excluded.modified_at,
+                deleted_at = excluded.deleted_at,
+                device_id = excluded.device_id
+            "#,
+            params![
+                id_uuid.as_bytes().to_vec(),
+                note_uuid.as_bytes().to_vec(),
+                attachment_uuid.as_bytes().to_vec(),
+                attachment_type,
+                created_at,
+                device_id.as_bytes().to_vec(),
+                modified_at,
+                deleted_at,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Sync operations for AudioFile
+    // ========================================================================
+
+    /// Get raw audio file data for sync (returns serde_json::Value)
+    pub fn get_audio_file_raw(&self, audio_file_id: &str) -> VoiceResult<Option<serde_json::Value>> {
+        let uuid = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at
+            FROM audio_files
+            WHERE id = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row([uuid_bytes], |row| {
+            let id_bytes: Vec<u8> = row.get(0)?;
+            let imported_at: String = row.get(1)?;
+            let filename: String = row.get(2)?;
+            let file_created_at: Option<String> = row.get(3)?;
+            let summary: Option<String> = row.get(4)?;
+            let device_id_bytes: Vec<u8> = row.get(5)?;
+            let modified_at: Option<String> = row.get(6)?;
+            let deleted_at: Option<String> = row.get(7)?;
+
+            Ok(serde_json::json!({
+                "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
+                "imported_at": imported_at,
+                "filename": filename,
+                "file_created_at": file_created_at,
+                "summary": summary,
+                "device_id": uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
+                "modified_at": modified_at,
+                "deleted_at": deleted_at,
+            }))
+        });
+
+        match result {
+            Ok(val) => Ok(Some(val)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(VoiceError::Database(e)),
+        }
+    }
+
+    /// Apply an audio file from sync
+    pub fn apply_sync_audio_file(
+        &self,
+        id: &str,
+        imported_at: &str,
+        filename: &str,
+        file_created_at: Option<&str>,
+        summary: Option<&str>,
+        modified_at: Option<&str>,
+        deleted_at: Option<&str>,
+    ) -> VoiceResult<()> {
+        let id_uuid = Uuid::parse_str(id)
+            .map_err(|e| VoiceError::validation("id", e.to_string()))?;
+        let device_id = get_local_device_id();
+
+        self.conn.execute(
+            r#"
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                filename = excluded.filename,
+                file_created_at = excluded.file_created_at,
+                summary = excluded.summary,
+                modified_at = excluded.modified_at,
+                deleted_at = excluded.deleted_at,
+                device_id = excluded.device_id
+            "#,
+            params![
+                id_uuid.as_bytes().to_vec(),
+                imported_at,
+                filename,
+                file_created_at,
+                summary,
+                device_id.as_bytes().to_vec(),
+                modified_at,
+                deleted_at,
+            ],
+        )?;
+
+        Ok(())
     }
 }
 

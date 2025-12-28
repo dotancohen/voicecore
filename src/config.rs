@@ -129,6 +129,8 @@ pub struct ConfigData {
     pub sync: SyncConfig,
     /// Server certificate fingerprint
     pub server_certificate_fingerprint: Option<String>,
+    /// Directory for storing audio files
+    pub audiofile_directory: Option<String>,
 }
 
 fn generate_device_id() -> String {
@@ -161,6 +163,7 @@ impl Default for ConfigData {
             device_name: get_default_device_name(),
             sync: SyncConfig::default(),
             server_certificate_fingerprint: None,
+            audiofile_directory: None,
         }
     }
 }
@@ -400,6 +403,33 @@ impl Config {
         }
     }
 
+    /// Get the audio file directory path
+    pub fn audiofile_directory(&self) -> Option<&str> {
+        self.data.audiofile_directory.as_deref()
+    }
+
+    /// Set the audio file directory path
+    pub fn set_audiofile_directory(&mut self, path: &str) -> VoiceResult<()> {
+        self.data.audiofile_directory = Some(path.to_string());
+        self.save()
+    }
+
+    /// Clear the audio file directory path
+    pub fn clear_audiofile_directory(&mut self) -> VoiceResult<()> {
+        self.data.audiofile_directory = None;
+        self.save()
+    }
+
+    /// Get the audio file trash directory path (audiofile_directory + "_trash")
+    pub fn audiofile_trash_directory(&self) -> Option<PathBuf> {
+        self.data.audiofile_directory.as_ref().map(|dir| {
+            let path = PathBuf::from(dir);
+            let parent = path.parent().unwrap_or(Path::new(""));
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            parent.join(format!("{}_trash", name))
+        })
+    }
+
     /// Get a configuration value
     pub fn get(&self, key: &str) -> Option<String> {
         match key {
@@ -408,6 +438,7 @@ impl Config {
             "device_id" => Some(self.data.device_id.clone()),
             "device_name" => Some(self.data.device_name.clone()),
             "server_certificate_fingerprint" => self.data.server_certificate_fingerprint.clone(),
+            "audiofile_directory" => self.data.audiofile_directory.clone(),
             _ => None,
         }
     }
@@ -421,6 +452,7 @@ impl Config {
             "server_certificate_fingerprint" => {
                 self.data.server_certificate_fingerprint = Some(value.to_string())
             }
+            "audiofile_directory" => self.data.audiofile_directory = Some(value.to_string()),
             _ => return Err(VoiceError::Config(format!("Unknown config key: {}", key))),
         }
         self.save()
@@ -497,5 +529,68 @@ mod tests {
             assert_eq!(config.device_name(), "Test Device");
             assert!(config.is_sync_enabled());
         }
+    }
+
+    #[test]
+    fn test_audiofile_directory_default_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        assert!(config.audiofile_directory().is_none());
+        assert!(config.audiofile_trash_directory().is_none());
+    }
+
+    #[test]
+    fn test_set_audiofile_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        config.set_audiofile_directory("/home/user/audiofiles").unwrap();
+
+        assert_eq!(config.audiofile_directory(), Some("/home/user/audiofiles"));
+        assert_eq!(
+            config.audiofile_trash_directory(),
+            Some(PathBuf::from("/home/user/audiofiles_trash"))
+        );
+    }
+
+    #[test]
+    fn test_audiofile_directory_persistence() {
+        let temp_dir = TempDir::new().unwrap();
+
+        {
+            let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            config.set_audiofile_directory("/path/to/audio").unwrap();
+        }
+
+        {
+            let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            assert_eq!(config.audiofile_directory(), Some("/path/to/audio"));
+        }
+    }
+
+    #[test]
+    fn test_clear_audiofile_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        config.set_audiofile_directory("/path/to/audio").unwrap();
+        assert!(config.audiofile_directory().is_some());
+
+        config.clear_audiofile_directory().unwrap();
+        assert!(config.audiofile_directory().is_none());
+    }
+
+    #[test]
+    fn test_audiofile_directory_via_get_set() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        // Initially None
+        assert!(config.get("audiofile_directory").is_none());
+
+        // Set via set()
+        config.set("audiofile_directory", "/audio/files").unwrap();
+        assert_eq!(config.get("audiofile_directory"), Some("/audio/files".to_string()));
     }
 }
