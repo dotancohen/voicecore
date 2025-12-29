@@ -57,6 +57,7 @@ struct HandshakeResponse {
     protocol_version: String,
     last_sync_timestamp: Option<String>,
     server_timestamp: String,
+    supports_audiofiles: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +96,7 @@ struct StatusResponse {
     device_name: String,
     protocol_version: String,
     status: String,
+    supports_audiofiles: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,12 +124,19 @@ async fn handshake(
     // Get last sync timestamp for this peer
     let last_sync = get_peer_last_sync(&state.db, &request.device_id);
 
+    // Check if audiofile_directory is configured
+    let supports_audiofiles = {
+        let config = state.config.lock().ok();
+        config.map(|c| c.audiofile_directory().is_some()).unwrap_or(false)
+    };
+
     let response = HandshakeResponse {
         device_id: state.device_id.clone(),
         device_name: state.device_name.clone(),
         protocol_version: "1.0".to_string(),
         last_sync_timestamp: last_sync,
         server_timestamp: Utc::now().to_rfc3339(),
+        supports_audiofiles,
     };
 
     Json(response).into_response()
@@ -233,11 +242,18 @@ async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
+    // Check if audiofile_directory is configured
+    let supports_audiofiles = {
+        let config = state.config.lock().ok();
+        config.map(|c| c.audiofile_directory().is_some()).unwrap_or(false)
+    };
+
     Json(StatusResponse {
         device_id: state.device_id.clone(),
         device_name: state.device_name.clone(),
         protocol_version: "1.0".to_string(),
         status: "ok".to_string(),
+        supports_audiofiles,
     })
 }
 
@@ -920,17 +936,25 @@ fn apply_note_change(
                         db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at)?;
                         return Ok(ApplyResult::Applied);
                     }
-                    // Different content - create content conflict
-                    db.create_note_content_conflict(
-                        note_id,
-                        local_content,
-                        local_modified_at.unwrap_or(""),
-                        remote_content,
-                        modified_at.unwrap_or(""),
-                        Some(remote_device_id.as_str()),
-                        remote_device_name,
-                    )?;
-                    return Ok(ApplyResult::Conflict);
+                    // Content conflict: only when BOTH have modified_at and they match
+                    // This avoids false conflicts when created_at is used as fallback
+                    if let (Some(local_mod), Some(remote_mod)) = (local_modified_at, modified_at) {
+                        if local_mod == remote_mod {
+                            db.create_note_content_conflict(
+                                note_id,
+                                local_content,
+                                local_mod,
+                                remote_content,
+                                remote_mod,
+                                Some(remote_device_id.as_str()),
+                                remote_device_name,
+                            )?;
+                            return Ok(ApplyResult::Conflict);
+                        }
+                    }
+                    // Timestamps differ - just apply newer version (LWW)
+                    db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at)?;
+                    return Ok(ApplyResult::Applied);
                 }
                 // Both deleted - no conflict, just apply
             }
@@ -1017,38 +1041,44 @@ fn apply_tag_change(
 
             let mut has_conflict = false;
 
-            // Check for name conflict
-            if local_changed && local_name != remote_name {
-                // Both renamed the tag differently - create rename conflict
-                db.create_tag_rename_conflict(
-                    tag_id,
-                    local_name,
-                    local_modified_at.unwrap_or(""),
-                    remote_name,
-                    modified_at.unwrap_or(""),
-                    Some(remote_device_id.as_str()),
-                    remote_device_name,
-                )?;
-                has_conflict = true;
-            }
+            // Conflict detection: only when BOTH have modified_at and they match
+            // This avoids false conflicts when created_at is used as fallback for timestamp comparison
+            if let (Some(local_mod), Some(remote_mod)) = (local_modified_at, modified_at) {
+                if local_mod == remote_mod {
+                    // Check for name conflict
+                    if local_name != remote_name {
+                        // Both renamed the tag differently at the same time
+                        db.create_tag_rename_conflict(
+                            tag_id,
+                            local_name,
+                            local_mod,
+                            remote_name,
+                            remote_mod,
+                            Some(remote_device_id.as_str()),
+                            remote_device_name,
+                        )?;
+                        has_conflict = true;
+                    }
 
-            // Check for parent_id conflict
-            if local_changed && local_parent_id != remote_parent_id {
-                // Both moved the tag to different parents - create parent conflict
-                db.create_tag_parent_conflict(
-                    tag_id,
-                    local_parent_id,
-                    local_modified_at.unwrap_or(""),
-                    remote_parent_id,
-                    modified_at.unwrap_or(""),
-                    Some(remote_device_id.as_str()),
-                    remote_device_name,
-                )?;
-                has_conflict = true;
+                    // Check for parent_id conflict
+                    if local_parent_id != remote_parent_id {
+                        // Both moved the tag to different parents at the same time
+                        db.create_tag_parent_conflict(
+                            tag_id,
+                            local_parent_id,
+                            local_mod,
+                            remote_parent_id,
+                            remote_mod,
+                            Some(remote_device_id.as_str()),
+                            remote_device_name,
+                        )?;
+                        has_conflict = true;
+                    }
+                }
             }
 
             if has_conflict {
-                // Don't apply the remote change - keep local state
+                // Don't apply the remote change - keep local state for true conflicts
                 return Ok(ApplyResult::Conflict);
             }
 

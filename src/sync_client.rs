@@ -73,6 +73,8 @@ struct HandshakeResponse {
     protocol_version: String,
     last_sync_timestamp: Option<String>,
     server_timestamp: Option<String>,
+    #[serde(default)]
+    supports_audiofiles: bool,
 }
 
 /// Sync change
@@ -323,6 +325,14 @@ impl SyncClient {
             }
         }
 
+        // Update last sync time
+        if result.success {
+            if let Err(e) = self.update_peer_sync_time(peer_id) {
+                result.errors.push(format!("Failed to update sync time: {}", e));
+            }
+        }
+
+        result.success = result.errors.is_empty();
         result
     }
 
@@ -378,6 +388,14 @@ impl SyncClient {
             }
         }
 
+        // Update last sync time
+        if result.success {
+            if let Err(e) = self.update_peer_sync_time(peer_id) {
+                result.errors.push(format!("Failed to update sync time: {}", e));
+            }
+        }
+
+        result.success = result.errors.is_empty();
         result
     }
 
@@ -518,6 +536,9 @@ impl SyncClient {
                             }
                             if let Some(device_name) = data.get("device_name") {
                                 result.insert("device_name".to_string(), device_name.clone());
+                            }
+                            if let Some(supports_audiofiles) = data.get("supports_audiofiles") {
+                                result.insert("supports_audiofiles".to_string(), supports_audiofiles.clone());
                             }
                             result
                         }
@@ -701,7 +722,7 @@ impl SyncClient {
         &self,
         db: &Database,
         change: &SyncChange,
-        _last_sync_at: Option<&str>,
+        last_sync_at: Option<&str>,
     ) -> VoiceResult<bool> {
         use crate::merge::merge_content;
 
@@ -722,6 +743,8 @@ impl SyncClient {
             let local_content = existing.get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let local_device_id = existing.get("device_id")
+                .and_then(|v| v.as_str());
             let local_time = local_modified.or(local_deleted);
 
             // Incoming timestamp: prefer modified_at, then deleted_at, then created_at
@@ -738,13 +761,77 @@ impl SyncClient {
                     return Ok(false);
                 }
 
-                // If local was modified and content differs, merge to preserve both
-                if content != local_content {
-                    let merge_result = merge_content(local_content, content, "LOCAL", "REMOTE");
-                    // Use the newer timestamp for the merged content
-                    let new_modified = if it > lt { it } else { lt };
-                    db.apply_sync_note(note_id, created_at, &merge_result.content, Some(new_modified), deleted_at)?;
+                // Check for delete vs edit conflict
+                // Case 1: Local is deleted, remote has edits
+                if local_deleted.is_some() && deleted_at.is_none() && modified_at.is_some() {
+                    // Remote edit is newer - resurrect with remote content
+                    // Create delete conflict record
+                    let _ = db.create_note_delete_conflict(
+                        note_id,
+                        content, // surviving content
+                        modified_at.unwrap_or(""),
+                        Some(change.device_id.as_str()),
+                        Some(local_content), // deleted content
+                        local_deleted.unwrap_or(""),
+                        local_device_id,
+                        None, // local device name not stored in note
+                    );
+                    db.apply_sync_note(note_id, created_at, content, modified_at, None)?;
                     return Ok(true);
+                }
+
+                // Case 2: Local has edits, remote is deleted
+                if local_deleted.is_none() && local_modified.is_some() && deleted_at.is_some() {
+                    // Local edit should survive - create delete conflict
+                    let _ = db.create_note_delete_conflict(
+                        note_id,
+                        local_content, // surviving content (local)
+                        local_modified.unwrap_or(""),
+                        local_device_id,
+                        Some(content), // deleted content (remote was trying to delete)
+                        deleted_at.unwrap_or(""),
+                        Some(change.device_id.as_str()),
+                        change.device_name.as_deref(),
+                    );
+                    // Don't apply the delete - local edit survives
+                    return Ok(false);
+                }
+
+                // Detect concurrent modifications:
+                // 1. If we have last_sync_at and both local and incoming were modified after it
+                // 2. OR if both have the exact same modified_at timestamp
+                let is_concurrent = if let (Some(local_mod), Some(incoming_mod)) = (local_modified, modified_at) {
+                    if let Some(last) = last_sync_at {
+                        // Both modified since last sync = concurrent
+                        local_mod > last && incoming_mod > last
+                    } else {
+                        // No sync history - only conflict if timestamps are exactly equal
+                        local_mod == incoming_mod
+                    }
+                } else {
+                    false
+                };
+
+                // Content conflict: concurrent modification with different content
+                if is_concurrent && content != local_content && deleted_at.is_none() && local_deleted.is_none() {
+                    if let (Some(local_mod), Some(incoming_mod)) = (local_modified, modified_at) {
+                        // Create content conflict record before merging
+                        let _ = db.create_note_content_conflict(
+                            note_id,
+                            local_content,
+                            local_mod,
+                            content,
+                            incoming_mod,
+                            Some(change.device_id.as_str()),
+                            change.device_name.as_deref(),
+                        );
+
+                        let merge_result = merge_content(local_content, content, "LOCAL", "REMOTE");
+                        // Use the newer timestamp for the merged content
+                        let new_modified = if it > lt { it } else { lt };
+                        db.apply_sync_note(note_id, created_at, &merge_result.content, Some(new_modified), deleted_at)?;
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -758,7 +845,7 @@ impl SyncClient {
         &self,
         db: &Database,
         change: &SyncChange,
-        _last_sync_at: Option<&str>,
+        last_sync_at: Option<&str>,
     ) -> VoiceResult<bool> {
         let tag_id = &change.entity_id;
         let data = &change.data;
@@ -767,6 +854,124 @@ impl SyncClient {
         let parent_id = data["parent_id"].as_str();
         let created_at = data["created_at"].as_str().unwrap_or("");
         let modified_at = data["modified_at"].as_str();
+        let deleted_at = data["deleted_at"].as_str();
+
+        // Check if local tag exists for conflict detection
+        if let Ok(Some(existing)) = db.get_tag_raw(tag_id) {
+            let local_name = existing.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let local_parent_id = existing.get("parent_id")
+                .and_then(|v| v.as_str());
+            let local_modified = existing.get("modified_at")
+                .and_then(|v| v.as_str());
+            let local_deleted = existing.get("deleted_at")
+                .and_then(|v| v.as_str());
+            let local_device_id = existing.get("device_id")
+                .and_then(|v| v.as_str());
+
+            let local_time = local_modified.or(local_deleted);
+            let incoming_time = modified_at.or(deleted_at).or(Some(created_at));
+
+            if let (Some(lt), Some(it)) = (local_time, incoming_time) {
+                // If incoming is strictly older, skip
+                if it < lt {
+                    return Ok(false);
+                }
+
+                // If same timestamp and same values, skip (idempotent)
+                if it == lt && name == local_name && parent_id == local_parent_id {
+                    return Ok(false);
+                }
+
+                // Check for delete vs rename conflict
+                if local_deleted.is_none() && deleted_at.is_some() && local_modified.is_some() {
+                    // Local was renamed, remote wants to delete
+                    // Keep local rename, record conflict
+                    let _ = db.create_tag_delete_conflict(
+                        tag_id,
+                        local_name, // surviving
+                        local_parent_id,
+                        local_modified.unwrap_or(""),
+                        local_device_id,
+                        None,
+                        deleted_at.unwrap_or(""),
+                        Some(change.device_id.as_str()),
+                        change.device_name.as_deref(),
+                    );
+                    return Ok(false);
+                }
+
+                if local_deleted.is_some() && deleted_at.is_none() && modified_at.is_some() {
+                    // Local was deleted, remote was renamed - resurrect with remote
+                    let _ = db.create_tag_delete_conflict(
+                        tag_id,
+                        name, // surviving (remote)
+                        parent_id,
+                        modified_at.unwrap_or(""),
+                        Some(change.device_id.as_str()),
+                        change.device_name.as_deref(),
+                        local_deleted.unwrap_or(""),
+                        local_device_id,
+                        None,
+                    );
+                    db.apply_sync_tag(tag_id, name, parent_id, created_at, modified_at)?;
+                    return Ok(true);
+                }
+
+                // Detect concurrent modifications:
+                // 1. If we have last_sync_at and both local and incoming were modified after it
+                // 2. OR if both have the exact same modified_at timestamp
+                let is_concurrent = if let (Some(local_mod), Some(incoming_mod)) = (local_modified, modified_at) {
+                    if let Some(last) = last_sync_at {
+                        // Both modified since last sync = concurrent
+                        local_mod > last && incoming_mod > last
+                    } else {
+                        // No sync history - only conflict if timestamps are exactly equal
+                        local_mod == incoming_mod
+                    }
+                } else {
+                    false
+                };
+
+                if is_concurrent && local_deleted.is_none() && deleted_at.is_none() {
+                    if let (Some(local_mod), Some(incoming_mod)) = (local_modified, modified_at) {
+                        // Check for concurrent rename conflict
+                        if name != local_name {
+                            // Both renamed to different names concurrently - merge with separator
+                            let _ = db.create_tag_rename_conflict(
+                                tag_id,
+                                local_name,
+                                local_mod,
+                                name,
+                                incoming_mod,
+                                Some(change.device_id.as_str()),
+                                change.device_name.as_deref(),
+                            );
+
+                            // Merge names with separator
+                            let merged_name = format!("{} | {}", local_name, name);
+                            db.apply_sync_tag(tag_id, &merged_name, parent_id, created_at, modified_at)?;
+                            return Ok(true);
+                        }
+
+                        // Check for parent conflict
+                        if parent_id != local_parent_id {
+                            let _ = db.create_tag_parent_conflict(
+                                tag_id,
+                                local_parent_id,
+                                local_mod,
+                                parent_id,
+                                incoming_mod,
+                                Some(change.device_id.as_str()),
+                                change.device_name.as_deref(),
+                            );
+                            // Use remote parent
+                        }
+                    }
+                }
+            }
+        }
 
         db.apply_sync_tag(tag_id, name, parent_id, created_at, modified_at)?;
         Ok(true)
@@ -791,6 +996,28 @@ impl SyncClient {
         let created_at = data["created_at"].as_str().unwrap_or("");
         let modified_at = data["modified_at"].as_str();
         let deleted_at = data["deleted_at"].as_str();
+
+        // Determine incoming timestamp
+        let incoming_time = deleted_at.or(modified_at).or(Some(created_at));
+
+        // Check if local note_tag exists and compare timestamps
+        if let Ok(Some(existing)) = db.get_note_tag_raw(note_id, tag_id) {
+            let local_modified = existing.get("modified_at").and_then(|v| v.as_str());
+            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_str());
+            let local_created = existing.get("created_at").and_then(|v| v.as_str());
+            let local_time = local_deleted.or(local_modified).or(local_created);
+
+            if let (Some(lt), Some(it)) = (local_time, incoming_time) {
+                // If incoming is strictly older than local, skip
+                if it < lt {
+                    return Ok(false);
+                }
+                // If same timestamp, skip (idempotent)
+                if it == lt {
+                    return Ok(false);
+                }
+            }
+        }
 
         db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at)?;
         Ok(true)
