@@ -2630,6 +2630,25 @@ impl Database {
         Ok(audio_files)
     }
 
+    /// Get all audio files from the database (including deleted ones)
+    pub fn get_all_audio_files(&self) -> VoiceResult<Vec<AudioFileRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, imported_at, filename, file_created_at, summary,
+                   device_id, modified_at, deleted_at
+            FROM audio_files
+            ORDER BY imported_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| self.row_to_audio_file(row))?;
+        let mut audio_files = Vec::new();
+        for audio_file in rows {
+            audio_files.push(audio_file?);
+        }
+        Ok(audio_files)
+    }
+
     /// Update an audio file's summary
     pub fn update_audio_file_summary(
         &self,

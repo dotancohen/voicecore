@@ -221,10 +221,17 @@ impl SyncClient {
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
+                // Download audio files from pulled changes
                 let audio_errors = self
                     .sync_audio_files_after_pull(peer_url, &pulled_changes, &dir)
                     .await;
                 result.errors.extend(audio_errors);
+
+                // Also download any missing audio files (handles failed previous downloads)
+                let missing_errors = self
+                    .download_missing_audio_files(peer_url, &dir)
+                    .await;
+                result.errors.extend(missing_errors);
             }
         }
 
@@ -318,10 +325,17 @@ impl SyncClient {
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
+                // Download audio files from pulled changes
                 let audio_errors = self
                     .sync_audio_files_after_pull(&peer.peer_url, &pulled_changes, &dir)
                     .await;
                 result.errors.extend(audio_errors);
+
+                // Also download any missing audio files (handles failed previous downloads)
+                let missing_errors = self
+                    .download_missing_audio_files(&peer.peer_url, &dir)
+                    .await;
+                result.errors.extend(missing_errors);
             }
         }
 
@@ -448,10 +462,17 @@ impl SyncClient {
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
+                // Download audio files from pulled changes
                 let audio_errors = self
                     .sync_audio_files_after_pull(peer_url, &pulled_changes, &dir)
                     .await;
                 result.errors.extend(audio_errors);
+
+                // Also download any missing audio files (handles failed previous downloads)
+                let missing_errors = self
+                    .download_missing_audio_files(peer_url, &dir)
+                    .await;
+                result.errors.extend(missing_errors);
             }
         }
 
@@ -1593,6 +1614,73 @@ impl SyncClient {
                 }
                 Err(e) => {
                     errors.push(format!("Failed to download audio {}: {}", audio_id, e));
+                }
+            }
+        }
+
+        errors
+    }
+
+    /// Download any audio files that exist in the database but are missing locally.
+    ///
+    /// This handles the case where audio file metadata was synced successfully but
+    /// the binary download failed (e.g., due to permission issues). On subsequent
+    /// syncs, this function will retry downloading missing files.
+    ///
+    /// Args:
+    ///     peer_url: Base URL of the peer sync server
+    ///     audiofile_directory: Directory to save audio files
+    ///
+    /// Returns:
+    ///     List of error messages (empty if all succeeded)
+    pub async fn download_missing_audio_files(
+        &self,
+        peer_url: &str,
+        audiofile_directory: &std::path::Path,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        // Get all audio files from the database
+        let audio_files = {
+            let db = self.db.lock().unwrap();
+            match db.get_all_audio_files() {
+                Ok(files) => files,
+                Err(e) => {
+                    errors.push(format!("Failed to get audio files from database: {}", e));
+                    return errors;
+                }
+            }
+        };
+
+        for audio_file in audio_files {
+            // Skip deleted audio files
+            if audio_file.deleted_at.is_some() {
+                continue;
+            }
+
+            let audio_id = &audio_file.id;
+
+            // Get extension from filename
+            let ext = audio_file
+                .filename
+                .rsplit('.')
+                .next()
+                .unwrap_or("bin");
+
+            let dest_path = audiofile_directory.join(format!("{}.{}", audio_id, ext));
+
+            // Skip if file already exists
+            if dest_path.exists() {
+                continue;
+            }
+
+            tracing::info!("Downloading missing audio file: {}", audio_id);
+            match self.download_audio_file(peer_url, audio_id, &dest_path).await {
+                Ok(bytes) => {
+                    tracing::info!("Downloaded missing audio file {} ({} bytes)", audio_id, bytes);
+                }
+                Err(e) => {
+                    errors.push(format!("Failed to download missing audio {}: {}", audio_id, e));
                 }
             }
         }
