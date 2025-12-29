@@ -1435,6 +1435,72 @@ impl Database {
         }
         result.insert("note_tags".to_string(), note_tags);
 
+        // Get all audio_files
+        let mut stmt = self.conn.prepare(
+            r#"SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at FROM audio_files"#
+        )?;
+        let af_rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+
+        let mut audio_files = Vec::new();
+        for row in af_rows {
+            let (id_bytes, imported_at, filename, file_created_at, summary, device_id_bytes, modified_at, deleted_at) = row?;
+            let mut af = HashMap::new();
+            af.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
+            af.insert("imported_at".to_string(), serde_json::Value::String(imported_at));
+            af.insert("filename".to_string(), serde_json::Value::String(filename));
+            af.insert("file_created_at".to_string(), file_created_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            af.insert("summary".to_string(), summary.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            af.insert("device_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default()));
+            af.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            af.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            audio_files.push(af);
+        }
+        result.insert("audio_files".to_string(), audio_files);
+
+        // Get all note_attachments
+        let mut stmt = self.conn.prepare(
+            r#"SELECT id, note_id, attachment_id, attachment_type, created_at, device_id, modified_at, deleted_at FROM note_attachments"#
+        )?;
+        let na_rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+
+        let mut note_attachments = Vec::new();
+        for row in na_rows {
+            let (id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, device_id_bytes, modified_at, deleted_at) = row?;
+            let mut na = HashMap::new();
+            na.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
+            na.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default()));
+            na.insert("attachment_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&attachment_id_bytes).unwrap_or_default()));
+            na.insert("attachment_type".to_string(), serde_json::Value::String(attachment_type));
+            na.insert("created_at".to_string(), serde_json::Value::String(created_at));
+            na.insert("device_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default()));
+            na.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            na.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            note_attachments.push(na);
+        }
+        result.insert("note_attachments".to_string(), note_attachments);
+
         Ok(result)
     }
 
