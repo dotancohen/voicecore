@@ -274,6 +274,67 @@ impl VoiceClient {
         })
     }
 
+    /// Clear sync state to force a full re-sync from scratch
+    ///
+    /// This deletes the sync peer record, causing the next sync to start
+    /// from the beginning and fetch all data fresh.
+    pub fn clear_sync_state(&self) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.clear_sync_peers()?;
+        Ok(())
+    }
+
+    /// Perform initial sync - fetches full dataset from server
+    ///
+    /// Unlike sync_now(), this ignores timestamps and fetches all data.
+    /// Use this for first-time sync or to re-fetch everything.
+    pub fn initial_sync(&self) -> Result<SyncResultData, VoiceCoreError> {
+        // Check if sync is configured
+        {
+            let cfg = self.config.lock().unwrap();
+            if !cfg.is_sync_enabled() {
+                return Err(VoiceCoreError::Sync {
+                    msg: "Sync is not enabled".to_string(),
+                });
+            }
+            if cfg.peers().is_empty() {
+                return Err(VoiceCoreError::Sync {
+                    msg: "No sync peers configured".to_string(),
+                });
+            }
+        }
+
+        // Get peer ID
+        let peer_id = {
+            let cfg = self.config.lock().unwrap();
+            cfg.peers()[0].peer_id.clone()
+        };
+
+        // Create sync client
+        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+
+        // Run initial sync in tokio runtime
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| VoiceCoreError::Sync {
+                msg: format!("Failed to create runtime: {}", e),
+            })?;
+
+        let result = rt.block_on(async { sync_client.initial_sync(&peer_id).await });
+
+        Ok(SyncResultData {
+            success: result.success,
+            notes_received: result.pulled as i32,
+            notes_sent: result.pushed as i32,
+            error_message: if result.errors.is_empty() {
+                None
+            } else {
+                Some(result.errors.join("; "))
+            },
+        })
+    }
+
     /// Get the device ID
     pub fn get_device_id(&self) -> String {
         let cfg = self.config.lock().unwrap();
@@ -375,6 +436,27 @@ impl VoiceClient {
             modified_at: a.modified_at,
             deleted_at: a.deleted_at,
         }))
+    }
+
+    /// Get all audio files in the database (for debugging)
+    pub fn get_all_audio_files(&self) -> Result<Vec<AudioFileData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let audio_files = db.get_all_audio_files()?;
+
+        Ok(audio_files
+            .into_iter()
+            .filter(|a| a.deleted_at.is_none())
+            .map(|a| AudioFileData {
+                id: a.id,
+                imported_at: a.imported_at,
+                filename: a.filename,
+                file_created_at: a.file_created_at,
+                summary: a.summary,
+                device_id: a.device_id,
+                modified_at: a.modified_at,
+                deleted_at: a.deleted_at,
+            })
+            .collect())
     }
 
     /// Get the file path for an audio file (if audiofile_directory is configured)

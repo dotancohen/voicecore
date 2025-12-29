@@ -947,6 +947,12 @@ impl Database {
         Ok(())
     }
 
+    /// Clear all sync peer records to force a full re-sync
+    pub fn clear_sync_peers(&self) -> VoiceResult<()> {
+        self.conn.execute("DELETE FROM sync_peers", [])?;
+        Ok(())
+    }
+
     /// Get all changes since a timestamp (for sync)
     pub fn get_changes_since(&self, since: Option<&str>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<String>)> {
         let mut changes = Vec::new();

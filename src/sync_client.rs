@@ -203,9 +203,10 @@ impl SyncClient {
 
         // Step 2: Pull changes
         let pulled_changes = match self.pull_changes(peer_url, adjusted_since.as_deref()).await {
-            Ok((applied, conflicts, changes)) => {
+            Ok((applied, conflicts, changes, errors)) => {
                 result.pulled = applied;
                 result.conflicts += conflicts;
+                result.errors.extend(errors);
                 changes
             }
             Err(e) => {
@@ -306,9 +307,10 @@ impl SyncClient {
 
         // Pull
         let pulled_changes = match self.pull_changes(peer_url, adjusted_since.as_deref()).await {
-            Ok((applied, conflicts, changes)) => {
+            Ok((applied, conflicts, changes, errors)) => {
                 result.pulled = applied;
                 result.conflicts = conflicts;
+                result.errors.extend(errors);
                 changes
             }
             Err(e) => {
@@ -446,9 +448,10 @@ impl SyncClient {
         // Step 3: Convert full sync data to changes and apply
         let pulled_changes = self.convert_full_sync_to_changes(&full_sync);
         match self.apply_changes(&pulled_changes) {
-            Ok((applied, conflicts)) => {
+            Ok((applied, conflicts, errors)) => {
                 result.pulled = applied;
                 result.conflicts = conflicts;
+                result.errors.extend(errors);
             }
             Err(e) => {
                 result.errors.push(format!("Failed to apply full sync: {}", e));
@@ -629,7 +632,7 @@ impl SyncClient {
         &self,
         peer_url: &str,
         since: Option<&str>,
-    ) -> VoiceResult<(i64, i64, Vec<SyncChange>)> {
+    ) -> VoiceResult<(i64, i64, Vec<SyncChange>, Vec<String>)> {
         let url = match since {
             Some(ts) => format!(
                 "{}/sync/changes?since={}",
@@ -662,9 +665,9 @@ impl SyncClient {
         let changes = batch.changes.clone();
 
         // Apply changes to local database
-        let (applied, conflicts) = self.apply_changes(&batch.changes)?;
+        let (applied, conflicts, errors) = self.apply_changes(&batch.changes)?;
 
-        Ok((applied, conflicts, changes))
+        Ok((applied, conflicts, changes, errors))
     }
 
     async fn push_changes(
@@ -711,10 +714,11 @@ impl SyncClient {
         Ok((result.applied, result.conflicts, pushed_changes))
     }
 
-    fn apply_changes(&self, changes: &[SyncChange]) -> VoiceResult<(i64, i64)> {
+    fn apply_changes(&self, changes: &[SyncChange]) -> VoiceResult<(i64, i64, Vec<String>)> {
         let db = self.db.lock().unwrap();
         let mut applied = 0i64;
         let mut conflicts = 0i64;
+        let mut errors = Vec::new();
 
         // Get last sync timestamp with this peer (use device_id as peer_id for self-tracking)
         let last_sync_at: Option<String> = None; // For pull, we don't use last_sync filtering here
@@ -732,11 +736,17 @@ impl SyncClient {
             match result {
                 Ok(true) => applied += 1,
                 Ok(false) => {} // Skipped
-                Err(_) => conflicts += 1,
+                Err(e) => {
+                    errors.push(format!(
+                        "Failed to apply {} {}: {}",
+                        change.entity_type, change.entity_id, e
+                    ));
+                    conflicts += 1;
+                }
             }
         }
 
-        Ok((applied, conflicts))
+        Ok((applied, conflicts, errors))
     }
 
     fn apply_note_change(
