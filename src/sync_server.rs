@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::database::Database;
 use crate::error::VoiceResult;
+use crate::merge::merge_content;
 use crate::sync_client::SyncChange;
 use crate::validation::validate_datetime_optional;
 
@@ -835,7 +836,40 @@ fn apply_note_change(
 
     match change.operation.as_str() {
         "create" => {
-            if existing.is_some() {
+            // Check if existing note is deleted - if so, treat as conflict/resurrection
+            if let Some(ref existing) = existing {
+                let local_deleted = existing.get("deleted_at").and_then(|v| v.as_str()).is_some();
+                if local_deleted {
+                    // Remote is creating (with deleted_at=None), local has deleted
+                    // This is "local deleted, remote edited" scenario - resurrect with conflict
+                    let remote_content = data["content"].as_str().unwrap_or("");
+                    let modified_at = data["modified_at"].as_str();
+                    let local_deleted_at = existing.get("deleted_at").and_then(|v| v.as_str()).unwrap_or("");
+
+                    // Create delete conflict for tracking
+                    db.create_note_delete_conflict(
+                        note_id,
+                        remote_content,                          // surviving_content
+                        modified_at.unwrap_or(""),               // surviving_modified_at
+                        Some(remote_device_id.as_str()),         // surviving_device_id
+                        None,                                    // deleted_content
+                        local_deleted_at,                        // deleted_at
+                        None,                                    // deleting_device_id (local)
+                        None,                                    // deleting_device_name
+                    )?;
+
+                    // Resurrect the note with remote content
+                    db.apply_sync_note(
+                        note_id,
+                        data["created_at"].as_str().unwrap_or(""),
+                        remote_content,
+                        modified_at,
+                        None,  // Clear deleted_at to resurrect
+                    )?;
+
+                    return Ok(ApplyResult::Conflict);
+                }
+                // Existing note is not deleted - skip duplicate create
                 return Ok(ApplyResult::Skipped);
             }
             db.apply_sync_note(
@@ -878,14 +912,20 @@ fn apply_note_change(
                 // Have sync history - check if local changed since then
                 local_time.map_or(false, |lt| lt > last)
             } else {
-                // No sync history with this peer for this entity
-                // Compare timestamps directly: if incoming is strictly newer than local,
-                // assume it's an update based on what we have (not a conflict).
-                // Only flag as "local changed" if local is newer or equal to incoming.
-                match (local_time, incoming_time) {
-                    (Some(lt), Some(it)) => lt >= it,  // Local "changed" if >= incoming
-                    (Some(_), None) => true,           // Local has time, incoming doesn't
-                    (None, _) => false,                // No local time means no local change
+                // No sync history with this peer - this is initial sync
+                // If content differs, we should treat it as a conflict to preserve both versions
+                // This handles the case where a note was created locally but never synced
+                let content_differs = !local_content.is_empty() && local_content != remote_content;
+                if content_differs {
+                    // Content differs with no sync history = conflict situation
+                    true
+                } else {
+                    // Same content or empty local - compare timestamps
+                    match (local_time, incoming_time) {
+                        (Some(lt), Some(it)) => lt >= it,  // Local "changed" if >= incoming
+                        (Some(_), None) => true,           // Local has time, incoming doesn't
+                        (None, _) => false,                // No local time means no local change
+                    }
                 }
             };
 
@@ -914,6 +954,14 @@ fn apply_note_change(
                         None,                                    // deleting_device_id (local)
                         None,                                    // deleting_device_name
                     )?;
+                    // Resurrect the note with remote content (clear deleted_at)
+                    db.apply_sync_note(
+                        note_id,
+                        created_at,
+                        remote_content,
+                        modified_at,
+                        None,  // Clear deleted_at to resurrect
+                    )?;
                     return Ok(ApplyResult::Conflict);
                 } else if !local_deleted && remote_deleted {
                     // Local edited, remote deleted - create delete conflict
@@ -936,25 +984,31 @@ fn apply_note_change(
                         db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at)?;
                         return Ok(ApplyResult::Applied);
                     }
-                    // Content conflict: only when BOTH have modified_at and they match
-                    // This avoids false conflicts when created_at is used as fallback
-                    if let (Some(local_mod), Some(remote_mod)) = (local_modified_at, modified_at) {
-                        if local_mod == remote_mod {
-                            db.create_note_content_conflict(
-                                note_id,
-                                local_content,
-                                local_mod,
-                                remote_content,
-                                remote_mod,
-                                Some(remote_device_id.as_str()),
-                                remote_device_name,
-                            )?;
-                            return Ok(ApplyResult::Conflict);
-                        }
-                    }
-                    // Timestamps differ - just apply newer version (LWW)
-                    db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at)?;
-                    return Ok(ApplyResult::Applied);
+                    // Both sides have different content - merge with conflict markers
+                    // This ensures no content is lost during sync
+                    let merge_result = merge_content(
+                        local_content,
+                        remote_content,
+                        "LOCAL",
+                        "REMOTE",
+                    );
+                    let merged_content = &merge_result.content;
+                    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+                    // Create conflict record for resolution tracking
+                    db.create_note_content_conflict(
+                        note_id,
+                        local_content,
+                        local_modified_at.unwrap_or(""),
+                        remote_content,
+                        modified_at.unwrap_or(""),
+                        Some(remote_device_id.as_str()),
+                        remote_device_name,
+                    )?;
+
+                    // Apply merged content to note
+                    db.apply_sync_note(note_id, created_at, merged_content, Some(&now), deleted_at)?;
+                    return Ok(ApplyResult::Conflict);
                 }
                 // Both deleted - no conflict, just apply
             }
@@ -1039,50 +1093,60 @@ fn apply_tag_change(
                 }
             }
 
-            let mut has_conflict = false;
+            let mut has_name_conflict = false;
+            let mut has_parent_conflict = false;
+            let mut final_name = remote_name.to_string();
+            let mut final_parent_id = remote_parent_id;
 
-            // Conflict detection: only when BOTH have modified_at and they match
-            // This avoids false conflicts when created_at is used as fallback for timestamp comparison
-            if let (Some(local_mod), Some(remote_mod)) = (local_modified_at, modified_at) {
-                if local_mod == remote_mod {
-                    // Check for name conflict
-                    if local_name != remote_name {
-                        // Both renamed the tag differently at the same time
-                        db.create_tag_rename_conflict(
-                            tag_id,
-                            local_name,
-                            local_mod,
-                            remote_name,
-                            remote_mod,
-                            Some(remote_device_id.as_str()),
-                            remote_device_name,
-                        )?;
-                        has_conflict = true;
-                    }
+            // If local changed, check for conflicts
+            if local_changed {
+                // Check for name conflict
+                if local_name != remote_name {
+                    // Both renamed the tag differently
+                    db.create_tag_rename_conflict(
+                        tag_id,
+                        local_name,
+                        local_modified_at.unwrap_or(""),
+                        remote_name,
+                        modified_at.unwrap_or(""),
+                        Some(remote_device_id.as_str()),
+                        remote_device_name,
+                    )?;
+                    has_name_conflict = true;
+                    // Combine both names so no rename is lost
+                    final_name = format!("{} | {}", local_name, remote_name);
+                }
 
-                    // Check for parent_id conflict
-                    if local_parent_id != remote_parent_id {
-                        // Both moved the tag to different parents at the same time
-                        db.create_tag_parent_conflict(
-                            tag_id,
-                            local_parent_id,
-                            local_mod,
-                            remote_parent_id,
-                            remote_mod,
-                            Some(remote_device_id.as_str()),
-                            remote_device_name,
-                        )?;
-                        has_conflict = true;
-                    }
+                // Check for parent_id conflict
+                if local_parent_id != remote_parent_id {
+                    // Both moved the tag to different parents
+                    db.create_tag_parent_conflict(
+                        tag_id,
+                        local_parent_id,
+                        local_modified_at.unwrap_or(""),
+                        remote_parent_id,
+                        modified_at.unwrap_or(""),
+                        Some(remote_device_id.as_str()),
+                        remote_device_name,
+                    )?;
+                    has_parent_conflict = true;
+                    // Keep local parent on conflict (user can resolve via UI)
+                    final_parent_id = local_parent_id;
                 }
             }
 
-            if has_conflict {
-                // Don't apply the remote change - keep local state for true conflicts
+            let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let final_modified = if has_name_conflict || has_parent_conflict {
+                Some(now.as_str())
+            } else {
+                modified_at
+            };
+
+            db.apply_sync_tag(tag_id, &final_name, final_parent_id, created_at, final_modified)?;
+
+            if has_name_conflict || has_parent_conflict {
                 return Ok(ApplyResult::Conflict);
             }
-
-            db.apply_sync_tag(tag_id, remote_name, remote_parent_id, created_at, modified_at)?;
             Ok(ApplyResult::Applied)
         }
         "delete" => {
@@ -1672,6 +1736,74 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
     }))
 }
 
+/// Apply sync changes from a peer to the local database.
+///
+/// This is the public API for applying changes, suitable for testing.
+/// Returns (applied_count, conflict_count, errors).
+pub fn apply_changes_from_peer(
+    db: &Database,
+    changes: &[SyncChange],
+    peer_device_id: &str,
+    peer_device_name: Option<&str>,
+) -> VoiceResult<(i64, i64, Vec<String>)> {
+    let mut applied = 0i64;
+    let mut conflicts = 0i64;
+    let mut errors = Vec::new();
+
+    // Get last sync timestamp with this peer
+    let last_sync_at = db.get_peer_last_sync(peer_device_id)?;
+
+    // Sort changes by dependency order to avoid FOREIGN KEY constraint failures:
+    // 1. notes, tags, audio_files first (no dependencies) - order 0
+    // 2. note_tags, note_attachments last (depend on notes, tags, audio_files) - order 1
+    fn entity_order(entity_type: &str) -> u8 {
+        match entity_type {
+            "note" | "tag" | "audio_file" => 0,
+            "note_tag" | "note_attachment" => 1,
+            _ => 2,
+        }
+    }
+
+    let mut sorted_changes: Vec<&SyncChange> = changes.iter().collect();
+    sorted_changes.sort_by(|a, b| {
+        let order_cmp = entity_order(&a.entity_type).cmp(&entity_order(&b.entity_type));
+        if order_cmp != std::cmp::Ordering::Equal {
+            order_cmp
+        } else {
+            a.timestamp.cmp(&b.timestamp)
+        }
+    });
+
+    for change in sorted_changes {
+        let result = match change.entity_type.as_str() {
+            "note" => apply_note_change(db, change, last_sync_at.as_deref()),
+            "tag" => apply_tag_change(db, change, last_sync_at.as_deref()),
+            "note_tag" => apply_note_tag_change(db, change, last_sync_at.as_deref()),
+            "note_attachment" => apply_note_attachment_change(db, change, last_sync_at.as_deref()),
+            "audio_file" => apply_audio_file_change(db, change, last_sync_at.as_deref()),
+            _ => {
+                errors.push(format!("Unknown entity type: {}", change.entity_type));
+                continue;
+            }
+        };
+
+        match result {
+            Ok(ApplyResult::Applied) => applied += 1,
+            Ok(ApplyResult::Conflict) => conflicts += 1,
+            Ok(ApplyResult::Skipped) => {}
+            Err(e) => errors.push(format!(
+                "Error applying {} {}: {}",
+                change.entity_type, change.entity_id, e
+            )),
+        }
+    }
+
+    // Update peer's last sync timestamp
+    db.update_peer_sync_time(peer_device_id, peer_device_name)?;
+
+    Ok((applied, conflicts, errors))
+}
+
 /// Create the sync server router
 pub fn create_router(
     db: Arc<Mutex<Database>>,
@@ -1792,8 +1924,8 @@ mod tests {
 
     #[test]
     fn test_both_devices_edit_same_note_creates_conflict() {
-        // CRITICAL: When both devices edit the same note, we MUST create a conflict.
-        // We must NEVER silently overwrite one version with another.
+        // CRITICAL: When both devices edit the same note, we MUST create a conflict
+        // and merge content with conflict markers so NO data is lost.
         let (db, _temp) = create_test_db();
 
         // Create a note locally
@@ -1820,14 +1952,22 @@ mod tests {
         // Apply with no last_sync (meaning local changed since last sync)
         let result = apply_note_change(&db, &remote_change, None).unwrap();
 
-        // MUST be a conflict, NOT applied
+        // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
-            "CRITICAL: Both devices edited same note - MUST create conflict, not overwrite!");
+            "CRITICAL: Both devices edited same note - MUST create conflict!");
 
-        // Verify local content was NOT overwritten
+        // Verify content was MERGED with conflict markers (no data loss)
         let note = db.get_note(&note_id).unwrap().unwrap();
-        assert_eq!(note.content.as_str(), "Local edited content",
-            "CRITICAL: Local content was overwritten! Data loss occurred!");
+        assert!(note.content.contains("<<<<<<< LOCAL"),
+            "CRITICAL: Merged content missing LOCAL marker!");
+        assert!(note.content.contains("Local edited content"),
+            "CRITICAL: Local content lost in merge!");
+        assert!(note.content.contains("======="),
+            "CRITICAL: Merged content missing separator!");
+        assert!(note.content.contains("Remote edited content"),
+            "CRITICAL: Remote content lost in merge!");
+        assert!(note.content.contains(">>>>>>> REMOTE"),
+            "CRITICAL: Merged content missing REMOTE marker!");
 
         // Verify a conflict record was created
         let conflicts = db.get_note_content_conflicts(false).unwrap();
@@ -1992,7 +2132,7 @@ mod tests {
     #[test]
     fn test_both_devices_rename_tag_creates_conflict() {
         // CRITICAL: When both devices rename the same tag differently,
-        // we MUST create a conflict. Cannot lose either name.
+        // we MUST create a conflict AND combine both names so no rename is lost.
         let (db, _temp) = create_test_db();
 
         // Create a tag
@@ -2022,11 +2162,11 @@ mod tests {
         assert_eq!(result, ApplyResult::Conflict,
             "CRITICAL: Both renamed tag differently - MUST create conflict!");
 
-        // Verify local name was NOT overwritten
+        // Verify tag name is COMBINED (no data loss)
         let tags = db.get_all_tags().unwrap();
         let tag = tags.iter().find(|t| t.id == tag_id).unwrap();
-        assert_eq!(tag.name.as_str(), "local_renamed",
-            "CRITICAL: Local tag name was overwritten! Data loss!");
+        assert_eq!(tag.name.as_str(), "local_renamed | remote_renamed",
+            "CRITICAL: Tag name should combine both versions!");
 
         // Verify conflict record exists
         let conflicts = db.get_tag_rename_conflicts(false).unwrap();
@@ -2111,7 +2251,7 @@ mod tests {
     fn test_no_silent_overwrites_ever() {
         // This test verifies the core invariant: we NEVER silently overwrite data.
         // Every conflict scenario must either:
-        // 1. Create a conflict record, OR
+        // 1. Create a conflict record AND merge content with markers, OR
         // 2. Be a case where both sides agree (same content, both deleted, etc.)
 
         let (db, _temp) = create_test_db();
@@ -2121,8 +2261,6 @@ mod tests {
 
         // Edit locally
         db.update_note(&note_id, "My precious local edits").unwrap();
-
-        let original_content = db.get_note(&note_id).unwrap().unwrap().content.clone();
 
         // Try to overwrite with remote data
         let remote_change = make_sync_change(
@@ -2140,18 +2278,35 @@ mod tests {
         );
 
         // Apply with no last_sync (local changed)
-        let _result = apply_note_change(&db, &remote_change, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None).unwrap();
 
-        // VERIFY: Content MUST still be the local version
+        // MUST be a conflict
+        assert_eq!(result, ApplyResult::Conflict,
+            "CRITICAL: Expected conflict when both sides edit!");
+
+        // VERIFY: Content is MERGED with conflict markers (no data loss)
         let after = db.get_note(&note_id).unwrap().unwrap();
         let after_content = &after.content;
 
-        assert_eq!(after_content, &original_content,
-            "CRITICAL DATA LOSS: Content was overwritten!\n\
-             Before: {}\n\
-             After: {}\n\
-             This is unacceptable - user data was silently lost!",
-            original_content, after_content);
+        // Both versions MUST be present
+        assert!(after_content.contains("My precious local edits"),
+            "CRITICAL DATA LOSS: Local content missing from merge!\n\
+             Merged content: {}\n\
+             Local content was silently lost!",
+            after_content);
+
+        assert!(after_content.contains("Remote trying to overwrite"),
+            "CRITICAL DATA LOSS: Remote content missing from merge!\n\
+             Merged content: {}\n\
+             Remote content was silently lost!",
+            after_content);
+
+        // Conflict markers MUST be present
+        assert!(after_content.contains("<<<<<<<") && after_content.contains(">>>>>>>"),
+            "CRITICAL: Merge conflict markers missing!\n\
+             Content: {}\n\
+             User won't know there was a conflict!",
+            after_content);
     }
 
     #[test]
