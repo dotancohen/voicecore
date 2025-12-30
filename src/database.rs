@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::error::{VoiceError, VoiceResult};
 use crate::validation::{
-    validate_note_id, validate_search_query, validate_tag_id, validate_tag_ids, validate_tag_path,
+    validate_note_id, validate_search_query, validate_tag_id, validate_tag_path,
 };
 
 // Global device ID for local operations
@@ -446,6 +446,194 @@ impl Database {
         Ok(())
     }
 
+    // =========================================================================
+    // UUID Prefix Resolution
+    // =========================================================================
+    // These methods resolve UUID prefixes (like Git's short commit hashes) to
+    // full UUIDs. If the input is already a valid full UUID, it's returned as-is.
+    // If the input is a prefix, it searches the database for matching entities.
+    //
+    // Two variants are provided:
+    // - resolve_*: Returns error if not found or ambiguous
+    // - try_resolve_*: Returns None if not found, error only if ambiguous
+
+    /// Try to resolve an ID or prefix. Returns None if not found, Some(id) if unique match,
+    /// or errors if ambiguous or invalid format.
+    fn try_resolve_id(
+        &self,
+        id_or_prefix: &str,
+        table: &str,
+        field_name: &str,
+        entity_name: &str,
+        extra_where: &str,
+    ) -> VoiceResult<Option<String>> {
+        let prefix_lower = id_or_prefix.replace('-', "").to_lowercase();
+
+        // Validate that input looks like a UUID prefix (hex chars only, max 32 chars)
+        if prefix_lower.is_empty() {
+            return Err(VoiceError::validation(field_name, "ID cannot be empty"));
+        }
+        if prefix_lower.len() > 32 {
+            return Err(VoiceError::validation(
+                field_name,
+                format!("invalid {} ID format", entity_name),
+            ));
+        }
+        if !prefix_lower.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(VoiceError::validation(
+                field_name,
+                format!("invalid {} ID format", entity_name),
+            ));
+        }
+
+        let like_pattern = format!("{}%", prefix_lower);
+
+        let sql = format!(
+            "SELECT id FROM {} WHERE lower(hex(id)) LIKE ?1 {} LIMIT 6",
+            table, extra_where
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([&like_pattern])?;
+
+        // Get first match
+        let first_row = rows.next()?;
+        let first = match first_row {
+            None => return Ok(None), // Not found
+            Some(row) => {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                uuid_bytes_to_hex(&id_bytes).ok_or_else(|| {
+                    VoiceError::validation(field_name, "invalid UUID in database")
+                })?
+            }
+        };
+
+        // Check for second match (ambiguous)
+        let second_row = rows.next()?;
+        if second_row.is_none() {
+            return Ok(Some(first));
+        }
+
+        // Ambiguous - collect remaining matches for error message
+        let second_bytes: Vec<u8> = second_row.unwrap().get(0)?;
+        let mut previews = vec![format!("{}...", &first[..12.min(first.len())])];
+        if let Some(hex) = uuid_bytes_to_hex(&second_bytes) {
+            previews.push(format!("{}...", &hex[..12.min(hex.len())]));
+        }
+
+        let mut count = 2;
+        while let Some(row) = rows.next()? {
+            count += 1;
+            if previews.len() < 5 {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                if let Some(hex) = uuid_bytes_to_hex(&id_bytes) {
+                    previews.push(format!("{}...", &hex[..12.min(hex.len())]));
+                }
+            }
+        }
+
+        let extra = if count > 5 {
+            format!(" (and {} more)", count - 5)
+        } else {
+            String::new()
+        };
+
+        Err(VoiceError::validation(
+            field_name,
+            format!(
+                "ambiguous prefix '{}' matches {} {}s: {}{}",
+                id_or_prefix, count, entity_name, previews.join(", "), extra
+            ),
+        ))
+    }
+
+    /// Resolve a note ID or prefix to a full note ID.
+    pub fn resolve_note_id(&self, id_or_prefix: &str) -> VoiceResult<String> {
+        self.try_resolve_id(id_or_prefix, "notes", "note_id", "note", "")?
+            .ok_or_else(|| {
+                VoiceError::validation(
+                    "note_id",
+                    format!("no note found matching prefix '{}'", id_or_prefix),
+                )
+            })
+    }
+
+    /// Try to resolve a note ID or prefix. Returns None if not found.
+    pub fn try_resolve_note_id(&self, id_or_prefix: &str) -> VoiceResult<Option<String>> {
+        self.try_resolve_id(id_or_prefix, "notes", "note_id", "note", "")
+    }
+
+    /// Resolve a tag ID or prefix to a full tag ID.
+    pub fn resolve_tag_id(&self, id_or_prefix: &str) -> VoiceResult<String> {
+        self.try_resolve_id(id_or_prefix, "tags", "tag_id", "tag", "")?
+            .ok_or_else(|| {
+                VoiceError::validation(
+                    "tag_id",
+                    format!("no tag found matching prefix '{}'", id_or_prefix),
+                )
+            })
+    }
+
+    /// Try to resolve a tag ID or prefix. Returns None if not found.
+    pub fn try_resolve_tag_id(&self, id_or_prefix: &str) -> VoiceResult<Option<String>> {
+        self.try_resolve_id(id_or_prefix, "tags", "tag_id", "tag", "")
+    }
+
+    /// Resolve an audio file ID or prefix to a full audio file ID.
+    /// Only searches non-deleted audio files.
+    pub fn resolve_audio_file_id(&self, id_or_prefix: &str) -> VoiceResult<String> {
+        self.try_resolve_id(
+            id_or_prefix,
+            "audio_files",
+            "audio_file_id",
+            "audio file",
+            "AND deleted_at IS NULL",
+        )?
+        .ok_or_else(|| {
+            VoiceError::validation(
+                "audio_file_id",
+                format!("no audio file found matching prefix '{}'", id_or_prefix),
+            )
+        })
+    }
+
+    /// Try to resolve an audio file ID or prefix. Returns None if not found.
+    /// Only searches non-deleted audio files.
+    pub fn try_resolve_audio_file_id(&self, id_or_prefix: &str) -> VoiceResult<Option<String>> {
+        self.try_resolve_id(
+            id_or_prefix,
+            "audio_files",
+            "audio_file_id",
+            "audio file",
+            "AND deleted_at IS NULL",
+        )
+    }
+
+    /// Try to resolve an audio file ID or prefix, including deleted files.
+    fn try_resolve_audio_file_id_including_deleted(
+        &self,
+        id_or_prefix: &str,
+    ) -> VoiceResult<Option<String>> {
+        self.try_resolve_id(id_or_prefix, "audio_files", "audio_file_id", "audio file", "")
+    }
+
+    /// Resolve multiple tag IDs or prefixes to full tag UUIDs.
+    /// Each ID can be a full UUID or a prefix.
+    pub fn resolve_tag_ids(&self, tag_ids: &[String]) -> VoiceResult<Vec<Uuid>> {
+        tag_ids
+            .iter()
+            .enumerate()
+            .map(|(i, tag_id)| {
+                let resolved = self.resolve_tag_id(tag_id).map_err(|e| {
+                    VoiceError::validation("tag_ids", format!("item {}: {}", i, e))
+                })?;
+                Uuid::parse_str(&resolved).map_err(|_| {
+                    VoiceError::validation("tag_ids", format!("item {}: invalid UUID", i))
+                })
+            })
+            .collect()
+    }
+
     /// Get the underlying connection (for advanced operations)
     pub fn connection(&self) -> &Connection {
         &self.conn
@@ -479,9 +667,15 @@ impl Database {
         Ok(notes)
     }
 
-    /// Get a note by ID with its associated tags
+    /// Get a note by ID (or ID prefix) with its associated tags
     pub fn get_note(&self, note_id: &str) -> VoiceResult<Option<NoteRow>> {
-        let uuid = validate_note_id(note_id)?;
+        // Use try_resolve to return None if not found (instead of error)
+        let resolved_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let mut stmt = self.conn.prepare(
@@ -522,9 +716,15 @@ impl Database {
         Ok(note_id.simple().to_string())
     }
 
-    /// Update a note's content
+    /// Update a note's content (accepts ID or ID prefix)
     pub fn update_note(&self, note_id: &str, content: &str) -> VoiceResult<bool> {
-        let uuid = validate_note_id(note_id)?;
+        // Use try_resolve to return false if not found (instead of error)
+        let resolved_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         if content.trim().is_empty() {
@@ -543,9 +743,15 @@ impl Database {
         Ok(updated > 0)
     }
 
-    /// Soft-delete a note
+    /// Soft-delete a note (accepts ID or ID prefix)
     pub fn delete_note(&self, note_id: &str) -> VoiceResult<bool> {
-        let uuid = validate_note_id(note_id)?;
+        // Use try_resolve to return false if not found (instead of error)
+        let resolved_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let deleted = self.conn.execute(
@@ -560,9 +766,14 @@ impl Database {
         Ok(deleted > 0)
     }
 
-    /// Delete a tag (hard delete - cascades to note_tags)
+    /// Delete a tag (hard delete - cascades to note_tags) (accepts ID or ID prefix)
     pub fn delete_tag(&self, tag_id: &str) -> VoiceResult<bool> {
-        let uuid = Uuid::parse_str(tag_id)
+        // Use try_resolve to return false if not found (instead of error)
+        let resolved_id = match self.try_resolve_tag_id(tag_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
@@ -588,9 +799,15 @@ impl Database {
         Ok(tags)
     }
 
-    /// Get a single tag by ID
+    /// Get a single tag by ID (or ID prefix)
     pub fn get_tag(&self, tag_id: &str) -> VoiceResult<Option<TagRow>> {
-        let uuid = validate_tag_id(tag_id)?;
+        // Use try_resolve to return None if not found (instead of error)
+        let resolved_id = match self.try_resolve_tag_id(tag_id)? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let mut stmt = self.conn.prepare(
@@ -746,9 +963,15 @@ impl Database {
         Ok(tags.len() > 1)
     }
 
-    /// Get all descendant tag IDs for a given tag using recursive CTE
+    /// Get all descendant tag IDs for a given tag using recursive CTE (accepts ID or ID prefix)
     pub fn get_tag_descendants(&self, tag_id: &str) -> VoiceResult<Vec<Vec<u8>>> {
-        let uuid = validate_tag_id(tag_id)?;
+        // Use try_resolve to return empty Vec if tag not found
+        let resolved_id = match self.try_resolve_tag_id(tag_id)? {
+            Some(id) => id,
+            None => return Ok(Vec::new()),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let mut stmt = self.conn.prepare(
@@ -775,13 +998,13 @@ impl Database {
         Ok(ids)
     }
 
-    /// Filter notes by tag IDs (including descendants)
+    /// Filter notes by tag IDs or prefixes (including descendants)
     pub fn filter_notes(&self, tag_ids: &[String]) -> VoiceResult<Vec<NoteRow>> {
         if tag_ids.is_empty() {
             return self.get_all_notes();
         }
 
-        let uuids = validate_tag_ids(tag_ids)?;
+        let uuids = self.resolve_tag_ids(tag_ids)?;
         let placeholders = vec!["?"; uuids.len()].join(",");
 
         let query = format!(
@@ -820,7 +1043,8 @@ impl Database {
         Ok(notes)
     }
 
-    /// Search notes by text content and/or tags using AND logic
+    /// Search notes by text content and/or tags using AND logic.
+    /// Tag IDs can be full UUIDs or prefixes.
     pub fn search_notes(
         &self,
         text_query: Option<&str>,
@@ -858,7 +1082,7 @@ impl Database {
         if let Some(groups) = tag_id_groups {
             for group in groups {
                 if !group.is_empty() {
-                    let uuids = validate_tag_ids(group)?;
+                    let uuids = self.resolve_tag_ids(group)?;
                     let placeholders = vec!["?"; uuids.len()].join(",");
                     query.push_str(&format!(
                         r#"
@@ -890,14 +1114,15 @@ impl Database {
         Ok(notes)
     }
 
-    /// Create a new tag
+    /// Create a new tag (parent_id accepts ID or ID prefix)
     pub fn create_tag(&self, name: &str, parent_id: Option<&str>) -> VoiceResult<String> {
         let tag_id = Uuid::now_v7();
         let uuid_bytes = tag_id.as_bytes().to_vec();
 
         let parent_bytes = match parent_id {
             Some(pid) => {
-                let uuid = validate_tag_id(pid)?;
+                let resolved_id = self.resolve_tag_id(pid)?;
+                let uuid = Uuid::parse_str(&resolved_id).map_err(|e| VoiceError::validation("parent_id", e.to_string()))?;
                 Some(uuid.as_bytes().to_vec())
             }
             None => None,
@@ -911,9 +1136,15 @@ impl Database {
         Ok(tag_id.simple().to_string())
     }
 
-    /// Rename a tag
+    /// Rename a tag (accepts ID or ID prefix)
     pub fn rename_tag(&self, tag_id: &str, new_name: &str) -> VoiceResult<bool> {
-        let uuid = validate_tag_id(tag_id)?;
+        // Use try_resolve to return false if not found (instead of error)
+        let resolved_id = match self.try_resolve_tag_id(tag_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let updated = self.conn.execute(
@@ -924,10 +1155,21 @@ impl Database {
         Ok(updated > 0)
     }
 
-    /// Add a tag to a note
+    /// Add a tag to a note (accepts ID or ID prefix for both)
     pub fn add_tag_to_note(&self, note_id: &str, tag_id: &str) -> VoiceResult<bool> {
-        let note_uuid = validate_note_id(note_id)?;
-        let tag_uuid = validate_tag_id(tag_id)?;
+        // Use try_resolve to return false if either entity not found
+        let resolved_note_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let resolved_tag_id = match self.try_resolve_tag_id(tag_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let note_uuid = Uuid::parse_str(&resolved_note_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
+        let tag_uuid = Uuid::parse_str(&resolved_tag_id)
+            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let note_bytes = note_uuid.as_bytes().to_vec();
         let tag_bytes = tag_uuid.as_bytes().to_vec();
 
@@ -976,10 +1218,21 @@ impl Database {
         Ok(changed)
     }
 
-    /// Remove a tag from a note (soft delete)
+    /// Remove a tag from a note (soft delete) (accepts ID or ID prefix for both)
     pub fn remove_tag_from_note(&self, note_id: &str, tag_id: &str) -> VoiceResult<bool> {
-        let note_uuid = validate_note_id(note_id)?;
-        let tag_uuid = validate_tag_id(tag_id)?;
+        // Use try_resolve to return false if either entity not found
+        let resolved_note_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let resolved_tag_id = match self.try_resolve_tag_id(tag_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let note_uuid = Uuid::parse_str(&resolved_note_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
+        let tag_uuid = Uuid::parse_str(&resolved_tag_id)
+            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let note_bytes = note_uuid.as_bytes().to_vec();
         let tag_bytes = tag_uuid.as_bytes().to_vec();
 
@@ -999,9 +1252,15 @@ impl Database {
         Ok(updated > 0)
     }
 
-    /// Get all active tags for a note
+    /// Get all active tags for a note (accepts ID or ID prefix)
     pub fn get_note_tags(&self, note_id: &str) -> VoiceResult<Vec<TagRow>> {
-        let uuid = validate_note_id(note_id)?;
+        // Use try_resolve to return empty Vec if note not found
+        let resolved_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(Vec::new()),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let mut stmt = self.conn.prepare(
@@ -2870,9 +3129,15 @@ impl Database {
         Ok(updated > 0)
     }
 
-    /// Get all attachments for a note
+    /// Get all attachments for a note (accepts ID or ID prefix)
     pub fn get_attachments_for_note(&self, note_id: &str) -> VoiceResult<Vec<NoteAttachmentRow>> {
-        let uuid = validate_note_id(note_id)?;
+        // Use try_resolve to return empty Vec if note not found
+        let resolved_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(Vec::new()),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let mut stmt = self.conn.prepare(
@@ -2966,9 +3231,14 @@ impl Database {
         Ok(audio_file_id.simple().to_string())
     }
 
-    /// Get an audio file by ID
+    /// Get an audio file by ID (accepts ID or ID prefix)
     pub fn get_audio_file(&self, audio_file_id: &str) -> VoiceResult<Option<AudioFileRow>> {
-        let uuid = Uuid::parse_str(audio_file_id)
+        // Use resolver that includes deleted files (so we can check deleted_at status)
+        let resolved_id = match self.try_resolve_audio_file_id_including_deleted(audio_file_id)? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
@@ -2988,9 +3258,15 @@ impl Database {
         }
     }
 
-    /// Get all audio files for a note (via note_attachments)
+    /// Get all audio files for a note (via note_attachments) (accepts ID or ID prefix)
     pub fn get_audio_files_for_note(&self, note_id: &str) -> VoiceResult<Vec<AudioFileRow>> {
-        let uuid = validate_note_id(note_id)?;
+        // Use try_resolve to return empty Vec if note not found
+        let resolved_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(Vec::new()),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let mut stmt = self.conn.prepare(
@@ -3057,9 +3333,14 @@ impl Database {
         Ok(updated > 0)
     }
 
-    /// Soft-delete an audio file
+    /// Soft-delete an audio file (accepts ID or ID prefix)
     pub fn delete_audio_file(&self, audio_file_id: &str) -> VoiceResult<bool> {
-        let uuid = Uuid::parse_str(audio_file_id)
+        // Use try_resolve to return false if not found (instead of error)
+        let resolved_id = match self.try_resolve_audio_file_id(audio_file_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
         let device_id = get_local_device_id();
