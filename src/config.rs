@@ -102,6 +102,13 @@ impl Default for SyncConfig {
     }
 }
 
+fn default_transcription_config() -> serde_json::Value {
+    serde_json::json!({
+        "preferred_languages": [],
+        "providers": {}
+    })
+}
+
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigData {
@@ -131,6 +138,9 @@ pub struct ConfigData {
     pub server_certificate_fingerprint: Option<String>,
     /// Directory for storing audio files
     pub audiofile_directory: Option<String>,
+    /// Transcription configuration (stored as generic JSON - voicecore doesn't interpret this)
+    #[serde(default = "default_transcription_config")]
+    pub transcription: serde_json::Value,
 }
 
 fn generate_device_id() -> String {
@@ -164,6 +174,7 @@ impl Default for ConfigData {
             sync: SyncConfig::default(),
             server_certificate_fingerprint: None,
             audiofile_directory: None,
+            transcription: default_transcription_config(),
         }
     }
 }
@@ -430,6 +441,20 @@ impl Config {
         })
     }
 
+    /// Get transcription configuration as raw JSON
+    ///
+    /// Voicecore stores this data but doesn't interpret it - the transcription
+    /// module is responsible for understanding the structure.
+    pub fn transcription_json(&self) -> &serde_json::Value {
+        &self.data.transcription
+    }
+
+    /// Set transcription configuration from raw JSON
+    pub fn set_transcription_json(&mut self, value: serde_json::Value) -> VoiceResult<()> {
+        self.data.transcription = value;
+        self.save()
+    }
+
     /// Get a configuration value
     pub fn get(&self, key: &str) -> Option<String> {
         match key {
@@ -592,5 +617,80 @@ mod tests {
         // Set via set()
         config.set("audiofile_directory", "/audio/files").unwrap();
         assert_eq!(config.get("audiofile_directory"), Some("/audio/files".to_string()));
+    }
+
+    #[test]
+    fn test_transcription_config_defaults() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        // Transcription config is stored as generic JSON
+        let transcription = config.transcription_json();
+        assert!(transcription.is_object());
+
+        // Default should have empty preferred languages
+        let languages = transcription.get("preferred_languages").unwrap();
+        assert!(languages.as_array().unwrap().is_empty());
+
+        // Default whisper config
+        let whisper = transcription.get("providers").unwrap().get("whisper").unwrap();
+        assert!(whisper.get("model_path").unwrap().is_null());
+    }
+
+    #[test]
+    fn test_set_transcription_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        let new_config = serde_json::json!({
+            "preferred_languages": ["he", "en"],
+            "providers": {
+                "whisper": {
+                    "model_path": "/path/to/model.bin"
+                }
+            }
+        });
+
+        config.set_transcription_json(new_config).unwrap();
+
+        let transcription = config.transcription_json();
+        let languages = transcription.get("preferred_languages").unwrap().as_array().unwrap();
+        assert_eq!(languages.len(), 2);
+        assert_eq!(languages[0], "he");
+        assert_eq!(languages[1], "en");
+    }
+
+    #[test]
+    fn test_transcription_config_persistence() {
+        let temp_dir = TempDir::new().unwrap();
+
+        {
+            let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let new_config = serde_json::json!({
+                "preferred_languages": ["ar", "en"],
+                "providers": {
+                    "whisper": {
+                        "model_path": "/models/whisper.bin"
+                    }
+                }
+            });
+            config.set_transcription_json(new_config).unwrap();
+        }
+
+        {
+            let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let transcription = config.transcription_json();
+            let languages = transcription.get("preferred_languages").unwrap().as_array().unwrap();
+            assert_eq!(languages.len(), 2);
+            assert_eq!(languages[0], "ar");
+            assert_eq!(languages[1], "en");
+            assert_eq!(
+                transcription.get("providers").unwrap()
+                    .get("whisper").unwrap()
+                    .get("model_path").unwrap()
+                    .as_str().unwrap(),
+                "/models/whisper.bin"
+            );
+        }
     }
 }

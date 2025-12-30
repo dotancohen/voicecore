@@ -80,6 +80,22 @@ pub struct AudioFileRow {
     pub deleted_at: Option<String>,
 }
 
+/// Transcription data returned from database queries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionRow {
+    pub id: String,
+    pub audio_file_id: String,
+    pub content: String,
+    pub content_segments: Option<String>,
+    pub service: String,
+    pub service_arguments: Option<String>,
+    pub service_response: Option<String>,
+    pub device_id: String,
+    pub created_at: String,
+    pub modified_at: Option<String>,
+    pub deleted_at: Option<String>,
+}
+
 /// Convert UUID bytes to hex string
 fn uuid_bytes_to_hex(bytes: &[u8]) -> Option<String> {
     if bytes.len() == 16 {
@@ -316,6 +332,22 @@ impl Database {
                 deleted_at DATETIME
             );
 
+            -- Create transcriptions table
+            CREATE TABLE IF NOT EXISTS transcriptions (
+                id BLOB PRIMARY KEY,
+                audio_file_id BLOB NOT NULL,
+                content TEXT NOT NULL,
+                content_segments TEXT,
+                service TEXT NOT NULL,
+                service_arguments TEXT,
+                service_response TEXT,
+                device_id BLOB NOT NULL,
+                created_at DATETIME NOT NULL,
+                modified_at DATETIME,
+                deleted_at DATETIME,
+                FOREIGN KEY (audio_file_id) REFERENCES audio_files (id) ON DELETE CASCADE
+            );
+
             -- Create indexes
             CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at);
             CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at);
@@ -335,6 +367,11 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_note_attachments_deleted_at ON note_attachments(deleted_at);
             CREATE INDEX IF NOT EXISTS idx_audio_files_modified_at ON audio_files(modified_at);
             CREATE INDEX IF NOT EXISTS idx_audio_files_deleted_at ON audio_files(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_audio_file_id ON transcriptions(audio_file_id);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_service ON transcriptions(service);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_created_at ON transcriptions(created_at);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_modified_at ON transcriptions(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_deleted_at ON transcriptions(deleted_at);
             "#,
         )?;
 
@@ -3558,6 +3595,146 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Transcription methods
+    // ========================================================================
+
+    /// Create a new transcription for an audio file
+    pub fn create_transcription(
+        &self,
+        audio_file_id: &str,
+        content: &str,
+        content_segments: Option<&str>,
+        service: &str,
+        service_arguments: Option<&str>,
+        service_response: Option<&str>,
+    ) -> VoiceResult<String> {
+        let id = Uuid::now_v7();
+        let device_id = get_local_device_id();
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+        let audio_file_uuid = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+
+        self.conn.execute(
+            r#"
+            INSERT INTO transcriptions (id, audio_file_id, content, content_segments, service, service_arguments, service_response, device_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                id.as_bytes().to_vec(),
+                audio_file_uuid.as_bytes().to_vec(),
+                content,
+                content_segments,
+                service,
+                service_arguments,
+                service_response,
+                device_id.as_bytes().to_vec(),
+                now,
+            ],
+        )?;
+
+        Ok(id.simple().to_string())
+    }
+
+    /// Get a transcription by ID
+    pub fn get_transcription(&self, transcription_id: &str) -> VoiceResult<Option<TranscriptionRow>> {
+        let id_uuid = Uuid::parse_str(transcription_id)
+            .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
+
+        let result = self.conn.query_row(
+            r#"
+            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, device_id, created_at, modified_at, deleted_at
+            FROM transcriptions
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![id_uuid.as_bytes().to_vec()],
+            |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let audio_file_id_bytes: Vec<u8> = row.get(1)?;
+                let device_id_bytes: Vec<u8> = row.get(7)?;
+                Ok(TranscriptionRow {
+                    id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
+                    audio_file_id: uuid_bytes_to_hex(&audio_file_id_bytes).unwrap_or_default(),
+                    content: row.get(2)?,
+                    content_segments: row.get(3)?,
+                    service: row.get(4)?,
+                    service_arguments: row.get(5)?,
+                    service_response: row.get(6)?,
+                    device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
+                    created_at: row.get(8)?,
+                    modified_at: row.get(9)?,
+                    deleted_at: row.get(10)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(transcription) => Ok(Some(transcription)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(VoiceError::Database(e)),
+        }
+    }
+
+    /// Get all transcriptions for an audio file
+    pub fn get_transcriptions_for_audio_file(&self, audio_file_id: &str) -> VoiceResult<Vec<TranscriptionRow>> {
+        let audio_file_uuid = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, device_id, created_at, modified_at, deleted_at
+            FROM transcriptions
+            WHERE audio_file_id = ? AND deleted_at IS NULL
+            ORDER BY created_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![audio_file_uuid.as_bytes().to_vec()], |row| {
+            let id_bytes: Vec<u8> = row.get(0)?;
+            let audio_file_id_bytes: Vec<u8> = row.get(1)?;
+            let device_id_bytes: Vec<u8> = row.get(7)?;
+            Ok(TranscriptionRow {
+                id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
+                audio_file_id: uuid_bytes_to_hex(&audio_file_id_bytes).unwrap_or_default(),
+                content: row.get(2)?,
+                content_segments: row.get(3)?,
+                service: row.get(4)?,
+                service_arguments: row.get(5)?,
+                service_response: row.get(6)?,
+                device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
+                created_at: row.get(8)?,
+                modified_at: row.get(9)?,
+                deleted_at: row.get(10)?,
+            })
+        })?;
+
+        let mut transcriptions = Vec::new();
+        for row in rows {
+            transcriptions.push(row?);
+        }
+
+        Ok(transcriptions)
+    }
+
+    /// Delete a transcription (soft delete)
+    pub fn delete_transcription(&self, transcription_id: &str) -> VoiceResult<bool> {
+        let id_uuid = Uuid::parse_str(transcription_id)
+            .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+        let count = self.conn.execute(
+            r#"
+            UPDATE transcriptions
+            SET deleted_at = ?, modified_at = ?
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![now, now, id_uuid.as_bytes().to_vec()],
+        )?;
+
+        Ok(count > 0)
     }
 }
 
