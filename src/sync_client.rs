@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::database::Database;
 use crate::error::{VoiceError, VoiceResult};
+use crate::validation::{normalize_datetime, normalize_datetime_optional};
 
 /// Result of a sync operation
 #[derive(Debug, Clone, Default)]
@@ -760,10 +761,15 @@ impl SyncClient {
         let note_id = &change.entity_id;
         let data = &change.data;
 
-        let created_at = data["created_at"].as_str().unwrap_or("");
+        // Normalize timestamps from incoming data (handles ISO 8601 with 'T' separator)
+        let created_at_raw = data["created_at"].as_str().unwrap_or("");
+        let created_at_normalized = normalize_datetime(created_at_raw);
+        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
         let content = data["content"].as_str().unwrap_or("");
-        let modified_at = data["modified_at"].as_str();
-        let deleted_at = data["deleted_at"].as_str();
+        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
+        let modified_at = modified_at_normalized.as_deref();
+        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
+        let deleted_at = deleted_at_normalized.as_deref();
 
         // Check if local note exists and compare timestamps
         if let Ok(Some(existing)) = db.get_note_raw(note_id) {
@@ -883,9 +889,14 @@ impl SyncClient {
 
         let name = data["name"].as_str().unwrap_or("");
         let parent_id = data["parent_id"].as_str();
-        let created_at = data["created_at"].as_str().unwrap_or("");
-        let modified_at = data["modified_at"].as_str();
-        let deleted_at = data["deleted_at"].as_str();
+        // Normalize timestamps from incoming data
+        let created_at_raw = data["created_at"].as_str().unwrap_or("");
+        let created_at_normalized = normalize_datetime(created_at_raw);
+        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
+        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
+        let modified_at = modified_at_normalized.as_deref();
+        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
+        let deleted_at = deleted_at_normalized.as_deref();
 
         // Check if local tag exists for conflict detection
         if let Ok(Some(existing)) = db.get_tag_raw(tag_id) {
@@ -1024,9 +1035,14 @@ impl SyncClient {
         let tag_id = parts[1];
         let data = &change.data;
 
-        let created_at = data["created_at"].as_str().unwrap_or("");
-        let modified_at = data["modified_at"].as_str();
-        let deleted_at = data["deleted_at"].as_str();
+        // Normalize timestamps from incoming data
+        let created_at_raw = data["created_at"].as_str().unwrap_or("");
+        let created_at_normalized = normalize_datetime(created_at_raw);
+        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
+        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
+        let modified_at = modified_at_normalized.as_deref();
+        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
+        let deleted_at = deleted_at_normalized.as_deref();
 
         // Determine incoming timestamp
         let incoming_time = deleted_at.or(modified_at).or(Some(created_at));
@@ -1062,12 +1078,18 @@ impl SyncClient {
         let audio_id = &change.entity_id;
         let data = &change.data;
 
-        let imported_at = data["imported_at"].as_str().unwrap_or("");
+        // Normalize timestamps from incoming data
+        let imported_at_raw = data["imported_at"].as_str().unwrap_or("");
+        let imported_at_normalized = normalize_datetime(imported_at_raw);
+        let imported_at = imported_at_normalized.as_deref().unwrap_or(imported_at_raw);
         let filename = data["filename"].as_str().unwrap_or("");
-        let file_created_at = data["file_created_at"].as_str();
+        let file_created_at_normalized = normalize_datetime_optional(data["file_created_at"].as_str());
+        let file_created_at = file_created_at_normalized.as_deref();
         let summary = data["summary"].as_str();
-        let modified_at = data["modified_at"].as_str();
-        let deleted_at = data["deleted_at"].as_str();
+        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
+        let modified_at = modified_at_normalized.as_deref();
+        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
+        let deleted_at = deleted_at_normalized.as_deref();
 
         db.apply_sync_audio_file(
             audio_id,
@@ -1092,9 +1114,14 @@ impl SyncClient {
         let note_id = data["note_id"].as_str().unwrap_or("");
         let attachment_id = data["attachment_id"].as_str().unwrap_or("");
         let attachment_type = data["attachment_type"].as_str().unwrap_or("");
-        let created_at = data["created_at"].as_str().unwrap_or("");
-        let modified_at = data["modified_at"].as_str();
-        let deleted_at = data["deleted_at"].as_str();
+        // Normalize timestamps from incoming data
+        let created_at_raw = data["created_at"].as_str().unwrap_or("");
+        let created_at_normalized = normalize_datetime(created_at_raw);
+        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
+        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
+        let modified_at = modified_at_normalized.as_deref();
+        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
+        let deleted_at = deleted_at_normalized.as_deref();
 
         db.apply_sync_note_attachment(
             attachment_link_id,

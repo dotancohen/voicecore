@@ -499,4 +499,84 @@ impl VoiceClient {
             Ok(None)
         }
     }
+
+    /// Update a note's content
+    pub fn update_note(&self, note_id: String, content: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.update_note(&note_id, &content).map_err(|e| VoiceCoreError::Database {
+            msg: e.to_string(),
+        })
+    }
+
+    /// Check if there are local changes that haven't been synced
+    pub fn has_unsynced_changes(&self) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let cfg = self.config.lock().unwrap();
+
+        // If sync is not enabled or no peers configured, no unsynced changes to report
+        if !cfg.is_sync_enabled() || cfg.peers().is_empty() {
+            return Ok(false);
+        }
+
+        // Get peer's last sync time
+        let peer_id = cfg.peers().first().map(|p| p.peer_id.as_str());
+        let last_sync = match peer_id {
+            Some(id) => db.get_peer_last_sync(id).ok().flatten(),
+            None => return Ok(false),
+        };
+
+        // If we've never synced with this peer, no baseline to compare against
+        let last_sync = match last_sync {
+            Some(ts) => ts,
+            None => return Ok(false),
+        };
+
+        // Check if there are changes since last sync
+        let (changes, _) = db.get_changes_since(Some(&last_sync), 1)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
+
+        Ok(!changes.is_empty())
+    }
+
+    /// Debug method to see sync state details
+    pub fn debug_sync_state(&self) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let cfg = self.config.lock().unwrap();
+
+        let mut info = String::new();
+
+        info.push_str(&format!("Sync enabled: {}\n", cfg.is_sync_enabled()));
+        info.push_str(&format!("Peers count: {}\n", cfg.peers().len()));
+
+        if let Some(peer) = cfg.peers().first() {
+            info.push_str(&format!("Peer ID: {}...\n", &peer.peer_id[..8]));
+
+            if let Ok(Some(last_sync)) = db.get_peer_last_sync(&peer.peer_id) {
+                info.push_str(&format!("Last sync: {}\n", last_sync));
+
+                // Check changes with >= (current behavior)
+                if let Ok((changes, _)) = db.get_changes_since(Some(&last_sync), 10) {
+                    info.push_str(&format!("Changes (>=): {}\n", changes.len()));
+
+                    // Show details of first few changes
+                    for (i, change) in changes.iter().take(3).enumerate() {
+                        if let Some(entity_type) = change.get("entity_type").and_then(|v| v.as_str()) {
+                            if let Some(timestamp) = change.get("timestamp").and_then(|v| v.as_str()) {
+                                info.push_str(&format!("  [{}] {}: {}\n", i, entity_type, timestamp));
+                            }
+                        }
+                    }
+                }
+
+                // Check changes with > (exclusive)
+                if let Ok((changes, _)) = db.get_changes_since_exclusive(Some(&last_sync), 10) {
+                    info.push_str(&format!("Changes (>): {}\n", changes.len()));
+                }
+            } else {
+                info.push_str("Last sync: None\n");
+            }
+        }
+
+        Ok(info)
+    }
 }

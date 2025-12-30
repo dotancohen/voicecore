@@ -337,6 +337,112 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_audio_files_deleted_at ON audio_files(deleted_at);
             "#,
         )?;
+
+        Ok(())
+    }
+
+    /// Normalize database data for consistency.
+    ///
+    /// This runs various normalization passes on the database:
+    /// - Timestamp normalization (ISO 8601 -> SQLite format)
+    /// - (Future: Unicode normalization, etc.)
+    ///
+    /// This should be run via `cli maintenance database-normalize`.
+    pub fn normalize_database(&mut self) -> VoiceResult<()> {
+        self.migrate_normalize_timestamps()?;
+        // Future normalizations can be added here
+        Ok(())
+    }
+
+    /// Normalize all datetime values to SQLite format (YYYY-MM-DD HH:MM:SS).
+    ///
+    /// This migration fixes timestamps that may have been stored in ISO 8601 format
+    /// (with 'T' separator and/or microseconds) from earlier sync operations.
+    /// String comparison of timestamps requires consistent format.
+    fn migrate_normalize_timestamps(&mut self) -> VoiceResult<()> {
+        // Check if migration already ran (using a simple marker in pragmas)
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        // Version 1 = timestamps normalized
+        if version >= 1 {
+            return Ok(());
+        }
+
+        // Normalize notes timestamps
+        self.conn.execute_batch(
+            r#"
+            UPDATE notes SET created_at = REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
+            WHERE created_at LIKE '%T%';
+
+            UPDATE notes SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
+            WHERE modified_at LIKE '%T%';
+
+            UPDATE notes SET deleted_at = REPLACE(SUBSTR(deleted_at, 1, 19), 'T', ' ')
+            WHERE deleted_at LIKE '%T%';
+            "#,
+        )?;
+
+        // Normalize tags timestamps
+        self.conn.execute_batch(
+            r#"
+            UPDATE tags SET created_at = REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
+            WHERE created_at LIKE '%T%';
+
+            UPDATE tags SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
+            WHERE modified_at LIKE '%T%';
+            "#,
+        )?;
+
+        // Normalize note_tags timestamps
+        self.conn.execute_batch(
+            r#"
+            UPDATE note_tags SET created_at = REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
+            WHERE created_at LIKE '%T%';
+
+            UPDATE note_tags SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
+            WHERE modified_at LIKE '%T%';
+
+            UPDATE note_tags SET deleted_at = REPLACE(SUBSTR(deleted_at, 1, 19), 'T', ' ')
+            WHERE deleted_at LIKE '%T%';
+            "#,
+        )?;
+
+        // Normalize audio_files timestamps
+        self.conn.execute_batch(
+            r#"
+            UPDATE audio_files SET imported_at = REPLACE(SUBSTR(imported_at, 1, 19), 'T', ' ')
+            WHERE imported_at LIKE '%T%';
+
+            UPDATE audio_files SET file_created_at = REPLACE(SUBSTR(file_created_at, 1, 19), 'T', ' ')
+            WHERE file_created_at LIKE '%T%';
+
+            UPDATE audio_files SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
+            WHERE modified_at LIKE '%T%';
+
+            UPDATE audio_files SET deleted_at = REPLACE(SUBSTR(deleted_at, 1, 19), 'T', ' ')
+            WHERE deleted_at LIKE '%T%';
+            "#,
+        )?;
+
+        // Normalize note_attachments timestamps
+        self.conn.execute_batch(
+            r#"
+            UPDATE note_attachments SET created_at = REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
+            WHERE created_at LIKE '%T%';
+
+            UPDATE note_attachments SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
+            WHERE modified_at LIKE '%T%';
+
+            UPDATE note_attachments SET deleted_at = REPLACE(SUBSTR(deleted_at, 1, 19), 'T', ' ')
+            WHERE deleted_at LIKE '%T%';
+            "#,
+        )?;
+
+        // Mark migration as complete
+        self.conn.execute("PRAGMA user_version = 1", [])?;
+
         Ok(())
     }
 
@@ -835,29 +941,39 @@ impl Database {
             )
             .optional()?;
 
-        match existing {
+        let changed = match existing {
             Some(deleted_at) => {
                 if deleted_at.is_some() {
                     // Reactivate soft-deleted association
                     self.conn.execute(
                         "UPDATE note_tags SET deleted_at = NULL, modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
-                        params![note_bytes, tag_bytes],
+                        params![&note_bytes, &tag_bytes],
                     )?;
-                    Ok(true)
+                    true
                 } else {
                     // Already active
-                    Ok(false)
+                    false
                 }
             }
             None => {
                 // Create new association
                 self.conn.execute(
                     "INSERT INTO note_tags (note_id, tag_id, created_at) VALUES (?, ?, datetime('now'))",
-                    params![note_bytes, tag_bytes],
+                    params![&note_bytes, &tag_bytes],
                 )?;
-                Ok(true)
+                true
             }
+        };
+
+        // Update the parent Note's modified_at to trigger sync
+        if changed {
+            self.conn.execute(
+                "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
+                params![note_bytes],
+            )?;
         }
+
+        Ok(changed)
     }
 
     /// Remove a tag from a note (soft delete)
@@ -869,8 +985,16 @@ impl Database {
 
         let updated = self.conn.execute(
             "UPDATE note_tags SET deleted_at = datetime('now'), modified_at = datetime('now') WHERE note_id = ? AND tag_id = ? AND deleted_at IS NULL",
-            params![note_bytes, tag_bytes],
+            params![&note_bytes, &tag_bytes],
         )?;
+
+        // Update the parent Note's modified_at to trigger sync
+        if updated > 0 {
+            self.conn.execute(
+                "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
+                params![note_bytes],
+            )?;
+        }
 
         Ok(updated > 0)
     }
@@ -1345,6 +1469,168 @@ impl Database {
                 data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
                 data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
                 change.insert("data".to_string(), serde_json::Value::Object(data));
+
+                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                    latest_timestamp = Some(timestamp);
+                }
+                changes.push(change);
+            }
+        }
+
+        Ok((changes, latest_timestamp))
+    }
+
+    /// Get changes since a timestamp using exclusive comparison (>)
+    /// This is used for checking unsynced changes where we want to exclude
+    /// items that were synced at exactly the sync timestamp.
+    pub fn get_changes_since_exclusive(&self, since: Option<&str>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<String>)> {
+        let since_ts = match since {
+            Some(ts) => ts,
+            None => return self.get_changes_since(None, limit),
+        };
+
+        let mut changes = Vec::new();
+        let mut latest_timestamp: Option<String> = None;
+
+        // Check notes with > (exclusive)
+        let note_count: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM notes
+            WHERE modified_at > ? OR (modified_at IS NULL AND created_at > ?)
+            "#,
+            params![since_ts, since_ts],
+            |row| row.get(0),
+        )?;
+
+        if note_count > 0 {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT id, created_at, content, modified_at, deleted_at
+                FROM notes
+                WHERE modified_at > ? OR (modified_at IS NULL AND created_at > ?)
+                ORDER BY COALESCE(modified_at, created_at)
+                LIMIT ?
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since_ts, since_ts, limit], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (id_bytes, created_at, content, modified_at, deleted_at) = row?;
+                let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
+                let operation = if deleted_at.is_some() {
+                    "delete"
+                } else if modified_at.is_some() {
+                    "update"
+                } else {
+                    "create"
+                };
+
+                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
+                let mut change = HashMap::new();
+                change.insert("entity_type".to_string(), serde_json::Value::String("note".to_string()));
+                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
+                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
+                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+
+                let mut data = serde_json::Map::new();
+                data.insert("id".to_string(), serde_json::Value::String(id_hex));
+                data.insert("created_at".to_string(), serde_json::Value::String(created_at));
+                data.insert("content".to_string(), serde_json::Value::String(content));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                change.insert("data".to_string(), serde_json::Value::Object(data));
+
+                latest_timestamp = Some(timestamp);
+                changes.push(change);
+
+                if changes.len() >= limit as usize {
+                    return Ok((changes, latest_timestamp));
+                }
+            }
+        }
+
+        // Check audio_files with > (exclusive)
+        let remaining = limit - changes.len() as i64;
+        if remaining > 0 {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
+                FROM audio_files
+                WHERE modified_at > ? OR (modified_at IS NULL AND imported_at > ?)
+                ORDER BY COALESCE(modified_at, imported_at)
+                LIMIT ?
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since_ts, since_ts, remaining], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (id_bytes, imported_at, _filename, _file_created_at, _summary, modified_at, deleted_at) = row?;
+                let timestamp = modified_at.clone().unwrap_or_else(|| imported_at.clone());
+
+                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
+                let mut change = HashMap::new();
+                change.insert("entity_type".to_string(), serde_json::Value::String("audio_file".to_string()));
+                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex));
+                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+
+                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                    latest_timestamp = Some(timestamp);
+                }
+                changes.push(change);
+            }
+        }
+
+        // Check note_attachments with > (exclusive)
+        let remaining = limit - changes.len() as i64;
+        if remaining > 0 {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
+                FROM note_attachments
+                WHERE modified_at > ? OR (modified_at IS NULL AND created_at > ?)
+                ORDER BY COALESCE(modified_at, created_at)
+                LIMIT ?
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since_ts, since_ts, remaining], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (id_bytes, _note_id_bytes, _attachment_id_bytes, _attachment_type, created_at, modified_at, _deleted_at) = row?;
+                let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
+
+                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
+                let mut change = HashMap::new();
+                change.insert("entity_type".to_string(), serde_json::Value::String("note_attachment".to_string()));
+                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex));
+                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
 
                 if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
                     latest_timestamp = Some(timestamp);
@@ -2520,6 +2806,7 @@ impl Database {
         let association_id = Uuid::now_v7();
 
         let device_id = get_local_device_id();
+        let note_bytes = note_uuid.as_bytes().to_vec();
 
         self.conn.execute(
             r#"
@@ -2528,11 +2815,17 @@ impl Database {
             "#,
             params![
                 association_id.as_bytes().to_vec(),
-                note_uuid.as_bytes().to_vec(),
+                &note_bytes,
                 attachment_uuid.as_bytes().to_vec(),
                 attachment_type,
                 device_id.as_bytes().to_vec(),
             ],
+        )?;
+
+        // Update the parent Note's modified_at to trigger sync
+        self.conn.execute(
+            "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
+            params![note_bytes],
         )?;
 
         Ok(association_id.simple().to_string())
@@ -2545,6 +2838,16 @@ impl Database {
         let uuid_bytes = uuid.as_bytes().to_vec();
         let device_id = get_local_device_id();
 
+        // Get the note_id before updating so we can update the note's modified_at
+        let note_bytes: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT note_id FROM note_attachments WHERE id = ? AND deleted_at IS NULL",
+                params![&uuid_bytes],
+                |row| row.get(0),
+            )
+            .optional()?;
+
         let updated = self.conn.execute(
             r#"
             UPDATE note_attachments
@@ -2553,6 +2856,16 @@ impl Database {
             "#,
             params![device_id.as_bytes().to_vec(), uuid_bytes],
         )?;
+
+        // Update the parent Note's modified_at to trigger sync
+        if updated > 0 {
+            if let Some(note_id) = note_bytes {
+                self.conn.execute(
+                    "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
+                    params![note_id],
+                )?;
+            }
+        }
 
         Ok(updated > 0)
     }

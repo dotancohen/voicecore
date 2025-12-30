@@ -147,6 +147,60 @@ pub fn validate_datetime_optional(value: Option<&str>, field_name: &str) -> Voic
     Ok(())
 }
 
+/// Normalize a datetime string to the standard format "YYYY-MM-DD HH:MM:SS".
+///
+/// This handles various input formats:
+/// - ISO 8601 with 'T': "2025-01-01T12:30:45" -> "2025-01-01 12:30:45"
+/// - ISO 8601 with microseconds: "2025-01-01T12:30:45.123456" -> "2025-01-01 12:30:45"
+/// - ISO 8601 with timezone: "2025-01-01T12:30:45+00:00" -> "2025-01-01 12:30:45"
+/// - Already correct format is returned as-is
+///
+/// Returns None if the input cannot be normalized.
+pub fn normalize_datetime(value: &str) -> Option<String> {
+    // If already in correct format, return as-is
+    if value.len() == 19 && !value.contains('T') {
+        if validate_datetime(value, "temp").is_ok() {
+            return Some(value.to_string());
+        }
+    }
+
+    // Try to normalize ISO 8601 format
+    // Format: YYYY-MM-DDTHH:MM:SS[.fraction][timezone]
+    let without_tz = value
+        .split('+')
+        .next()
+        .unwrap_or(value)
+        .split('Z')
+        .next()
+        .unwrap_or(value);
+
+    // Split on 'T' to separate date and time
+    let parts: Vec<&str> = without_tz.split('T').collect();
+    if parts.len() == 2 {
+        let date_part = parts[0];
+        let time_part = parts[1];
+
+        // Remove fractional seconds (e.g., .123456)
+        let time_without_fraction = time_part.split('.').next().unwrap_or(time_part);
+
+        // Reconstruct with space separator
+        let normalized = format!("{} {}", date_part, time_without_fraction);
+
+        // Validate the result
+        if normalized.len() == 19 && validate_datetime(&normalized, "temp").is_ok() {
+            return Some(normalized);
+        }
+    }
+
+    // If we can't normalize, return None
+    None
+}
+
+/// Normalize an optional datetime string.
+pub fn normalize_datetime_optional(value: Option<&str>) -> Option<String> {
+    value.and_then(normalize_datetime)
+}
+
 /// Validate a UUID value (must be 16 bytes).
 pub fn validate_uuid(value: &[u8], field_name: &str) -> VoiceResult<()> {
     if value.len() != UUID_BYTES_LENGTH {
@@ -630,6 +684,70 @@ mod tests {
         assert!(validate_datetime_optional(None, "test").is_ok());
         assert!(validate_datetime_optional(Some("2025-01-01 00:00:00"), "test").is_ok());
         assert!(validate_datetime_optional(Some("2025-1-1 0:0:0"), "test").is_err());
+    }
+
+    #[test]
+    fn test_normalize_datetime_already_correct() {
+        assert_eq!(
+            normalize_datetime("2025-01-01 00:00:00"),
+            Some("2025-01-01 00:00:00".to_string())
+        );
+        assert_eq!(
+            normalize_datetime("2025-12-31 23:59:59"),
+            Some("2025-12-31 23:59:59".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_datetime_iso8601_with_t() {
+        assert_eq!(
+            normalize_datetime("2025-01-01T12:30:45"),
+            Some("2025-01-01 12:30:45".to_string())
+        );
+        assert_eq!(
+            normalize_datetime("2025-12-31T23:59:59"),
+            Some("2025-12-31 23:59:59".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_datetime_with_microseconds() {
+        assert_eq!(
+            normalize_datetime("2025-01-01T12:30:45.123456"),
+            Some("2025-01-01 12:30:45".to_string())
+        );
+        assert_eq!(
+            normalize_datetime("2025-12-29T23:29:14.462391"),
+            Some("2025-12-29 23:29:14".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_datetime_with_timezone() {
+        assert_eq!(
+            normalize_datetime("2025-01-01T12:30:45+00:00"),
+            Some("2025-01-01 12:30:45".to_string())
+        );
+        assert_eq!(
+            normalize_datetime("2025-01-01T12:30:45Z"),
+            Some("2025-01-01 12:30:45".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_datetime_invalid() {
+        assert!(normalize_datetime("invalid").is_none());
+        assert!(normalize_datetime("").is_none());
+        assert!(normalize_datetime("2025-1-1 0:0:0").is_none());
+    }
+
+    #[test]
+    fn test_normalize_datetime_optional() {
+        assert!(normalize_datetime_optional(None).is_none());
+        assert_eq!(
+            normalize_datetime_optional(Some("2025-01-01T12:30:45")),
+            Some("2025-01-01 12:30:45".to_string())
+        );
     }
 
     #[test]
