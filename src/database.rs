@@ -3736,6 +3736,38 @@ impl Database {
 
         Ok(count > 0)
     }
+
+    /// Update a transcription's content and service response
+    ///
+    /// Used to update a pending transcription after the transcription completes.
+    pub fn update_transcription(
+        &self,
+        transcription_id: &str,
+        content: &str,
+        content_segments: Option<&str>,
+        service_response: Option<&str>,
+    ) -> VoiceResult<bool> {
+        let id_uuid = Uuid::parse_str(transcription_id)
+            .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+        let count = self.conn.execute(
+            r#"
+            UPDATE transcriptions
+            SET content = ?, content_segments = ?, service_response = ?, modified_at = ?
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![
+                content,
+                content_segments,
+                service_response,
+                now,
+                id_uuid.as_bytes().to_vec()
+            ],
+        )?;
+
+        Ok(count > 0)
+    }
 }
 
 // ============================================================================
