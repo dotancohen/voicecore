@@ -90,11 +90,15 @@ pub struct TranscriptionRow {
     pub service: String,
     pub service_arguments: Option<String>,
     pub service_response: Option<String>,
+    pub state: String,
     pub device_id: String,
     pub created_at: String,
     pub modified_at: Option<String>,
     pub deleted_at: Option<String>,
 }
+
+/// Default state for new transcriptions
+pub const DEFAULT_TRANSCRIPTION_STATE: &str = "original !verified !verbatim !cleaned !polished";
 
 /// Convert UUID bytes to hex string
 fn uuid_bytes_to_hex(bytes: &[u8]) -> Option<String> {
@@ -341,6 +345,7 @@ impl Database {
                 service TEXT NOT NULL,
                 service_arguments TEXT,
                 service_response TEXT,
+                state TEXT NOT NULL DEFAULT 'original !verified !verbatim !cleaned !polished',
                 device_id BLOB NOT NULL,
                 created_at DATETIME NOT NULL,
                 modified_at DATETIME,
@@ -374,6 +379,9 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_transcriptions_deleted_at ON transcriptions(deleted_at);
             "#,
         )?;
+
+        // Run migrations for existing databases
+        self.migrate_add_transcription_state()?;
 
         Ok(())
     }
@@ -479,6 +487,43 @@ impl Database {
 
         // Mark migration as complete
         self.conn.execute("PRAGMA user_version = 1", [])?;
+
+        Ok(())
+    }
+
+    /// Add state column to transcriptions table.
+    ///
+    /// This migration adds the `state` field to track transcription processing state:
+    /// "original !verified !verbatim !cleaned !polished"
+    fn migrate_add_transcription_state(&mut self) -> VoiceResult<()> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        // Version 2 = transcription state column added
+        if version >= 2 {
+            return Ok(());
+        }
+
+        // Add state column to transcriptions table if it doesn't exist
+        // SQLite doesn't have IF NOT EXISTS for columns, so we check first
+        let has_state: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('transcriptions') WHERE name = 'state'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if !has_state {
+            self.conn.execute(
+                &format!(
+                    "ALTER TABLE transcriptions ADD COLUMN state TEXT NOT NULL DEFAULT '{}'",
+                    DEFAULT_TRANSCRIPTION_STATE
+                ),
+                [],
+            )?;
+        }
+
+        self.conn.execute("PRAGMA user_version = 2", [])?;
 
         Ok(())
     }
@@ -3610,18 +3655,20 @@ impl Database {
         service: &str,
         service_arguments: Option<&str>,
         service_response: Option<&str>,
+        state: Option<&str>,
     ) -> VoiceResult<String> {
         let id = Uuid::now_v7();
         let device_id = get_local_device_id();
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let state = state.unwrap_or(DEFAULT_TRANSCRIPTION_STATE);
 
         let audio_file_uuid = Uuid::parse_str(audio_file_id)
             .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
 
         self.conn.execute(
             r#"
-            INSERT INTO transcriptions (id, audio_file_id, content, content_segments, service, service_arguments, service_response, device_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO transcriptions (id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 id.as_bytes().to_vec(),
@@ -3631,6 +3678,7 @@ impl Database {
                 service,
                 service_arguments,
                 service_response,
+                state,
                 device_id.as_bytes().to_vec(),
                 now,
             ],
@@ -3646,7 +3694,7 @@ impl Database {
 
         let result = self.conn.query_row(
             r#"
-            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, device_id, created_at, modified_at, deleted_at
+            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
             FROM transcriptions
             WHERE id = ? AND deleted_at IS NULL
             "#,
@@ -3654,7 +3702,7 @@ impl Database {
             |row| {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let audio_file_id_bytes: Vec<u8> = row.get(1)?;
-                let device_id_bytes: Vec<u8> = row.get(7)?;
+                let device_id_bytes: Vec<u8> = row.get(8)?;
                 Ok(TranscriptionRow {
                     id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
                     audio_file_id: uuid_bytes_to_hex(&audio_file_id_bytes).unwrap_or_default(),
@@ -3663,10 +3711,11 @@ impl Database {
                     service: row.get(4)?,
                     service_arguments: row.get(5)?,
                     service_response: row.get(6)?,
+                    state: row.get(7)?,
                     device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
-                    created_at: row.get(8)?,
-                    modified_at: row.get(9)?,
-                    deleted_at: row.get(10)?,
+                    created_at: row.get(9)?,
+                    modified_at: row.get(10)?,
+                    deleted_at: row.get(11)?,
                 })
             },
         );
@@ -3685,7 +3734,7 @@ impl Database {
 
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, device_id, created_at, modified_at, deleted_at
+            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
             FROM transcriptions
             WHERE audio_file_id = ? AND deleted_at IS NULL
             ORDER BY created_at DESC
@@ -3695,7 +3744,7 @@ impl Database {
         let rows = stmt.query_map(params![audio_file_uuid.as_bytes().to_vec()], |row| {
             let id_bytes: Vec<u8> = row.get(0)?;
             let audio_file_id_bytes: Vec<u8> = row.get(1)?;
-            let device_id_bytes: Vec<u8> = row.get(7)?;
+            let device_id_bytes: Vec<u8> = row.get(8)?;
             Ok(TranscriptionRow {
                 id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
                 audio_file_id: uuid_bytes_to_hex(&audio_file_id_bytes).unwrap_or_default(),
@@ -3704,10 +3753,11 @@ impl Database {
                 service: row.get(4)?,
                 service_arguments: row.get(5)?,
                 service_response: row.get(6)?,
+                state: row.get(7)?,
                 device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
-                created_at: row.get(8)?,
-                modified_at: row.get(9)?,
-                deleted_at: row.get(10)?,
+                created_at: row.get(9)?,
+                modified_at: row.get(10)?,
+                deleted_at: row.get(11)?,
             })
         })?;
 
@@ -3737,34 +3787,55 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Update a transcription's content and service response
+    /// Update a transcription's content, state, and service response
     ///
-    /// Used to update a pending transcription after the transcription completes.
+    /// Used to update a pending transcription after the transcription completes,
+    /// or when the user edits the transcription content or state.
     pub fn update_transcription(
         &self,
         transcription_id: &str,
         content: &str,
         content_segments: Option<&str>,
         service_response: Option<&str>,
+        state: Option<&str>,
     ) -> VoiceResult<bool> {
         let id_uuid = Uuid::parse_str(transcription_id)
             .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        let count = self.conn.execute(
-            r#"
-            UPDATE transcriptions
-            SET content = ?, content_segments = ?, service_response = ?, modified_at = ?
-            WHERE id = ? AND deleted_at IS NULL
-            "#,
-            params![
-                content,
-                content_segments,
-                service_response,
-                now,
-                id_uuid.as_bytes().to_vec()
-            ],
-        )?;
+        // If state is provided, update it; otherwise keep existing
+        let count = if let Some(state) = state {
+            self.conn.execute(
+                r#"
+                UPDATE transcriptions
+                SET content = ?, content_segments = ?, service_response = ?, state = ?, modified_at = ?
+                WHERE id = ? AND deleted_at IS NULL
+                "#,
+                params![
+                    content,
+                    content_segments,
+                    service_response,
+                    state,
+                    now,
+                    id_uuid.as_bytes().to_vec()
+                ],
+            )?
+        } else {
+            self.conn.execute(
+                r#"
+                UPDATE transcriptions
+                SET content = ?, content_segments = ?, service_response = ?, modified_at = ?
+                WHERE id = ? AND deleted_at IS NULL
+                "#,
+                params![
+                    content,
+                    content_segments,
+                    service_response,
+                    now,
+                    id_uuid.as_bytes().to_vec()
+                ],
+            )?
+        };
 
         Ok(count > 0)
     }
