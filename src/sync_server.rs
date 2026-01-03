@@ -1579,6 +1579,113 @@ fn apply_audio_file_change(
     }
 }
 
+fn apply_transcription_change(
+    db: &Database,
+    change: &SyncChange,
+    last_sync_at: Option<&str>,
+) -> VoiceResult<ApplyResult> {
+    let transcription_id = &change.entity_id;
+    let data = &change.data;
+
+    // Validate datetime format for all incoming timestamps
+    validate_datetime_optional(data["created_at"].as_str(), "transcription.created_at")?;
+    validate_datetime_optional(data["modified_at"].as_str(), "transcription.modified_at")?;
+    validate_datetime_optional(data["deleted_at"].as_str(), "transcription.deleted_at")?;
+
+    // Determine the timestamp of this incoming change
+    let incoming_time = if change.operation == "delete" {
+        data["deleted_at"].as_str().or_else(|| data["modified_at"].as_str())
+    } else {
+        data["modified_at"].as_str().or_else(|| data["created_at"].as_str())
+    };
+
+    // If this change happened before or at last_sync, skip it
+    if let (Some(last), Some(incoming)) = (last_sync_at, incoming_time) {
+        if incoming <= last {
+            return Ok(ApplyResult::Skipped);
+        }
+    }
+
+    let existing = db.get_transcription_raw(transcription_id)?;
+
+    // Extract incoming data
+    let id = data["id"].as_str().unwrap_or("");
+    let audio_file_id = data["audio_file_id"].as_str().unwrap_or("");
+    let content = data["content"].as_str().unwrap_or("");
+    let content_segments = data["content_segments"].as_str();
+    let service = data["service"].as_str().unwrap_or("");
+    let service_arguments = data["service_arguments"].as_str();
+    let service_response = data["service_response"].as_str();
+    let state = data["state"].as_str().unwrap_or(crate::database::DEFAULT_TRANSCRIPTION_STATE);
+    let device_id = data["device_id"].as_str().unwrap_or("");
+    let created_at = data["created_at"].as_str().unwrap_or("");
+    let modified_at = data["modified_at"].as_str();
+    let deleted_at = data["deleted_at"].as_str();
+
+    // Determine if local changed since last_sync
+    let local_changed = if let Some(ref ex) = existing {
+        let local_time = ex.get("modified_at")
+            .and_then(|v| v.as_str())
+            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
+            .or_else(|| ex.get("created_at").and_then(|v| v.as_str()));
+        let incoming_time = modified_at.or(deleted_at);
+
+        if let Some(last) = last_sync_at {
+            local_time.map_or(false, |lt| lt > last)
+        } else {
+            match (local_time, incoming_time) {
+                (Some(lt), Some(it)) => lt >= it,
+                (Some(_), None) => true,
+                (None, _) => false,
+            }
+        }
+    } else {
+        false
+    };
+
+    match change.operation.as_str() {
+        "create" => {
+            if existing.is_some() {
+                return Ok(ApplyResult::Skipped);
+            }
+            db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+            Ok(ApplyResult::Applied)
+        }
+        "update" | "delete" => {
+            if existing.is_none() {
+                db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+                return Ok(ApplyResult::Applied);
+            }
+
+            let existing = existing.unwrap();
+            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_str()).is_some();
+            let remote_deleted = deleted_at.is_some();
+
+            // If both deleted, apply
+            if local_deleted && remote_deleted {
+                db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+                return Ok(ApplyResult::Applied);
+            }
+
+            // If local edited but remote deletes, create conflict (preserve local)
+            if !local_deleted && remote_deleted && local_changed {
+                return Ok(ApplyResult::Conflict);
+            }
+
+            // If local deleted but remote has updates
+            if local_deleted && !remote_deleted {
+                db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+                return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
+            }
+
+            // Otherwise apply the update
+            db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+            Ok(ApplyResult::Applied)
+        }
+        _ => Ok(ApplyResult::Skipped),
+    }
+}
+
 fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value> {
     let db = db.lock().unwrap();
     let conn = db.connection();
@@ -1727,12 +1834,55 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
         }));
     }
 
+    // Get all transcriptions
+    let mut transcriptions = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at FROM transcriptions",
+    )?;
+    let transcription_rows = stmt.query_map([], |row| {
+        let id_bytes: Vec<u8> = row.get(0)?;
+        let audio_file_id_bytes: Vec<u8> = row.get(1)?;
+        let content: String = row.get(2)?;
+        let content_segments: Option<String> = row.get(3)?;
+        let service: String = row.get(4)?;
+        let service_arguments: Option<String> = row.get(5)?;
+        let service_response: Option<String> = row.get(6)?;
+        let state: String = row.get(7)?;
+        let device_id_bytes: Vec<u8> = row.get(8)?;
+        let created_at: String = row.get(9)?;
+        let modified_at: Option<String> = row.get(10)?;
+        let deleted_at: Option<String> = row.get(11)?;
+        Ok((id_bytes, audio_file_id_bytes, content, content_segments, service, service_arguments, service_response, state, device_id_bytes, created_at, modified_at, deleted_at))
+    })?;
+
+    for row in transcription_rows {
+        let (id_bytes, audio_file_id_bytes, content, content_segments, service, service_arguments, service_response, state, device_id_bytes, created_at, modified_at, deleted_at) = row?;
+        let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
+        let audio_file_id_hex = crate::validation::uuid_bytes_to_hex(&audio_file_id_bytes)?;
+        let device_id_hex = crate::validation::uuid_bytes_to_hex(&device_id_bytes)?;
+        transcriptions.push(serde_json::json!({
+            "id": id_hex,
+            "audio_file_id": audio_file_id_hex,
+            "content": content,
+            "content_segments": content_segments,
+            "service": service,
+            "service_arguments": service_arguments,
+            "service_response": service_response,
+            "state": state,
+            "device_id": device_id_hex,
+            "created_at": created_at,
+            "modified_at": modified_at,
+            "deleted_at": deleted_at,
+        }));
+    }
+
     Ok(serde_json::json!({
         "notes": notes,
         "tags": tags,
         "note_tags": note_tags,
         "note_attachments": note_attachments,
         "audio_files": audio_files,
+        "transcriptions": transcriptions,
     }))
 }
 
@@ -1755,11 +1905,11 @@ pub fn apply_changes_from_peer(
 
     // Sort changes by dependency order to avoid FOREIGN KEY constraint failures:
     // 1. notes, tags, audio_files first (no dependencies) - order 0
-    // 2. note_tags, note_attachments last (depend on notes, tags, audio_files) - order 1
+    // 2. note_tags, note_attachments, transcriptions last (depend on notes, tags, audio_files) - order 1
     fn entity_order(entity_type: &str) -> u8 {
         match entity_type {
             "note" | "tag" | "audio_file" => 0,
-            "note_tag" | "note_attachment" => 1,
+            "note_tag" | "note_attachment" | "transcription" => 1,
             _ => 2,
         }
     }
@@ -1781,6 +1931,7 @@ pub fn apply_changes_from_peer(
             "note_tag" => apply_note_tag_change(db, change, last_sync_at.as_deref()),
             "note_attachment" => apply_note_attachment_change(db, change, last_sync_at.as_deref()),
             "audio_file" => apply_audio_file_change(db, change, last_sync_at.as_deref()),
+            "transcription" => apply_transcription_change(db, change, last_sync_at.as_deref()),
             _ => {
                 errors.push(format!("Unknown entity type: {}", change.entity_type));
                 continue;

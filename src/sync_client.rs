@@ -125,6 +125,7 @@ struct FullSyncResponse {
     note_tags: Vec<serde_json::Value>,
     audio_files: Option<Vec<serde_json::Value>>,
     note_attachments: Option<Vec<serde_json::Value>>,
+    transcriptions: Option<Vec<serde_json::Value>>,
     device_id: String,
     device_name: Option<String>,
     timestamp: String,
@@ -731,6 +732,7 @@ impl SyncClient {
                 "note_tag" => self.apply_note_tag_change(&db, change, last_sync_at.as_deref()),
                 "audio_file" => self.apply_audio_file_change(&db, change),
                 "note_attachment" => self.apply_note_attachment_change(&db, change),
+                "transcription" => self.apply_transcription_change(&db, change),
                 _ => continue,
             };
 
@@ -1135,6 +1137,48 @@ impl SyncClient {
         Ok(true)
     }
 
+    fn apply_transcription_change(
+        &self,
+        db: &Database,
+        change: &SyncChange,
+    ) -> VoiceResult<bool> {
+        let transcription_id = &change.entity_id;
+        let data = &change.data;
+
+        let audio_file_id = data["audio_file_id"].as_str().unwrap_or("");
+        let content = data["content"].as_str().unwrap_or("");
+        let content_segments = data["content_segments"].as_str();
+        let service = data["service"].as_str().unwrap_or("");
+        let service_arguments = data["service_arguments"].as_str();
+        let service_response = data["service_response"].as_str();
+        let state = data["state"].as_str().unwrap_or(crate::database::DEFAULT_TRANSCRIPTION_STATE);
+        let device_id = data["device_id"].as_str().unwrap_or("");
+        // Normalize timestamps from incoming data
+        let created_at_raw = data["created_at"].as_str().unwrap_or("");
+        let created_at_normalized = normalize_datetime(created_at_raw);
+        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
+        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
+        let modified_at = modified_at_normalized.as_deref();
+        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
+        let deleted_at = deleted_at_normalized.as_deref();
+
+        db.apply_sync_transcription(
+            transcription_id,
+            audio_file_id,
+            content,
+            content_segments,
+            service,
+            service_arguments,
+            service_response,
+            state,
+            device_id,
+            created_at,
+            modified_at,
+            deleted_at,
+        )?;
+        Ok(true)
+    }
+
     fn get_changes_since(&self, since: Option<&str>) -> VoiceResult<Vec<SyncChange>> {
         let db = self.db.lock().unwrap();
         let (changes, _) = db.get_changes_since(since, 10000)?;
@@ -1388,6 +1432,30 @@ impl SyncClient {
                         entity_id: id.to_string(),
                         operation: "create".to_string(),
                         data: attachment.clone(),
+                        timestamp,
+                        device_id: full_sync.device_id.clone(),
+                        device_name: full_sync.device_name.clone(),
+                    });
+                }
+            }
+        }
+
+        // Convert transcriptions
+        if let Some(transcriptions) = &full_sync.transcriptions {
+            for transcription in transcriptions {
+                if let Some(id) = transcription.get("id").and_then(|v| v.as_str()) {
+                    let timestamp = transcription
+                        .get("modified_at")
+                        .or_else(|| transcription.get("created_at"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    changes.push(SyncChange {
+                        entity_type: "transcription".to_string(),
+                        entity_id: id.to_string(),
+                        operation: "create".to_string(),
+                        data: transcription.clone(),
                         timestamp,
                         device_id: full_sync.device_id.clone(),
                         device_name: full_sync.device_name.clone(),

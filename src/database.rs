@@ -1818,6 +1818,106 @@ impl Database {
             }
         }
 
+        // Get transcription changes
+        let remaining = limit - changes.len() as i64;
+        if remaining > 0 {
+            let transcription_rows: Vec<(Vec<u8>, Vec<u8>, String, Option<String>, String, Option<String>, Option<String>, String, Vec<u8>, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
+                let mut stmt = self.conn.prepare(
+                    r#"
+                    SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
+                    FROM transcriptions
+                    WHERE modified_at >= ? OR (modified_at IS NULL AND created_at >= ?)
+                    ORDER BY COALESCE(modified_at, created_at)
+                    LIMIT ?
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![since_ts, since_ts, remaining], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut stmt = self.conn.prepare(
+                    r#"
+                    SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
+                    FROM transcriptions
+                    ORDER BY COALESCE(modified_at, created_at)
+                    LIMIT ?
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![remaining], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            for (id_bytes, audio_file_id_bytes, content, content_segments, service, service_arguments, service_response, state, device_id_bytes, created_at, modified_at, deleted_at) in transcription_rows {
+                let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
+                let operation = if deleted_at.is_some() {
+                    "delete"
+                } else if modified_at.is_some() {
+                    "update"
+                } else {
+                    "create"
+                };
+
+                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
+                let audio_file_id_hex = uuid_bytes_to_hex(&audio_file_id_bytes).unwrap_or_default();
+                let device_id_hex = uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default();
+
+                let mut change = HashMap::new();
+                change.insert("entity_type".to_string(), serde_json::Value::String("transcription".to_string()));
+                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
+                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
+                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+
+                let mut data = serde_json::Map::new();
+                data.insert("id".to_string(), serde_json::Value::String(id_hex));
+                data.insert("audio_file_id".to_string(), serde_json::Value::String(audio_file_id_hex));
+                data.insert("content".to_string(), serde_json::Value::String(content));
+                data.insert("content_segments".to_string(), content_segments.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("service".to_string(), serde_json::Value::String(service));
+                data.insert("service_arguments".to_string(), service_arguments.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("service_response".to_string(), service_response.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("state".to_string(), serde_json::Value::String(state));
+                data.insert("device_id".to_string(), serde_json::Value::String(device_id_hex));
+                data.insert("created_at".to_string(), serde_json::Value::String(created_at));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                change.insert("data".to_string(), serde_json::Value::Object(data));
+
+                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                    latest_timestamp = Some(timestamp);
+                }
+                changes.push(change);
+            }
+        }
+
         Ok((changes, latest_timestamp))
     }
 
@@ -3640,6 +3740,115 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    /// Apply a synced transcription (insert or update)
+    pub fn apply_sync_transcription(
+        &self,
+        id: &str,
+        audio_file_id: &str,
+        content: &str,
+        content_segments: Option<&str>,
+        service: &str,
+        service_arguments: Option<&str>,
+        service_response: Option<&str>,
+        state: &str,
+        device_id: &str,
+        created_at: &str,
+        modified_at: Option<&str>,
+        deleted_at: Option<&str>,
+    ) -> VoiceResult<()> {
+        let id_uuid = Uuid::parse_str(id)
+            .map_err(|e| VoiceError::validation("id", e.to_string()))?;
+        let audio_file_uuid = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let device_uuid = Uuid::parse_str(device_id)
+            .map_err(|e| VoiceError::validation("device_id", e.to_string()))?;
+
+        self.conn.execute(
+            r#"
+            INSERT INTO transcriptions (id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                audio_file_id = excluded.audio_file_id,
+                content = excluded.content,
+                content_segments = excluded.content_segments,
+                service = excluded.service,
+                service_arguments = excluded.service_arguments,
+                service_response = excluded.service_response,
+                state = excluded.state,
+                device_id = excluded.device_id,
+                modified_at = excluded.modified_at,
+                deleted_at = excluded.deleted_at
+            "#,
+            params![
+                id_uuid.as_bytes().to_vec(),
+                audio_file_uuid.as_bytes().to_vec(),
+                content,
+                content_segments,
+                service,
+                service_arguments,
+                service_response,
+                state,
+                device_uuid.as_bytes().to_vec(),
+                created_at,
+                modified_at,
+                deleted_at,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get a transcription as raw JSON (for sync conflict detection)
+    pub fn get_transcription_raw(&self, transcription_id: &str) -> VoiceResult<Option<serde_json::Value>> {
+        let uuid = Uuid::parse_str(transcription_id)
+            .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
+            FROM transcriptions
+            WHERE id = ?
+            "#,
+        )?;
+
+        let result = stmt.query_row([uuid_bytes], |row| {
+            let id_bytes: Vec<u8> = row.get(0)?;
+            let audio_file_id_bytes: Vec<u8> = row.get(1)?;
+            let content: String = row.get(2)?;
+            let content_segments: Option<String> = row.get(3)?;
+            let service: String = row.get(4)?;
+            let service_arguments: Option<String> = row.get(5)?;
+            let service_response: Option<String> = row.get(6)?;
+            let state: String = row.get(7)?;
+            let device_id_bytes: Vec<u8> = row.get(8)?;
+            let created_at: String = row.get(9)?;
+            let modified_at: Option<String> = row.get(10)?;
+            let deleted_at: Option<String> = row.get(11)?;
+
+            Ok(serde_json::json!({
+                "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
+                "audio_file_id": uuid_bytes_to_hex(&audio_file_id_bytes).unwrap_or_default(),
+                "content": content,
+                "content_segments": content_segments,
+                "service": service,
+                "service_arguments": service_arguments,
+                "service_response": service_response,
+                "state": state,
+                "device_id": uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
+                "created_at": created_at,
+                "modified_at": modified_at,
+                "deleted_at": deleted_at,
+            }))
+        });
+
+        match result {
+            Ok(val) => Ok(Some(val)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(VoiceError::Database(e)),
+        }
     }
 
     // ========================================================================
