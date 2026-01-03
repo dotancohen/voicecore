@@ -95,6 +95,23 @@ pub struct NoteAttachmentData {
     pub deleted_at: Option<String>,
 }
 
+/// A transcription from the database
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TranscriptionData {
+    pub id: String,
+    pub audio_file_id: String,
+    pub content: String,
+    pub content_segments: Option<String>,
+    pub service: String,
+    pub service_arguments: Option<String>,
+    pub service_response: Option<String>,
+    pub state: String,
+    pub device_id: String,
+    pub created_at: String,
+    pub modified_at: Option<String>,
+    pub deleted_at: Option<String>,
+}
+
 /// Sync operation result
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SyncResultData {
@@ -578,5 +595,100 @@ impl VoiceClient {
         }
 
         Ok(info)
+    }
+
+    // =========================================================================
+    // Transcription Methods
+    // =========================================================================
+
+    /// Get all transcriptions for an audio file
+    pub fn get_transcriptions_for_audio_file(&self, audio_file_id: String) -> Result<Vec<TranscriptionData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let transcriptions = db.get_transcriptions_for_audio_file(&audio_file_id)?;
+
+        Ok(transcriptions
+            .into_iter()
+            .map(|t| TranscriptionData {
+                id: t.id,
+                audio_file_id: t.audio_file_id,
+                content: t.content,
+                content_segments: t.content_segments,
+                service: t.service,
+                service_arguments: t.service_arguments,
+                service_response: t.service_response,
+                state: t.state,
+                device_id: t.device_id,
+                created_at: t.created_at,
+                modified_at: t.modified_at,
+                deleted_at: t.deleted_at,
+            })
+            .collect())
+    }
+
+    /// Get a single transcription by ID
+    pub fn get_transcription(&self, transcription_id: String) -> Result<Option<TranscriptionData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let transcription = db.get_transcription(&transcription_id)?;
+
+        Ok(transcription.map(|t| TranscriptionData {
+            id: t.id,
+            audio_file_id: t.audio_file_id,
+            content: t.content,
+            content_segments: t.content_segments,
+            service: t.service,
+            service_arguments: t.service_arguments,
+            service_response: t.service_response,
+            state: t.state,
+            device_id: t.device_id,
+            created_at: t.created_at,
+            modified_at: t.modified_at,
+            deleted_at: t.deleted_at,
+        }))
+    }
+
+    /// Update a transcription's state
+    ///
+    /// State is a space-separated list of tags. Tags prefixed with `!` indicate false/negation.
+    /// Example: "original !verified !verbatim !cleaned !polished"
+    pub fn update_transcription_state(&self, transcription_id: String, state: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+
+        // Get existing transcription to preserve other fields
+        let existing = db.get_transcription(&transcription_id)?
+            .ok_or_else(|| VoiceCoreError::Database {
+                msg: format!("Transcription not found: {}", transcription_id),
+            })?;
+
+        db.update_transcription(
+            &transcription_id,
+            &existing.content,
+            existing.content_segments.as_deref(),
+            existing.service_response.as_deref(),
+            Some(&state),
+        ).map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Update a transcription's content and optionally its state
+    pub fn update_transcription(
+        &self,
+        transcription_id: String,
+        content: String,
+        state: Option<String>,
+    ) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+
+        // Get existing transcription to preserve other fields
+        let existing = db.get_transcription(&transcription_id)?
+            .ok_or_else(|| VoiceCoreError::Database {
+                msg: format!("Transcription not found: {}", transcription_id),
+            })?;
+
+        db.update_transcription(
+            &transcription_id,
+            &content,
+            existing.content_segments.as_deref(),
+            existing.service_response.as_deref(),
+            state.as_deref(),
+        ).map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
     }
 }
