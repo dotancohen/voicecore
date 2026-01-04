@@ -226,7 +226,7 @@ async fn apply_changes(
 
 async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
     // Get all notes, tags, and note_tags
-    let data = match get_full_dataset(&state.db) {
+    let mut data = match get_full_dataset(&state.db) {
         Ok(d) => d,
         Err(e) => {
             return (
@@ -238,6 +238,15 @@ async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
                 .into_response();
         }
     };
+
+    // Add required metadata fields that the client expects
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("device_id".to_string(), serde_json::Value::String(state.device_id.clone()));
+        obj.insert("device_name".to_string(), serde_json::Value::String(state.device_name.clone()));
+        obj.insert("timestamp".to_string(), serde_json::Value::String(
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        ));
+    }
 
     Json(data).into_response()
 }
