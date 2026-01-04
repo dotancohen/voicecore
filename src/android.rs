@@ -525,6 +525,22 @@ impl VoiceClient {
         })
     }
 
+    /// Delete a note (soft delete - sets deleted_at timestamp)
+    pub fn delete_note(&self, note_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.delete_note(&note_id).map_err(|e| VoiceCoreError::Database {
+            msg: e.to_string(),
+        })
+    }
+
+    /// Delete a tag (soft delete - sets deleted_at timestamp)
+    pub fn delete_tag(&self, tag_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.delete_tag(&tag_id).map_err(|e| VoiceCoreError::Database {
+            msg: e.to_string(),
+        })
+    }
+
     /// Check if there are local changes that haven't been synced
     pub fn has_unsynced_changes(&self) -> Result<bool, VoiceCoreError> {
         let db = self.db.lock().unwrap();
