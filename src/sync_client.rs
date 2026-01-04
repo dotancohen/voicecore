@@ -959,7 +959,8 @@ impl SyncClient {
                         local_device_id,
                         None,
                     );
-                    db.apply_sync_tag(tag_id, name, parent_id, created_at, modified_at)?;
+                    // Resurrect by clearing deleted_at
+                    db.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, None)?;
                     return Ok(true);
                 }
 
@@ -993,9 +994,9 @@ impl SyncClient {
                                 change.device_name.as_deref(),
                             );
 
-                            // Merge names with separator
+                            // Merge names with separator (deleted_at is None in this branch)
                             let merged_name = format!("{} | {}", local_name, name);
-                            db.apply_sync_tag(tag_id, &merged_name, parent_id, created_at, modified_at)?;
+                            db.apply_sync_tag_with_deleted(tag_id, &merged_name, parent_id, created_at, modified_at, None)?;
                             return Ok(true);
                         }
 
@@ -1017,7 +1018,7 @@ impl SyncClient {
             }
         }
 
-        db.apply_sync_tag(tag_id, name, parent_id, created_at, modified_at)?;
+        db.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, deleted_at)?;
         Ok(true)
     }
 
@@ -2128,6 +2129,7 @@ mod tests {
                 note_tags: vec![],
                 audio_files: None,
                 note_attachments: None,
+                transcriptions: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
                 timestamp: "2025-01-01 00:00:00".to_string(),
@@ -2154,6 +2156,7 @@ mod tests {
                 note_tags: vec![],
                 audio_files: None,
                 note_attachments: None,
+                transcriptions: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
                 timestamp: "2025-01-01 00:00:00".to_string(),
@@ -2182,6 +2185,7 @@ mod tests {
                 note_tags: vec![],
                 audio_files: Some(vec![audio_file]),
                 note_attachments: None,
+                transcriptions: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
                 timestamp: "2025-01-01 00:00:00".to_string(),

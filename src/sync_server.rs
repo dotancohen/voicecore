@@ -466,11 +466,11 @@ fn get_changes_since(
     let remaining = limit - changes.len() as i64;
     if remaining > 0 {
         let tags_query = if since.is_some() {
-            "SELECT id, name, parent_id, created_at, modified_at FROM tags \
+            "SELECT id, name, parent_id, created_at, modified_at, deleted_at FROM tags \
              WHERE modified_at > ? OR (modified_at IS NULL AND created_at > ?) \
              ORDER BY COALESCE(modified_at, created_at) LIMIT ?"
         } else {
-            "SELECT id, name, parent_id, created_at, modified_at FROM tags \
+            "SELECT id, name, parent_id, created_at, modified_at, deleted_at FROM tags \
              ORDER BY COALESCE(modified_at, created_at) LIMIT ?"
         };
 
@@ -482,7 +482,8 @@ fn get_changes_since(
                 let parent_id_bytes: Option<Vec<u8>> = row.get(2)?;
                 let created_at: String = row.get(3)?;
                 let modified_at: Option<String> = row.get(4)?;
-                Ok((id_bytes, name, parent_id_bytes, created_at, modified_at))
+                let deleted_at: Option<String> = row.get(5)?;
+                Ok((id_bytes, name, parent_id_bytes, created_at, modified_at, deleted_at))
             })?
             .collect()
         } else {
@@ -492,19 +493,26 @@ fn get_changes_since(
                 let parent_id_bytes: Option<Vec<u8>> = row.get(2)?;
                 let created_at: String = row.get(3)?;
                 let modified_at: Option<String> = row.get(4)?;
-                Ok((id_bytes, name, parent_id_bytes, created_at, modified_at))
+                let deleted_at: Option<String> = row.get(5)?;
+                Ok((id_bytes, name, parent_id_bytes, created_at, modified_at, deleted_at))
             })?
             .collect()
         };
 
         for row in tag_rows {
-            let (id_bytes, name, parent_id_bytes, created_at, modified_at) = row?;
+            let (id_bytes, name, parent_id_bytes, created_at, modified_at, deleted_at) = row?;
             let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
             let parent_id_hex = parent_id_bytes
                 .map(|b| crate::validation::uuid_bytes_to_hex(&b))
                 .transpose()?;
 
-            let operation = if modified_at.is_some() { "update" } else { "create" };
+            let operation = if deleted_at.is_some() {
+                "delete"
+            } else if modified_at.is_some() {
+                "update"
+            } else {
+                "create"
+            };
             let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
 
             if latest_timestamp.is_none() || latest_timestamp.as_ref() < Some(&timestamp) {
@@ -521,6 +529,7 @@ fn get_changes_since(
                     "parent_id": parent_id_hex,
                     "created_at": created_at,
                     "modified_at": modified_at,
+                    "deleted_at": deleted_at,
                 }),
                 timestamp,
                 device_id: String::new(),
@@ -1209,9 +1218,11 @@ fn apply_tag_change(
                 return Ok(ApplyResult::Conflict);
             }
 
-            // No local changes - safe to delete
-            // Note: This is a hard delete since tags don't have soft delete
-            db.delete_tag(tag_id)?;
+            // No local changes - safe to delete (soft delete with original timestamp)
+            let local_created_at = existing.get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            db.apply_sync_tag_with_deleted(tag_id, local_name, local_parent_id, local_created_at, Some(deleted_at), Some(deleted_at))?;
             Ok(ApplyResult::Applied)
         }
         _ => Ok(ApplyResult::Skipped),
@@ -3015,5 +3026,521 @@ mod tests {
 
         assert!(result.is_ok(), "Valid datetime should be accepted: {:?}", result);
         assert_eq!(result.unwrap(), ApplyResult::Applied, "Valid datetime should be applied");
+    }
+
+    // =========================================================================
+    // TWO-INSTANCE SYNC TESTS - CRITICAL FOR VERIFYING SYNC PROPAGATION
+    // These tests simulate two separate VoiceCore instances syncing through
+    // a shared database (like the sync server scenario).
+    // =========================================================================
+
+    #[test]
+    fn test_two_instances_sync_deleted_note() {
+        // CRITICAL: This test verifies that when Instance A deletes a note,
+        // the deletion is properly propagated to Instance B via sync.
+
+        // Create two separate databases (simulating two devices)
+        let (instance_a, _temp_a) = create_test_db();
+        let (instance_b, _temp_b) = create_test_db();
+
+        // Create a note on Instance A
+        let note_id = instance_a.create_note("Shared note content").unwrap();
+        let note = instance_a.get_note(&note_id).unwrap().unwrap();
+
+        // Sync the note to Instance B (simulating initial sync)
+        instance_b.apply_sync_note(
+            &note_id,
+            &note.created_at,
+            &note.content,
+            None,
+            None,
+        ).unwrap();
+
+        // Verify Instance B has the note
+        let b_note = instance_b.get_note(&note_id).unwrap();
+        assert!(b_note.is_some(), "Instance B should have the note after initial sync");
+
+        // Now Instance A deletes the note
+        instance_a.delete_note(&note_id).unwrap();
+
+        // Verify Instance A sees the note as deleted
+        let a_note = instance_a.get_note(&note_id).unwrap();
+        assert!(a_note.is_none(), "Instance A should NOT see deleted note via get_note");
+
+        // Get the changes from Instance A (this is what gets sent to the server)
+        let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
+
+        // Find the delete change for our note
+        let delete_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("note") &&
+            c.get("entity_id").and_then(|v| v.as_str()) == Some(&note_id) &&
+            c.get("operation").and_then(|v| v.as_str()) == Some("delete")
+        });
+
+        assert!(delete_change.is_some(),
+            "CRITICAL: Instance A should report the delete operation in get_changes_since!");
+
+        // Extract data from the change to apply to Instance B
+        let change = delete_change.unwrap();
+        let data = change.get("data").unwrap();
+        let deleted_at = data.get("deleted_at").and_then(|v| v.as_str());
+        let modified_at = data.get("modified_at").and_then(|v| v.as_str());
+        let created_at = data.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let content = data.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Apply the delete to Instance B
+        instance_b.apply_sync_note(
+            &note_id,
+            created_at,
+            content,
+            modified_at,
+            deleted_at,
+        ).unwrap();
+
+        // Verify Instance B now sees the note as deleted
+        let b_note_after = instance_b.get_note(&note_id).unwrap();
+        assert!(b_note_after.is_none(),
+            "CRITICAL: Instance B should NOT see the note after syncing the delete!");
+    }
+
+    #[test]
+    fn test_two_instances_sync_deleted_tag() {
+        // CRITICAL: This test verifies that when Instance A deletes a tag,
+        // the deletion is properly propagated to Instance B via sync.
+
+        // Create two separate databases (simulating two devices)
+        let (instance_a, _temp_a) = create_test_db();
+        let (instance_b, _temp_b) = create_test_db();
+
+        // Create a tag on Instance A
+        let tag_id = instance_a.create_tag("Shared tag", None).unwrap();
+        let tag = instance_a.get_tag(&tag_id).unwrap().unwrap();
+
+        // Sync the tag to Instance B (simulating initial sync)
+        instance_b.apply_sync_tag(
+            &tag_id,
+            &tag.name,
+            None,
+            tag.created_at.as_deref().unwrap_or(""),
+            None,
+        ).unwrap();
+
+        // Verify Instance B has the tag
+        let b_tag = instance_b.get_tag(&tag_id).unwrap();
+        assert!(b_tag.is_some(), "Instance B should have the tag after initial sync");
+
+        // Now Instance A deletes the tag (soft delete)
+        instance_a.delete_tag(&tag_id).unwrap();
+
+        // Verify Instance A sees the tag as deleted
+        let a_tag = instance_a.get_tag(&tag_id).unwrap();
+        assert!(a_tag.is_none(), "Instance A should NOT see deleted tag via get_tag");
+
+        // Get the changes from Instance A (this is what gets sent to the server)
+        let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
+
+        // Find the delete change for our tag
+        let delete_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("tag") &&
+            c.get("entity_id").and_then(|v| v.as_str()) == Some(&tag_id) &&
+            c.get("operation").and_then(|v| v.as_str()) == Some("delete")
+        });
+
+        assert!(delete_change.is_some(),
+            "CRITICAL: Instance A should report the tag delete operation in get_changes_since!");
+
+        // Extract data from the change to apply to Instance B
+        let change = delete_change.unwrap();
+        let data = change.get("data").unwrap();
+        let deleted_at = data.get("deleted_at").and_then(|v| v.as_str());
+        let modified_at = data.get("modified_at").and_then(|v| v.as_str());
+        let created_at = data.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let parent_id = data.get("parent_id").and_then(|v| v.as_str());
+
+        // Apply the delete to Instance B using the new method
+        instance_b.apply_sync_tag_with_deleted(
+            &tag_id,
+            name,
+            parent_id,
+            created_at,
+            modified_at,
+            deleted_at,
+        ).unwrap();
+
+        // Verify Instance B now sees the tag as deleted
+        let b_tag_after = instance_b.get_tag(&tag_id).unwrap();
+        assert!(b_tag_after.is_none(),
+            "CRITICAL: Instance B should NOT see the tag after syncing the delete!");
+    }
+
+    #[test]
+    fn test_get_changes_since_includes_deleted_notes() {
+        // Verify that get_changes_since properly reports deleted notes
+        let (db, _temp) = create_test_db();
+
+        // Create and delete a note
+        let note_id = db.create_note("Test note").unwrap();
+        db.delete_note(&note_id).unwrap();
+
+        // Get changes
+        let (changes, _) = db.get_changes_since(None, 100).unwrap();
+
+        // Find the change for our note
+        let note_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("note") &&
+            c.get("entity_id").and_then(|v| v.as_str()) == Some(&note_id)
+        });
+
+        assert!(note_change.is_some(), "Deleted note should appear in get_changes_since");
+
+        let change = note_change.unwrap();
+        assert_eq!(
+            change.get("operation").and_then(|v| v.as_str()),
+            Some("delete"),
+            "Operation should be 'delete' for deleted note"
+        );
+
+        let data = change.get("data").unwrap();
+        assert!(
+            data.get("deleted_at").is_some() && !data.get("deleted_at").unwrap().is_null(),
+            "deleted_at should be set in the data"
+        );
+    }
+
+    #[test]
+    fn test_get_changes_since_includes_deleted_tags() {
+        // Verify that get_changes_since properly reports deleted tags
+        let (db, _temp) = create_test_db();
+
+        // Create and delete a tag
+        let tag_id = db.create_tag("Test tag", None).unwrap();
+        db.delete_tag(&tag_id).unwrap();
+
+        // Get changes
+        let (changes, _) = db.get_changes_since(None, 100).unwrap();
+
+        // Find the change for our tag
+        let tag_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("tag") &&
+            c.get("entity_id").and_then(|v| v.as_str()) == Some(&tag_id)
+        });
+
+        assert!(tag_change.is_some(), "Deleted tag should appear in get_changes_since");
+
+        let change = tag_change.unwrap();
+        assert_eq!(
+            change.get("operation").and_then(|v| v.as_str()),
+            Some("delete"),
+            "Operation should be 'delete' for deleted tag"
+        );
+
+        let data = change.get("data").unwrap();
+        assert!(
+            data.get("deleted_at").is_some() && !data.get("deleted_at").unwrap().is_null(),
+            "deleted_at should be set in the tag data"
+        );
+    }
+
+    #[test]
+    fn test_full_dataset_includes_deleted_tags() {
+        // Verify that get_full_dataset properly includes deleted tags with their deleted_at
+        let (db, _temp) = create_test_db();
+
+        // Create a tag and delete it
+        let tag_id = db.create_tag("Deleted tag", None).unwrap();
+        db.delete_tag(&tag_id).unwrap();
+
+        // Create a non-deleted tag for comparison
+        let active_tag_id = db.create_tag("Active tag", None).unwrap();
+
+        // Get full dataset
+        let dataset = db.get_full_dataset().unwrap();
+        let tags = dataset.get("tags").unwrap();
+
+        // Find the deleted tag
+        let deleted_tag = tags.iter().find(|t| {
+            t.get("id").and_then(|v| v.as_str()) == Some(&tag_id)
+        });
+
+        assert!(deleted_tag.is_some(), "Full dataset should include deleted tags");
+
+        let deleted_tag = deleted_tag.unwrap();
+        assert!(
+            deleted_tag.get("deleted_at").is_some() && !deleted_tag.get("deleted_at").unwrap().is_null(),
+            "Deleted tag should have deleted_at in full dataset"
+        );
+
+        // Verify active tag doesn't have deleted_at
+        let active_tag = tags.iter().find(|t| {
+            t.get("id").and_then(|v| v.as_str()) == Some(&active_tag_id)
+        });
+
+        assert!(active_tag.is_some(), "Active tag should be in full dataset");
+        let active_tag = active_tag.unwrap();
+        assert!(
+            active_tag.get("deleted_at").is_none() || active_tag.get("deleted_at").unwrap().is_null(),
+            "Active tag should NOT have deleted_at set"
+        );
+    }
+
+    // =========================================================================
+    // ATTACHMENT SYNC TESTS
+    // These tests verify that notes with attachments sync correctly.
+    // =========================================================================
+
+    #[test]
+    fn test_two_instances_sync_note_with_audio_attachment() {
+        // CRITICAL: Verify that a note with an audio attachment syncs correctly
+        // between two instances
+
+        let (instance_a, _temp_a) = create_test_db();
+        let (instance_b, _temp_b) = create_test_db();
+
+        // Create a note and audio file on Instance A
+        let note_id = instance_a.create_note("Note with audio").unwrap();
+        let audio_id = instance_a.create_audio_file("recording.mp3", Some("2025-01-01 12:00:00")).unwrap();
+
+        // Attach audio to note
+        let attachment_id = instance_a.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
+
+        // Get changes from Instance A
+        let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
+
+        // Should have: note, audio_file, note_attachment
+        let note_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("note") &&
+            c.get("entity_id").and_then(|v| v.as_str()) == Some(&note_id)
+        });
+        assert!(note_change.is_some(), "Note should be in changes");
+
+        let audio_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("audio_file") &&
+            c.get("entity_id").and_then(|v| v.as_str()) == Some(&audio_id)
+        });
+        assert!(audio_change.is_some(), "Audio file should be in changes");
+
+        let attachment_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("note_attachment")
+        });
+        assert!(attachment_change.is_some(), "Note attachment should be in changes");
+
+        // Apply note to Instance B
+        let note_data = note_change.unwrap().get("data").unwrap();
+        instance_b.apply_sync_note(
+            &note_id,
+            note_data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+            note_data.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+            note_data.get("modified_at").and_then(|v| v.as_str()),
+            note_data.get("deleted_at").and_then(|v| v.as_str()),
+        ).unwrap();
+
+        // Apply audio file to Instance B
+        let audio_data = audio_change.unwrap().get("data").unwrap();
+        instance_b.apply_sync_audio_file(
+            &audio_id,
+            audio_data.get("imported_at").and_then(|v| v.as_str()).unwrap_or(""),
+            audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
+            audio_data.get("file_created_at").and_then(|v| v.as_str()),
+            audio_data.get("summary").and_then(|v| v.as_str()),
+            audio_data.get("modified_at").and_then(|v| v.as_str()),
+            audio_data.get("deleted_at").and_then(|v| v.as_str()),
+        ).unwrap();
+
+        // Apply attachment to Instance B
+        let att_data = attachment_change.unwrap().get("data").unwrap();
+        let att_entity_id = attachment_change.unwrap().get("entity_id").and_then(|v| v.as_str()).unwrap();
+        instance_b.apply_sync_note_attachment(
+            att_entity_id,
+            att_data.get("note_id").and_then(|v| v.as_str()).unwrap_or(""),
+            att_data.get("attachment_id").and_then(|v| v.as_str()).unwrap_or(""),
+            att_data.get("attachment_type").and_then(|v| v.as_str()).unwrap_or(""),
+            att_data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+            att_data.get("modified_at").and_then(|v| v.as_str()),
+            att_data.get("deleted_at").and_then(|v| v.as_str()),
+        ).unwrap();
+
+        // Verify Instance B has the note
+        let b_note = instance_b.get_note(&note_id).unwrap();
+        assert!(b_note.is_some(), "Instance B should have the note");
+        assert_eq!(b_note.unwrap().content, "Note with audio");
+
+        // Verify Instance B has the audio file
+        let b_audio = instance_b.get_audio_file(&audio_id).unwrap();
+        assert!(b_audio.is_some(), "Instance B should have the audio file");
+        assert_eq!(b_audio.unwrap().filename, "recording.mp3");
+
+        // Verify the attachment relationship exists on Instance B
+        let b_attachments = instance_b.get_attachments_for_note(&note_id).unwrap();
+        assert_eq!(b_attachments.len(), 1, "Instance B should have 1 attachment on the note");
+        assert_eq!(b_attachments[0].attachment_id, audio_id);
+    }
+
+    #[test]
+    fn test_two_instances_sync_detached_attachment() {
+        // Verify that detaching an attachment syncs correctly
+
+        let (instance_a, _temp_a) = create_test_db();
+        let (instance_b, _temp_b) = create_test_db();
+
+        // Create note with attachment on Instance A
+        let note_id = instance_a.create_note("Note with audio").unwrap();
+        let audio_id = instance_a.create_audio_file("recording.mp3", None).unwrap();
+        let attachment_id = instance_a.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
+
+        // Sync to Instance B (initial sync)
+        let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
+        for change in &changes {
+            let entity_type = change.get("entity_type").and_then(|v| v.as_str()).unwrap_or("");
+            let data = change.get("data").unwrap();
+
+            match entity_type {
+                "note" => {
+                    let id = change.get("entity_id").and_then(|v| v.as_str()).unwrap();
+                    instance_b.apply_sync_note(
+                        id,
+                        data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("modified_at").and_then(|v| v.as_str()),
+                        data.get("deleted_at").and_then(|v| v.as_str()),
+                    ).unwrap();
+                }
+                "audio_file" => {
+                    let id = change.get("entity_id").and_then(|v| v.as_str()).unwrap();
+                    instance_b.apply_sync_audio_file(
+                        id,
+                        data.get("imported_at").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("file_created_at").and_then(|v| v.as_str()),
+                        data.get("summary").and_then(|v| v.as_str()),
+                        data.get("modified_at").and_then(|v| v.as_str()),
+                        data.get("deleted_at").and_then(|v| v.as_str()),
+                    ).unwrap();
+                }
+                "note_attachment" => {
+                    let id = change.get("entity_id").and_then(|v| v.as_str()).unwrap();
+                    instance_b.apply_sync_note_attachment(
+                        id,
+                        data.get("note_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("attachment_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("attachment_type").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("modified_at").and_then(|v| v.as_str()),
+                        data.get("deleted_at").and_then(|v| v.as_str()),
+                    ).unwrap();
+                }
+                _ => {}
+            }
+        }
+
+        // Verify B has the attachment
+        let b_attachments = instance_b.get_attachments_for_note(&note_id).unwrap();
+        assert_eq!(b_attachments.len(), 1, "Instance B should have attachment after initial sync");
+
+        // Now Instance A detaches the attachment
+        instance_a.detach_from_note(&attachment_id).unwrap();
+
+        // Get new changes
+        let (changes2, _) = instance_a.get_changes_since(None, 100).unwrap();
+
+        // Find the detach change
+        let detach_change = changes2.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("note_attachment") &&
+            c.get("operation").and_then(|v| v.as_str()) == Some("delete")
+        });
+
+        assert!(detach_change.is_some(), "Should have a delete operation for the attachment");
+
+        // Apply the detach to Instance B
+        let change = detach_change.unwrap();
+        let data = change.get("data").unwrap();
+        let id = change.get("entity_id").and_then(|v| v.as_str()).unwrap();
+        instance_b.apply_sync_note_attachment(
+            id,
+            data.get("note_id").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("attachment_id").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("attachment_type").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+            data.get("modified_at").and_then(|v| v.as_str()),
+            data.get("deleted_at").and_then(|v| v.as_str()),
+        ).unwrap();
+
+        // Verify Instance B no longer shows the attachment
+        let b_attachments_after = instance_b.get_attachments_for_note(&note_id).unwrap();
+        assert_eq!(b_attachments_after.len(), 0,
+            "CRITICAL: Instance B should have 0 attachments after syncing the detach");
+    }
+
+    // =========================================================================
+    // TRANSCRIPTION SYNC TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_two_instances_sync_transcription() {
+        // Verify that transcriptions sync correctly between instances
+
+        let (instance_a, _temp_a) = create_test_db();
+        let (instance_b, _temp_b) = create_test_db();
+
+        // Create an audio file on Instance A
+        let audio_id = instance_a.create_audio_file("speech.mp3", None).unwrap();
+
+        // Create a transcription for it
+        let transcription_id = instance_a.create_transcription(
+            &audio_id,
+            "This is the transcribed text from the audio.",  // content
+            None,                                              // content_segments
+            "whisper",                                         // service
+            None,                                              // service_arguments
+            None,                                              // service_response
+            None,                                              // state (uses default)
+        ).unwrap();
+
+        // Get changes from Instance A
+        let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
+
+        // Apply audio file to Instance B first
+        let audio_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("audio_file")
+        }).unwrap();
+        let audio_data = audio_change.get("data").unwrap();
+        instance_b.apply_sync_audio_file(
+            &audio_id,
+            audio_data.get("imported_at").and_then(|v| v.as_str()).unwrap_or(""),
+            audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
+            audio_data.get("file_created_at").and_then(|v| v.as_str()),
+            audio_data.get("summary").and_then(|v| v.as_str()),
+            audio_data.get("modified_at").and_then(|v| v.as_str()),
+            audio_data.get("deleted_at").and_then(|v| v.as_str()),
+        ).unwrap();
+
+        // Find and apply transcription
+        let trans_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("transcription")
+        });
+
+        assert!(trans_change.is_some(), "Transcription should be in changes");
+
+        let trans_data = trans_change.unwrap().get("data").unwrap();
+        instance_b.apply_sync_transcription(
+            &transcription_id,
+            trans_data.get("audio_file_id").and_then(|v| v.as_str()).unwrap_or(""),
+            trans_data.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+            trans_data.get("content_segments").and_then(|v| v.as_str()),
+            trans_data.get("service").and_then(|v| v.as_str()).unwrap_or(""),
+            trans_data.get("service_arguments").and_then(|v| v.as_str()),
+            trans_data.get("service_response").and_then(|v| v.as_str()),
+            trans_data.get("state").and_then(|v| v.as_str()).unwrap_or(""),
+            trans_data.get("device_id").and_then(|v| v.as_str()).unwrap_or(""),
+            trans_data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+            trans_data.get("modified_at").and_then(|v| v.as_str()),
+            trans_data.get("deleted_at").and_then(|v| v.as_str()),
+        ).unwrap();
+
+        // Verify Instance B has the transcription
+        let b_transcriptions = instance_b.get_transcriptions_for_audio_file(&audio_id).unwrap();
+        assert_eq!(b_transcriptions.len(), 1, "Instance B should have 1 transcription");
+        assert_eq!(b_transcriptions[0].content, "This is the transcribed text from the audio.");
+        assert_eq!(b_transcriptions[0].service, "whisper");
     }
 }

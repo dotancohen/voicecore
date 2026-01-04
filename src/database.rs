@@ -166,6 +166,7 @@ impl Database {
                 parent_id BLOB,
                 created_at DATETIME NOT NULL,
                 modified_at DATETIME,
+                deleted_at DATETIME,
                 FOREIGN KEY (parent_id) REFERENCES tags (id) ON DELETE CASCADE
             );
 
@@ -382,6 +383,7 @@ impl Database {
 
         // Run migrations for existing databases
         self.migrate_add_transcription_state()?;
+        self.migrate_add_tags_deleted_at()?;
 
         Ok(())
     }
@@ -524,6 +526,41 @@ impl Database {
         }
 
         self.conn.execute("PRAGMA user_version = 2", [])?;
+
+        Ok(())
+    }
+
+    /// Add deleted_at column to tags table for soft delete support.
+    ///
+    /// This migration enables soft-delete for tags (like notes) so that
+    /// tag deletions can be synced between devices.
+    fn migrate_add_tags_deleted_at(&mut self) -> VoiceResult<()> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        // Version 3 = tags deleted_at column added
+        if version >= 3 {
+            return Ok(());
+        }
+
+        // Check if column exists (in case of partial migration)
+        let has_deleted_at: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('tags') WHERE name = 'deleted_at'",
+                [],
+                |row| row.get(0),
+            )?;
+
+        if !has_deleted_at {
+            self.conn.execute(
+                "ALTER TABLE tags ADD COLUMN deleted_at DATETIME",
+                [],
+            )?;
+        }
+
+        self.conn.execute("PRAGMA user_version = 3", [])?;
 
         Ok(())
     }
@@ -772,7 +809,7 @@ impl Database {
             FROM notes n
             LEFT JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
-            WHERE n.id = ?
+            WHERE n.id = ? AND n.deleted_at IS NULL
             GROUP BY n.id
             "#,
         )?;
@@ -848,7 +885,7 @@ impl Database {
         Ok(deleted > 0)
     }
 
-    /// Delete a tag (hard delete - cascades to note_tags) (accepts ID or ID prefix)
+    /// Delete a tag (soft delete - sets deleted_at timestamp) (accepts ID or ID prefix)
     pub fn delete_tag(&self, tag_id: &str) -> VoiceResult<bool> {
         // Use try_resolve to return false if not found (instead of error)
         let resolved_id = match self.try_resolve_tag_id(tag_id)? {
@@ -859,18 +896,23 @@ impl Database {
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
+        // Soft delete: set deleted_at and modified_at timestamps
         let deleted = self.conn.execute(
-            "DELETE FROM tags WHERE id = ?",
+            r#"
+            UPDATE tags
+            SET deleted_at = datetime('now'), modified_at = datetime('now')
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
             params![uuid_bytes],
         )?;
 
         Ok(deleted > 0)
     }
 
-    /// Get all tags with their hierarchy information
+    /// Get all tags with their hierarchy information (excludes deleted tags)
     pub fn get_all_tags(&self) -> VoiceResult<Vec<TagRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, parent_id, created_at, modified_at FROM tags ORDER BY name",
+            "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE deleted_at IS NULL ORDER BY name",
         )?;
 
         let rows = stmt.query_map([], |row| self.row_to_tag(row))?;
@@ -893,7 +935,7 @@ impl Database {
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE id = ?",
+            "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE id = ? AND deleted_at IS NULL",
         )?;
 
         let mut rows = stmt.query_map([uuid_bytes], |row| self.row_to_tag(row))?;
@@ -904,10 +946,10 @@ impl Database {
         }
     }
 
-    /// Get all tags with a given name (case-insensitive)
+    /// Get all tags with a given name (case-insensitive, excludes deleted tags)
     pub fn get_tags_by_name(&self, name: &str) -> VoiceResult<Vec<TagRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?)",
+            "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?) AND deleted_at IS NULL",
         )?;
 
         let rows = stmt.query_map([name], |row| self.row_to_tag(row))?;
@@ -933,13 +975,13 @@ impl Database {
             let part = part.trim();
             let tag = if current_parent_id.is_none() {
                 self.conn.query_row(
-                    "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?) AND parent_id IS NULL",
+                    "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?) AND parent_id IS NULL AND deleted_at IS NULL",
                     [part],
                     |row| self.row_to_tag(row),
                 )
             } else {
                 self.conn.query_row(
-                    "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?) AND parent_id = ?",
+                    "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?) AND parent_id = ? AND deleted_at IS NULL",
                     params![part, current_parent_id.as_ref().unwrap()],
                     |row| self.row_to_tag(row),
                 )
@@ -1008,10 +1050,10 @@ impl Database {
         Ok(current_tags)
     }
 
-    /// Get tags by name with no parent (root tags)
+    /// Get tags by name with no parent (root tags, excludes deleted tags)
     fn get_tags_by_name_and_no_parent(&self, name: &str) -> VoiceResult<Vec<TagRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?) AND parent_id IS NULL",
+            "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?) AND parent_id IS NULL AND deleted_at IS NULL",
         )?;
 
         let rows = stmt.query_map([name], |row| self.row_to_tag(row))?;
@@ -1022,13 +1064,13 @@ impl Database {
         Ok(tags)
     }
 
-    /// Get tags by name and parent ID
+    /// Get tags by name and parent ID (excludes deleted tags)
     fn get_tags_by_name_and_parent(&self, name: &str, parent_id: &str) -> VoiceResult<Vec<TagRow>> {
         let uuid = validate_tag_id(parent_id)?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?) AND parent_id = ?",
+            "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE LOWER(name) = LOWER(?) AND parent_id = ? AND deleted_at IS NULL",
         )?;
 
         let rows = stmt.query_map(params![name, uuid_bytes], |row| self.row_to_tag(row))?;
@@ -1497,10 +1539,10 @@ impl Database {
         // Get tag changes
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
-            let tag_rows: Vec<(Vec<u8>, String, Option<Vec<u8>>, String, Option<String>)> = if let Some(since_ts) = since {
+            let tag_rows: Vec<(Vec<u8>, String, Option<Vec<u8>>, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
                 let mut stmt = self.conn.prepare(
                     r#"
-                    SELECT id, name, parent_id, created_at, modified_at
+                    SELECT id, name, parent_id, created_at, modified_at, deleted_at
                     FROM tags
                     WHERE modified_at >= ? OR (modified_at IS NULL AND created_at >= ?)
                     ORDER BY COALESCE(modified_at, created_at)
@@ -1514,13 +1556,14 @@ impl Database {
                         row.get::<_, Option<Vec<u8>>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             } else {
                 let mut stmt = self.conn.prepare(
                     r#"
-                    SELECT id, name, parent_id, created_at, modified_at
+                    SELECT id, name, parent_id, created_at, modified_at, deleted_at
                     FROM tags
                     ORDER BY COALESCE(modified_at, created_at)
                     LIMIT ?
@@ -1533,14 +1576,21 @@ impl Database {
                         row.get::<_, Option<Vec<u8>>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
 
-            for (id_bytes, name, parent_id_bytes, created_at, modified_at) in tag_rows {
+            for (id_bytes, name, parent_id_bytes, created_at, modified_at, deleted_at) in tag_rows {
                 let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
-                let operation = if modified_at.is_some() { "update" } else { "create" };
+                let operation = if deleted_at.is_some() {
+                    "delete"
+                } else if modified_at.is_some() {
+                    "update"
+                } else {
+                    "create"
+                };
 
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
                 let parent_id_hex = parent_id_bytes.and_then(|b| uuid_bytes_to_hex(&b));
@@ -1557,6 +1607,7 @@ impl Database {
                 data.insert("parent_id".to_string(), parent_id_hex.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
                 data.insert("created_at".to_string(), serde_json::Value::String(created_at));
                 data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
                 change.insert("data".to_string(), serde_json::Value::Object(data));
 
                 if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
@@ -2116,7 +2167,7 @@ impl Database {
 
         // Get all tags
         let mut stmt = self.conn.prepare(
-            r#"SELECT id, name, parent_id, created_at, modified_at FROM tags"#
+            r#"SELECT id, name, parent_id, created_at, modified_at, deleted_at FROM tags"#
         )?;
         let tag_rows = stmt.query_map([], |row| {
             Ok((
@@ -2125,18 +2176,20 @@ impl Database {
                 row.get::<_, Option<Vec<u8>>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
 
         let mut tags = Vec::new();
         for row in tag_rows {
-            let (id_bytes, name, parent_id_bytes, created_at, modified_at) = row?;
+            let (id_bytes, name, parent_id_bytes, created_at, modified_at, deleted_at) = row?;
             let mut tag = HashMap::new();
             tag.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
             tag.insert("name".to_string(), serde_json::Value::String(name));
             tag.insert("parent_id".to_string(), parent_id_bytes.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             tag.insert("created_at".to_string(), serde_json::Value::String(created_at));
             tag.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            tag.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             tags.push(tag);
         }
         result.insert("tags".to_string(), tags);
@@ -2284,6 +2337,19 @@ impl Database {
         created_at: &str,
         modified_at: Option<&str>,
     ) -> VoiceResult<bool> {
+        self.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, None)
+    }
+
+    /// Apply a sync tag change including deleted_at timestamp
+    pub fn apply_sync_tag_with_deleted(
+        &self,
+        tag_id: &str,
+        name: &str,
+        parent_id: Option<&str>,
+        created_at: &str,
+        modified_at: Option<&str>,
+        deleted_at: Option<&str>,
+    ) -> VoiceResult<bool> {
         let uuid = Uuid::parse_str(tag_id)
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
@@ -2305,14 +2371,14 @@ impl Database {
         if existing.is_some() {
             // Update existing tag
             self.conn.execute(
-                "UPDATE tags SET name = ?, parent_id = ?, modified_at = ? WHERE id = ?",
-                params![name, parent_bytes, modified_at, uuid_bytes],
+                "UPDATE tags SET name = ?, parent_id = ?, modified_at = ?, deleted_at = ? WHERE id = ?",
+                params![name, parent_bytes, modified_at, deleted_at, uuid_bytes],
             )?;
         } else {
             // Insert new tag
             self.conn.execute(
-                "INSERT INTO tags (id, name, parent_id, created_at, modified_at) VALUES (?, ?, ?, ?, ?)",
-                params![uuid_bytes, name, parent_bytes, created_at, modified_at],
+                "INSERT INTO tags (id, name, parent_id, created_at, modified_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![uuid_bytes, name, parent_bytes, created_at, modified_at, deleted_at],
             )?;
         }
         Ok(true)
@@ -4096,9 +4162,16 @@ mod tests {
         let notes = db.get_all_notes().unwrap();
         assert!(notes.is_empty());
 
-        // But should still be retrievable by ID
-        let note = db.get_note(&note_id).unwrap().unwrap();
-        assert!(note.deleted_at.is_some());
+        // get_note should NOT return deleted notes (consistent with get_tag behavior)
+        let note = db.get_note(&note_id).unwrap();
+        assert!(note.is_none(), "get_note should not return deleted notes");
+
+        // But should still be retrievable via get_note_raw for sync purposes
+        let note_raw = db.get_note_raw(&note_id).unwrap();
+        assert!(note_raw.is_some());
+        let note_data = note_raw.unwrap();
+        let deleted_at = note_data.get("deleted_at").and_then(|v| v.as_str());
+        assert!(deleted_at.is_some(), "deleted note should have deleted_at in raw data");
     }
 
     #[test]
