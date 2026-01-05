@@ -885,6 +885,163 @@ impl Database {
         Ok(deleted > 0)
     }
 
+    /// Merge two notes into one.
+    /// - Keeps the note with the earliest created_at timestamp
+    /// - Concatenates content with "----------------" separator (skipped if one is empty)
+    /// - Moves tags from victim to survivor (deduplicates)
+    /// - Moves attachments from victim to survivor
+    /// - Soft-deletes the victim note
+    /// Returns the surviving note ID.
+    pub fn merge_notes(&self, note_id_1: &str, note_id_2: &str) -> VoiceResult<String> {
+        // 1. Resolve both note IDs
+        let resolved_id_1 = self
+            .try_resolve_note_id(note_id_1)?
+            .ok_or_else(|| VoiceError::validation("note_id_1", "Note not found"))?;
+        let resolved_id_2 = self
+            .try_resolve_note_id(note_id_2)?
+            .ok_or_else(|| VoiceError::validation("note_id_2", "Note not found"))?;
+
+        // Check if same note
+        if resolved_id_1 == resolved_id_2 {
+            return Err(VoiceError::validation(
+                "note_ids",
+                "Cannot merge a note with itself",
+            ));
+        }
+
+        let uuid_1 = Uuid::parse_str(&resolved_id_1)
+            .map_err(|e| VoiceError::validation("note_id_1", e.to_string()))?;
+        let uuid_2 = Uuid::parse_str(&resolved_id_2)
+            .map_err(|e| VoiceError::validation("note_id_2", e.to_string()))?;
+        let bytes_1 = uuid_1.as_bytes().to_vec();
+        let bytes_2 = uuid_2.as_bytes().to_vec();
+
+        // 2. Get both notes (must exist and not be deleted)
+        let note_1: (String, String, Option<String>) = self
+            .conn
+            .query_row(
+                "SELECT created_at, content, deleted_at FROM notes WHERE id = ?",
+                params![&bytes_1],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|_| VoiceError::validation("note_id_1", "Note not found"))?;
+
+        let note_2: (String, String, Option<String>) = self
+            .conn
+            .query_row(
+                "SELECT created_at, content, deleted_at FROM notes WHERE id = ?",
+                params![&bytes_2],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|_| VoiceError::validation("note_id_2", "Note not found"))?;
+
+        // Check if either note is deleted
+        if note_1.2.is_some() {
+            return Err(VoiceError::validation("note_id_1", "Note is deleted"));
+        }
+        if note_2.2.is_some() {
+            return Err(VoiceError::validation("note_id_2", "Note is deleted"));
+        }
+
+        // 3. Determine survivor (earlier created_at) and victim (later)
+        let (survivor_id, survivor_bytes, survivor_content, victim_bytes, victim_content) =
+            if note_1.0 <= note_2.0 {
+                (resolved_id_1, bytes_1, note_1.1, bytes_2, note_2.1)
+            } else {
+                (resolved_id_2, bytes_2, note_2.1, bytes_1, note_1.1)
+            };
+
+        // 4. Build merged content
+        let merged_content = if survivor_content.is_empty() && victim_content.is_empty() {
+            String::new()
+        } else if survivor_content.is_empty() {
+            victim_content
+        } else if victim_content.is_empty() {
+            survivor_content
+        } else {
+            format!("{}\n----------------\n{}", survivor_content, victim_content)
+        };
+
+        // 5. Update survivor's content
+        self.conn.execute(
+            "UPDATE notes SET content = ?, modified_at = datetime('now') WHERE id = ?",
+            params![&merged_content, &survivor_bytes],
+        )?;
+
+        // 6. Move tags from victim to survivor (with deduplication)
+        // First, get all active tags on the victim
+        let mut stmt = self.conn.prepare(
+            "SELECT tag_id FROM note_tags WHERE note_id = ? AND deleted_at IS NULL",
+        )?;
+        let victim_tags: Vec<Vec<u8>> = stmt
+            .query_map(params![&victim_bytes], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for tag_bytes in victim_tags {
+            // Check if survivor already has this tag (active)
+            let survivor_has_tag: bool = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM note_tags WHERE note_id = ? AND tag_id = ? AND deleted_at IS NULL",
+                    params![&survivor_bytes, &tag_bytes],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            if survivor_has_tag {
+                // Soft-delete the victim's association (duplicate)
+                self.conn.execute(
+                    "UPDATE note_tags SET deleted_at = datetime('now'), modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
+                    params![&victim_bytes, &tag_bytes],
+                )?;
+            } else {
+                // Check if survivor has a soft-deleted association we can reactivate
+                let survivor_had_tag: bool = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM note_tags WHERE note_id = ? AND tag_id = ? AND deleted_at IS NOT NULL",
+                        params![&survivor_bytes, &tag_bytes],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+
+                if survivor_had_tag {
+                    // Reactivate survivor's association
+                    self.conn.execute(
+                        "UPDATE note_tags SET deleted_at = NULL, modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
+                        params![&survivor_bytes, &tag_bytes],
+                    )?;
+                    // Soft-delete victim's association
+                    self.conn.execute(
+                        "UPDATE note_tags SET deleted_at = datetime('now'), modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
+                        params![&victim_bytes, &tag_bytes],
+                    )?;
+                } else {
+                    // Move the association to survivor
+                    self.conn.execute(
+                        "UPDATE note_tags SET note_id = ?, modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
+                        params![&survivor_bytes, &victim_bytes, &tag_bytes],
+                    )?;
+                }
+            }
+        }
+
+        // 7. Move attachments from victim to survivor
+        self.conn.execute(
+            "UPDATE note_attachments SET note_id = ?, modified_at = datetime('now') WHERE note_id = ? AND deleted_at IS NULL",
+            params![&survivor_bytes, &victim_bytes],
+        )?;
+
+        // 8. Soft-delete the victim note
+        self.conn.execute(
+            "UPDATE notes SET deleted_at = datetime('now'), modified_at = datetime('now') WHERE id = ?",
+            params![&victim_bytes],
+        )?;
+
+        Ok(survivor_id)
+    }
+
     /// Delete a tag (soft delete - sets deleted_at timestamp) (accepts ID or ID prefix)
     pub fn delete_tag(&self, tag_id: &str) -> VoiceResult<bool> {
         // Use try_resolve to return false if not found (instead of error)

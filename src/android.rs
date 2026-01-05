@@ -533,6 +533,20 @@ impl VoiceClient {
         })
     }
 
+    /// Merge two notes into one.
+    /// Returns the surviving note ID (the one with earlier created_at).
+    pub fn merge_notes(
+        &self,
+        note_id_1: String,
+        note_id_2: String,
+    ) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.merge_notes(&note_id_1, &note_id_2)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
     /// Delete a tag (soft delete - sets deleted_at timestamp)
     pub fn delete_tag(&self, tag_id: String) -> Result<bool, VoiceCoreError> {
         let db = self.db.lock().unwrap();
