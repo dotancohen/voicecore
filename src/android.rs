@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::Config;
 use crate::database::Database;
+use crate::search;
 use crate::sync_client::SyncClient;
 
 /// Error type exposed to Kotlin via UniFFI
@@ -110,6 +111,24 @@ pub struct TranscriptionData {
     pub created_at: String,
     pub modified_at: Option<String>,
     pub deleted_at: Option<String>,
+}
+
+/// A tag from the database
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TagData {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub created_at: Option<String>,
+    pub modified_at: Option<String>,
+}
+
+/// Result of a search operation
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SearchResultData {
+    pub notes: Vec<NoteData>,
+    pub ambiguous_tags: Vec<String>,
+    pub not_found_tags: Vec<String>,
 }
 
 /// Sync operation result
@@ -720,5 +739,68 @@ impl VoiceClient {
             existing.service_response.as_deref(),
             state.as_deref(),
         ).map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    // =========================================================================
+    // Tag and Search Methods
+    // =========================================================================
+
+    /// Get all tags from the database
+    pub fn get_all_tags(&self) -> Result<Vec<TagData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let tags = db.get_all_tags()?;
+
+        Ok(tags
+            .into_iter()
+            .map(|t| TagData {
+                id: t.id,
+                name: t.name,
+                parent_id: t.parent_id,
+                created_at: t.created_at,
+                modified_at: t.modified_at,
+            })
+            .collect())
+    }
+
+    /// Get all tags for a specific note
+    pub fn get_tags_for_note(&self, note_id: String) -> Result<Vec<TagData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let tags = db.get_note_tags(&note_id)?;
+
+        Ok(tags
+            .into_iter()
+            .map(|t| TagData {
+                id: t.id,
+                name: t.name,
+                parent_id: t.parent_id,
+                created_at: t.created_at,
+                modified_at: t.modified_at,
+            })
+            .collect())
+    }
+
+    /// Execute a search query
+    ///
+    /// Supports "tag:Name" syntax for tag filtering and free text search.
+    /// Multiple tags can be combined: "tag:Work tag:Important meeting notes"
+    pub fn search_notes(&self, query: String) -> Result<SearchResultData, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let result = search::execute_search(&db, &query)?;
+
+        Ok(SearchResultData {
+            notes: result
+                .notes
+                .into_iter()
+                .map(|n| NoteData {
+                    id: n.id,
+                    content: n.content,
+                    created_at: n.created_at,
+                    modified_at: n.modified_at,
+                    deleted_at: n.deleted_at,
+                })
+                .collect(),
+            ambiguous_tags: result.ambiguous_tags,
+            not_found_tags: result.not_found_tags,
+        })
     }
 }
