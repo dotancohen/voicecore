@@ -1617,6 +1617,13 @@ impl Database {
         Ok(())
     }
 
+    /// Reset sync timestamps to NULL to force re-fetching all data
+    /// Unlike clear_sync_peers, this preserves peer configuration
+    pub fn reset_sync_timestamps(&self) -> VoiceResult<()> {
+        self.conn.execute("UPDATE sync_peers SET last_sync_at = NULL", [])?;
+        Ok(())
+    }
+
     /// Get all changes since a timestamp (for sync)
     pub fn get_changes_since(&self, since: Option<&str>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<String>)> {
         let mut changes = Vec::new();

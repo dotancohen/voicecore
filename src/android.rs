@@ -320,6 +320,16 @@ impl VoiceClient {
         Ok(())
     }
 
+    /// Reset sync timestamps to force re-fetching all data from peers
+    ///
+    /// Unlike clear_sync_state, this preserves peer configuration but clears
+    /// the last_sync_at timestamps, causing the next sync to fetch all data.
+    pub fn reset_sync_timestamps(&self) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.reset_sync_timestamps()?;
+        Ok(())
+    }
+
     /// Perform initial sync - fetches full dataset from server
     ///
     /// Unlike sync_now(), this ignores timestamps and fetches all data.
