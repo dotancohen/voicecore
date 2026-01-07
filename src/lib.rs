@@ -29,6 +29,9 @@ pub mod sync_server;
 pub mod tls;
 pub mod validation;
 
+/// Length of short UUID display (e.g., "019b8ffd5711" instead of full 32-char UUID)
+pub const UUID_SHORT_LEN: usize = 12;
+
 // Android-specific bindings module
 #[cfg(feature = "uniffi")]
 pub mod android;

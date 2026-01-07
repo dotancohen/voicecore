@@ -28,6 +28,7 @@ use crate::database::Database;
 use crate::error::VoiceResult;
 use crate::merge::merge_content;
 use crate::sync_client::SyncChange;
+use crate::UUID_SHORT_LEN;
 use crate::validation::validate_datetime_optional;
 
 /// Server shutdown handle
@@ -113,7 +114,7 @@ async fn handshake(
 ) -> impl IntoResponse {
     tracing::debug!(
         "Handshake from device_id={}... device_name={}",
-        &request.device_id[..8.min(request.device_id.len())],
+        &request.device_id[..UUID_SHORT_LEN.min(request.device_id.len())],
         request.device_name
     );
 
@@ -182,7 +183,7 @@ async fn get_changes(
         tracing::trace!(
             "  {} {} {}",
             change.entity_type,
-            &change.entity_id[..8.min(change.entity_id.len())],
+            &change.entity_id[..UUID_SHORT_LEN.min(change.entity_id.len())],
             change.operation
         );
     }
@@ -205,14 +206,14 @@ async fn apply_changes(
 ) -> impl IntoResponse {
     tracing::debug!(
         "POST /sync/apply from device_id={}... ({} changes)",
-        &request.device_id[..8.min(request.device_id.len())],
+        &request.device_id[..UUID_SHORT_LEN.min(request.device_id.len())],
         request.changes.len()
     );
     for change in &request.changes {
         tracing::trace!(
             "  Incoming: {} {} {}",
             change.entity_type,
-            &change.entity_id[..8.min(change.entity_id.len())],
+            &change.entity_id[..UUID_SHORT_LEN.min(change.entity_id.len())],
             change.operation
         );
     }
@@ -235,6 +236,8 @@ async fn apply_changes(
         &request.changes,
         &request.device_id,
         Some(request.device_name.as_str()),
+        Some(&state.device_id),
+        Some(&state.device_name),
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -333,7 +336,7 @@ async fn download_audio_file(
     State(state): State<AppState>,
     Path(audio_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    tracing::debug!("GET /sync/audio/{}/file", &audio_id[..8.min(audio_id.len())]);
+    tracing::debug!("GET /sync/audio/{}/file", &audio_id[..UUID_SHORT_LEN.min(audio_id.len())]);
 
     // Validate audio_id is a valid UUID
     let _uuid = Uuid::parse_str(&audio_id)
@@ -384,7 +387,7 @@ async fn upload_audio_file(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     tracing::debug!(
         "POST /sync/audio/{}/file ({} bytes)",
-        &audio_id[..8.min(audio_id.len())],
+        &audio_id[..UUID_SHORT_LEN.min(audio_id.len())],
         body.len()
     );
 
@@ -964,6 +967,8 @@ fn apply_sync_changes(
     changes: &[SyncChange],
     peer_device_id: &str,
     peer_device_name: Option<&str>,
+    local_device_id: Option<&str>,
+    local_device_name: Option<&str>,
 ) -> VoiceResult<(i64, i64, Vec<String>)> {
     let db = db.lock().unwrap();
     let mut applied = 0i64;
@@ -972,13 +977,13 @@ fn apply_sync_changes(
 
     // Get last sync timestamp with this peer
     let last_sync_at = db.get_peer_last_sync(peer_device_id)?;
-    tracing::trace!("Last sync with peer {}: {:?}", &peer_device_id[..8.min(peer_device_id.len())], last_sync_at);
+    tracing::trace!("Last sync with peer {}: {:?}", &peer_device_id[..UUID_SHORT_LEN.min(peer_device_id.len())], last_sync_at);
 
     for change in changes {
         let result = match change.entity_type.as_str() {
-            "note" => apply_note_change(&db, change, last_sync_at.as_deref()),
-            "tag" => apply_tag_change(&db, change, last_sync_at.as_deref()),
-            "note_tag" => apply_note_tag_change(&db, change, last_sync_at.as_deref()),
+            "note" => apply_note_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
+            "tag" => apply_tag_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
+            "note_tag" => apply_note_tag_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
             "note_attachment" => apply_note_attachment_change(&db, change, last_sync_at.as_deref()),
             "audio_file" => apply_audio_file_change(&db, change, last_sync_at.as_deref()),
             "transcription" => apply_transcription_change(&db, change, last_sync_at.as_deref()),
@@ -994,7 +999,7 @@ fn apply_sync_changes(
                 tracing::trace!(
                     "Applied: {} {} {}",
                     change.entity_type,
-                    &change.entity_id[..8.min(change.entity_id.len())],
+                    &change.entity_id[..UUID_SHORT_LEN.min(change.entity_id.len())],
                     change.operation
                 );
                 applied += 1;
@@ -1003,7 +1008,7 @@ fn apply_sync_changes(
                 tracing::debug!(
                     "Conflict: {} {} {}",
                     change.entity_type,
-                    &change.entity_id[..8.min(change.entity_id.len())],
+                    &change.entity_id[..UUID_SHORT_LEN.min(change.entity_id.len())],
                     change.operation
                 );
                 conflicts += 1;
@@ -1012,7 +1017,7 @@ fn apply_sync_changes(
                 tracing::trace!(
                     "Skipped: {} {} {}",
                     change.entity_type,
-                    &change.entity_id[..8.min(change.entity_id.len())],
+                    &change.entity_id[..UUID_SHORT_LEN.min(change.entity_id.len())],
                     change.operation
                 );
             }
@@ -1046,6 +1051,8 @@ fn apply_note_change(
     db: &Database,
     change: &SyncChange,
     last_sync_at: Option<&str>,
+    local_device_id: Option<&str>,
+    local_device_name: Option<&str>,
 ) -> VoiceResult<ApplyResult> {
     let note_id = &change.entity_id;
     let data = &change.data;
@@ -1078,10 +1085,11 @@ fn apply_note_change(
                         remote_content,                          // surviving_content
                         modified_at.unwrap_or(""),               // surviving_modified_at
                         Some(remote_device_id.as_str()),         // surviving_device_id
+                        remote_device_name,                      // surviving_device_name
                         None,                                    // deleted_content
                         local_deleted_at,                        // deleted_at
-                        None,                                    // deleting_device_id (local)
-                        None,                                    // deleting_device_name
+                        local_device_id,                         // deleting_device_id (local)
+                        local_device_name,                       // deleting_device_name (local)
                     )?;
 
                     // Resurrect the note with remote content
@@ -1175,10 +1183,11 @@ fn apply_note_change(
                         remote_content,                          // surviving_content
                         modified_at.unwrap_or(""),               // surviving_modified_at
                         Some(remote_device_id.as_str()),         // surviving_device_id
+                        remote_device_name,                      // surviving_device_name
                         None,                                    // deleted_content
                         local_deleted_at.unwrap_or(""),          // deleted_at
-                        None,                                    // deleting_device_id (local)
-                        None,                                    // deleting_device_name
+                        local_device_id,                         // deleting_device_id (local)
+                        local_device_name,                       // deleting_device_name (local)
                     )?;
                     // Resurrect the note with remote content (clear deleted_at)
                     db.apply_sync_note(
@@ -1196,7 +1205,8 @@ fn apply_note_change(
                         note_id,
                         local_content,                           // surviving_content
                         local_modified_at.unwrap_or(""),         // surviving_modified_at
-                        None,                                    // surviving_device_id (local)
+                        local_device_id,                         // surviving_device_id (local)
+                        local_device_name,                       // surviving_device_name (local)
                         None,                                    // deleted_content
                         deleted_at.unwrap_or(""),                // deleted_at
                         Some(remote_device_id.as_str()),         // deleting_device_id
@@ -1226,6 +1236,8 @@ fn apply_note_change(
                         note_id,
                         local_content,
                         local_modified_at.unwrap_or(""),
+                        local_device_id,
+                        local_device_name,
                         remote_content,
                         modified_at.unwrap_or(""),
                         Some(remote_device_id.as_str()),
@@ -1250,6 +1262,8 @@ fn apply_tag_change(
     db: &Database,
     change: &SyncChange,
     last_sync_at: Option<&str>,
+    local_device_id: Option<&str>,
+    local_device_name: Option<&str>,
 ) -> VoiceResult<ApplyResult> {
     let tag_id = &change.entity_id;
     let data = &change.data;
@@ -1333,6 +1347,8 @@ fn apply_tag_change(
                         tag_id,
                         local_name,
                         local_modified_at.unwrap_or(""),
+                        local_device_id,
+                        local_device_name,
                         remote_name,
                         modified_at.unwrap_or(""),
                         Some(remote_device_id.as_str()),
@@ -1350,6 +1366,8 @@ fn apply_tag_change(
                         tag_id,
                         local_parent_id,
                         local_modified_at.unwrap_or(""),
+                        local_device_id,
+                        local_device_name,
                         remote_parent_id,
                         modified_at.unwrap_or(""),
                         Some(remote_device_id.as_str()),
@@ -1417,8 +1435,8 @@ fn apply_tag_change(
                     local_name,                          // surviving_name
                     local_parent_id,                     // surviving_parent_id
                     local_modified_at.unwrap_or(""),     // surviving_modified_at
-                    None,                                // surviving_device_id (local)
-                    None,                                // surviving_device_name
+                    local_device_id,                     // surviving_device_id (local)
+                    local_device_name,                   // surviving_device_name (local)
                     deleted_at,                          // deleted_at
                     Some(remote_device_id.as_str()),     // deleting_device_id
                     remote_device_name,                  // deleting_device_name
@@ -1441,6 +1459,8 @@ fn apply_note_tag_change(
     db: &Database,
     change: &SyncChange,
     last_sync_at: Option<&str>,
+    local_device_id: Option<&str>,
+    local_device_name: Option<&str>,
 ) -> VoiceResult<ApplyResult> {
     // Parse entity_id (format: "note_id:tag_id")
     let parts: Vec<&str> = change.entity_id.split(':').collect();
@@ -1452,11 +1472,13 @@ fn apply_note_tag_change(
     let note_id = parts[0];
     let tag_id = parts[1];
     let data = &change.data;
+    let remote_device_id = &change.device_id;
+    let remote_device_name = change.device_name.as_deref();
 
     tracing::trace!(
         "note_tag: processing note={}... tag={}... op={}",
-        &note_id[..8.min(note_id.len())],
-        &tag_id[..8.min(tag_id.len())],
+        &note_id[..UUID_SHORT_LEN.min(note_id.len())],
+        &tag_id[..UUID_SHORT_LEN.min(tag_id.len())],
         change.operation
     );
 
@@ -1519,6 +1541,27 @@ fn apply_note_tag_change(
                 }
                 // Local is deleted, remote wants active - reactivate
                 let ex_created_at = ex.get("created_at").and_then(|v| v.as_str()).unwrap_or(created_at);
+                let local_modified_at = ex.get("modified_at").and_then(|v| v.as_str());
+                let local_deleted_at = ex.get("deleted_at").and_then(|v| v.as_str());
+
+                if local_changed {
+                    // Create conflict record: local deleted, remote wants to reactivate
+                    db.create_note_tag_conflict(
+                        note_id,
+                        tag_id,
+                        Some(ex_created_at),
+                        local_modified_at,
+                        local_deleted_at,
+                        local_device_id,
+                        local_device_name,
+                        Some(created_at),
+                        modified_at,
+                        None,  // remote is reactivating
+                        Some(remote_device_id.as_str()),
+                        remote_device_name,
+                    )?;
+                }
+
                 db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, None)?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
@@ -1539,6 +1582,22 @@ fn apply_note_tag_change(
             // Local is active, remote wants to delete
             if local_changed {
                 // Both changed - favor preservation (keep active)
+                let ex_created_at = ex.get("created_at").and_then(|v| v.as_str());
+                let local_modified_at = ex.get("modified_at").and_then(|v| v.as_str());
+                db.create_note_tag_conflict(
+                    note_id,
+                    tag_id,
+                    ex_created_at,
+                    local_modified_at,
+                    None,  // local is active
+                    local_device_id,
+                    local_device_name,
+                    Some(created_at),
+                    modified_at,
+                    deleted_at,  // remote wants to delete
+                    Some(remote_device_id.as_str()),
+                    remote_device_name,
+                )?;
                 return Ok(ApplyResult::Conflict);
             }
             // Apply the delete
@@ -1560,6 +1619,24 @@ fn apply_note_tag_change(
 
             if !remote_deleted && local_deleted {
                 // Remote reactivated, local still deleted - reactivate
+                if local_changed {
+                    let local_modified_at = ex.get("modified_at").and_then(|v| v.as_str());
+                    let local_deleted_at = ex.get("deleted_at").and_then(|v| v.as_str());
+                    db.create_note_tag_conflict(
+                        note_id,
+                        tag_id,
+                        Some(ex_created_at),
+                        local_modified_at,
+                        local_deleted_at,  // local is deleted
+                        local_device_id,
+                        local_device_name,
+                        Some(created_at),
+                        modified_at,
+                        None,  // remote reactivating
+                        Some(remote_device_id.as_str()),
+                        remote_device_name,
+                    )?;
+                }
                 db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, None)?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
@@ -1567,6 +1644,21 @@ fn apply_note_tag_change(
             if remote_deleted && !local_deleted {
                 // Remote wants to delete, local is active
                 if local_changed {
+                    let local_modified_at = ex.get("modified_at").and_then(|v| v.as_str());
+                    db.create_note_tag_conflict(
+                        note_id,
+                        tag_id,
+                        Some(ex_created_at),
+                        local_modified_at,
+                        None,  // local is active
+                        local_device_id,
+                        local_device_name,
+                        Some(created_at),
+                        modified_at,
+                        deleted_at,  // remote wants to delete
+                        Some(remote_device_id.as_str()),
+                        remote_device_name,
+                    )?;
                     return Ok(ApplyResult::Conflict); // Keep active
                 }
                 db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, deleted_at)?;
@@ -2131,6 +2223,8 @@ pub fn apply_changes_from_peer(
     changes: &[SyncChange],
     peer_device_id: &str,
     peer_device_name: Option<&str>,
+    local_device_id: Option<&str>,
+    local_device_name: Option<&str>,
 ) -> VoiceResult<(i64, i64, Vec<String>)> {
     let mut applied = 0i64;
     let mut conflicts = 0i64;
@@ -2162,9 +2256,9 @@ pub fn apply_changes_from_peer(
 
     for change in sorted_changes {
         let result = match change.entity_type.as_str() {
-            "note" => apply_note_change(db, change, last_sync_at.as_deref()),
-            "tag" => apply_tag_change(db, change, last_sync_at.as_deref()),
-            "note_tag" => apply_note_tag_change(db, change, last_sync_at.as_deref()),
+            "note" => apply_note_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
+            "tag" => apply_tag_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
+            "note_tag" => apply_note_tag_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
             "note_attachment" => apply_note_attachment_change(db, change, last_sync_at.as_deref()),
             "audio_file" => apply_audio_file_change(db, change, last_sync_at.as_deref()),
             "transcription" => apply_transcription_change(db, change, last_sync_at.as_deref()),

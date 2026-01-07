@@ -320,6 +320,16 @@ The database includes a `schema_version` table for migrations. Current schema ve
 
 ## Sync Protocol
 
+This section documents the sync protocol for implementing new clients (e.g., mobile apps, web clients).
+
+### Protocol Overview
+
+VoiceCore uses a bidirectional sync protocol where any device can act as both client and server. The protocol supports:
+- Incremental sync (only changes since last sync)
+- Full sync (complete dataset transfer for initial sync or recovery)
+- Audio file transfer (binary content via separate endpoints)
+- Conflict detection and resolution
+
 ### Endpoints
 
 | Method | Path | Description |
@@ -329,19 +339,305 @@ The database includes a `schema_version` table for migrations. Current schema ve
 | `POST` | `/sync/apply` | Apply remote changes to local database |
 | `GET` | `/sync/full` | Full dataset for initial sync |
 | `GET` | `/sync/status` | Health check and server info |
+| `GET` | `/sync/audio/<audio_id>` | Download audio file binary content |
+| `POST` | `/sync/audio/<audio_id>` | Upload audio file binary content |
+
+### Endpoint Details
+
+#### POST /sync/handshake
+
+Exchange device identities and determine last sync timestamp.
+
+**Request:**
+```json
+{
+    "device_id": "018d1234abcd5678...",
+    "device_name": "My Android Phone",
+    "protocol_version": "1.0"
+}
+```
+
+**Response:**
+```json
+{
+    "device_id": "018d5678efgh9012...",
+    "device_name": "Home Server",
+    "protocol_version": "1.0",
+    "last_sync_timestamp": "2024-01-15 10:30:00",
+    "server_timestamp": "2024-01-15 12:00:00",
+    "supports_audiofiles": true
+}
+```
+
+#### GET /sync/changes
+
+Pull changes since a given timestamp.
+
+**Query Parameters:**
+- `since` (optional): ISO timestamp `YYYY-MM-DD HH:MM:SS`. If omitted, returns all changes.
+- `limit` (optional): Maximum number of changes to return. Default: 1000.
+
+**Response:**
+```json
+{
+    "changes": [ /* array of SyncChange objects */ ],
+    "from_timestamp": "2024-01-15 10:30:00",
+    "to_timestamp": "2024-01-15 12:00:00",
+    "device_id": "018d5678efgh9012...",
+    "device_name": "Home Server",
+    "is_complete": true
+}
+```
+
+If `is_complete` is `false`, there are more changes available. Call again with updated `since` parameter.
+
+#### POST /sync/apply
+
+Apply changes from another device.
+
+**Request:**
+```json
+{
+    "device_id": "018d1234abcd5678...",
+    "device_name": "My Android Phone",
+    "changes": [ /* array of SyncChange objects */ ]
+}
+```
+
+**Response:**
+```json
+{
+    "applied": 15,
+    "conflicts": 2,
+    "errors": ["Error applying note abc123: validation failed"]
+}
+```
+
+#### GET /sync/full
+
+Get complete dataset for initial sync.
+
+**Response:** Same format as `/sync/changes` but includes all data regardless of timestamps.
+
+#### GET /sync/status
+
+Health check endpoint.
+
+**Response:**
+```json
+{
+    "device_id": "018d5678efgh9012...",
+    "device_name": "Home Server",
+    "protocol_version": "1.0",
+    "status": "ok",
+    "supports_audiofiles": true
+}
+```
+
+### Entity Types
+
+The sync protocol supports these entity types:
+
+| Entity Type | Description | Dependencies |
+|-------------|-------------|--------------|
+| `note` | Note content and metadata | None |
+| `tag` | Tag definitions with hierarchy | None (parent_id is self-referential) |
+| `audio_file` | Audio file metadata (not content) | None |
+| `note_tag` | Note-to-tag associations | Requires note, tag |
+| `note_attachment` | Note-to-attachment associations | Requires note, audio_file |
+| `transcription` | Audio transcription text | Requires audio_file |
+
+**Dependency Order:** When applying changes, process entities in dependency order:
+1. First: `note`, `tag`, `audio_file` (no dependencies)
+2. Then: `note_tag`, `note_attachment`, `transcription` (depend on entities from step 1)
 
 ### Change Format
 
 ```json
 {
     "entity_type": "note",
-    "entity_id": "018d1234abcd...",
-    "operation": "update",
-    "data": { "content": "...", "modified_at": "..." },
+    "entity_id": "018d1234abcd5678901234567890abcd",
+    "operation": "create",
+    "data": {
+        "content": "Meeting notes from today...",
+        "created_at": "2024-01-15 10:30:00",
+        "modified_at": "2024-01-15 10:30:00",
+        "device_id": "018d5678efgh90123456789012345678"
+    },
     "timestamp": "2024-01-15 10:30:00",
-    "device_id": "018d5678efgh..."
+    "device_id": "018d5678efgh90123456789012345678"
 }
 ```
+
+**Fields:**
+- `entity_type`: One of the entity types listed above
+- `entity_id`: UUID7 hex string (32 characters, no hyphens)
+- `operation`: `create`, `update`, or `delete`
+- `data`: Entity-specific data (see below)
+- `timestamp`: When the change occurred (server's `modified_at`)
+- `device_id`: Device that made the change
+
+### Entity Data Formats
+
+#### Note
+
+```json
+{
+    "content": "Note text content",
+    "created_at": "2024-01-15 10:30:00",
+    "modified_at": "2024-01-15 10:35:00",
+    "deleted_at": null,
+    "device_id": "018d..."
+}
+```
+
+#### Tag
+
+```json
+{
+    "name": "Work",
+    "parent_id": null,
+    "created_at": "2024-01-15 10:30:00",
+    "modified_at": "2024-01-15 10:30:00",
+    "deleted_at": null,
+    "device_id": "018d..."
+}
+```
+
+#### Note Tag (Association)
+
+```json
+{
+    "note_id": "018d...",
+    "tag_id": "018d...",
+    "created_at": "2024-01-15 10:30:00",
+    "modified_at": "2024-01-15 10:30:00",
+    "deleted_at": null,
+    "device_id": "018d..."
+}
+```
+
+#### Audio File
+
+```json
+{
+    "filename": "recording_2024-01-15.m4a",
+    "file_path": "/path/to/audio/recording.m4a",
+    "mime_type": "audio/mp4",
+    "file_size": 1234567,
+    "duration_ms": 60000,
+    "created_at": "2024-01-15 10:30:00",
+    "modified_at": "2024-01-15 10:30:00",
+    "deleted_at": null,
+    "device_id": "018d..."
+}
+```
+
+**Note:** The `file_path` is the original path on the creating device. Clients should download the actual binary via `/sync/audio/<audio_id>`.
+
+#### Note Attachment
+
+```json
+{
+    "note_id": "018d...",
+    "attachment_id": "018d...",
+    "attachment_type": "audio_file",
+    "created_at": "2024-01-15 10:30:00",
+    "modified_at": "2024-01-15 10:30:00",
+    "deleted_at": null,
+    "device_id": "018d..."
+}
+```
+
+#### Transcription
+
+```json
+{
+    "audio_file_id": "018d...",
+    "language": "en",
+    "text": "Transcribed text content...",
+    "provider": "whisper",
+    "model": "large-v3",
+    "segments": "[{\"start\": 0.0, \"end\": 2.5, \"text\": \"Hello\"}]",
+    "state": "original",
+    "created_at": "2024-01-15 10:30:00",
+    "modified_at": "2024-01-15 10:30:00",
+    "device_id": "018d..."
+}
+```
+
+### Audio File Transfer
+
+Audio files are transferred separately from metadata:
+
+**Download:** `GET /sync/audio/<audio_id>`
+- Returns raw binary audio content
+- Content-Type header indicates MIME type
+
+**Upload:** `POST /sync/audio/<audio_id>`
+- Send raw binary audio content in request body
+- Set Content-Type header appropriately
+
+### Sync Flow
+
+#### Initial Sync (First Connection)
+
+1. `POST /sync/handshake` - Exchange device identities
+2. `GET /sync/full` - Pull complete dataset from peer
+3. Apply all changes locally (respecting dependency order)
+4. For each audio_file, `GET /sync/audio/<id>` to download content
+5. `POST /sync/apply` - Push local changes to peer
+6. For each local audio_file, `POST /sync/audio/<id>` to upload content
+
+#### Incremental Sync
+
+1. `POST /sync/handshake` - Exchange identities, get `last_sync_timestamp`
+2. `GET /sync/changes?since=<last_sync_timestamp>` - Pull changes
+3. Apply changes locally
+4. Download any new audio files
+5. `POST /sync/apply` - Push local changes since last sync
+6. Upload any new local audio files
+7. Store new `server_timestamp` as `last_sync_timestamp` for next sync
+
+### Conflict Handling
+
+When both devices modify the same entity between syncs, a conflict is created:
+
+- **Note content conflict:** Both edited the same note
+- **Note delete conflict:** One edited, one deleted
+- **Tag rename conflict:** Both renamed the same tag
+
+Conflicts are stored in dedicated tables and must be resolved manually. The `apply` endpoint returns the conflict count.
+
+### Timestamp Format
+
+**CRITICAL:** All timestamps MUST be in format `YYYY-MM-DD HH:MM:SS` with zero-padded values.
+
+- Correct: `2024-01-05 09:30:00`
+- Wrong: `2024-1-5 9:30:00` (not zero-padded)
+- Wrong: `2024-01-05T09:30:00` (ISO 8601 format)
+
+Timestamps are compared as strings for Last-Write-Wins logic. Non-padded dates break lexicographic ordering.
+
+### Implementing a New Client
+
+To implement sync in a new client:
+
+1. **Store device identity:** Generate a UUID7 for `device_id`, store with `device_name`
+
+2. **Track sync state:** Store `last_sync_timestamp` per peer
+
+3. **Implement change tracking:** Track local changes since last sync (by `modified_at`)
+
+4. **Handle all entity types:** Implement create/update/delete for all 6 entity types
+
+5. **Respect dependency order:** Apply changes in correct order
+
+6. **Handle audio files:** Download/upload binary content separately
+
+7. **Handle conflicts:** Store conflicts for user resolution
+
+8. **Validate timestamps:** Ensure all timestamps use correct format
 
 ## Validation Rules
 
