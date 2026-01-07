@@ -804,6 +804,7 @@ fn apply_sync_changes(
             "note_tag" => apply_note_tag_change(&db, change, last_sync_at.as_deref()),
             "note_attachment" => apply_note_attachment_change(&db, change, last_sync_at.as_deref()),
             "audio_file" => apply_audio_file_change(&db, change, last_sync_at.as_deref()),
+            "transcription" => apply_transcription_change(&db, change, last_sync_at.as_deref()),
             _ => {
                 errors.push(format!("Unknown entity type: {}", change.entity_type));
                 continue;

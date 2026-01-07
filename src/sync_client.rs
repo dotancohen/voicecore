@@ -184,10 +184,10 @@ impl SyncClient {
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
 
-        // Use LOCAL last_sync timestamp (what we know we have) rather than server's
-        // The server may not have a record if we never pushed changes to it
+        // Use the OLDER of local and server timestamps (NULL = infinitely old)
+        // This ensures that if either side has reset timestamps, we sync everything
         let local_last_sync = self.get_local_last_sync(peer_id);
-        let last_sync = local_last_sync.or(handshake.last_sync_timestamp);
+        let last_sync = Self::older_timestamp(local_last_sync, handshake.last_sync_timestamp);
         let clock_skew = self.calculate_clock_skew(handshake.server_timestamp.as_deref());
 
         // Adjust pull timestamp for clock skew
@@ -244,13 +244,16 @@ impl SyncClient {
         let pushed_changes = if local_changes_to_push.is_empty() {
             Vec::new()
         } else {
+            eprintln!("[SYNC DEBUG] Pushing {} changes to server...", local_changes_to_push.len());
             match self.push_changes_with_data(peer_url, &local_changes_to_push).await {
                 Ok((applied, conflicts)) => {
+                    eprintln!("[SYNC DEBUG] Server response: applied={}, conflicts={}", applied, conflicts);
                     result.pushed = applied;
                     result.conflicts += conflicts;
                     local_changes_to_push
                 }
                 Err(e) => {
+                    eprintln!("[SYNC DEBUG] Push error: {}", e);
                     result.errors.push(format!("Push failed: {}", e));
                     Vec::new()
                 }
@@ -301,9 +304,9 @@ impl SyncClient {
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
 
-        // Use LOCAL last_sync timestamp rather than server's
+        // Use the OLDER of local and server timestamps (NULL = infinitely old)
         let local_last_sync = self.get_local_last_sync(peer_id);
-        let last_sync = local_last_sync.or(handshake.last_sync_timestamp);
+        let last_sync = Self::older_timestamp(local_last_sync, handshake.last_sync_timestamp);
         let clock_skew = self.calculate_clock_skew(handshake.server_timestamp.as_deref());
         let adjusted_since = self.adjust_timestamp_for_skew(last_sync.as_deref(), clock_skew);
 
@@ -1207,6 +1210,19 @@ impl SyncClient {
             .collect();
 
         Ok(sync_changes)
+    }
+
+    /// Return the older of two timestamps, treating None as infinitely old.
+    /// If either is None, returns None (meaning "sync everything").
+    /// If both are Some, returns the lexicographically smaller (older) timestamp.
+    fn older_timestamp(a: Option<String>, b: Option<String>) -> Option<String> {
+        match (a, b) {
+            (None, _) | (_, None) => None,
+            (Some(ts_a), Some(ts_b)) => {
+                // Timestamps are in "YYYY-MM-DD HH:MM:SS" format, so lexicographic comparison works
+                Some(std::cmp::min(ts_a, ts_b))
+            }
+        }
     }
 
     fn calculate_clock_skew(&self, server_timestamp: Option<&str>) -> f64 {
