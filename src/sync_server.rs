@@ -3759,4 +3759,149 @@ mod tests {
         assert_eq!(b_transcriptions[0].content, "This is the transcribed text from the audio.");
         assert_eq!(b_transcriptions[0].service, "whisper");
     }
+
+    /// All entity types that should be synced. This is the authoritative list.
+    /// If you add a new syncable entity type, add it here AND to get_changes_since.
+    const ALL_SYNC_ENTITY_TYPES: &[&str] = &[
+        "note",
+        "tag",
+        "note_tag",
+        "note_attachment",
+        "audio_file",
+        "transcription",
+    ];
+
+    #[test]
+    fn test_get_changes_since_returns_all_entity_types() {
+        // CRITICAL TEST: Ensures get_changes_since returns ALL syncable entity types.
+        // This test exists because we had a bug where transcriptions were missing
+        // from get_changes_since, causing them to never sync to clients.
+        //
+        // If this test fails after adding a new entity type, you need to:
+        // 1. Add the entity type to ALL_SYNC_ENTITY_TYPES above
+        // 2. Add the query for that entity type in get_changes_since()
+        // 3. Create test data for it below
+
+        let (db, _temp) = create_test_db();
+
+        // Create one of each entity type
+        let note_id = db.create_note("Test note content").unwrap();
+        let tag_id = db.create_tag("TestTag", None).unwrap();
+        db.add_tag_to_note(&note_id, &tag_id).unwrap();
+        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+        let _attachment_id = db.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
+        let _transcription_id = db.create_transcription(
+            &audio_id,
+            "Test transcription content",
+            None,  // content_segments
+            "whisper",
+            None,  // service_arguments
+            None,  // service_response
+            None,  // state (uses default)
+        ).unwrap();
+
+        // Get all changes
+        let (changes, _) = db.get_changes_since(None, 1000).unwrap();
+
+        // Collect the entity types we got
+        let mut found_types: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for change in &changes {
+            if let Some(entity_type) = change.get("entity_type").and_then(|v| v.as_str()) {
+                found_types.insert(entity_type.to_string());
+            }
+        }
+
+        // Verify ALL expected entity types are present
+        for expected_type in ALL_SYNC_ENTITY_TYPES {
+            assert!(
+                found_types.contains(*expected_type),
+                "CRITICAL: get_changes_since is missing entity type '{}'. \
+                 Found types: {:?}. \
+                 This will cause {} entities to never sync to clients! \
+                 Add the query for '{}' to get_changes_since().",
+                expected_type,
+                found_types,
+                expected_type,
+                expected_type
+            );
+        }
+
+        // Also verify we didn't get any unexpected types
+        for found_type in &found_types {
+            assert!(
+                ALL_SYNC_ENTITY_TYPES.contains(&found_type.as_str()),
+                "Unexpected entity type '{}' in get_changes_since. \
+                 If this is a new entity type, add it to ALL_SYNC_ENTITY_TYPES.",
+                found_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_changes_since_returns_modified_transcription() {
+        // Specific test for the bug where transcription state changes weren't syncing.
+        // When a transcription is modified (e.g., state changed from "original" to "verified"),
+        // it must appear in get_changes_since.
+
+        let (db, _temp) = create_test_db();
+
+        // Create audio file and transcription
+        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+        let transcription_id = db.create_transcription(
+            &audio_id,
+            "Test content",
+            None,
+            "whisper",
+            None,
+            None,
+            None,  // state (uses default)
+        ).unwrap();
+
+        // Record the current time as our "last sync"
+        let last_sync = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+        // Wait a moment to ensure the modification timestamp is later
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Modify the transcription (simulate changing state to "verified")
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let device_id = "00000000000000000000000000000000";  // Dummy device ID for test
+        db.apply_sync_transcription(
+            &transcription_id,
+            &audio_id,
+            "Test content",
+            None,
+            "whisper",
+            None,
+            None,
+            "verified",  // Changed state
+            device_id,
+            &now,  // created_at
+            Some(&now),  // modified_at
+            None,  // deleted_at
+        ).unwrap();
+
+        // Get changes since last sync
+        let (changes, _) = db.get_changes_since(Some(&last_sync), 1000).unwrap();
+
+        // Find the transcription change
+        let trans_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("transcription") &&
+            c.get("entity_id").and_then(|v| v.as_str()) == Some(&transcription_id)
+        });
+
+        assert!(
+            trans_change.is_some(),
+            "Modified transcription must appear in get_changes_since! \
+             This bug caused transcription state changes to never sync."
+        );
+
+        // Verify the state was updated
+        let data = trans_change.unwrap().get("data").unwrap();
+        assert_eq!(
+            data.get("state").and_then(|v| v.as_str()),
+            Some("verified"),
+            "Transcription state should be 'verified'"
+        );
+    }
 }
