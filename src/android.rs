@@ -789,6 +789,31 @@ impl VoiceClient {
             .collect())
     }
 
+    /// Add a tag to a note
+    ///
+    /// Creates a note_tag association between the note and tag.
+    /// Returns true if successful, false if the association already exists.
+    pub fn add_tag_to_note(&self, note_id: String, tag_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.add_tag_to_note(&note_id, &tag_id)
+            .map(|_| true)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Remove a tag from a note
+    ///
+    /// Soft-deletes the note_tag association between the note and tag.
+    /// Returns true if the tag was removed, false if the association didn't exist.
+    pub fn remove_tag_from_note(&self, note_id: String, tag_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.remove_tag_from_note(&note_id, &tag_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
     /// Execute a search query
     ///
     /// Supports "tag:Name" syntax for tag filtering and free text search.
