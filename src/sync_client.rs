@@ -244,16 +244,16 @@ impl SyncClient {
         let pushed_changes = if local_changes_to_push.is_empty() {
             Vec::new()
         } else {
-            eprintln!("[SYNC DEBUG] Pushing {} changes to server...", local_changes_to_push.len());
+            tracing::debug!("Pushing {} changes to server...", local_changes_to_push.len());
             match self.push_changes_with_data(peer_url, &local_changes_to_push).await {
                 Ok((applied, conflicts)) => {
-                    eprintln!("[SYNC DEBUG] Server response: applied={}, conflicts={}", applied, conflicts);
+                    tracing::debug!("Server response: applied={}, conflicts={}", applied, conflicts);
                     result.pushed = applied;
                     result.conflicts += conflicts;
                     local_changes_to_push
                 }
                 Err(e) => {
-                    eprintln!("[SYNC DEBUG] Push error: {}", e);
+                    tracing::warn!("Push error: {}", e);
                     result.errors.push(format!("Push failed: {}", e));
                     Vec::new()
                 }
@@ -669,8 +669,15 @@ impl SyncClient {
         // Clone changes before applying so we can return them for audio sync
         let changes = batch.changes.clone();
 
+        // Log received changes
+        tracing::debug!("Received {} changes to pull", changes.len());
+        for change in &changes {
+            tracing::trace!("  Pull: {} {} from {}", change.entity_type, &change.entity_id[..8.min(change.entity_id.len())], change.device_id);
+        }
+
         // Apply changes to local database
         let (applied, conflicts, errors) = self.apply_changes(&batch.changes)?;
+        tracing::debug!("Applied {} changes, {} conflicts", applied, conflicts);
 
         Ok((applied, conflicts, changes, errors))
     }
@@ -1034,6 +1041,7 @@ impl SyncClient {
         // Parse entity_id (format: "note_id:tag_id")
         let parts: Vec<&str> = change.entity_id.split(':').collect();
         if parts.len() != 2 {
+            tracing::warn!("note_tag: invalid entity_id format: {}", change.entity_id);
             return Ok(false);
         }
 
@@ -1050,6 +1058,15 @@ impl SyncClient {
         let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
         let deleted_at = deleted_at_normalized.as_deref();
 
+        tracing::trace!(
+            "note_tag: note={}... tag={}... created={} modified={:?} deleted={:?}",
+            &note_id[..8.min(note_id.len())],
+            &tag_id[..8.min(tag_id.len())],
+            created_at,
+            modified_at,
+            deleted_at
+        );
+
         // Determine incoming timestamp
         let incoming_time = deleted_at.or(modified_at).or(Some(created_at));
 
@@ -1060,19 +1077,33 @@ impl SyncClient {
             let local_created = existing.get("created_at").and_then(|v| v.as_str());
             let local_time = local_deleted.or(local_modified).or(local_created);
 
+            tracing::trace!(
+                "note_tag: existing local_time={:?} incoming_time={:?}",
+                local_time, incoming_time
+            );
+
             if let (Some(lt), Some(it)) = (local_time, incoming_time) {
                 // If incoming is strictly older than local, skip
                 if it < lt {
+                    tracing::debug!("note_tag: skipped (incoming {} older than local {})", it, lt);
                     return Ok(false);
                 }
                 // If same timestamp, skip (idempotent)
                 if it == lt {
+                    tracing::trace!("note_tag: skipped (same timestamp {})", it);
                     return Ok(false);
                 }
             }
+        } else {
+            tracing::trace!("note_tag: no existing local record, will insert");
         }
 
         db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at)?;
+        tracing::debug!(
+            "note_tag: applied note={}... tag={}...",
+            &note_id[..8.min(note_id.len())],
+            &tag_id[..8.min(tag_id.len())]
+        );
         Ok(true)
     }
 

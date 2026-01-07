@@ -111,8 +111,15 @@ async fn handshake(
     State(state): State<AppState>,
     Json(request): Json<HandshakeRequest>,
 ) -> impl IntoResponse {
+    tracing::debug!(
+        "Handshake from device_id={}... device_name={}",
+        &request.device_id[..8.min(request.device_id.len())],
+        request.device_name
+    );
+
     // Validate device_id
     if request.device_id.len() != 32 || !request.device_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        tracing::warn!("Invalid device_id format: {}", request.device_id);
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -124,6 +131,7 @@ async fn handshake(
 
     // Get last sync timestamp for this peer
     let last_sync = get_peer_last_sync(&state.db, &request.device_id);
+    tracing::debug!("Last sync with this peer: {:?}", last_sync);
 
     // Check if audiofile_directory is configured
     let supports_audiofiles = {
@@ -148,11 +156,13 @@ async fn get_changes(
     Query(query): Query<ChangesQuery>,
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(1000).min(10000);
+    tracing::debug!("GET /sync/changes since={:?} limit={}", query.since, limit);
 
     // Get changes from database
     let (changes, latest_timestamp) = match get_changes_since(&state.db, query.since.as_deref(), limit) {
         Ok(result) => result,
         Err(e) => {
+            tracing::error!("Failed to get changes: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -162,6 +172,20 @@ async fn get_changes(
                 .into_response();
         }
     };
+
+    tracing::debug!(
+        "Returning {} changes, to_timestamp={:?}",
+        changes.len(),
+        latest_timestamp
+    );
+    for change in &changes {
+        tracing::trace!(
+            "  {} {} {}",
+            change.entity_type,
+            &change.entity_id[..8.min(change.entity_id.len())],
+            change.operation
+        );
+    }
 
     let response = ChangesResponse {
         changes: changes.clone(),
@@ -179,8 +203,23 @@ async fn apply_changes(
     State(state): State<AppState>,
     Json(request): Json<ApplyRequest>,
 ) -> impl IntoResponse {
+    tracing::debug!(
+        "POST /sync/apply from device_id={}... ({} changes)",
+        &request.device_id[..8.min(request.device_id.len())],
+        request.changes.len()
+    );
+    for change in &request.changes {
+        tracing::trace!(
+            "  Incoming: {} {} {}",
+            change.entity_type,
+            &change.entity_id[..8.min(change.entity_id.len())],
+            change.operation
+        );
+    }
+
     // Validate device_id
     if request.device_id.len() != 32 || !request.device_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        tracing::warn!("Invalid device_id format: {}", request.device_id);
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -199,6 +238,7 @@ async fn apply_changes(
     ) {
         Ok(result) => result,
         Err(e) => {
+            tracing::error!("Failed to apply changes: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -208,6 +248,14 @@ async fn apply_changes(
                 .into_response();
         }
     };
+
+    tracing::debug!(
+        "Applied {} changes, {} conflicts, {} errors",
+        applied, conflicts, errors.len()
+    );
+    for err in &errors {
+        tracing::warn!("  Error: {}", err);
+    }
 
     // Update sync_peers to track when we last synced with this peer
     // This allows the handshake to return accurate last_sync_timestamp
@@ -225,10 +273,13 @@ async fn apply_changes(
 }
 
 async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
+    tracing::debug!("GET /sync/full (initial sync request)");
+
     // Get all notes, tags, and note_tags
     let mut data = match get_full_dataset(&state.db) {
         Ok(d) => d,
         Err(e) => {
+            tracing::error!("Failed to get full dataset: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -238,6 +289,16 @@ async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
                 .into_response();
         }
     };
+
+    // Log counts
+    if let Some(obj) = data.as_object() {
+        tracing::debug!(
+            "Full sync: {} notes, {} tags, {} note_tags",
+            obj.get("notes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+            obj.get("tags").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+            obj.get("note_tags").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
+        );
+    }
 
     // Add required metadata fields that the client expects
     if let Some(obj) = data.as_object_mut() {
@@ -272,6 +333,8 @@ async fn download_audio_file(
     State(state): State<AppState>,
     Path(audio_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    tracing::debug!("GET /sync/audio/{}/file", &audio_id[..8.min(audio_id.len())]);
+
     // Validate audio_id is a valid UUID
     let _uuid = Uuid::parse_str(&audio_id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
@@ -319,6 +382,12 @@ async fn upload_audio_file(
     Path(audio_id): Path<String>,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    tracing::debug!(
+        "POST /sync/audio/{}/file ({} bytes)",
+        &audio_id[..8.min(audio_id.len())],
+        body.len()
+    );
+
     // Validate audio_id is a valid UUID
     let _uuid = Uuid::parse_str(&audio_id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
@@ -796,6 +865,7 @@ fn apply_sync_changes(
 
     // Get last sync timestamp with this peer
     let last_sync_at = db.get_peer_last_sync(peer_device_id)?;
+    tracing::trace!("Last sync with peer {}: {:?}", &peer_device_id[..8.min(peer_device_id.len())], last_sync_at);
 
     for change in changes {
         let result = match change.entity_type.as_str() {
@@ -806,19 +876,49 @@ fn apply_sync_changes(
             "audio_file" => apply_audio_file_change(&db, change, last_sync_at.as_deref()),
             "transcription" => apply_transcription_change(&db, change, last_sync_at.as_deref()),
             _ => {
+                tracing::warn!("Unknown entity type: {}", change.entity_type);
                 errors.push(format!("Unknown entity type: {}", change.entity_type));
                 continue;
             }
         };
 
         match result {
-            Ok(ApplyResult::Applied) => applied += 1,
-            Ok(ApplyResult::Conflict) => conflicts += 1,
-            Ok(ApplyResult::Skipped) => {}
-            Err(e) => errors.push(format!(
-                "Error applying {} {}: {}",
-                change.entity_type, change.entity_id, e
-            )),
+            Ok(ApplyResult::Applied) => {
+                tracing::trace!(
+                    "Applied: {} {} {}",
+                    change.entity_type,
+                    &change.entity_id[..8.min(change.entity_id.len())],
+                    change.operation
+                );
+                applied += 1;
+            }
+            Ok(ApplyResult::Conflict) => {
+                tracing::debug!(
+                    "Conflict: {} {} {}",
+                    change.entity_type,
+                    &change.entity_id[..8.min(change.entity_id.len())],
+                    change.operation
+                );
+                conflicts += 1;
+            }
+            Ok(ApplyResult::Skipped) => {
+                tracing::trace!(
+                    "Skipped: {} {} {}",
+                    change.entity_type,
+                    &change.entity_id[..8.min(change.entity_id.len())],
+                    change.operation
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Error applying {} {}: {}",
+                    change.entity_type, change.entity_id, e
+                );
+                errors.push(format!(
+                    "Error applying {} {}: {}",
+                    change.entity_type, change.entity_id, e
+                ));
+            }
         }
     }
 
@@ -1238,12 +1338,20 @@ fn apply_note_tag_change(
     // Parse entity_id (format: "note_id:tag_id")
     let parts: Vec<&str> = change.entity_id.split(':').collect();
     if parts.len() != 2 {
+        tracing::warn!("note_tag: invalid entity_id format: {}", change.entity_id);
         return Ok(ApplyResult::Skipped);
     }
 
     let note_id = parts[0];
     let tag_id = parts[1];
     let data = &change.data;
+
+    tracing::trace!(
+        "note_tag: processing note={}... tag={}... op={}",
+        &note_id[..8.min(note_id.len())],
+        &tag_id[..8.min(tag_id.len())],
+        change.operation
+    );
 
     // Validate datetime format for all incoming timestamps
     // This prevents malformed dates like "2025-1-1" which break string comparisons
