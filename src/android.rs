@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::database::Database;
 use crate::search;
 use crate::sync_client::SyncClient;
+use crate::UUID_SHORT_LEN;
 
 /// Error type exposed to Kotlin via UniFFI
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -625,7 +626,7 @@ impl VoiceClient {
         info.push_str(&format!("Peers count: {}\n", cfg.peers().len()));
 
         if let Some(peer) = cfg.peers().first() {
-            info.push_str(&format!("Peer ID: {}...\n", &peer.peer_id[..8]));
+            info.push_str(&format!("Peer ID: {}...\n", &peer.peer_id[..UUID_SHORT_LEN.min(peer.peer_id.len())]));
 
             if let Ok(Some(last_sync)) = db.get_peer_last_sync(&peer.peer_id) {
                 info.push_str(&format!("Last sync: {}\n", last_sync));

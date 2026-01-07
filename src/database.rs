@@ -286,6 +286,8 @@ impl Database {
                 local_created_at DATETIME,
                 local_modified_at DATETIME,
                 local_deleted_at DATETIME,
+                local_device_id BLOB,
+                local_device_name TEXT,
                 remote_created_at DATETIME,
                 remote_modified_at DATETIME,
                 remote_deleted_at DATETIME,
@@ -2698,6 +2700,8 @@ impl Database {
         note_id: &str,
         local_content: &str,
         local_modified_at: &str,
+        local_device_id: Option<&str>,
+        local_device_name: Option<&str>,
         remote_content: &str,
         remote_modified_at: &str,
         remote_device_id: Option<&str>,
@@ -2710,6 +2714,9 @@ impl Database {
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let note_bytes = note_uuid.as_bytes().to_vec();
 
+        let local_device_bytes = local_device_id.and_then(|id| {
+            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
+        });
         let remote_device_bytes = remote_device_id.and_then(|id| {
             Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
         });
@@ -2717,15 +2724,17 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO conflicts_note_content
-            (id, note_id, local_content, local_modified_at, local_device_id,
+            (id, note_id, local_content, local_modified_at, local_device_id, local_device_name,
              remote_content, remote_modified_at, remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             "#,
             params![
                 conflict_bytes,
                 note_bytes,
                 local_content,
                 local_modified_at,
+                local_device_bytes,
+                local_device_name,
                 remote_content,
                 remote_modified_at,
                 remote_device_bytes,
@@ -2743,6 +2752,7 @@ impl Database {
         surviving_content: &str,
         surviving_modified_at: &str,
         surviving_device_id: Option<&str>,
+        surviving_device_name: Option<&str>,
         deleted_content: Option<&str>,
         deleted_at: &str,
         deleting_device_id: Option<&str>,
@@ -2766,8 +2776,9 @@ impl Database {
             r#"
             INSERT INTO conflicts_note_delete
             (id, note_id, surviving_content, surviving_modified_at, surviving_device_id,
-             deleted_content, deleted_at, deleting_device_id, deleting_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             surviving_device_name, deleted_content, deleted_at, deleting_device_id,
+             deleting_device_name, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             "#,
             params![
                 conflict_bytes,
@@ -2775,6 +2786,7 @@ impl Database {
                 surviving_content,
                 surviving_modified_at,
                 surviving_device_bytes,
+                surviving_device_name,
                 deleted_content,
                 deleted_at,
                 deleting_device_bytes,
@@ -2791,6 +2803,8 @@ impl Database {
         tag_id: &str,
         local_name: &str,
         local_modified_at: &str,
+        local_device_id: Option<&str>,
+        local_device_name: Option<&str>,
         remote_name: &str,
         remote_modified_at: &str,
         remote_device_id: Option<&str>,
@@ -2803,6 +2817,9 @@ impl Database {
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let tag_bytes = tag_uuid.as_bytes().to_vec();
 
+        let local_device_bytes = local_device_id.and_then(|id| {
+            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
+        });
         let remote_device_bytes = remote_device_id.and_then(|id| {
             Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
         });
@@ -2810,15 +2827,17 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO conflicts_tag_rename
-            (id, tag_id, local_name, local_modified_at, local_device_id,
+            (id, tag_id, local_name, local_modified_at, local_device_id, local_device_name,
              remote_name, remote_modified_at, remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             "#,
             params![
                 conflict_bytes,
                 tag_bytes,
                 local_name,
                 local_modified_at,
+                local_device_bytes,
+                local_device_name,
                 remote_name,
                 remote_modified_at,
                 remote_device_bytes,
@@ -2837,6 +2856,8 @@ impl Database {
         local_created_at: Option<&str>,
         local_modified_at: Option<&str>,
         local_deleted_at: Option<&str>,
+        local_device_id: Option<&str>,
+        local_device_name: Option<&str>,
         remote_created_at: Option<&str>,
         remote_modified_at: Option<&str>,
         remote_deleted_at: Option<&str>,
@@ -2853,6 +2874,9 @@ impl Database {
         let note_bytes = note_uuid.as_bytes().to_vec();
         let tag_bytes = tag_uuid.as_bytes().to_vec();
 
+        let local_device_bytes = local_device_id.and_then(|id| {
+            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
+        });
         let remote_device_bytes = remote_device_id.and_then(|id| {
             Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
         });
@@ -2861,10 +2885,10 @@ impl Database {
             r#"
             INSERT INTO conflicts_note_tag
             (id, note_id, tag_id,
-             local_created_at, local_modified_at, local_deleted_at,
-             remote_created_at, remote_modified_at, remote_deleted_at,
-             remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             local_created_at, local_modified_at, local_deleted_at, local_device_id, local_device_name,
+             remote_created_at, remote_modified_at, remote_deleted_at, remote_device_id, remote_device_name,
+             created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             "#,
             params![
                 conflict_bytes,
@@ -2873,6 +2897,8 @@ impl Database {
                 local_created_at,
                 local_modified_at,
                 local_deleted_at,
+                local_device_bytes,
+                local_device_name,
                 remote_created_at,
                 remote_modified_at,
                 remote_deleted_at,
@@ -2890,6 +2916,8 @@ impl Database {
         tag_id: &str,
         local_parent_id: Option<&str>,
         local_modified_at: &str,
+        local_device_id: Option<&str>,
+        local_device_name: Option<&str>,
         remote_parent_id: Option<&str>,
         remote_modified_at: &str,
         remote_device_id: Option<&str>,
@@ -2905,11 +2933,13 @@ impl Database {
         let local_parent_bytes = local_parent_id.and_then(|id| {
             Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
         });
+        let local_device_bytes = local_device_id.and_then(|id| {
+            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
+        });
 
         let remote_parent_bytes = remote_parent_id.and_then(|id| {
             Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
         });
-
         let remote_device_bytes = remote_device_id.and_then(|id| {
             Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
         });
@@ -2917,15 +2947,17 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO conflicts_tag_parent
-            (id, tag_id, local_parent_id, local_modified_at, local_device_id,
+            (id, tag_id, local_parent_id, local_modified_at, local_device_id, local_device_name,
              remote_parent_id, remote_modified_at, remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             "#,
             params![
                 conflict_bytes,
                 tag_bytes,
                 local_parent_bytes,
                 local_modified_at,
+                local_device_bytes,
+                local_device_name,
                 remote_parent_bytes,
                 remote_modified_at,
                 remote_device_bytes,

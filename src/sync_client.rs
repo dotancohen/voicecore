@@ -20,6 +20,7 @@ use crate::config::Config;
 use crate::database::Database;
 use crate::error::{VoiceError, VoiceResult};
 use crate::validation::{normalize_datetime, normalize_datetime_optional};
+use crate::UUID_SHORT_LEN;
 
 /// Result of a sync operation
 #[derive(Debug, Clone, Default)]
@@ -672,7 +673,7 @@ impl SyncClient {
         // Log received changes
         tracing::debug!("Received {} changes to pull", changes.len());
         for change in &changes {
-            tracing::trace!("  Pull: {} {} from {}", change.entity_type, &change.entity_id[..8.min(change.entity_id.len())], change.device_id);
+            tracing::trace!("  Pull: {} {} from {}", change.entity_type, &change.entity_id[..UUID_SHORT_LEN.min(change.entity_id.len())], change.device_id);
         }
 
         // Apply changes to local database
@@ -792,7 +793,7 @@ impl SyncClient {
             let local_content = existing.get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let local_device_id = existing.get("device_id")
+            let _local_device_id = existing.get("device_id")
                 .and_then(|v| v.as_str());
             let local_time = local_modified.or(local_deleted);
 
@@ -817,13 +818,14 @@ impl SyncClient {
                     // Create delete conflict record
                     let _ = db.create_note_delete_conflict(
                         note_id,
-                        content, // surviving content
+                        content,                                 // surviving content (remote)
                         modified_at.unwrap_or(""),
-                        Some(change.device_id.as_str()),
-                        Some(local_content), // deleted content
+                        Some(change.device_id.as_str()),         // surviving_device_id
+                        change.device_name.as_deref(),           // surviving_device_name
+                        Some(local_content),                     // deleted content
                         local_deleted.unwrap_or(""),
-                        local_device_id,
-                        None, // local device name not stored in note
+                        Some(&self.device_id),                   // deleting_device_id (local)
+                        Some(&self.device_name),                 // deleting_device_name (local)
                     );
                     db.apply_sync_note(note_id, created_at, content, modified_at, None)?;
                     return Ok(true);
@@ -834,13 +836,14 @@ impl SyncClient {
                     // Local edit should survive - create delete conflict
                     let _ = db.create_note_delete_conflict(
                         note_id,
-                        local_content, // surviving content (local)
+                        local_content,                           // surviving content (local)
                         local_modified.unwrap_or(""),
-                        local_device_id,
-                        Some(content), // deleted content (remote was trying to delete)
+                        Some(&self.device_id),                   // surviving_device_id (local)
+                        Some(&self.device_name),                 // surviving_device_name (local)
+                        Some(content),                           // deleted content
                         deleted_at.unwrap_or(""),
-                        Some(change.device_id.as_str()),
-                        change.device_name.as_deref(),
+                        Some(change.device_id.as_str()),         // deleting_device_id
+                        change.device_name.as_deref(),           // deleting_device_name
                     );
                     // Don't apply the delete - local edit survives
                     return Ok(false);
@@ -869,6 +872,8 @@ impl SyncClient {
                             note_id,
                             local_content,
                             local_mod,
+                            Some(&self.device_id),
+                            Some(&self.device_name),
                             content,
                             incoming_mod,
                             Some(change.device_id.as_str()),
@@ -921,7 +926,7 @@ impl SyncClient {
                 .and_then(|v| v.as_str());
             let local_deleted = existing.get("deleted_at")
                 .and_then(|v| v.as_str());
-            let local_device_id = existing.get("device_id")
+            let _local_device_id = existing.get("device_id")
                 .and_then(|v| v.as_str());
 
             let local_time = local_modified.or(local_deleted);
@@ -947,8 +952,8 @@ impl SyncClient {
                         local_name, // surviving
                         local_parent_id,
                         local_modified.unwrap_or(""),
-                        local_device_id,
-                        None,
+                        Some(&self.device_id),
+                        Some(&self.device_name),
                         deleted_at.unwrap_or(""),
                         Some(change.device_id.as_str()),
                         change.device_name.as_deref(),
@@ -966,8 +971,8 @@ impl SyncClient {
                         Some(change.device_id.as_str()),
                         change.device_name.as_deref(),
                         local_deleted.unwrap_or(""),
-                        local_device_id,
-                        None,
+                        Some(&self.device_id),
+                        Some(&self.device_name),
                     );
                     // Resurrect by clearing deleted_at
                     db.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, None)?;
@@ -998,6 +1003,8 @@ impl SyncClient {
                                 tag_id,
                                 local_name,
                                 local_mod,
+                                Some(&self.device_id),
+                                Some(&self.device_name),
                                 name,
                                 incoming_mod,
                                 Some(change.device_id.as_str()),
@@ -1016,6 +1023,8 @@ impl SyncClient {
                                 tag_id,
                                 local_parent_id,
                                 local_mod,
+                                Some(&self.device_id),
+                                Some(&self.device_name),
                                 parent_id,
                                 incoming_mod,
                                 Some(change.device_id.as_str()),
@@ -1060,8 +1069,8 @@ impl SyncClient {
 
         tracing::trace!(
             "note_tag: note={}... tag={}... created={} modified={:?} deleted={:?}",
-            &note_id[..8.min(note_id.len())],
-            &tag_id[..8.min(tag_id.len())],
+            &note_id[..UUID_SHORT_LEN.min(note_id.len())],
+            &tag_id[..UUID_SHORT_LEN.min(tag_id.len())],
             created_at,
             modified_at,
             deleted_at
@@ -1101,8 +1110,8 @@ impl SyncClient {
         db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at)?;
         tracing::debug!(
             "note_tag: applied note={}... tag={}...",
-            &note_id[..8.min(note_id.len())],
-            &tag_id[..8.min(tag_id.len())]
+            &note_id[..UUID_SHORT_LEN.min(note_id.len())],
+            &tag_id[..UUID_SHORT_LEN.min(tag_id.len())]
         );
         Ok(true)
     }
