@@ -3025,6 +3025,41 @@ impl Database {
         Ok(counts)
     }
 
+    /// Get the types of unresolved conflicts for a specific note.
+    ///
+    /// Returns a list of conflict type strings (e.g., ["content", "delete"]).
+    /// Returns an empty list if the note has no unresolved conflicts.
+    pub fn get_note_conflict_types(&self, note_id: &str) -> VoiceResult<Vec<String>> {
+        let resolved_id = self.resolve_note_id(note_id)?;
+        let note_uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
+        let note_bytes = note_uuid.as_bytes().to_vec();
+
+        let mut types = Vec::new();
+
+        // Check for note content conflicts
+        let content_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM conflicts_note_content WHERE note_id = ? AND resolved_at IS NULL",
+            params![note_bytes],
+            |row| row.get(0),
+        )?;
+        if content_count > 0 {
+            types.push("content".to_string());
+        }
+
+        // Check for note delete conflicts
+        let delete_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM conflicts_note_delete WHERE note_id = ? AND resolved_at IS NULL",
+            params![note_bytes],
+            |row| row.get(0),
+        )?;
+        if delete_count > 0 {
+            types.push("delete".to_string());
+        }
+
+        Ok(types)
+    }
+
     /// Get note content conflicts
     pub fn get_note_content_conflicts(&self, include_resolved: bool) -> VoiceResult<Vec<HashMap<String, serde_json::Value>>> {
         let query = if include_resolved {

@@ -838,4 +838,14 @@ impl VoiceClient {
             not_found_tags: result.not_found_tags,
         })
     }
+
+    /// Get the types of unresolved conflicts for a specific note.
+    ///
+    /// Returns a list of conflict type strings (e.g., ["content", "delete"]).
+    /// Returns an empty list if the note has no unresolved conflicts.
+    pub fn get_note_conflict_types(&self, note_id: String) -> Result<Vec<String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.get_note_conflict_types(&note_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
 }
