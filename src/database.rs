@@ -1342,7 +1342,8 @@ impl Database {
                 n.content,
                 n.modified_at,
                 n.deleted_at,
-                GROUP_CONCAT(t.name, ', ') as tag_names
+                GROUP_CONCAT(t.name, ', ') as tag_names,
+                NULL as di_cache_note_pane_display
             FROM notes n
             INNER JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
@@ -1387,7 +1388,8 @@ impl Database {
                 n.content,
                 n.modified_at,
                 n.deleted_at,
-                GROUP_CONCAT(t.name, ', ') as tag_names
+                GROUP_CONCAT(t.name, ', ') as tag_names,
+                NULL as di_cache_note_pane_display
             FROM notes n
             LEFT JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
