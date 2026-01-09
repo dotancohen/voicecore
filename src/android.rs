@@ -585,6 +585,54 @@ impl VoiceClient {
         })
     }
 
+    /// Create a new tag
+    ///
+    /// # Arguments
+    /// * `name` - The tag name
+    /// * `parent_id` - Optional parent tag ID (None for root-level tag)
+    ///
+    /// # Returns
+    /// The ID of the newly created tag
+    pub fn create_tag(&self, name: String, parent_id: Option<String>) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.create_tag(&name, parent_id.as_deref())
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Rename a tag
+    ///
+    /// # Arguments
+    /// * `tag_id` - The tag ID
+    /// * `new_name` - The new name for the tag
+    ///
+    /// # Returns
+    /// True if the tag was renamed, false if not found
+    pub fn rename_tag(&self, tag_id: String, new_name: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.rename_tag(&tag_id, &new_name)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Move a tag to a different parent (or make it a root tag)
+    ///
+    /// # Arguments
+    /// * `tag_id` - The tag ID to move
+    /// * `new_parent_id` - The new parent ID, or None to make it a root tag
+    ///
+    /// # Returns
+    /// True if the tag was moved, false if not found
+    pub fn reparent_tag(&self, tag_id: String, new_parent_id: Option<String>) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.reparent_tag(&tag_id, new_parent_id.as_deref())
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
     /// Check if there are local changes that haven't been synced
     pub fn has_unsynced_changes(&self) -> Result<bool, VoiceCoreError> {
         let db = self.db.lock().unwrap();
@@ -848,5 +896,25 @@ impl VoiceClient {
         let db = self.db.lock().unwrap();
         db.get_note_conflict_types(&note_id)
             .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Filter notes by tag IDs.
+    ///
+    /// Returns notes that have ALL the specified tags.
+    pub fn filter_notes(&self, tag_ids: Vec<String>) -> Result<Vec<NoteData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let notes = db.filter_notes(&tag_ids)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
+
+        Ok(notes
+            .into_iter()
+            .map(|n| NoteData {
+                id: n.id,
+                content: n.content,
+                created_at: n.created_at,
+                modified_at: n.modified_at,
+                deleted_at: n.deleted_at,
+            })
+            .collect())
     }
 }

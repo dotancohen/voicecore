@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{VoiceError, VoiceResult};
+use crate::models::SyncChange;
 use crate::validation::{
     validate_note_id, validate_search_query, validate_tag_id, validate_tag_path,
 };
@@ -1773,7 +1774,7 @@ impl Database {
                 r#"
                 SELECT id, created_at, content, modified_at, deleted_at
                 FROM notes
-                WHERE modified_at >= ? OR (modified_at IS NULL AND created_at >= ?)
+                WHERE modified_at >= ? OR created_at >= ?
                 ORDER BY COALESCE(modified_at, created_at)
                 LIMIT ?
                 "#,
@@ -1846,7 +1847,7 @@ impl Database {
                     r#"
                     SELECT id, name, parent_id, created_at, modified_at, deleted_at
                     FROM tags
-                    WHERE modified_at >= ? OR (modified_at IS NULL AND created_at >= ?)
+                    WHERE modified_at >= ? OR created_at >= ?
                     ORDER BY COALESCE(modified_at, created_at)
                     LIMIT ?
                     "#,
@@ -2009,7 +2010,7 @@ impl Database {
                     r#"
                     SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
                     FROM audio_files
-                    WHERE modified_at >= ? OR (modified_at IS NULL AND imported_at >= ?)
+                    WHERE modified_at >= ? OR imported_at >= ?
                     ORDER BY COALESCE(modified_at, imported_at)
                     LIMIT ?
                     "#,
@@ -2179,7 +2180,7 @@ impl Database {
                     r#"
                     SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
                     FROM transcriptions
-                    WHERE modified_at >= ? OR (modified_at IS NULL AND created_at >= ?)
+                    WHERE modified_at >= ? OR created_at >= ?
                     ORDER BY COALESCE(modified_at, created_at)
                     LIMIT ?
                     "#,
@@ -2290,7 +2291,7 @@ impl Database {
         let note_count: i64 = self.conn.query_row(
             r#"
             SELECT COUNT(*) FROM notes
-            WHERE modified_at > ? OR (modified_at IS NULL AND created_at > ?)
+            WHERE modified_at > ? OR created_at > ?
             "#,
             params![since_ts, since_ts],
             |row| row.get(0),
@@ -2301,7 +2302,7 @@ impl Database {
                 r#"
                 SELECT id, created_at, content, modified_at, deleted_at
                 FROM notes
-                WHERE modified_at > ? OR (modified_at IS NULL AND created_at > ?)
+                WHERE modified_at > ? OR created_at > ?
                 ORDER BY COALESCE(modified_at, created_at)
                 LIMIT ?
                 "#,
@@ -2358,7 +2359,7 @@ impl Database {
                 r#"
                 SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
                 FROM audio_files
-                WHERE modified_at > ? OR (modified_at IS NULL AND imported_at > ?)
+                WHERE modified_at > ? OR imported_at > ?
                 ORDER BY COALESCE(modified_at, imported_at)
                 LIMIT ?
                 "#,
@@ -2399,7 +2400,7 @@ impl Database {
                 r#"
                 SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
                 FROM note_attachments
-                WHERE modified_at > ? OR (modified_at IS NULL AND created_at > ?)
+                WHERE modified_at > ? OR created_at > ?
                 ORDER BY COALESCE(modified_at, created_at)
                 LIMIT ?
                 "#,
@@ -2434,6 +2435,46 @@ impl Database {
         }
 
         Ok((changes, latest_timestamp))
+    }
+
+    /// Get changes since a timestamp, returning SyncChange structs.
+    /// Uses exclusive comparison (>) for incremental sync.
+    /// This is the primary method for sync_server to use.
+    pub fn get_changes_since_as_sync_changes(
+        &self,
+        since: Option<&str>,
+        limit: i64,
+    ) -> VoiceResult<(Vec<SyncChange>, Option<String>)> {
+        // Use exclusive comparison (>) for incremental sync
+        let (changes, latest_timestamp) = if since.is_some() {
+            self.get_changes_since_exclusive(since, limit)?
+        } else {
+            self.get_changes_since(None, limit)?
+        };
+
+        // Convert HashMap changes to SyncChange structs
+        let sync_changes: Vec<SyncChange> = changes
+            .into_iter()
+            .filter_map(|c| {
+                let entity_type = c.get("entity_type")?.as_str()?.to_string();
+                let entity_id = c.get("entity_id")?.as_str()?.to_string();
+                let operation = c.get("operation")?.as_str().unwrap_or("create").to_string();
+                let timestamp = c.get("timestamp")?.as_str()?.to_string();
+                let data = c.get("data").cloned().unwrap_or(serde_json::Value::Null);
+
+                Some(SyncChange {
+                    entity_type,
+                    entity_id,
+                    operation,
+                    data,
+                    timestamp,
+                    device_id: String::new(),
+                    device_name: None,
+                })
+            })
+            .collect();
+
+        Ok((sync_changes, latest_timestamp))
     }
 
     /// Get full dataset for initial sync

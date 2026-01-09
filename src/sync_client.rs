@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::database::Database;
 use crate::error::{VoiceError, VoiceResult};
+use crate::models::SyncChange;
 use crate::validation::{normalize_datetime, normalize_datetime_optional};
 use crate::UUID_SHORT_LEN;
 
@@ -77,18 +78,6 @@ struct HandshakeResponse {
     server_timestamp: Option<String>,
     #[serde(default)]
     supports_audiofiles: bool,
-}
-
-/// Sync change
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncChange {
-    pub entity_type: String,
-    pub entity_id: String,
-    pub operation: String,
-    pub data: serde_json::Value,
-    pub timestamp: String,
-    pub device_id: String,
-    pub device_name: Option<String>,
 }
 
 /// Sync batch response
