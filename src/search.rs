@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::database::{Database, NoteRow};
+use crate::database::{Database, NoteRow, MARKED_TAG_NAME, SYSTEM_TAG_NAME};
 use crate::error::VoiceResult;
 
 /// Parsed search input.
@@ -72,6 +72,9 @@ pub fn parse_search_input(search_input: &str) -> ParsedSearch {
             if !tag_name.is_empty() {
                 tag_terms.push(tag_name.to_string());
             }
+        } else if word.to_lowercase() == "is:marked" {
+            // Transform is:marked to internal tag path
+            tag_terms.push(format!("{}/{}", SYSTEM_TAG_NAME, MARKED_TAG_NAME));
         } else {
             text_words.push(word.to_string());
         }
@@ -296,5 +299,35 @@ mod tests {
         let result = parse_search_input("  hello   tag:Work   world  ");
         assert_eq!(result.tag_terms, vec!["Work"]);
         assert_eq!(result.free_text, "hello world");
+    }
+
+    #[test]
+    fn test_parse_is_marked() {
+        let result = parse_search_input("is:marked");
+        assert_eq!(result.tag_terms, vec!["_system/_marked"]);
+        assert!(result.free_text.is_empty());
+    }
+
+    #[test]
+    fn test_parse_is_marked_with_text() {
+        let result = parse_search_input("hello is:marked world");
+        assert_eq!(result.tag_terms, vec!["_system/_marked"]);
+        assert_eq!(result.free_text, "hello world");
+    }
+
+    #[test]
+    fn test_parse_is_marked_case_insensitive() {
+        let result = parse_search_input("IS:MARKED");
+        assert_eq!(result.tag_terms, vec!["_system/_marked"]);
+
+        let result2 = parse_search_input("Is:Marked");
+        assert_eq!(result2.tag_terms, vec!["_system/_marked"]);
+    }
+
+    #[test]
+    fn test_parse_is_marked_with_tags() {
+        let result = parse_search_input("tag:Work is:marked tag:Important");
+        assert_eq!(result.tag_terms, vec!["Work", "_system/_marked", "Important"]);
+        assert!(result.free_text.is_empty());
     }
 }

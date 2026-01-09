@@ -23,6 +23,12 @@ use crate::validation::{
 // Global device ID for local operations
 static LOCAL_DEVICE_ID: OnceLock<Uuid> = OnceLock::new();
 
+/// System tag name - parent of all hidden system tags (e.g., _marked)
+pub const SYSTEM_TAG_NAME: &str = "_system";
+
+/// Marked tag name - child of _system, used for starring/bookmarking notes
+pub const MARKED_TAG_NAME: &str = "_marked";
+
 /// Set the local device ID for database operations.
 pub fn set_local_device_id(device_id: Uuid) {
     let _ = LOCAL_DEVICE_ID.set(device_id);
@@ -390,6 +396,7 @@ impl Database {
         self.migrate_add_transcription_state()?;
         self.migrate_add_tags_deleted_at()?;
         self.migrate_add_note_cache()?;
+        self.migrate_add_system_tags()?;
 
         Ok(())
     }
@@ -601,6 +608,65 @@ impl Database {
         }
 
         self.conn.execute("PRAGMA user_version = 4", [])?;
+
+        Ok(())
+    }
+
+    /// Migration: Create system tags (_system and _marked)
+    fn migrate_add_system_tags(&mut self) -> VoiceResult<()> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        // Version 5 = system tags created
+        if version >= 5 {
+            return Ok(());
+        }
+
+        // Check if _system tag already exists
+        let system_tag_exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM tags WHERE name = ? AND parent_id IS NULL AND deleted_at IS NULL",
+            params![SYSTEM_TAG_NAME],
+            |row| row.get(0),
+        )?;
+
+        let system_tag_id = if system_tag_exists {
+            // Get existing _system tag ID
+            let id_bytes: Vec<u8> = self.conn.query_row(
+                "SELECT id FROM tags WHERE name = ? AND parent_id IS NULL AND deleted_at IS NULL",
+                params![SYSTEM_TAG_NAME],
+                |row| row.get(0),
+            )?;
+            id_bytes
+        } else {
+            // Create _system tag
+            let system_id = Uuid::now_v7();
+            let system_bytes = system_id.as_bytes().to_vec();
+            self.conn.execute(
+                "INSERT INTO tags (id, name, parent_id, created_at) VALUES (?, ?, NULL, datetime('now'))",
+                params![&system_bytes, SYSTEM_TAG_NAME],
+            )?;
+            system_bytes
+        };
+
+        // Check if _marked tag already exists under _system
+        let marked_tag_exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM tags WHERE name = ? AND parent_id = ? AND deleted_at IS NULL",
+            params![MARKED_TAG_NAME, &system_tag_id],
+            |row| row.get(0),
+        )?;
+
+        if !marked_tag_exists {
+            // Create _marked tag as child of _system
+            let marked_id = Uuid::now_v7();
+            let marked_bytes = marked_id.as_bytes().to_vec();
+            self.conn.execute(
+                "INSERT INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, datetime('now'))",
+                params![&marked_bytes, MARKED_TAG_NAME, &system_tag_id],
+            )?;
+        }
+
+        self.conn.execute("PRAGMA user_version = 5", [])?;
 
         Ok(())
     }
@@ -1699,6 +1765,107 @@ impl Database {
             tags.push(tag?);
         }
         Ok(tags)
+    }
+
+    // ============================================================================
+    // Note marking (starring/bookmarking) methods
+    // ============================================================================
+
+    /// Get the _system tag ID
+    fn get_system_tag_id(&self) -> VoiceResult<Option<Vec<u8>>> {
+        let result: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tags WHERE name = ? AND parent_id IS NULL AND deleted_at IS NULL",
+                params![SYSTEM_TAG_NAME],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Get the _marked tag ID (child of _system)
+    fn get_marked_tag_id(&self) -> VoiceResult<Option<Vec<u8>>> {
+        let system_id = match self.get_system_tag_id()? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        let result: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tags WHERE name = ? AND parent_id = ? AND deleted_at IS NULL",
+                params![MARKED_TAG_NAME, &system_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Check if a note is marked (starred)
+    pub fn is_note_marked(&self, note_id: &str) -> VoiceResult<bool> {
+        let resolved_note_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+
+        let marked_tag_id = match self.get_marked_tag_id()? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+
+        let note_uuid = Uuid::parse_str(&resolved_note_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
+        let note_bytes = note_uuid.as_bytes().to_vec();
+
+        let is_marked: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM note_tags WHERE note_id = ? AND tag_id = ? AND deleted_at IS NULL",
+            params![&note_bytes, &marked_tag_id],
+            |row| row.get(0),
+        )?;
+
+        Ok(is_marked)
+    }
+
+    /// Mark a note (add the _marked tag)
+    pub fn mark_note(&self, note_id: &str) -> VoiceResult<bool> {
+        let marked_tag_id = match self.get_marked_tag_id()? {
+            Some(id) => id,
+            None => return Err(VoiceError::database_op("_system/_marked tag not found")),
+        };
+
+        let marked_tag_hex = crate::validation::uuid_bytes_to_hex(&marked_tag_id)?;
+        self.add_tag_to_note(note_id, &marked_tag_hex)
+    }
+
+    /// Unmark a note (remove the _marked tag)
+    pub fn unmark_note(&self, note_id: &str) -> VoiceResult<bool> {
+        let marked_tag_id = match self.get_marked_tag_id()? {
+            Some(id) => id,
+            None => return Ok(false), // No _marked tag means nothing to remove
+        };
+
+        let marked_tag_hex = crate::validation::uuid_bytes_to_hex(&marked_tag_id)?;
+        self.remove_tag_from_note(note_id, &marked_tag_hex)
+    }
+
+    /// Toggle a note's marked state, returns the new state
+    pub fn toggle_note_marked(&self, note_id: &str) -> VoiceResult<bool> {
+        if self.is_note_marked(note_id)? {
+            self.unmark_note(note_id)?;
+            Ok(false)
+        } else {
+            self.mark_note(note_id)?;
+            Ok(true)
+        }
+    }
+
+    /// Get the _system tag ID as hex string (for filtering in UI)
+    pub fn get_system_tag_id_hex(&self) -> VoiceResult<Option<String>> {
+        match self.get_system_tag_id()? {
+            Some(bytes) => Ok(Some(crate::validation::uuid_bytes_to_hex(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     /// Close the database connection

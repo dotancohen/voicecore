@@ -863,6 +863,64 @@ impl VoiceClient {
             })
     }
 
+    // =========================================================================
+    // Note marking (star/bookmark) methods
+    // =========================================================================
+
+    /// Check if a note is marked (starred/bookmarked)
+    pub fn is_note_marked(&self, note_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.is_note_marked(&note_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Mark a note (add the _system/_marked tag)
+    ///
+    /// Returns true if the note was marked, false if already marked.
+    pub fn mark_note(&self, note_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.mark_note(&note_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Unmark a note (remove the _system/_marked tag)
+    ///
+    /// Returns true if the note was unmarked, false if not marked.
+    pub fn unmark_note(&self, note_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.unmark_note(&note_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Toggle a note's marked state
+    ///
+    /// Returns the new marked state (true if now marked, false if now unmarked).
+    pub fn toggle_note_marked(&self, note_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.toggle_note_marked(&note_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Get the _system tag ID as a hex string
+    ///
+    /// Used for filtering system tags from UI display.
+    /// Returns None if the _system tag doesn't exist yet.
+    pub fn get_system_tag_id_hex(&self) -> Result<Option<String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.get_system_tag_id_hex()
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
     /// Execute a search query
     ///
     /// Supports "tag:Name" syntax for tag filtering and free text search.
