@@ -1484,6 +1484,92 @@ impl Database {
         Ok(updated > 0)
     }
 
+    /// Move a tag to a different parent (or make it a root tag)
+    ///
+    /// # Arguments
+    /// * `tag_id` - ID or prefix of the tag to move
+    /// * `new_parent_id` - ID or prefix of new parent, or None to make it a root tag
+    ///
+    /// # Returns
+    /// True if the tag was moved, false if tag not found
+    pub fn reparent_tag(&self, tag_id: &str, new_parent_id: Option<&str>) -> VoiceResult<bool> {
+        // Use try_resolve to return false if not found
+        let resolved_id = match self.try_resolve_tag_id(tag_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
+        let tag_bytes = uuid.as_bytes().to_vec();
+
+        // Resolve new parent if provided
+        let parent_bytes: Option<Vec<u8>> = match new_parent_id {
+            Some(pid) => {
+                let resolved_parent = self.resolve_tag_id(pid)?;
+                let parent_uuid = Uuid::parse_str(&resolved_parent)
+                    .map_err(|e| VoiceError::validation("new_parent_id", e.to_string()))?;
+
+                // Prevent circular reference: tag cannot be its own ancestor
+                if resolved_parent == resolved_id {
+                    return Err(VoiceError::validation("new_parent_id", "A tag cannot be its own parent"));
+                }
+
+                // Check if new parent is a descendant of this tag (would create a cycle)
+                if self.is_tag_descendant_of(&resolved_parent, &resolved_id)? {
+                    return Err(VoiceError::validation(
+                        "new_parent_id",
+                        "Cannot move tag under its own descendant",
+                    ));
+                }
+
+                Some(parent_uuid.as_bytes().to_vec())
+            }
+            None => None,
+        };
+
+        let updated = self.conn.execute(
+            "UPDATE tags SET parent_id = ?, modified_at = datetime('now') WHERE id = ?",
+            params![parent_bytes, tag_bytes],
+        )?;
+
+        Ok(updated > 0)
+    }
+
+    /// Check if a tag is a descendant of another tag
+    fn is_tag_descendant_of(&self, potential_descendant: &str, potential_ancestor: &str) -> VoiceResult<bool> {
+        let descendant_uuid = Uuid::parse_str(potential_descendant)
+            .map_err(|e| VoiceError::validation("potential_descendant", e.to_string()))?;
+        let ancestor_uuid = Uuid::parse_str(potential_ancestor)
+            .map_err(|e| VoiceError::validation("potential_ancestor", e.to_string()))?;
+        let descendant_bytes = descendant_uuid.as_bytes().to_vec();
+        let ancestor_bytes = ancestor_uuid.as_bytes().to_vec();
+
+        // Walk up the parent chain from descendant to see if we hit ancestor
+        let mut current_id = descendant_bytes;
+        loop {
+            let parent: Option<Option<Vec<u8>>> = self
+                .conn
+                .query_row(
+                    "SELECT parent_id FROM tags WHERE id = ? AND deleted_at IS NULL",
+                    params![&current_id],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?;
+
+            match parent {
+                Some(Some(parent_id)) => {
+                    if parent_id == ancestor_bytes {
+                        return Ok(true);
+                    }
+                    current_id = parent_id;
+                }
+                _ => break,
+            }
+        }
+
+        Ok(false)
+    }
+
     /// Add a tag to a note (accepts ID or ID prefix for both)
     pub fn add_tag_to_note(&self, note_id: &str, tag_id: &str) -> VoiceResult<bool> {
         // Use try_resolve to return false if either entity not found
