@@ -68,6 +68,11 @@ impl VoiceError {
     pub fn database_op(message: impl Into<String>) -> Self {
         VoiceError::DatabaseOperation(message.into())
     }
+
+    /// Create a new not found error
+    pub fn not_found(entity_type: impl Into<String>, id: impl Into<String>) -> Self {
+        VoiceError::NotFound(format!("{} with id '{}' not found", entity_type.into(), id.into()))
+    }
 }
 
 /// Validation error with field and message

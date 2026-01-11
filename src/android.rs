@@ -69,6 +69,8 @@ pub struct NoteData {
     pub created_at: String,
     pub modified_at: Option<String>,
     pub deleted_at: Option<String>,
+    /// Cache for notes list pane display (JSON with date, marked, content_preview)
+    pub list_display_cache: Option<String>,
 }
 
 /// An audio file from the database
@@ -203,6 +205,7 @@ impl VoiceClient {
                 created_at: n.created_at,
                 modified_at: n.modified_at,
                 deleted_at: n.deleted_at,
+                list_display_cache: n.list_display_cache,
             })
             .collect())
     }
@@ -909,6 +912,29 @@ impl VoiceClient {
             })
     }
 
+    /// Rebuild the list pane display cache for a single note
+    ///
+    /// The cache stores pre-computed data for the Notes List display:
+    /// date, marked status, and content preview (first 100 chars).
+    pub fn rebuild_note_list_cache(&self, note_id: String) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.rebuild_note_list_cache(&note_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Rebuild the list pane display cache for all notes
+    ///
+    /// Returns the number of notes processed.
+    pub fn rebuild_all_note_list_caches(&self) -> Result<u32, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.rebuild_all_note_list_caches()
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
     /// Get the _system tag ID as a hex string
     ///
     /// Used for filtering system tags from UI display.
@@ -939,6 +965,7 @@ impl VoiceClient {
                     created_at: n.created_at,
                     modified_at: n.modified_at,
                     deleted_at: n.deleted_at,
+                    list_display_cache: n.list_display_cache,
                 })
                 .collect(),
             ambiguous_tags: result.ambiguous_tags,

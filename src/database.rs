@@ -29,6 +29,49 @@ pub const SYSTEM_TAG_NAME: &str = "_system";
 /// Marked tag name - child of _system, used for starring/bookmarking notes
 pub const MARKED_TAG_NAME: &str = "_marked";
 
+// =============================================================================
+// Cache Registry - All di_cache_* fields in the database
+// =============================================================================
+// This registry lists all cache columns that can be rebuilt. When adding a new
+// cache column to any table, add it here so it's included in rebuild-all-caches.
+
+/// Describes a cache field in the database
+#[derive(Debug, Clone)]
+pub struct CacheFieldInfo {
+    /// The table containing this cache field
+    pub table: &'static str,
+    /// The column name (e.g., "di_cache_note_pane_display")
+    pub column: &'static str,
+    /// Human-readable description
+    pub description: &'static str,
+}
+
+/// Registry of all cache fields in the database.
+/// Add new cache columns here when they are created.
+pub static CACHE_REGISTRY: &[CacheFieldInfo] = &[
+    CacheFieldInfo {
+        table: "notes",
+        column: "di_cache_note_pane_display",
+        description: "Note pane display cache (tags, conflicts, attachments)",
+    },
+    CacheFieldInfo {
+        table: "notes",
+        column: "di_cache_note_list_pane_display",
+        description: "Notes list pane display cache (date, marked, content_preview)",
+    },
+];
+
+/// Summary of a cache rebuild operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheRebuildSummary {
+    /// Number of notes processed
+    pub notes_processed: u32,
+    /// Number of cache fields rebuilt per note
+    pub cache_fields_rebuilt: u32,
+    /// Errors encountered during rebuild (if any)
+    pub errors: Vec<String>,
+}
+
 /// Set the local device ID for database operations.
 pub fn set_local_device_id(device_id: Uuid) {
     let _ = LOCAL_DEVICE_ID.set(device_id);
@@ -50,6 +93,8 @@ pub struct NoteRow {
     pub deleted_at: Option<String>,
     pub tag_names: Option<String>,
     pub display_cache: Option<String>,
+    /// Cache for notes list pane display (JSON with date, marked, content_preview)
+    pub list_display_cache: Option<String>,
 }
 
 /// Tag data returned from database queries
@@ -165,7 +210,8 @@ impl Database {
                 content TEXT NOT NULL,
                 modified_at DATETIME,
                 deleted_at DATETIME,
-                di_cache_note_pane_display TEXT
+                di_cache_note_pane_display TEXT,
+                di_cache_note_list_pane_display TEXT
             );
 
             -- Create tags table with UUID7 BLOB primary key
@@ -377,6 +423,10 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_note_tags_created_at ON note_tags(created_at);
             CREATE INDEX IF NOT EXISTS idx_note_tags_deleted_at ON note_tags(deleted_at);
             CREATE INDEX IF NOT EXISTS idx_note_tags_modified_at ON note_tags(modified_at);
+            -- Composite indexes for tag search: covers all columns in EXISTS subquery
+            CREATE INDEX IF NOT EXISTS idx_note_tags_search ON note_tags(note_id, tag_id, deleted_at);
+            -- Reverse index for finding notes by tag
+            CREATE INDEX IF NOT EXISTS idx_note_tags_by_tag ON note_tags(tag_id, note_id, deleted_at);
             CREATE INDEX IF NOT EXISTS idx_note_attachments_note_id ON note_attachments(note_id);
             CREATE INDEX IF NOT EXISTS idx_note_attachments_attachment_id ON note_attachments(attachment_id);
             CREATE INDEX IF NOT EXISTS idx_note_attachments_type ON note_attachments(attachment_type);
@@ -397,6 +447,7 @@ impl Database {
         self.migrate_add_tags_deleted_at()?;
         self.migrate_add_note_cache()?;
         self.migrate_add_system_tags()?;
+        self.migrate_add_note_list_cache()?;
 
         Ok(())
     }
@@ -671,6 +722,40 @@ impl Database {
         Ok(())
     }
 
+    /// Migration: Add di_cache_note_list_pane_display column to notes table.
+    ///
+    /// This migration adds the cache column for pre-computed notes list display data.
+    fn migrate_add_note_list_cache(&mut self) -> VoiceResult<()> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        // Version 6 = note list cache column added
+        if version >= 6 {
+            return Ok(());
+        }
+
+        // Check if column exists (in case of partial migration)
+        let has_cache: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('notes') WHERE name = 'di_cache_note_list_pane_display'",
+                [],
+                |row| row.get(0),
+            )?;
+
+        if !has_cache {
+            self.conn.execute(
+                "ALTER TABLE notes ADD COLUMN di_cache_note_list_pane_display TEXT",
+                [],
+            )?;
+        }
+
+        self.conn.execute("PRAGMA user_version = 6", [])?;
+
+        Ok(())
+    }
+
     // =========================================================================
     // UUID Prefix Resolution
     // =========================================================================
@@ -875,7 +960,8 @@ impl Database {
                 n.modified_at,
                 n.deleted_at,
                 GROUP_CONCAT(t.name, ', ') as tag_names,
-                NULL as di_cache_note_pane_display
+                NULL as di_cache_note_pane_display,
+                n.di_cache_note_list_pane_display
             FROM notes n
             LEFT JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
@@ -913,7 +999,8 @@ impl Database {
                 n.modified_at,
                 n.deleted_at,
                 GROUP_CONCAT(t.name, ', ') as tag_names,
-                n.di_cache_note_pane_display
+                n.di_cache_note_pane_display,
+                n.di_cache_note_list_pane_display
             FROM notes n
             LEFT JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
@@ -940,7 +1027,12 @@ impl Database {
             params![uuid_bytes, content],
         )?;
 
-        Ok(note_id.simple().to_string())
+        let note_id_hex = note_id.simple().to_string();
+
+        // Rebuild list cache for the new note
+        let _ = self.rebuild_note_list_cache(&note_id_hex);
+
+        Ok(note_id_hex)
     }
 
     /// Update a note's content (accepts ID or ID prefix)
@@ -967,9 +1059,10 @@ impl Database {
             params![content, uuid_bytes],
         )?;
 
-        // Rebuild display cache if update succeeded
+        // Rebuild display caches if update succeeded
         if updated > 0 {
             let _ = self.rebuild_note_cache(&resolved_id);
+            let _ = self.rebuild_note_list_cache(&resolved_id);
         }
 
         Ok(updated > 0)
@@ -1410,7 +1503,8 @@ impl Database {
                 n.modified_at,
                 n.deleted_at,
                 GROUP_CONCAT(t.name, ', ') as tag_names,
-                NULL as di_cache_note_pane_display
+                NULL as di_cache_note_pane_display,
+                n.di_cache_note_list_pane_display
             FROM notes n
             INNER JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
@@ -1456,7 +1550,8 @@ impl Database {
                 n.modified_at,
                 n.deleted_at,
                 GROUP_CONCAT(t.name, ', ') as tag_names,
-                NULL as di_cache_note_pane_display
+                NULL as di_cache_note_pane_display,
+                n.di_cache_note_list_pane_display
             FROM notes n
             LEFT JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
@@ -1835,7 +1930,14 @@ impl Database {
         };
 
         let marked_tag_hex = crate::validation::uuid_bytes_to_hex(&marked_tag_id)?;
-        self.add_tag_to_note(note_id, &marked_tag_hex)
+        let result = self.add_tag_to_note(note_id, &marked_tag_hex)?;
+
+        // Rebuild list cache since marked status changed
+        if result {
+            let _ = self.rebuild_note_list_cache(note_id);
+        }
+
+        Ok(result)
     }
 
     /// Unmark a note (remove the _marked tag)
@@ -1846,7 +1948,14 @@ impl Database {
         };
 
         let marked_tag_hex = crate::validation::uuid_bytes_to_hex(&marked_tag_id)?;
-        self.remove_tag_from_note(note_id, &marked_tag_hex)
+        let result = self.remove_tag_from_note(note_id, &marked_tag_hex)?;
+
+        // Rebuild list cache since marked status changed
+        if result {
+            let _ = self.rebuild_note_list_cache(note_id);
+        }
+
+        Ok(result)
     }
 
     /// Toggle a note's marked state, returns the new state
@@ -2835,6 +2944,12 @@ impl Database {
                 params![uuid_bytes, created_at, content, modified_at, deleted_at],
             )?;
         }
+
+        // Rebuild list cache after sync (only if not deleted)
+        if deleted_at.is_none() {
+            let _ = self.rebuild_note_list_cache(note_id);
+        }
+
         Ok(true)
     }
 
@@ -2932,6 +3047,14 @@ impl Database {
                 params![note_bytes, tag_bytes, created_at, modified_at, deleted_at],
             )?;
         }
+
+        // Check if this is the _marked tag - if so, rebuild list cache
+        if let Some(marked_tag_id) = self.get_marked_tag_id()? {
+            if tag_bytes == marked_tag_id {
+                let _ = self.rebuild_note_list_cache(note_id);
+            }
+        }
+
         Ok(true)
     }
 
@@ -3857,6 +3980,7 @@ impl Database {
         let deleted_at: Option<String> = row.get(4)?;
         let tag_names: Option<String> = row.get(5)?;
         let display_cache: Option<String> = row.get(6)?;
+        let list_display_cache: Option<String> = row.get(7)?;
 
         Ok(NoteRow {
             id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -3866,6 +3990,7 @@ impl Database {
             deleted_at: deleted_at.map(|s| parse_sqlite_datetime(&s)),
             tag_names,
             display_cache,
+            list_display_cache,
         })
     }
 
@@ -4790,6 +4915,90 @@ impl Database {
         Ok(())
     }
 
+    /// Rebuild the list pane display cache for a specific note.
+    ///
+    /// The cache contains pre-computed data for the notes list pane:
+    /// - date: created_at timestamp
+    /// - marked: whether the note has the _system/_marked tag
+    /// - content_preview: first 100 characters of content
+    ///
+    /// This should be called after any mutation that affects the note's list display.
+    pub fn rebuild_note_list_cache(&self, note_id: &str) -> VoiceResult<()> {
+        let resolved_id = self.resolve_note_id(note_id)?;
+        let note_uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
+        let note_bytes = note_uuid.as_bytes().to_vec();
+
+        // 1. Get note's created_at and content
+        let (created_at, content): (String, String) = self.conn.query_row(
+            "SELECT created_at, content FROM notes WHERE id = ? AND deleted_at IS NULL",
+            params![&note_bytes],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => VoiceError::not_found("note", note_id),
+            _ => VoiceError::Database(e),
+        })?;
+
+        // 2. Check if note is marked (has _system/_marked tag)
+        let is_marked = self.is_note_marked(&resolved_id)?;
+
+        // 3. Get content preview (first 100 chars, newlines replaced with spaces)
+        let content_preview: String = content
+            .chars()
+            .take(100)
+            .collect::<String>()
+            .replace('\n', " ")
+            .replace('\r', "");
+
+        // 4. Build JSON cache
+        let cache = serde_json::json!({
+            "date": parse_sqlite_datetime(&created_at),
+            "marked": is_marked,
+            "content_preview": content_preview,
+            "cached_at": Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        });
+
+        let cache_str = serde_json::to_string(&cache)
+            .map_err(|e| VoiceError::Other(format!("Failed to serialize list cache: {}", e)))?;
+
+        // 5. Update the cache column
+        self.conn.execute(
+            "UPDATE notes SET di_cache_note_list_pane_display = ? WHERE id = ?",
+            params![cache_str, note_bytes],
+        )?;
+
+        Ok(())
+    }
+
+    /// Rebuild the list pane display cache for all notes.
+    ///
+    /// Returns the number of notes processed.
+    pub fn rebuild_all_note_list_caches(&self) -> VoiceResult<u32> {
+        // Get all non-deleted note IDs
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM notes WHERE deleted_at IS NULL"
+        )?;
+
+        let note_ids: Vec<String> = stmt
+            .query_map([], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                Ok(uuid_bytes_to_hex(&id_bytes).unwrap_or_default())
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let count = note_ids.len() as u32;
+
+        for note_id in note_ids {
+            if let Err(e) = self.rebuild_note_list_cache(&note_id) {
+                // Log error but continue with other notes
+                eprintln!("Warning: Failed to rebuild list cache for note {}: {}", note_id, e);
+            }
+        }
+
+        Ok(count)
+    }
+
     /// Rebuild the display cache for all notes.
     ///
     /// Returns the number of notes processed.
@@ -4817,6 +5026,61 @@ impl Database {
         }
 
         Ok(count)
+    }
+
+    /// Rebuild ALL cache fields for a single note.
+    ///
+    /// This rebuilds every cache column listed in CACHE_REGISTRY for the given note.
+    /// Currently rebuilds: di_cache_note_pane_display, di_cache_note_list_pane_display
+    pub fn rebuild_all_caches_for_note(&self, note_id: &str) -> VoiceResult<()> {
+        // Rebuild note pane cache
+        self.rebuild_note_cache(note_id)?;
+        // Rebuild list pane cache
+        self.rebuild_note_list_cache(note_id)?;
+        Ok(())
+    }
+
+    /// Rebuild ALL cache fields for all notes in the database.
+    ///
+    /// This rebuilds every cache column listed in CACHE_REGISTRY.
+    /// Returns a summary of notes processed.
+    pub fn rebuild_all_database_caches(&self) -> VoiceResult<CacheRebuildSummary> {
+        // Get all non-deleted note IDs
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM notes WHERE deleted_at IS NULL"
+        )?;
+
+        let note_ids: Vec<String> = stmt
+            .query_map([], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                Ok(uuid_bytes_to_hex(&id_bytes).unwrap_or_default())
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let total_notes = note_ids.len() as u32;
+        let mut errors: Vec<String> = Vec::new();
+
+        for note_id in &note_ids {
+            // Rebuild all caches for this note
+            if let Err(e) = self.rebuild_note_cache(note_id) {
+                errors.push(format!("note_pane_cache for {}: {}", note_id, e));
+            }
+            if let Err(e) = self.rebuild_note_list_cache(note_id) {
+                errors.push(format!("note_list_cache for {}: {}", note_id, e));
+            }
+        }
+
+        Ok(CacheRebuildSummary {
+            notes_processed: total_notes,
+            cache_fields_rebuilt: CACHE_REGISTRY.len() as u32,
+            errors,
+        })
+    }
+
+    /// Get information about all registered cache fields.
+    pub fn get_cache_registry_info() -> Vec<CacheFieldInfo> {
+        CACHE_REGISTRY.to_vec()
     }
 
     /// Rebuild display caches for all notes associated with an audio file.
