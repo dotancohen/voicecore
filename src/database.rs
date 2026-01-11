@@ -1790,8 +1790,15 @@ impl Database {
                 "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
                 params![note_bytes],
             )?;
-            // Rebuild display cache
+            // Rebuild note pane cache (tags list changed)
             let _ = self.rebuild_note_cache(&resolved_note_id);
+
+            // Also rebuild list cache if this is the _marked tag (marked status changed)
+            if let Some(marked_tag_id) = self.get_marked_tag_id()? {
+                if tag_bytes == marked_tag_id {
+                    let _ = self.rebuild_note_list_cache(&resolved_note_id);
+                }
+            }
         }
 
         Ok(changed)
@@ -1826,8 +1833,15 @@ impl Database {
                 "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
                 params![note_bytes],
             )?;
-            // Rebuild display cache
+            // Rebuild note pane cache (tags list changed)
             let _ = self.rebuild_note_cache(&resolved_note_id);
+
+            // Also rebuild list cache if this is the _marked tag (marked status changed)
+            if let Some(marked_tag_id) = self.get_marked_tag_id()? {
+                if tag_bytes == marked_tag_id {
+                    let _ = self.rebuild_note_list_cache(&resolved_note_id);
+                }
+            }
         }
 
         Ok(updated > 0)
@@ -2945,9 +2959,12 @@ impl Database {
             )?;
         }
 
-        // Rebuild list cache after sync (only if not deleted)
+        // Rebuild caches after sync (only if not deleted)
         if deleted_at.is_none() {
+            // List cache: content_preview may have changed
             let _ = self.rebuild_note_list_cache(note_id);
+            // Note pane cache: conflicts may have been created during sync
+            let _ = self.rebuild_note_cache(note_id);
         }
 
         Ok(true)
@@ -3048,7 +3065,10 @@ impl Database {
             )?;
         }
 
-        // Check if this is the _marked tag - if so, rebuild list cache
+        // Always rebuild note pane cache (tags list changed)
+        let _ = self.rebuild_note_cache(note_id);
+
+        // Also rebuild list cache if this is the _marked tag (marked status changed)
         if let Some(marked_tag_id) = self.get_marked_tag_id()? {
             if tag_bytes == marked_tag_id {
                 let _ = self.rebuild_note_list_cache(note_id);
