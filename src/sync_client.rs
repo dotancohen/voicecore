@@ -1120,6 +1120,7 @@ impl SyncClient {
         let filename = data["filename"].as_str().unwrap_or("");
         let file_created_at_normalized = normalize_datetime_optional(data["file_created_at"].as_str());
         let file_created_at = file_created_at_normalized.as_deref();
+        let duration_seconds = data["duration_seconds"].as_i64();
         let summary = data["summary"].as_str();
         let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
         let modified_at = modified_at_normalized.as_deref();
@@ -1131,6 +1132,7 @@ impl SyncClient {
             imported_at,
             filename,
             file_created_at,
+            duration_seconds,
             summary,
             modified_at,
             deleted_at,

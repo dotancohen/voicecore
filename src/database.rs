@@ -127,6 +127,7 @@ pub struct AudioFileRow {
     pub imported_at: String,
     pub filename: String,
     pub file_created_at: Option<String>,
+    pub duration_seconds: Option<i64>,
     pub summary: Option<String>,
     pub device_id: String,
     pub modified_at: Option<String>,
@@ -150,6 +151,17 @@ pub struct TranscriptionRow {
     pub deleted_at: Option<String>,
 }
 
+/// Result of a tag change operation (add/remove tag from note)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagChangeResult {
+    /// Whether the tag association was actually changed
+    pub changed: bool,
+    /// The note ID that was affected
+    pub note_id: String,
+    /// Whether the list pane cache was rebuilt
+    pub list_cache_rebuilt: bool,
+}
+
 /// Default state for new transcriptions
 pub const DEFAULT_TRANSCRIPTION_STATE: &str = "original !verified !verbatim !cleaned !polished";
 
@@ -162,11 +174,10 @@ fn uuid_bytes_to_hex(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// Parse SQLite datetime string to ISO format
+/// Parse SQLite datetime string, returning as-is
 fn parse_sqlite_datetime(s: &str) -> String {
-    // SQLite uses "YYYY-MM-DD HH:MM:SS" format
-    // Convert to ISO format with T separator
-    s.replace(' ', "T")
+    // SQLite uses "YYYY-MM-DD HH:MM:SS" format - return unchanged
+    s.to_string()
 }
 
 /// Database wrapper for SQLite operations
@@ -388,6 +399,7 @@ impl Database {
                 imported_at DATETIME NOT NULL,
                 filename TEXT NOT NULL,
                 file_created_at DATETIME,
+                duration_seconds INTEGER,
                 summary TEXT,
                 device_id BLOB NOT NULL,
                 modified_at DATETIME,
@@ -448,6 +460,7 @@ impl Database {
         self.migrate_add_note_cache()?;
         self.migrate_add_system_tags()?;
         self.migrate_add_note_list_cache()?;
+        self.migrate_add_audio_duration()?;
 
         Ok(())
     }
@@ -752,6 +765,40 @@ impl Database {
         }
 
         self.conn.execute("PRAGMA user_version = 6", [])?;
+
+        Ok(())
+    }
+
+    /// Migration: Add duration_seconds column to audio_files table.
+    ///
+    /// This migration adds the column for storing audio file duration in seconds.
+    fn migrate_add_audio_duration(&mut self) -> VoiceResult<()> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        // Version 7 = duration_seconds column added
+        if version >= 7 {
+            return Ok(());
+        }
+
+        // Check if column exists (in case of partial migration)
+        let has_duration: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('audio_files') WHERE name = 'duration_seconds'",
+                [],
+                |row| row.get(0),
+            )?;
+
+        if !has_duration {
+            self.conn.execute(
+                "ALTER TABLE audio_files ADD COLUMN duration_seconds INTEGER",
+                [],
+            )?;
+        }
+
+        self.conn.execute("PRAGMA user_version = 7", [])?;
 
         Ok(())
     }
@@ -1733,15 +1780,25 @@ impl Database {
     }
 
     /// Add a tag to a note (accepts ID or ID prefix for both)
-    pub fn add_tag_to_note(&self, note_id: &str, tag_id: &str) -> VoiceResult<bool> {
-        // Use try_resolve to return false if either entity not found
+    ///
+    /// Returns a TagChangeResult indicating what was changed and whether caches were rebuilt.
+    pub fn add_tag_to_note(&self, note_id: &str, tag_id: &str) -> VoiceResult<TagChangeResult> {
+        // Use try_resolve to return unchanged result if either entity not found
         let resolved_note_id = match self.try_resolve_note_id(note_id)? {
             Some(id) => id,
-            None => return Ok(false),
+            None => return Ok(TagChangeResult {
+                changed: false,
+                note_id: note_id.to_string(),
+                list_cache_rebuilt: false,
+            }),
         };
         let resolved_tag_id = match self.try_resolve_tag_id(tag_id)? {
             Some(id) => id,
-            None => return Ok(false),
+            None => return Ok(TagChangeResult {
+                changed: false,
+                note_id: resolved_note_id.clone(),
+                list_cache_rebuilt: false,
+            }),
         };
         let note_uuid = Uuid::parse_str(&resolved_note_id)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
@@ -1784,36 +1841,46 @@ impl Database {
             }
         };
 
-        // Update the parent Note's modified_at to trigger sync
+        // Update caches and return result
+        let mut list_cache_rebuilt = false;
         if changed {
+            // Update the parent Note's modified_at to trigger sync
             self.conn.execute(
                 "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
                 params![note_bytes],
             )?;
             // Rebuild note pane cache (tags list changed)
             let _ = self.rebuild_note_cache(&resolved_note_id);
-
-            // Also rebuild list cache if this is the _marked tag (marked status changed)
-            if let Some(marked_tag_id) = self.get_marked_tag_id()? {
-                if tag_bytes == marked_tag_id {
-                    let _ = self.rebuild_note_list_cache(&resolved_note_id);
-                }
-            }
+            // Always rebuild list cache since tags are displayed in the list pane
+            let _ = self.rebuild_note_list_cache(&resolved_note_id);
+            list_cache_rebuilt = true;
         }
 
-        Ok(changed)
+        Ok(TagChangeResult {
+            changed,
+            note_id: resolved_note_id,
+            list_cache_rebuilt,
+        })
     }
 
     /// Remove a tag from a note (soft delete) (accepts ID or ID prefix for both)
-    pub fn remove_tag_from_note(&self, note_id: &str, tag_id: &str) -> VoiceResult<bool> {
-        // Use try_resolve to return false if either entity not found
+    pub fn remove_tag_from_note(&self, note_id: &str, tag_id: &str) -> VoiceResult<TagChangeResult> {
+        // Use try_resolve to return unchanged result if either entity not found
         let resolved_note_id = match self.try_resolve_note_id(note_id)? {
             Some(id) => id,
-            None => return Ok(false),
+            None => return Ok(TagChangeResult {
+                changed: false,
+                note_id: note_id.to_string(),
+                list_cache_rebuilt: false,
+            }),
         };
         let resolved_tag_id = match self.try_resolve_tag_id(tag_id)? {
             Some(id) => id,
-            None => return Ok(false),
+            None => return Ok(TagChangeResult {
+                changed: false,
+                note_id: resolved_note_id,
+                list_cache_rebuilt: false,
+            }),
         };
         let note_uuid = Uuid::parse_str(&resolved_note_id)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
@@ -1827,8 +1894,11 @@ impl Database {
             params![&note_bytes, &tag_bytes],
         )?;
 
+        let changed = updated > 0;
+        let mut list_cache_rebuilt = false;
+
         // Update the parent Note's modified_at to trigger sync
-        if updated > 0 {
+        if changed {
             self.conn.execute(
                 "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
                 params![note_bytes],
@@ -1836,15 +1906,16 @@ impl Database {
             // Rebuild note pane cache (tags list changed)
             let _ = self.rebuild_note_cache(&resolved_note_id);
 
-            // Also rebuild list cache if this is the _marked tag (marked status changed)
-            if let Some(marked_tag_id) = self.get_marked_tag_id()? {
-                if tag_bytes == marked_tag_id {
-                    let _ = self.rebuild_note_list_cache(&resolved_note_id);
-                }
-            }
+            // Always rebuild list cache (tags are now shown in list view)
+            let _ = self.rebuild_note_list_cache(&resolved_note_id);
+            list_cache_rebuilt = true;
         }
 
-        Ok(updated > 0)
+        Ok(TagChangeResult {
+            changed,
+            note_id: resolved_note_id,
+            list_cache_rebuilt,
+        })
     }
 
     /// Get all active tags for a note (accepts ID or ID prefix)
@@ -1946,12 +2017,8 @@ impl Database {
         let marked_tag_hex = crate::validation::uuid_bytes_to_hex(&marked_tag_id)?;
         let result = self.add_tag_to_note(note_id, &marked_tag_hex)?;
 
-        // Rebuild list cache since marked status changed
-        if result {
-            let _ = self.rebuild_note_list_cache(note_id);
-        }
-
-        Ok(result)
+        // List cache is already rebuilt by add_tag_to_note
+        Ok(result.changed)
     }
 
     /// Unmark a note (remove the _marked tag)
@@ -1964,12 +2031,8 @@ impl Database {
         let marked_tag_hex = crate::validation::uuid_bytes_to_hex(&marked_tag_id)?;
         let result = self.remove_tag_from_note(note_id, &marked_tag_hex)?;
 
-        // Rebuild list cache since marked status changed
-        if result {
-            let _ = self.rebuild_note_list_cache(note_id);
-        }
-
-        Ok(result)
+        // List cache is already rebuilt by remove_tag_from_note
+        Ok(result.changed)
     }
 
     /// Toggle a note's marked state, returns the new state
@@ -2856,7 +2919,7 @@ impl Database {
 
         // Get all audio_files
         let mut stmt = self.conn.prepare(
-            r#"SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at FROM audio_files"#
+            r#"SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at FROM audio_files"#
         )?;
         let af_rows = stmt.query_map([], |row| {
             Ok((
@@ -2864,21 +2927,23 @@ impl Database {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })?;
 
         let mut audio_files = Vec::new();
         for row in af_rows {
-            let (id_bytes, imported_at, filename, file_created_at, summary, device_id_bytes, modified_at, deleted_at) = row?;
+            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at) = row?;
             let mut af = HashMap::new();
             af.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
             af.insert("imported_at".to_string(), serde_json::Value::String(imported_at));
             af.insert("filename".to_string(), serde_json::Value::String(filename));
             af.insert("file_created_at".to_string(), file_created_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            af.insert("duration_seconds".to_string(), duration_seconds.map_or(serde_json::Value::Null, |d| serde_json::json!(d)));
             af.insert("summary".to_string(), summary.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             af.insert("device_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default()));
             af.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
@@ -4200,19 +4265,30 @@ impl Database {
         filename: &str,
         file_created_at: Option<&str>,
     ) -> VoiceResult<String> {
+        self.create_audio_file_with_duration(filename, file_created_at, None)
+    }
+
+    /// Create a new audio file record with optional duration
+    pub fn create_audio_file_with_duration(
+        &self,
+        filename: &str,
+        file_created_at: Option<&str>,
+        duration_seconds: Option<i64>,
+    ) -> VoiceResult<String> {
         let audio_file_id = Uuid::now_v7();
         let uuid_bytes = audio_file_id.as_bytes().to_vec();
         let device_id = get_local_device_id();
 
         self.conn.execute(
             r#"
-            INSERT INTO audio_files (id, imported_at, filename, file_created_at, device_id)
-            VALUES (?, datetime('now'), ?, ?, ?)
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, device_id)
+            VALUES (?, datetime('now'), ?, ?, ?, ?)
             "#,
             params![
                 uuid_bytes,
                 filename,
                 file_created_at,
+                duration_seconds,
                 device_id.as_bytes().to_vec(),
             ],
         )?;
@@ -4233,7 +4309,7 @@ impl Database {
 
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at
+            SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at
             FROM audio_files
             WHERE id = ?
             "#,
@@ -4260,8 +4336,8 @@ impl Database {
 
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT af.id, af.imported_at, af.filename, af.file_created_at, af.summary,
-                   af.device_id, af.modified_at, af.deleted_at
+            SELECT af.id, af.imported_at, af.filename, af.file_created_at, af.duration_seconds,
+                   af.summary, af.device_id, af.modified_at, af.deleted_at
             FROM audio_files af
             INNER JOIN note_attachments na ON af.id = na.attachment_id
             WHERE na.note_id = ?
@@ -4284,8 +4360,8 @@ impl Database {
     pub fn get_all_audio_files(&self) -> VoiceResult<Vec<AudioFileRow>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, imported_at, filename, file_created_at, summary,
-                   device_id, modified_at, deleted_at
+            SELECT id, imported_at, filename, file_created_at, duration_seconds,
+                   summary, device_id, modified_at, deleted_at
             FROM audio_files
             ORDER BY imported_at DESC
             "#,
@@ -4351,21 +4427,75 @@ impl Database {
         Ok(updated > 0)
     }
 
+    /// Update an audio file's duration
+    pub fn update_audio_file_duration(
+        &self,
+        audio_file_id: &str,
+        duration_seconds: i64,
+    ) -> VoiceResult<bool> {
+        let resolved_id = match self.try_resolve_audio_file_id(audio_file_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+        let device_id = get_local_device_id();
+
+        let updated = self.conn.execute(
+            r#"
+            UPDATE audio_files
+            SET duration_seconds = ?, modified_at = datetime('now'), device_id = ?
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![duration_seconds, device_id.as_bytes().to_vec(), uuid_bytes],
+        )?;
+
+        // Rebuild list cache for any notes that have this audio file attached
+        if updated > 0 {
+            self.rebuild_caches_for_audio_file(&resolved_id);
+        }
+
+        Ok(updated > 0)
+    }
+
+    /// Get all audio files that are missing duration information
+    pub fn get_audio_files_missing_duration(&self) -> VoiceResult<Vec<AudioFileRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, imported_at, filename, file_created_at, duration_seconds,
+                   summary, device_id, modified_at, deleted_at
+            FROM audio_files
+            WHERE duration_seconds IS NULL AND deleted_at IS NULL
+            ORDER BY imported_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| self.row_to_audio_file(row))?;
+        let mut audio_files = Vec::new();
+        for audio_file in rows {
+            audio_files.push(audio_file?);
+        }
+        Ok(audio_files)
+    }
+
     fn row_to_audio_file(&self, row: &Row) -> rusqlite::Result<AudioFileRow> {
         let id_bytes: Vec<u8> = row.get(0)?;
         let imported_at: String = row.get(1)?;
         let filename: String = row.get(2)?;
         let file_created_at: Option<String> = row.get(3)?;
-        let summary: Option<String> = row.get(4)?;
-        let device_id_bytes: Vec<u8> = row.get(5)?;
-        let modified_at: Option<String> = row.get(6)?;
-        let deleted_at: Option<String> = row.get(7)?;
+        let duration_seconds: Option<i64> = row.get(4)?;
+        let summary: Option<String> = row.get(5)?;
+        let device_id_bytes: Vec<u8> = row.get(6)?;
+        let modified_at: Option<String> = row.get(7)?;
+        let deleted_at: Option<String> = row.get(8)?;
 
         Ok(AudioFileRow {
             id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
             imported_at: parse_sqlite_datetime(&imported_at),
             filename,
             file_created_at: file_created_at.map(|s| parse_sqlite_datetime(&s)),
+            duration_seconds,
             summary,
             device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
             modified_at: modified_at.map(|s| parse_sqlite_datetime(&s)),
@@ -4519,6 +4649,7 @@ impl Database {
         imported_at: &str,
         filename: &str,
         file_created_at: Option<&str>,
+        duration_seconds: Option<i64>,
         summary: Option<&str>,
         modified_at: Option<&str>,
         deleted_at: Option<&str>,
@@ -4529,11 +4660,12 @@ impl Database {
 
         self.conn.execute(
             r#"
-            INSERT INTO audio_files (id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 filename = excluded.filename,
                 file_created_at = excluded.file_created_at,
+                duration_seconds = excluded.duration_seconds,
                 summary = excluded.summary,
                 modified_at = excluded.modified_at,
                 deleted_at = excluded.deleted_at,
@@ -4544,6 +4676,7 @@ impl Database {
                 imported_at,
                 filename,
                 file_created_at,
+                duration_seconds,
                 summary,
                 device_id.as_bytes().to_vec(),
                 modified_at,
@@ -4962,19 +5095,64 @@ impl Database {
         // 2. Check if note is marked (has _system/_marked tag)
         let is_marked = self.is_note_marked(&resolved_id)?;
 
-        // 3. Get content preview (first 100 chars, newlines replaced with spaces)
+        // 3. Get content preview (first 200 chars, newlines replaced with spaces)
         let content_preview: String = content
             .chars()
-            .take(100)
+            .take(200)
             .collect::<String>()
             .replace('\n', " ")
             .replace('\r', "");
 
-        // 4. Build JSON cache
+        // 4. Get total duration of attached audio files (in seconds)
+        let total_duration: Option<i64> = self.conn.query_row(
+            r#"
+            SELECT SUM(af.duration_seconds)
+            FROM note_attachments na
+            JOIN audio_files af ON na.attachment_id = af.id
+            WHERE na.note_id = ?
+              AND na.deleted_at IS NULL
+              AND af.deleted_at IS NULL
+              AND af.duration_seconds IS NOT NULL
+            "#,
+            params![&note_bytes],
+            |row| row.get(0),
+        ).unwrap_or(None);
+
+        // 5. Get tags for this note (excluding system tags starting with _)
+        let mut tag_stmt = self.conn.prepare(
+            r#"
+            SELECT t.id, t.name, t.parent_id
+            FROM tags t
+            JOIN note_tags nt ON t.id = nt.tag_id
+            WHERE nt.note_id = ?
+              AND nt.deleted_at IS NULL
+              AND t.deleted_at IS NULL
+              AND t.name NOT LIKE '\_%' ESCAPE '\'
+            ORDER BY t.name
+            "#,
+        )?;
+        let tag_rows = tag_stmt.query_map(params![&note_bytes], |row| {
+            let id_bytes: Vec<u8> = row.get(0)?;
+            let name: String = row.get(1)?;
+            let parent_id: Option<Vec<u8>> = row.get(2)?;
+            Ok((id_bytes, name, parent_id))
+        })?;
+
+        let mut tag_display_names: Vec<String> = Vec::new();
+        for row in tag_rows {
+            let (id_bytes, name, parent_id) = row?;
+            let tag_id = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
+            let display_name = self.get_tag_display_name(&tag_id, &name, parent_id.as_deref())?;
+            tag_display_names.push(display_name);
+        }
+
+        // 6. Build JSON cache
         let cache = serde_json::json!({
             "date": parse_sqlite_datetime(&created_at),
             "marked": is_marked,
             "content_preview": content_preview,
+            "duration_seconds": total_duration,
+            "tags": tag_display_names,
             "cached_at": Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
         });
 
@@ -5138,7 +5316,7 @@ impl Database {
         }
     }
 
-    /// Get tags for a note with full hierarchical paths.
+    /// Get tags for a note with display names (minimal paths handling ambiguity).
     fn get_note_tags_with_paths(&self, note_id: &str) -> VoiceResult<Vec<serde_json::Value>> {
         let note_uuid = Uuid::parse_str(note_id)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
@@ -5150,6 +5328,7 @@ impl Database {
             FROM tags t
             INNER JOIN note_tags nt ON t.id = nt.tag_id
             WHERE nt.note_id = ? AND nt.deleted_at IS NULL AND t.deleted_at IS NULL
+              AND t.name NOT LIKE '\_%' ESCAPE '\'
             "#
         )?;
 
@@ -5160,15 +5339,15 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
 
-        // Build full paths for each tag
+        // Build display names for each tag (minimal path handling ambiguity)
         let mut result = Vec::new();
         for (id_bytes, name, parent_id) in tags {
             let tag_id = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-            let full_path = self.build_tag_path(&id_bytes, &name, parent_id.as_deref())?;
+            let display_name = self.get_tag_display_name(&tag_id, &name, parent_id.as_deref())?;
             result.push(serde_json::json!({
                 "id": tag_id,
                 "name": name,
-                "full_path": full_path
+                "display_name": display_name
             }));
         }
 
@@ -5190,6 +5369,79 @@ impl Database {
 
             if let Some((parent_name, grandparent_id)) = result {
                 path_parts.push(parent_name);
+                current_parent = grandparent_id;
+            } else {
+                break;
+            }
+        }
+
+        path_parts.reverse();
+        Ok(path_parts.join("/"))
+    }
+
+    /// Get the minimal display name for a tag, adding parent prefixes only if ambiguous.
+    ///
+    /// If the tag name is unique, returns just the name (e.g., "Paris").
+    /// If ambiguous, adds parent prefixes recursively until unique (e.g., "France/Paris").
+    fn get_tag_display_name(&self, tag_id: &str, tag_name: &str, parent_id: Option<&[u8]>) -> VoiceResult<String> {
+        // Check if tag name is ambiguous
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tags WHERE name = ? COLLATE NOCASE AND deleted_at IS NULL",
+            params![tag_name],
+            |row| row.get(0),
+        )?;
+
+        if count <= 1 {
+            // Name is unique, just return it
+            return Ok(tag_name.to_string());
+        }
+
+        // Name is ambiguous, need to add parent prefix
+        // Build path going up until we have a unique path
+        let mut path_parts = vec![tag_name.to_string()];
+        let mut current_parent = parent_id.map(|p| p.to_vec());
+
+        while let Some(parent_bytes) = current_parent {
+            let result: Option<(String, Option<Vec<u8>>)> = self.conn.query_row(
+                "SELECT name, parent_id FROM tags WHERE id = ? AND deleted_at IS NULL",
+                params![&parent_bytes],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+
+            if let Some((parent_name, grandparent_id)) = result {
+                path_parts.push(parent_name.clone());
+
+                // Check if current path is now unique
+                let current_path: String = {
+                    let mut tmp = path_parts.clone();
+                    tmp.reverse();
+                    tmp.join("/")
+                };
+
+                // Count how many tags end with this path
+                let path_count: i64 = self.conn.query_row(
+                    r#"
+                    WITH RECURSIVE tag_paths AS (
+                        SELECT id, name, parent_id, name as path
+                        FROM tags WHERE deleted_at IS NULL
+                        UNION ALL
+                        SELECT t.id, t.name, t.parent_id, p.name || '/' || tp.path
+                        FROM tags t
+                        JOIN tag_paths tp ON t.id = tp.parent_id
+                        JOIN tags p ON t.id = p.id
+                        WHERE t.deleted_at IS NULL
+                    )
+                    SELECT COUNT(*) FROM tag_paths WHERE path = ? COLLATE NOCASE
+                    "#,
+                    params![&current_path],
+                    |row| row.get(0),
+                ).unwrap_or(0);
+
+                if path_count <= 1 {
+                    // Path is now unique
+                    break;
+                }
+
                 current_parent = grandparent_id;
             } else {
                 break;
@@ -5309,9 +5561,9 @@ impl Database {
                 let created_at: String = row.get(3)?;
                 let content: String = row.get(4)?;
 
-                // Truncate content to first 100 characters for preview
-                let content_preview: String = if content.chars().count() > 100 {
-                    content.chars().take(100).collect::<String>() + "…"
+                // Truncate content to first 200 characters for preview
+                let content_preview: String = if content.chars().count() > 200 {
+                    content.chars().take(200).collect::<String>() + "…"
                 } else {
                     content.clone()
                 };

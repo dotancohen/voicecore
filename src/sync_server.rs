@@ -1328,6 +1328,7 @@ fn apply_audio_file_change(
     let imported_at = data["imported_at"].as_str().unwrap_or("");
     let filename = data["filename"].as_str().unwrap_or("");
     let file_created_at = data["file_created_at"].as_str();
+    let duration_seconds = data["duration_seconds"].as_i64();
     let summary = data["summary"].as_str();
     let modified_at = data["modified_at"].as_str();
     let deleted_at = data["deleted_at"].as_str();
@@ -1360,12 +1361,12 @@ fn apply_audio_file_change(
             if existing.is_some() {
                 return Ok(ApplyResult::Skipped);
             }
-            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
             Ok(ApplyResult::Applied)
         }
         "update" | "delete" => {
             if existing.is_none() {
-                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1376,7 +1377,7 @@ fn apply_audio_file_change(
             // Audio files are simpler - no content conflicts (metadata + binary)
             // If both deleted, apply
             if local_deleted && remote_deleted {
-                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1387,12 +1388,12 @@ fn apply_audio_file_change(
 
             // If local deleted but remote has updates (reactivation or edit)
             if local_deleted && !remote_deleted {
-                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
 
             // Otherwise apply the update
-            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, summary, modified_at, deleted_at)?;
+            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
             Ok(ApplyResult::Applied)
         }
         _ => Ok(ApplyResult::Skipped),
@@ -1627,27 +1628,29 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
     // Get all audio_files
     let mut audio_files = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at FROM audio_files",
+        "SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at FROM audio_files",
     )?;
     let audio_file_rows = stmt.query_map([], |row| {
         let id_bytes: Vec<u8> = row.get(0)?;
         let imported_at: String = row.get(1)?;
         let filename: String = row.get(2)?;
         let file_created_at: Option<String> = row.get(3)?;
-        let summary: Option<String> = row.get(4)?;
-        let modified_at: Option<String> = row.get(5)?;
-        let deleted_at: Option<String> = row.get(6)?;
-        Ok((id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at))
+        let duration_seconds: Option<f64> = row.get(4)?;
+        let summary: Option<String> = row.get(5)?;
+        let modified_at: Option<String> = row.get(6)?;
+        let deleted_at: Option<String> = row.get(7)?;
+        Ok((id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at))
     })?;
 
     for row in audio_file_rows {
-        let (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at) = row?;
+        let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at) = row?;
         let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
         audio_files.push(serde_json::json!({
             "id": id_hex,
             "imported_at": imported_at,
             "filename": filename,
             "file_created_at": file_created_at,
+            "duration_seconds": duration_seconds,
             "summary": summary,
             "modified_at": modified_at,
             "deleted_at": deleted_at,
@@ -1923,7 +1926,7 @@ mod tests {
         );
 
         // Apply with no last_sync (meaning local changed since last sync)
-        let result = apply_note_change(&db, &remote_change, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -1972,7 +1975,7 @@ mod tests {
         );
 
         // Apply with last_sync before the remote change (local unchanged)
-        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 06:00:00")).unwrap();
+        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 06:00:00"), None, None).unwrap();
 
         // Should apply cleanly
         assert_eq!(result, ApplyResult::Applied);
@@ -2013,7 +2016,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2056,7 +2059,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2092,7 +2095,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
 
         // Should apply (both agree on deletion)
         assert_eq!(result, ApplyResult::Applied);
@@ -2129,7 +2132,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2169,7 +2172,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
 
         // Should apply cleanly - they agree
         assert_eq!(result, ApplyResult::Applied);
@@ -2210,7 +2213,7 @@ mod tests {
 
         // Use a far-future last_sync so local operations are considered "before last_sync"
         // This simulates: local deleted before last sync, then remote reactivates
-        let result = apply_note_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00")).unwrap();
+        let result = apply_note_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00"), None, None).unwrap();
 
         // Should apply since local hasn't changed since last_sync
         assert_eq!(result, ApplyResult::Applied);
@@ -2251,7 +2254,7 @@ mod tests {
         );
 
         // Apply with no last_sync (local changed)
-        let result = apply_note_change(&db, &remote_change, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2305,7 +2308,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        apply_note_change(&db, &remote_change, None).unwrap();
+        apply_note_change(&db, &remote_change, None, None, None).unwrap();
 
         // MUST be able to query unresolved conflicts
         let conflicts = db.get_note_content_conflicts(false).unwrap();
@@ -2342,7 +2345,7 @@ mod tests {
         );
 
         // last_sync is AFTER the remote change
-        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 12:00:00")).unwrap();
+        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 12:00:00"), None, None).unwrap();
 
         assert_eq!(result, ApplyResult::Skipped, "Old changes should be skipped");
 
@@ -2403,6 +2406,8 @@ mod tests {
             &changes,
             "00000000000070008000000000000099",
             Some("Remote"),
+            None,
+            None,
         ).unwrap();
 
         // Both should be conflicts
@@ -2444,7 +2449,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2488,7 +2493,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
 
         // Should apply - they agree
         assert_eq!(result, ApplyResult::Applied);
@@ -2521,7 +2526,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2559,7 +2564,7 @@ mod tests {
         );
 
         // Use far-future last_sync so local appears unchanged
-        let result = apply_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00")).unwrap();
+        let result = apply_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00"), None, None).unwrap();
 
         // Should apply
         assert_eq!(result, ApplyResult::Applied);
@@ -2599,7 +2604,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
 
         // Should apply (not conflict) since content is identical
         assert_eq!(result, ApplyResult::Applied,
@@ -2636,7 +2641,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2726,6 +2731,8 @@ mod tests {
             &changes,
             "00000000000070008000000000000099",
             Some("Test Device"),
+            None,
+            None,
         ).unwrap();
 
         // Should have 3 successful applications
@@ -2764,6 +2771,8 @@ mod tests {
             &changes,
             "00000000000070008000000000000099",
             Some("Test"),
+            None,
+            None,
         ).unwrap();
 
         assert_eq!(applied, 0);
@@ -2793,7 +2802,7 @@ mod tests {
         };
 
         // Apply should reject the malformed datetime
-        let result = apply_note_change(&db, &malformed_change, None);
+        let result = apply_note_change(&db, &malformed_change, None, None, None);
 
         assert!(result.is_err(), "Malformed datetime should cause an error");
         let err = result.unwrap_err();
@@ -2824,7 +2833,7 @@ mod tests {
         );
 
         // Apply should succeed
-        let result = apply_note_change(&db, &valid_change, None);
+        let result = apply_note_change(&db, &valid_change, None, None, None);
 
         assert!(result.is_ok(), "Valid datetime should be accepted: {:?}", result);
         assert_eq!(result.unwrap(), ApplyResult::Applied, "Valid datetime should be applied");
@@ -3144,6 +3153,7 @@ mod tests {
             audio_data.get("imported_at").and_then(|v| v.as_str()).unwrap_or(""),
             audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
             audio_data.get("file_created_at").and_then(|v| v.as_str()),
+            audio_data.get("duration_seconds").and_then(|v| v.as_i64()),
             audio_data.get("summary").and_then(|v| v.as_str()),
             audio_data.get("modified_at").and_then(|v| v.as_str()),
             audio_data.get("deleted_at").and_then(|v| v.as_str()),
@@ -3214,6 +3224,7 @@ mod tests {
                         data.get("imported_at").and_then(|v| v.as_str()).unwrap_or(""),
                         data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
                         data.get("file_created_at").and_then(|v| v.as_str()),
+                        data.get("duration_seconds").and_then(|v| v.as_i64()),
                         data.get("summary").and_then(|v| v.as_str()),
                         data.get("modified_at").and_then(|v| v.as_str()),
                         data.get("deleted_at").and_then(|v| v.as_str()),
@@ -3311,6 +3322,7 @@ mod tests {
             audio_data.get("imported_at").and_then(|v| v.as_str()).unwrap_or(""),
             audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
             audio_data.get("file_created_at").and_then(|v| v.as_str()),
+            audio_data.get("duration_seconds").and_then(|v| v.as_i64()),
             audio_data.get("summary").and_then(|v| v.as_str()),
             audio_data.get("modified_at").and_then(|v| v.as_str()),
             audio_data.get("deleted_at").and_then(|v| v.as_str()),

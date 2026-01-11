@@ -134,6 +134,17 @@ pub struct SearchResultData {
     pub not_found_tags: Vec<String>,
 }
 
+/// Result of a tag change operation (add/remove tag from note)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TagChangeResultData {
+    /// Whether the tag association was actually changed
+    pub changed: bool,
+    /// The note ID that was affected
+    pub note_id: String,
+    /// Whether the list pane cache was rebuilt
+    pub list_cache_rebuilt: bool,
+}
+
 /// Sync operation result
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SyncResultData {
@@ -844,11 +855,16 @@ impl VoiceClient {
     /// Add a tag to a note
     ///
     /// Creates a note_tag association between the note and tag.
-    /// Returns true if successful, false if the association already exists.
-    pub fn add_tag_to_note(&self, note_id: String, tag_id: String) -> Result<bool, VoiceCoreError> {
+    /// Returns TagChangeResultData with changed=true if tag was added,
+    /// changed=false if it already existed.
+    pub fn add_tag_to_note(&self, note_id: String, tag_id: String) -> Result<TagChangeResultData, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.add_tag_to_note(&note_id, &tag_id)
-            .map(|_| true)
+            .map(|result| TagChangeResultData {
+                changed: result.changed,
+                note_id: result.note_id,
+                list_cache_rebuilt: result.list_cache_rebuilt,
+            })
             .map_err(|e| VoiceCoreError::Database {
                 msg: e.to_string(),
             })
@@ -857,10 +873,16 @@ impl VoiceClient {
     /// Remove a tag from a note
     ///
     /// Soft-deletes the note_tag association between the note and tag.
-    /// Returns true if the tag was removed, false if the association didn't exist.
-    pub fn remove_tag_from_note(&self, note_id: String, tag_id: String) -> Result<bool, VoiceCoreError> {
+    /// Returns TagChangeResultData with changed=true if tag was removed,
+    /// changed=false if the association didn't exist.
+    pub fn remove_tag_from_note(&self, note_id: String, tag_id: String) -> Result<TagChangeResultData, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.remove_tag_from_note(&note_id, &tag_id)
+            .map(|result| TagChangeResultData {
+                changed: result.changed,
+                note_id: result.note_id,
+                list_cache_rebuilt: result.list_cache_rebuilt,
+            })
             .map_err(|e| VoiceCoreError::Database {
                 msg: e.to_string(),
             })
@@ -999,6 +1021,7 @@ impl VoiceClient {
                 created_at: n.created_at,
                 modified_at: n.modified_at,
                 deleted_at: n.deleted_at,
+                list_display_cache: n.list_display_cache,
             })
             .collect())
     }
