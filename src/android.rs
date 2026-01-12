@@ -960,8 +960,7 @@ impl VoiceClient {
     /// Get the _system tag ID as a hex string
     ///
     /// Used for filtering system tags from UI display.
-    /// Returns None if the _system tag doesn't exist yet.
-    pub fn get_system_tag_id_hex(&self) -> Result<Option<String>, VoiceCoreError> {
+    pub fn get_system_tag_id_hex(&self) -> Result<String, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.get_system_tag_id_hex()
             .map_err(|e| VoiceCoreError::Database {

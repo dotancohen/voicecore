@@ -2147,8 +2147,10 @@ mod tests {
             let (db, config, _temp_dir) = create_test_db_and_config();
             let client = SyncClient::new(db, config).unwrap();
 
+            // Empty db still has system tags (_system, _marked)
             let changes = client.get_changes_since(None).unwrap();
-            assert!(changes.is_empty());
+            assert_eq!(changes.len(), 2);
+            assert!(changes.iter().all(|c| c.entity_type == "tag"));
         }
 
         #[test]

@@ -29,6 +29,12 @@ pub const SYSTEM_TAG_NAME: &str = "_system";
 /// Marked tag name - child of _system, used for starring/bookmarking notes
 pub const MARKED_TAG_NAME: &str = "_marked";
 
+/// Deterministic UUID for _system tag - same on all devices to prevent duplicates during sync.
+pub const SYSTEM_TAG_UUID: &str = "a1b2c3d4-0000-5000-8000-000000000001";
+
+/// Deterministic UUID for _marked tag - same on all devices to prevent duplicates during sync.
+pub const MARKED_TAG_UUID: &str = "a1b2c3d4-0000-5000-8000-000000000002";
+
 // =============================================================================
 // Cache Registry - All di_cache_* fields in the database
 // =============================================================================
@@ -454,13 +460,24 @@ impl Database {
             "#,
         )?;
 
-        // Run migrations for existing databases
-        self.migrate_add_transcription_state()?;
-        self.migrate_add_tags_deleted_at()?;
-        self.migrate_add_note_cache()?;
-        self.migrate_add_system_tags()?;
-        self.migrate_add_note_list_cache()?;
-        self.migrate_add_audio_duration()?;
+        // Create system tags with deterministic UUIDs
+        // These are the same on all devices to prevent duplicates during sync
+        let system_uuid = Uuid::parse_str(SYSTEM_TAG_UUID)
+            .map_err(|e| VoiceError::Other(format!("Invalid SYSTEM_TAG_UUID: {}", e)))?;
+        let marked_uuid = Uuid::parse_str(MARKED_TAG_UUID)
+            .map_err(|e| VoiceError::Other(format!("Invalid MARKED_TAG_UUID: {}", e)))?;
+        let system_bytes = system_uuid.as_bytes().to_vec();
+        let marked_bytes = marked_uuid.as_bytes().to_vec();
+
+        // Insert system tags if they don't exist (OR IGNORE handles duplicates)
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, NULL, datetime('now'))",
+            params![&system_bytes, SYSTEM_TAG_NAME],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, datetime('now'))",
+            params![&marked_bytes, MARKED_TAG_NAME, &system_bytes],
+        )?;
 
         Ok(())
     }
@@ -473,27 +490,19 @@ impl Database {
     ///
     /// This should be run via `cli maintenance database-normalize`.
     pub fn normalize_database(&mut self) -> VoiceResult<()> {
-        self.migrate_normalize_timestamps()?;
+        self.normalize_timestamps()?;
         // Future normalizations can be added here
         Ok(())
     }
 
     /// Normalize all datetime values to SQLite format (YYYY-MM-DD HH:MM:SS).
     ///
-    /// This migration fixes timestamps that may have been stored in ISO 8601 format
+    /// This fixes timestamps that may have been stored in ISO 8601 format
     /// (with 'T' separator and/or microseconds) from earlier sync operations.
     /// String comparison of timestamps requires consistent format.
-    fn migrate_normalize_timestamps(&mut self) -> VoiceResult<()> {
-        // Check if migration already ran (using a simple marker in pragmas)
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
-        // Version 1 = timestamps normalized
-        if version >= 1 {
-            return Ok(());
-        }
-
+    ///
+    /// This is idempotent - the WHERE clauses only match rows needing updates.
+    fn normalize_timestamps(&mut self) -> VoiceResult<()> {
         // Normalize notes timestamps
         self.conn.execute_batch(
             r#"
@@ -564,242 +573,6 @@ impl Database {
             "#,
         )?;
 
-        // Mark migration as complete
-        self.conn.execute("PRAGMA user_version = 1", [])?;
-
-        Ok(())
-    }
-
-    /// Add state column to transcriptions table.
-    ///
-    /// This migration adds the `state` field to track transcription processing state:
-    /// "original !verified !verbatim !cleaned !polished"
-    fn migrate_add_transcription_state(&mut self) -> VoiceResult<()> {
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
-        // Version 2 = transcription state column added
-        if version >= 2 {
-            return Ok(());
-        }
-
-        // Add state column to transcriptions table if it doesn't exist
-        // SQLite doesn't have IF NOT EXISTS for columns, so we check first
-        let has_state: bool = self.conn.query_row(
-            "SELECT COUNT(*) > 0 FROM pragma_table_info('transcriptions') WHERE name = 'state'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        if !has_state {
-            self.conn.execute(
-                &format!(
-                    "ALTER TABLE transcriptions ADD COLUMN state TEXT NOT NULL DEFAULT '{}'",
-                    DEFAULT_TRANSCRIPTION_STATE
-                ),
-                [],
-            )?;
-        }
-
-        self.conn.execute("PRAGMA user_version = 2", [])?;
-
-        Ok(())
-    }
-
-    /// Add deleted_at column to tags table for soft delete support.
-    ///
-    /// This migration enables soft-delete for tags (like notes) so that
-    /// tag deletions can be synced between devices.
-    fn migrate_add_tags_deleted_at(&mut self) -> VoiceResult<()> {
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
-        // Version 3 = tags deleted_at column added
-        if version >= 3 {
-            return Ok(());
-        }
-
-        // Check if column exists (in case of partial migration)
-        let has_deleted_at: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('tags') WHERE name = 'deleted_at'",
-                [],
-                |row| row.get(0),
-            )?;
-
-        if !has_deleted_at {
-            self.conn.execute(
-                "ALTER TABLE tags ADD COLUMN deleted_at DATETIME",
-                [],
-            )?;
-        }
-
-        self.conn.execute("PRAGMA user_version = 3", [])?;
-
-        Ok(())
-    }
-
-    /// Add di_cache_note_pane_display column to notes table.
-    ///
-    /// This migration adds the cache column for pre-computed note display data.
-    fn migrate_add_note_cache(&mut self) -> VoiceResult<()> {
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
-        // Version 4 = note cache column added
-        if version >= 4 {
-            return Ok(());
-        }
-
-        // Check if column exists (in case of partial migration)
-        let has_cache: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('notes') WHERE name = 'di_cache_note_pane_display'",
-                [],
-                |row| row.get(0),
-            )?;
-
-        if !has_cache {
-            self.conn.execute(
-                "ALTER TABLE notes ADD COLUMN di_cache_note_pane_display TEXT",
-                [],
-            )?;
-        }
-
-        self.conn.execute("PRAGMA user_version = 4", [])?;
-
-        Ok(())
-    }
-
-    /// Migration: Create system tags (_system and _marked)
-    fn migrate_add_system_tags(&mut self) -> VoiceResult<()> {
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
-        // Version 5 = system tags created
-        if version >= 5 {
-            return Ok(());
-        }
-
-        // Check if _system tag already exists
-        let system_tag_exists: bool = self.conn.query_row(
-            "SELECT COUNT(*) > 0 FROM tags WHERE name = ? AND parent_id IS NULL AND deleted_at IS NULL",
-            params![SYSTEM_TAG_NAME],
-            |row| row.get(0),
-        )?;
-
-        let system_tag_id = if system_tag_exists {
-            // Get existing _system tag ID
-            let id_bytes: Vec<u8> = self.conn.query_row(
-                "SELECT id FROM tags WHERE name = ? AND parent_id IS NULL AND deleted_at IS NULL",
-                params![SYSTEM_TAG_NAME],
-                |row| row.get(0),
-            )?;
-            id_bytes
-        } else {
-            // Create _system tag
-            let system_id = Uuid::now_v7();
-            let system_bytes = system_id.as_bytes().to_vec();
-            self.conn.execute(
-                "INSERT INTO tags (id, name, parent_id, created_at) VALUES (?, ?, NULL, datetime('now'))",
-                params![&system_bytes, SYSTEM_TAG_NAME],
-            )?;
-            system_bytes
-        };
-
-        // Check if _marked tag already exists under _system
-        let marked_tag_exists: bool = self.conn.query_row(
-            "SELECT COUNT(*) > 0 FROM tags WHERE name = ? AND parent_id = ? AND deleted_at IS NULL",
-            params![MARKED_TAG_NAME, &system_tag_id],
-            |row| row.get(0),
-        )?;
-
-        if !marked_tag_exists {
-            // Create _marked tag as child of _system
-            let marked_id = Uuid::now_v7();
-            let marked_bytes = marked_id.as_bytes().to_vec();
-            self.conn.execute(
-                "INSERT INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, datetime('now'))",
-                params![&marked_bytes, MARKED_TAG_NAME, &system_tag_id],
-            )?;
-        }
-
-        self.conn.execute("PRAGMA user_version = 5", [])?;
-
-        Ok(())
-    }
-
-    /// Migration: Add di_cache_note_list_pane_display column to notes table.
-    ///
-    /// This migration adds the cache column for pre-computed notes list display data.
-    fn migrate_add_note_list_cache(&mut self) -> VoiceResult<()> {
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
-        // Version 6 = note list cache column added
-        if version >= 6 {
-            return Ok(());
-        }
-
-        // Check if column exists (in case of partial migration)
-        let has_cache: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('notes') WHERE name = 'di_cache_note_list_pane_display'",
-                [],
-                |row| row.get(0),
-            )?;
-
-        if !has_cache {
-            self.conn.execute(
-                "ALTER TABLE notes ADD COLUMN di_cache_note_list_pane_display TEXT",
-                [],
-            )?;
-        }
-
-        self.conn.execute("PRAGMA user_version = 6", [])?;
-
-        Ok(())
-    }
-
-    /// Migration: Add duration_seconds column to audio_files table.
-    ///
-    /// This migration adds the column for storing audio file duration in seconds.
-    fn migrate_add_audio_duration(&mut self) -> VoiceResult<()> {
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
-        // Version 7 = duration_seconds column added
-        if version >= 7 {
-            return Ok(());
-        }
-
-        // Check if column exists (in case of partial migration)
-        let has_duration: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('audio_files') WHERE name = 'duration_seconds'",
-                [],
-                |row| row.get(0),
-            )?;
-
-        if !has_duration {
-            self.conn.execute(
-                "ALTER TABLE audio_files ADD COLUMN duration_seconds INTEGER",
-                [],
-            )?;
-        }
-
-        self.conn.execute("PRAGMA user_version = 7", [])?;
-
         Ok(())
     }
 
@@ -846,62 +619,28 @@ impl Database {
         let like_pattern = format!("{}%", prefix_lower);
 
         let sql = format!(
-            "SELECT id FROM {} WHERE lower(hex(id)) LIKE ?1 {} LIMIT 6",
+            "SELECT id FROM {} WHERE lower(hex(id)) LIKE ?1 {} LIMIT 2",
             table, extra_where
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([&like_pattern])?;
+        let results: Vec<Vec<u8>> = stmt
+            .query_map([&like_pattern], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
 
-        // Get first match
-        let first_row = rows.next()?;
-        let first = match first_row {
-            None => return Ok(None), // Not found
-            Some(row) => {
-                let id_bytes: Vec<u8> = row.get(0)?;
-                uuid_bytes_to_hex(&id_bytes).ok_or_else(|| {
+        match results.len() {
+            0 => Ok(None),
+            1 => {
+                let hex = uuid_bytes_to_hex(&results[0]).ok_or_else(|| {
                     VoiceError::validation(field_name, "invalid UUID in database")
-                })?
+                })?;
+                Ok(Some(hex))
             }
-        };
-
-        // Check for second match (ambiguous)
-        let second_row = rows.next()?;
-        if second_row.is_none() {
-            return Ok(Some(first));
+            _ => Err(VoiceError::validation(
+                field_name,
+                format!("ambiguous {} prefix '{}'", entity_name, id_or_prefix),
+            )),
         }
-
-        // Ambiguous - collect remaining matches for error message
-        let second_bytes: Vec<u8> = second_row.unwrap().get(0)?;
-        let mut previews = vec![format!("{}...", &first[..12.min(first.len())])];
-        if let Some(hex) = uuid_bytes_to_hex(&second_bytes) {
-            previews.push(format!("{}...", &hex[..12.min(hex.len())]));
-        }
-
-        let mut count = 2;
-        while let Some(row) = rows.next()? {
-            count += 1;
-            if previews.len() < 5 {
-                let id_bytes: Vec<u8> = row.get(0)?;
-                if let Some(hex) = uuid_bytes_to_hex(&id_bytes) {
-                    previews.push(format!("{}...", &hex[..12.min(hex.len())]));
-                }
-            }
-        }
-
-        let extra = if count > 5 {
-            format!(" (and {} more)", count - 5)
-        } else {
-            String::new()
-        };
-
-        Err(VoiceError::validation(
-            field_name,
-            format!(
-                "ambiguous prefix '{}' matches {} {}s: {}{}",
-                id_or_prefix, count, entity_name, previews.join(", "), extra
-            ),
-        ))
     }
 
     /// Resolve a note ID or prefix to a full note ID.
@@ -1018,11 +757,9 @@ impl Database {
             "#,
         )?;
 
-        let rows = stmt.query_map([], |row| self.row_to_note(row))?;
-        let mut notes = Vec::new();
-        for note in rows {
-            notes.push(note?);
-        }
+        let notes = stmt
+            .query_map([], |row| self.row_to_note(row))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(notes)
     }
 
@@ -1571,11 +1308,9 @@ impl Database {
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
 
-        let rows = stmt.query_map(params_refs.as_slice(), |row| self.row_to_note(row))?;
-        let mut notes = Vec::new();
-        for note in rows {
-            notes.push(note?);
-        }
+        let notes = stmt
+            .query_map(params_refs.as_slice(), |row| self.row_to_note(row))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(notes)
     }
 
@@ -1644,11 +1379,9 @@ impl Database {
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
 
-        let rows = stmt.query_map(params_refs.as_slice(), |row| self.row_to_note(row))?;
-        let mut notes = Vec::new();
-        for note in rows {
-            notes.push(note?);
-        }
+        let notes = stmt
+            .query_map(params_refs.as_slice(), |row| self.row_to_note(row))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(notes)
     }
 
@@ -1951,35 +1684,18 @@ impl Database {
     // Note marking (starring/bookmarking) methods
     // ============================================================================
 
-    /// Get the _system tag ID
-    fn get_system_tag_id(&self) -> VoiceResult<Option<Vec<u8>>> {
-        let result: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT id FROM tags WHERE name = ? AND parent_id IS NULL AND deleted_at IS NULL",
-                params![SYSTEM_TAG_NAME],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(result)
+    /// Get the _system tag ID (deterministic UUID, created at init)
+    fn get_system_tag_id(&self) -> VoiceResult<Vec<u8>> {
+        let uuid = Uuid::parse_str(SYSTEM_TAG_UUID)
+            .map_err(|e| VoiceError::Other(format!("Invalid SYSTEM_TAG_UUID: {}", e)))?;
+        Ok(uuid.as_bytes().to_vec())
     }
 
-    /// Get the _marked tag ID (child of _system)
-    fn get_marked_tag_id(&self) -> VoiceResult<Option<Vec<u8>>> {
-        let system_id = match self.get_system_tag_id()? {
-            Some(id) => id,
-            None => return Ok(None),
-        };
-
-        let result: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT id FROM tags WHERE name = ? AND parent_id = ? AND deleted_at IS NULL",
-                params![MARKED_TAG_NAME, &system_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(result)
+    /// Get the _marked tag ID (deterministic UUID, created at init)
+    fn get_marked_tag_id(&self) -> VoiceResult<Vec<u8>> {
+        let uuid = Uuid::parse_str(MARKED_TAG_UUID)
+            .map_err(|e| VoiceError::Other(format!("Invalid MARKED_TAG_UUID: {}", e)))?;
+        Ok(uuid.as_bytes().to_vec())
     }
 
     /// Check if a note is marked (starred)
@@ -1989,10 +1705,7 @@ impl Database {
             None => return Ok(false),
         };
 
-        let marked_tag_id = match self.get_marked_tag_id()? {
-            Some(id) => id,
-            None => return Ok(false),
-        };
+        let marked_tag_id = self.get_marked_tag_id()?;
 
         let note_uuid = Uuid::parse_str(&resolved_note_id)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
@@ -2009,11 +1722,7 @@ impl Database {
 
     /// Mark a note (add the _marked tag)
     pub fn mark_note(&self, note_id: &str) -> VoiceResult<bool> {
-        let marked_tag_id = match self.get_marked_tag_id()? {
-            Some(id) => id,
-            None => return Err(VoiceError::database_op("_system/_marked tag not found")),
-        };
-
+        let marked_tag_id = self.get_marked_tag_id()?;
         let marked_tag_hex = crate::validation::uuid_bytes_to_hex(&marked_tag_id)?;
         let result = self.add_tag_to_note(note_id, &marked_tag_hex)?;
 
@@ -2023,11 +1732,7 @@ impl Database {
 
     /// Unmark a note (remove the _marked tag)
     pub fn unmark_note(&self, note_id: &str) -> VoiceResult<bool> {
-        let marked_tag_id = match self.get_marked_tag_id()? {
-            Some(id) => id,
-            None => return Ok(false), // No _marked tag means nothing to remove
-        };
-
+        let marked_tag_id = self.get_marked_tag_id()?;
         let marked_tag_hex = crate::validation::uuid_bytes_to_hex(&marked_tag_id)?;
         let result = self.remove_tag_from_note(note_id, &marked_tag_hex)?;
 
@@ -2047,11 +1752,9 @@ impl Database {
     }
 
     /// Get the _system tag ID as hex string (for filtering in UI)
-    pub fn get_system_tag_id_hex(&self) -> VoiceResult<Option<String>> {
-        match self.get_system_tag_id()? {
-            Some(bytes) => Ok(Some(crate::validation::uuid_bytes_to_hex(&bytes)?)),
-            None => Ok(None),
-        }
+    pub fn get_system_tag_id_hex(&self) -> VoiceResult<String> {
+        let bytes = self.get_system_tag_id()?;
+        crate::validation::uuid_bytes_to_hex(&bytes)
     }
 
     /// Close the database connection
@@ -3134,10 +2837,9 @@ impl Database {
         let _ = self.rebuild_note_cache(note_id);
 
         // Also rebuild list cache if this is the _marked tag (marked status changed)
-        if let Some(marked_tag_id) = self.get_marked_tag_id()? {
-            if tag_bytes == marked_tag_id {
-                let _ = self.rebuild_note_list_cache(note_id);
-            }
+        let marked_tag_id = self.get_marked_tag_id()?;
+        if tag_bytes == marked_tag_id {
+            let _ = self.rebuild_note_list_cache(note_id);
         }
 
         Ok(true)
@@ -5688,7 +5390,12 @@ mod tests {
     fn test_create_database() {
         let db = Database::new_in_memory().unwrap();
         assert!(db.get_all_notes().unwrap().is_empty());
-        assert!(db.get_all_tags().unwrap().is_empty());
+        // Database has system tags (_system, _marked) by default
+        let tags = db.get_all_tags().unwrap();
+        assert_eq!(tags.len(), 2);
+        let tag_names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(tag_names.contains(&"_system"));
+        assert!(tag_names.contains(&"_marked"));
     }
 
     #[test]
@@ -5769,8 +5476,8 @@ mod tests {
         let note_id = db.create_note("Test note").unwrap();
         let tag_id = db.create_tag("Work", None).unwrap();
 
-        let added = db.add_tag_to_note(&note_id, &tag_id).unwrap();
-        assert!(added);
+        let result = db.add_tag_to_note(&note_id, &tag_id).unwrap();
+        assert!(result.changed);
 
         let tags = db.get_note_tags(&note_id).unwrap();
         assert_eq!(tags.len(), 1);
