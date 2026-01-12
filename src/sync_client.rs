@@ -816,7 +816,7 @@ impl SyncClient {
                         Some(&self.device_id),                   // deleting_device_id (local)
                         Some(&self.device_name),                 // deleting_device_name (local)
                     );
-                    db.apply_sync_note(note_id, created_at, content, modified_at, None)?;
+                    db.apply_sync_note(note_id, created_at, content, modified_at, None, None)?;
                     return Ok(true);
                 }
 
@@ -872,7 +872,7 @@ impl SyncClient {
                         let merge_result = merge_content(local_content, content, "LOCAL", "REMOTE");
                         // Use the newer timestamp for the merged content
                         let new_modified = if it > lt { it } else { lt };
-                        db.apply_sync_note(note_id, created_at, &merge_result.content, Some(new_modified), deleted_at)?;
+                        db.apply_sync_note(note_id, created_at, &merge_result.content, Some(new_modified), deleted_at, None)?;
                         return Ok(true);
                     }
                 }
@@ -880,7 +880,7 @@ impl SyncClient {
         }
 
         // No conflict or local doesn't exist - just apply
-        db.apply_sync_note(note_id, created_at, content, modified_at, deleted_at)?;
+        db.apply_sync_note(note_id, created_at, content, modified_at, deleted_at, None)?;
         Ok(true)
     }
 
@@ -964,7 +964,7 @@ impl SyncClient {
                         Some(&self.device_name),
                     );
                     // Resurrect by clearing deleted_at
-                    db.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, None)?;
+                    db.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, None, None)?;
                     return Ok(true);
                 }
 
@@ -1002,7 +1002,7 @@ impl SyncClient {
 
                             // Merge names with separator (deleted_at is None in this branch)
                             let merged_name = format!("{} | {}", local_name, name);
-                            db.apply_sync_tag_with_deleted(tag_id, &merged_name, parent_id, created_at, modified_at, None)?;
+                            db.apply_sync_tag_with_deleted(tag_id, &merged_name, parent_id, created_at, modified_at, None, None)?;
                             return Ok(true);
                         }
 
@@ -1026,7 +1026,7 @@ impl SyncClient {
             }
         }
 
-        db.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, deleted_at)?;
+        db.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, deleted_at, None)?;
         Ok(true)
     }
 
@@ -1096,7 +1096,7 @@ impl SyncClient {
             tracing::trace!("note_tag: no existing local record, will insert");
         }
 
-        db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at)?;
+        db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at, None)?;
         tracing::debug!(
             "note_tag: applied note={}... tag={}...",
             &note_id[..UUID_SHORT_LEN.min(note_id.len())],
@@ -1136,6 +1136,7 @@ impl SyncClient {
             summary,
             modified_at,
             deleted_at,
+            None,  // sync_received_at - None for client-side operations
         )?;
         Ok(true)
     }
@@ -1168,6 +1169,7 @@ impl SyncClient {
             created_at,
             modified_at,
             deleted_at,
+            None,  // sync_received_at - None for client-side operations
         )?;
         Ok(true)
     }
@@ -1210,6 +1212,7 @@ impl SyncClient {
             created_at,
             modified_at,
             deleted_at,
+            None,  // sync_received_at - None for client-side operations
         )?;
         Ok(true)
     }

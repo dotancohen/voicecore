@@ -467,18 +467,22 @@ fn apply_sync_changes(
     let mut conflicts = 0i64;
     let mut errors = Vec::new();
 
+    // Get current Unix timestamp for sync_received_at
+    // This is used to track when the server received the change (not when the change was made)
+    let sync_received_at = Utc::now().timestamp();
+
     // Get last sync timestamp with this peer
     let last_sync_at = db.get_peer_last_sync(peer_device_id)?;
     tracing::trace!("Last sync with peer {}: {:?}", &peer_device_id[..UUID_SHORT_LEN.min(peer_device_id.len())], last_sync_at);
 
     for change in changes {
         let result = match change.entity_type.as_str() {
-            "note" => apply_note_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
-            "tag" => apply_tag_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
-            "note_tag" => apply_note_tag_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
-            "note_attachment" => apply_note_attachment_change(&db, change, last_sync_at.as_deref()),
-            "audio_file" => apply_audio_file_change(&db, change, last_sync_at.as_deref()),
-            "transcription" => apply_transcription_change(&db, change, last_sync_at.as_deref()),
+            "note" => apply_note_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
+            "tag" => apply_tag_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
+            "note_tag" => apply_note_tag_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
+            "note_attachment" => apply_note_attachment_change(&db, change, last_sync_at.as_deref(), sync_received_at),
+            "audio_file" => apply_audio_file_change(&db, change, last_sync_at.as_deref(), sync_received_at),
+            "transcription" => apply_transcription_change(&db, change, last_sync_at.as_deref(), sync_received_at),
             _ => {
                 tracing::warn!("Unknown entity type: {}", change.entity_type);
                 errors.push(format!("Unknown entity type: {}", change.entity_type));
@@ -545,6 +549,7 @@ fn apply_note_change(
     last_sync_at: Option<&str>,
     local_device_id: Option<&str>,
     local_device_name: Option<&str>,
+    sync_received_at: i64,
 ) -> VoiceResult<ApplyResult> {
     let note_id = &change.entity_id;
     let data = &change.data;
@@ -591,6 +596,7 @@ fn apply_note_change(
                         remote_content,
                         modified_at,
                         None,  // Clear deleted_at to resurrect
+                        Some(sync_received_at),
                     )?;
 
                     return Ok(ApplyResult::Conflict);
@@ -604,6 +610,7 @@ fn apply_note_change(
                 data["content"].as_str().unwrap_or(""),
                 data["modified_at"].as_str(),
                 data["deleted_at"].as_str(),
+                Some(sync_received_at),
             )?;
             Ok(ApplyResult::Applied)
         }
@@ -614,7 +621,7 @@ fn apply_note_change(
             let deleted_at = data["deleted_at"].as_str();
 
             if existing.is_none() {
-                db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at)?;
+                db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -688,6 +695,7 @@ fn apply_note_change(
                         remote_content,
                         modified_at,
                         None,  // Clear deleted_at to resurrect
+                        Some(sync_received_at),
                     )?;
                     return Ok(ApplyResult::Conflict);
                 } else if !local_deleted && remote_deleted {
@@ -709,7 +717,7 @@ fn apply_note_change(
                     // Both edited - check if content is identical
                     if local_content == remote_content {
                         // Same content - no conflict needed, just apply to update timestamps
-                        db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at)?;
+                        db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at, Some(sync_received_at))?;
                         return Ok(ApplyResult::Applied);
                     }
                     // Both sides have different content - merge with conflict markers
@@ -737,13 +745,13 @@ fn apply_note_change(
                     )?;
 
                     // Apply merged content to note
-                    db.apply_sync_note(note_id, created_at, merged_content, Some(&now), deleted_at)?;
+                    db.apply_sync_note(note_id, created_at, merged_content, Some(&now), deleted_at, Some(sync_received_at))?;
                     return Ok(ApplyResult::Conflict);
                 }
                 // Both deleted - no conflict, just apply
             }
 
-            db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at)?;
+            db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         _ => Ok(ApplyResult::Skipped),
@@ -756,6 +764,7 @@ fn apply_tag_change(
     last_sync_at: Option<&str>,
     local_device_id: Option<&str>,
     local_device_name: Option<&str>,
+    sync_received_at: i64,
 ) -> VoiceResult<ApplyResult> {
     let tag_id = &change.entity_id;
     let data = &change.data;
@@ -781,6 +790,7 @@ fn apply_tag_change(
                 data["parent_id"].as_str(),
                 data["created_at"].as_str().unwrap_or(""),
                 data["modified_at"].as_str(),
+                Some(sync_received_at),
             )?;
             Ok(ApplyResult::Applied)
         }
@@ -791,7 +801,7 @@ fn apply_tag_change(
             let modified_at = data["modified_at"].as_str();
 
             if existing.is_none() {
-                db.apply_sync_tag(tag_id, remote_name, remote_parent_id, created_at, modified_at)?;
+                db.apply_sync_tag(tag_id, remote_name, remote_parent_id, created_at, modified_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -878,7 +888,7 @@ fn apply_tag_change(
                 modified_at
             };
 
-            db.apply_sync_tag(tag_id, &final_name, final_parent_id, created_at, final_modified)?;
+            db.apply_sync_tag(tag_id, &final_name, final_parent_id, created_at, final_modified, Some(sync_received_at))?;
 
             if has_name_conflict || has_parent_conflict {
                 return Ok(ApplyResult::Conflict);
@@ -940,7 +950,7 @@ fn apply_tag_change(
             let local_created_at = existing.get("created_at")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            db.apply_sync_tag_with_deleted(tag_id, local_name, local_parent_id, local_created_at, Some(deleted_at), Some(deleted_at))?;
+            db.apply_sync_tag_with_deleted(tag_id, local_name, local_parent_id, local_created_at, Some(deleted_at), Some(deleted_at), Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         _ => Ok(ApplyResult::Skipped),
@@ -953,6 +963,7 @@ fn apply_note_tag_change(
     last_sync_at: Option<&str>,
     local_device_id: Option<&str>,
     local_device_name: Option<&str>,
+    sync_received_at: i64,
 ) -> VoiceResult<ApplyResult> {
     // Parse entity_id (format: "note_id:tag_id")
     let parts: Vec<&str> = change.entity_id.split(':').collect();
@@ -1054,17 +1065,17 @@ fn apply_note_tag_change(
                     )?;
                 }
 
-                db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, None)?;
+                db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, None, Some(sync_received_at))?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
             // New association
-            db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, None)?;
+            db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, None, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         "delete" => {
             if existing.is_none() {
                 // Create as deleted for sync consistency
-                db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at)?;
+                db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
             let ex = existing.unwrap();
@@ -1094,13 +1105,13 @@ fn apply_note_tag_change(
             }
             // Apply the delete
             let ex_created_at = ex.get("created_at").and_then(|v| v.as_str()).unwrap_or(created_at);
-            db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, deleted_at)?;
+            db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         "update" => {
             // Update operation - typically reactivation (deleted_at cleared)
             if existing.is_none() {
-                db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at)?;
+                db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1129,7 +1140,7 @@ fn apply_note_tag_change(
                         remote_device_name,
                     )?;
                 }
-                db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, None)?;
+                db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, None, Some(sync_received_at))?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
 
@@ -1153,12 +1164,12 @@ fn apply_note_tag_change(
                     )?;
                     return Ok(ApplyResult::Conflict); // Keep active
                 }
-                db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, deleted_at)?;
+                db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
             // Both have same deleted state - update timestamps
-            db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, deleted_at)?;
+            db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         _ => Ok(ApplyResult::Skipped),
@@ -1169,6 +1180,7 @@ fn apply_note_attachment_change(
     db: &Database,
     change: &SyncChange,
     last_sync_at: Option<&str>,
+    sync_received_at: i64,
 ) -> VoiceResult<ApplyResult> {
     let attachment_assoc_id = &change.entity_id;
     let data = &change.data;
@@ -1234,17 +1246,17 @@ fn apply_note_attachment_change(
                     return Ok(ApplyResult::Skipped);
                 }
                 // Local is deleted, remote wants active - reactivate
-                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, None)?;
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, None, Some(sync_received_at))?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
             // New association
-            db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, None)?;
+            db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, None, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         "delete" => {
             if existing.is_none() {
                 // Create as deleted for sync consistency
-                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
             let ex = existing.unwrap();
@@ -1257,12 +1269,12 @@ fn apply_note_attachment_change(
                 return Ok(ApplyResult::Conflict);
             }
             // Apply the delete
-            db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+            db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         "update" => {
             if existing.is_none() {
-                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1272,7 +1284,7 @@ fn apply_note_attachment_change(
 
             if !remote_deleted && local_deleted {
                 // Remote reactivated, local still deleted - reactivate
-                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, None)?;
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, None, Some(sync_received_at))?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
 
@@ -1281,12 +1293,12 @@ fn apply_note_attachment_change(
                 if local_changed {
                     return Ok(ApplyResult::Conflict); // Keep active
                 }
-                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+                db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
             // Both have same deleted state - update timestamps
-            db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at)?;
+            db.apply_sync_note_attachment(id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         _ => Ok(ApplyResult::Skipped),
@@ -1297,6 +1309,7 @@ fn apply_audio_file_change(
     db: &Database,
     change: &SyncChange,
     last_sync_at: Option<&str>,
+    sync_received_at: i64,
 ) -> VoiceResult<ApplyResult> {
     let audio_file_id = &change.entity_id;
     let data = &change.data;
@@ -1361,12 +1374,12 @@ fn apply_audio_file_change(
             if existing.is_some() {
                 return Ok(ApplyResult::Skipped);
             }
-            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
+            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         "update" | "delete" => {
             if existing.is_none() {
-                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1377,7 +1390,7 @@ fn apply_audio_file_change(
             // Audio files are simpler - no content conflicts (metadata + binary)
             // If both deleted, apply
             if local_deleted && remote_deleted {
-                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1388,12 +1401,12 @@ fn apply_audio_file_change(
 
             // If local deleted but remote has updates (reactivation or edit)
             if local_deleted && !remote_deleted {
-                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
 
             // Otherwise apply the update
-            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at)?;
+            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         _ => Ok(ApplyResult::Skipped),
@@ -1404,6 +1417,7 @@ fn apply_transcription_change(
     db: &Database,
     change: &SyncChange,
     last_sync_at: Option<&str>,
+    sync_received_at: i64,
 ) -> VoiceResult<ApplyResult> {
     let transcription_id = &change.entity_id;
     let data = &change.data;
@@ -1469,12 +1483,12 @@ fn apply_transcription_change(
             if existing.is_some() {
                 return Ok(ApplyResult::Skipped);
             }
-            db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+            db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         "update" | "delete" => {
             if existing.is_none() {
-                db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+                db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1484,7 +1498,7 @@ fn apply_transcription_change(
 
             // If both deleted, apply
             if local_deleted && remote_deleted {
-                db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+                db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1495,12 +1509,12 @@ fn apply_transcription_change(
 
             // If local deleted but remote has updates
             if local_deleted && !remote_deleted {
-                db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+                db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at, Some(sync_received_at))?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
 
             // Otherwise apply the update
-            db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)?;
+            db.apply_sync_transcription(id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
         _ => Ok(ApplyResult::Skipped),
@@ -1728,6 +1742,9 @@ pub fn apply_changes_from_peer(
     // Get last sync timestamp with this peer
     let last_sync_at = db.get_peer_last_sync(peer_device_id)?;
 
+    // Get current Unix timestamp for sync_received_at
+    let sync_received_at = Utc::now().timestamp();
+
     // Sort changes by dependency order to avoid FOREIGN KEY constraint failures:
     // 1. notes, tags, audio_files first (no dependencies) - order 0
     // 2. note_tags, note_attachments, transcriptions last (depend on notes, tags, audio_files) - order 1
@@ -1751,12 +1768,12 @@ pub fn apply_changes_from_peer(
 
     for change in sorted_changes {
         let result = match change.entity_type.as_str() {
-            "note" => apply_note_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
-            "tag" => apply_tag_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
-            "note_tag" => apply_note_tag_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name),
-            "note_attachment" => apply_note_attachment_change(db, change, last_sync_at.as_deref()),
-            "audio_file" => apply_audio_file_change(db, change, last_sync_at.as_deref()),
-            "transcription" => apply_transcription_change(db, change, last_sync_at.as_deref()),
+            "note" => apply_note_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
+            "tag" => apply_tag_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
+            "note_tag" => apply_note_tag_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
+            "note_attachment" => apply_note_attachment_change(db, change, last_sync_at.as_deref(), sync_received_at),
+            "audio_file" => apply_audio_file_change(db, change, last_sync_at.as_deref(), sync_received_at),
+            "transcription" => apply_transcription_change(db, change, last_sync_at.as_deref(), sync_received_at),
             _ => {
                 errors.push(format!("Unknown entity type: {}", change.entity_type));
                 continue;
@@ -1926,7 +1943,7 @@ mod tests {
         );
 
         // Apply with no last_sync (meaning local changed since last sync)
-        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -1975,7 +1992,7 @@ mod tests {
         );
 
         // Apply with last_sync before the remote change (local unchanged)
-        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 06:00:00"), None, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 06:00:00"), None, None, 0).unwrap();
 
         // Should apply cleanly
         assert_eq!(result, ApplyResult::Applied);
@@ -2016,7 +2033,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2059,7 +2076,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2095,7 +2112,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // Should apply (both agree on deletion)
         assert_eq!(result, ApplyResult::Applied);
@@ -2132,7 +2149,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2172,7 +2189,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // Should apply cleanly - they agree
         assert_eq!(result, ApplyResult::Applied);
@@ -2213,7 +2230,7 @@ mod tests {
 
         // Use a far-future last_sync so local operations are considered "before last_sync"
         // This simulates: local deleted before last sync, then remote reactivates
-        let result = apply_note_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00"), None, None).unwrap();
+        let result = apply_note_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00"), None, None, 0).unwrap();
 
         // Should apply since local hasn't changed since last_sync
         assert_eq!(result, ApplyResult::Applied);
@@ -2254,7 +2271,7 @@ mod tests {
         );
 
         // Apply with no last_sync (local changed)
-        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2308,7 +2325,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        apply_note_change(&db, &remote_change, None, None, None).unwrap();
+        apply_note_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // MUST be able to query unresolved conflicts
         let conflicts = db.get_note_content_conflicts(false).unwrap();
@@ -2345,7 +2362,7 @@ mod tests {
         );
 
         // last_sync is AFTER the remote change
-        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 12:00:00"), None, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 12:00:00"), None, None, 0).unwrap();
 
         assert_eq!(result, ApplyResult::Skipped, "Old changes should be skipped");
 
@@ -2432,7 +2449,7 @@ mod tests {
         let child_tag = db.create_tag("child", None).unwrap();
 
         // Local moves child to parent_a
-        db.apply_sync_tag(&child_tag, "child", Some(&parent_a), "", Some("2025-12-24 10:00:00")).unwrap();
+        db.apply_sync_tag(&child_tag, "child", Some(&parent_a), "", Some("2025-12-24 10:00:00"), None).unwrap();
 
         // Remote tries to move child to parent_b
         let remote_change = make_sync_change(
@@ -2449,7 +2466,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2476,7 +2493,7 @@ mod tests {
         let child = db.create_tag("child", None).unwrap();
 
         // Local moves to parent
-        db.apply_sync_tag(&child, "child", Some(&parent), "", Some("2025-12-24 10:00:00")).unwrap();
+        db.apply_sync_tag(&child, "child", Some(&parent), "", Some("2025-12-24 10:00:00"), None).unwrap();
 
         // Remote also moves to same parent
         let remote_change = make_sync_change(
@@ -2493,7 +2510,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // Should apply - they agree
         assert_eq!(result, ApplyResult::Applied);
@@ -2526,7 +2543,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_tag_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2564,7 +2581,7 @@ mod tests {
         );
 
         // Use far-future last_sync so local appears unchanged
-        let result = apply_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00"), None, None).unwrap();
+        let result = apply_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00"), None, None, 0).unwrap();
 
         // Should apply
         assert_eq!(result, ApplyResult::Applied);
@@ -2604,7 +2621,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // Should apply (not conflict) since content is identical
         assert_eq!(result, ApplyResult::Applied,
@@ -2641,7 +2658,7 @@ mod tests {
             "00000000000070008000000000000099",
         );
 
-        let result = apply_note_change(&db, &remote_change, None, None, None).unwrap();
+        let result = apply_note_change(&db, &remote_change, None, None, None, 0).unwrap();
 
         // MUST be a conflict
         assert_eq!(result, ApplyResult::Conflict,
@@ -2802,7 +2819,7 @@ mod tests {
         };
 
         // Apply should reject the malformed datetime
-        let result = apply_note_change(&db, &malformed_change, None, None, None);
+        let result = apply_note_change(&db, &malformed_change, None, None, None, 0);
 
         assert!(result.is_err(), "Malformed datetime should cause an error");
         let err = result.unwrap_err();
@@ -2833,7 +2850,7 @@ mod tests {
         );
 
         // Apply should succeed
-        let result = apply_note_change(&db, &valid_change, None, None, None);
+        let result = apply_note_change(&db, &valid_change, None, None, None, 0);
 
         assert!(result.is_ok(), "Valid datetime should be accepted: {:?}", result);
         assert_eq!(result.unwrap(), ApplyResult::Applied, "Valid datetime should be applied");
@@ -2863,6 +2880,7 @@ mod tests {
             &note_id,
             &note.created_at,
             &note.content,
+            None,
             None,
             None,
         ).unwrap();
@@ -2906,6 +2924,7 @@ mod tests {
             content,
             modified_at,
             deleted_at,
+            None,
         ).unwrap();
 
         // Verify Instance B now sees the note as deleted
@@ -2933,6 +2952,7 @@ mod tests {
             &tag.name,
             None,
             tag.created_at.as_deref().unwrap_or(""),
+            None,
             None,
         ).unwrap();
 
@@ -2977,6 +2997,7 @@ mod tests {
             created_at,
             modified_at,
             deleted_at,
+            None,
         ).unwrap();
 
         // Verify Instance B now sees the tag as deleted
@@ -3144,6 +3165,7 @@ mod tests {
             note_data.get("content").and_then(|v| v.as_str()).unwrap_or(""),
             note_data.get("modified_at").and_then(|v| v.as_str()),
             note_data.get("deleted_at").and_then(|v| v.as_str()),
+            None,
         ).unwrap();
 
         // Apply audio file to Instance B
@@ -3157,6 +3179,7 @@ mod tests {
             audio_data.get("summary").and_then(|v| v.as_str()),
             audio_data.get("modified_at").and_then(|v| v.as_str()),
             audio_data.get("deleted_at").and_then(|v| v.as_str()),
+            None,
         ).unwrap();
 
         // Apply attachment to Instance B
@@ -3170,6 +3193,7 @@ mod tests {
             att_data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
             att_data.get("modified_at").and_then(|v| v.as_str()),
             att_data.get("deleted_at").and_then(|v| v.as_str()),
+            None,
         ).unwrap();
 
         // Verify Instance B has the note
@@ -3215,6 +3239,7 @@ mod tests {
                         data.get("content").and_then(|v| v.as_str()).unwrap_or(""),
                         data.get("modified_at").and_then(|v| v.as_str()),
                         data.get("deleted_at").and_then(|v| v.as_str()),
+                        None,
                     ).unwrap();
                 }
                 "audio_file" => {
@@ -3228,6 +3253,7 @@ mod tests {
                         data.get("summary").and_then(|v| v.as_str()),
                         data.get("modified_at").and_then(|v| v.as_str()),
                         data.get("deleted_at").and_then(|v| v.as_str()),
+                        None,
                     ).unwrap();
                 }
                 "note_attachment" => {
@@ -3240,6 +3266,7 @@ mod tests {
                         data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
                         data.get("modified_at").and_then(|v| v.as_str()),
                         data.get("deleted_at").and_then(|v| v.as_str()),
+                        None,
                     ).unwrap();
                 }
                 _ => {}
@@ -3276,6 +3303,7 @@ mod tests {
             data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
             data.get("modified_at").and_then(|v| v.as_str()),
             data.get("deleted_at").and_then(|v| v.as_str()),
+            None,
         ).unwrap();
 
         // Verify Instance B no longer shows the attachment
@@ -3326,6 +3354,7 @@ mod tests {
             audio_data.get("summary").and_then(|v| v.as_str()),
             audio_data.get("modified_at").and_then(|v| v.as_str()),
             audio_data.get("deleted_at").and_then(|v| v.as_str()),
+            None,
         ).unwrap();
 
         // Find and apply transcription
@@ -3349,6 +3378,7 @@ mod tests {
             trans_data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
             trans_data.get("modified_at").and_then(|v| v.as_str()),
             trans_data.get("deleted_at").and_then(|v| v.as_str()),
+            None,
         ).unwrap();
 
         // Verify Instance B has the transcription
@@ -3477,6 +3507,7 @@ mod tests {
             &now,  // created_at
             Some(&now),  // modified_at
             None,  // deleted_at
+            None,  // sync_received_at - None for local operations
         ).unwrap();
 
         // Get changes since last sync

@@ -205,6 +205,7 @@ impl Database {
 
         let mut db = Self { conn };
         db.init_database()?;
+        db.migrate_add_sync_received_at()?;
         Ok(db)
     }
 
@@ -213,6 +214,7 @@ impl Database {
         let conn = Connection::open_in_memory()?;
         let mut db = Self { conn };
         db.init_database()?;
+        db.migrate_add_sync_received_at()?;
         Ok(db)
     }
 
@@ -227,6 +229,7 @@ impl Database {
                 content TEXT NOT NULL,
                 modified_at DATETIME,
                 deleted_at DATETIME,
+                sync_received_at INTEGER,
                 di_cache_note_pane_display TEXT,
                 di_cache_note_list_pane_display TEXT
             );
@@ -239,6 +242,7 @@ impl Database {
                 created_at DATETIME NOT NULL,
                 modified_at DATETIME,
                 deleted_at DATETIME,
+                sync_received_at INTEGER,
                 FOREIGN KEY (parent_id) REFERENCES tags (id) ON DELETE CASCADE
             );
 
@@ -249,6 +253,7 @@ impl Database {
                 created_at DATETIME NOT NULL,
                 modified_at DATETIME,
                 deleted_at DATETIME,
+                sync_received_at INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE,
                 FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE,
                 PRIMARY KEY (note_id, tag_id)
@@ -396,6 +401,7 @@ impl Database {
                 device_id BLOB NOT NULL,
                 modified_at DATETIME,
                 deleted_at DATETIME,
+                sync_received_at INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE
             );
 
@@ -409,7 +415,8 @@ impl Database {
                 summary TEXT,
                 device_id BLOB NOT NULL,
                 modified_at DATETIME,
-                deleted_at DATETIME
+                deleted_at DATETIME,
+                sync_received_at INTEGER
             );
 
             -- Create transcriptions table
@@ -426,6 +433,7 @@ impl Database {
                 created_at DATETIME NOT NULL,
                 modified_at DATETIME,
                 deleted_at DATETIME,
+                sync_received_at INTEGER,
                 FOREIGN KEY (audio_file_id) REFERENCES audio_files (id) ON DELETE CASCADE
             );
 
@@ -457,6 +465,13 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_transcriptions_created_at ON transcriptions(created_at);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_modified_at ON transcriptions(modified_at);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_deleted_at ON transcriptions(deleted_at);
+            -- Indexes for sync_received_at (used by get_changes_since for sync)
+            CREATE INDEX IF NOT EXISTS idx_notes_sync_received_at ON notes(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_tags_sync_received_at ON tags(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_note_tags_sync_received_at ON note_tags(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_sync_received_at ON note_attachments(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_audio_files_sync_received_at ON audio_files(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_sync_received_at ON transcriptions(sync_received_at);
             "#,
         )?;
 
@@ -572,6 +587,52 @@ impl Database {
             WHERE deleted_at LIKE '%T%';
             "#,
         )?;
+
+        Ok(())
+    }
+
+    /// Migrate existing databases to add sync_received_at column.
+    ///
+    /// This column stores Unix timestamp (seconds since epoch) of when the server
+    /// received a sync change. It's used to correctly track which changes need to
+    /// be sent to clients, avoiding the bug where changes made before a client's
+    /// last sync but pushed to server after are never sent.
+    ///
+    /// This is idempotent - it checks if the column exists before adding it.
+    fn migrate_add_sync_received_at(&mut self) -> VoiceResult<()> {
+        // Helper to check if a column exists in a table
+        fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+            let sql = format!("PRAGMA table_info({})", table);
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let rows = stmt.query_map([], |row| {
+                let name: String = row.get(1)?;
+                Ok(name)
+            }).unwrap();
+            for row in rows {
+                if let Ok(name) = row {
+                    if name == column {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        let tables = ["notes", "tags", "note_tags", "note_attachments", "audio_files", "transcriptions"];
+
+        for table in tables {
+            if !column_exists(&self.conn, table, "sync_received_at") {
+                let sql = format!("ALTER TABLE {} ADD COLUMN sync_received_at INTEGER", table);
+                self.conn.execute(&sql, [])?;
+
+                // Create index for the new column
+                let index_sql = format!(
+                    "CREATE INDEX IF NOT EXISTS idx_{}_sync_received_at ON {}(sync_received_at)",
+                    table, table
+                );
+                self.conn.execute(&index_sql, [])?;
+            }
+        }
 
         Ok(())
     }
@@ -1825,17 +1886,19 @@ impl Database {
         let mut latest_timestamp: Option<String> = None;
 
         // Get note changes
+        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
         let note_rows: Vec<(Vec<u8>, String, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
             let mut stmt = self.conn.prepare(
                 r#"
                 SELECT id, created_at, content, modified_at, deleted_at
                 FROM notes
-                WHERE modified_at >= ? OR created_at >= ?
-                ORDER BY COALESCE(modified_at, created_at)
+                WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
+                   OR (sync_received_at IS NULL AND (modified_at >= ? OR created_at >= ?))
+                ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', modified_at) AS INTEGER), CAST(strftime('%s', created_at) AS INTEGER))
                 LIMIT ?
                 "#,
             )?;
-            let rows = stmt.query_map(params![since_ts, since_ts, limit], |row| {
+            let rows = stmt.query_map(params![since_ts, since_ts, since_ts, limit], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
@@ -1896,6 +1959,7 @@ impl Database {
         }
 
         // Get tag changes
+        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
             let tag_rows: Vec<(Vec<u8>, String, Option<Vec<u8>>, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
@@ -1903,12 +1967,13 @@ impl Database {
                     r#"
                     SELECT id, name, parent_id, created_at, modified_at, deleted_at
                     FROM tags
-                    WHERE modified_at >= ? OR created_at >= ?
-                    ORDER BY COALESCE(modified_at, created_at)
+                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
+                       OR (sync_received_at IS NULL AND (modified_at >= ? OR created_at >= ?))
+                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', modified_at) AS INTEGER), CAST(strftime('%s', created_at) AS INTEGER))
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, String>(1)?,
@@ -1977,6 +2042,7 @@ impl Database {
         }
 
         // Get note_tag changes
+        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
             let nt_rows: Vec<(Vec<u8>, Vec<u8>, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
@@ -1984,12 +2050,13 @@ impl Database {
                     r#"
                     SELECT note_id, tag_id, created_at, modified_at, deleted_at
                     FROM note_tags
-                    WHERE created_at >= ? OR deleted_at >= ? OR modified_at >= ?
-                    ORDER BY COALESCE(modified_at, deleted_at, created_at)
+                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
+                       OR (sync_received_at IS NULL AND (created_at >= ? OR deleted_at >= ? OR modified_at >= ?))
+                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, deleted_at, created_at)) AS INTEGER))
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, since_ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
@@ -2059,6 +2126,7 @@ impl Database {
         }
 
         // Get audio_file changes
+        // Filter by sync_received_at if set, otherwise fall back to modified_at/imported_at
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
             let audio_rows: Vec<(Vec<u8>, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = if let Some(since_ts) = since {
@@ -2066,12 +2134,13 @@ impl Database {
                     r#"
                     SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
                     FROM audio_files
-                    WHERE modified_at >= ? OR imported_at >= ?
-                    ORDER BY COALESCE(modified_at, imported_at)
+                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
+                       OR (sync_received_at IS NULL AND (modified_at >= ? OR imported_at >= ?))
+                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, imported_at)) AS INTEGER))
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, String>(1)?,
@@ -2141,6 +2210,7 @@ impl Database {
         }
 
         // Get note_attachment changes
+        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
             let na_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, String, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
@@ -2148,12 +2218,13 @@ impl Database {
                     r#"
                     SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
                     FROM note_attachments
-                    WHERE created_at >= ? OR deleted_at >= ? OR modified_at >= ?
-                    ORDER BY COALESCE(modified_at, deleted_at, created_at)
+                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
+                       OR (sync_received_at IS NULL AND (created_at >= ? OR deleted_at >= ? OR modified_at >= ?))
+                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, deleted_at, created_at)) AS INTEGER))
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, since_ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
@@ -2229,6 +2300,7 @@ impl Database {
         }
 
         // Get transcription changes
+        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
             let transcription_rows: Vec<(Vec<u8>, Vec<u8>, String, Option<String>, String, Option<String>, Option<String>, String, Vec<u8>, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
@@ -2236,12 +2308,13 @@ impl Database {
                     r#"
                     SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
                     FROM transcriptions
-                    WHERE modified_at >= ? OR created_at >= ?
-                    ORDER BY COALESCE(modified_at, created_at)
+                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
+                       OR (sync_received_at IS NULL AND (modified_at >= ? OR created_at >= ?))
+                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, created_at)) AS INTEGER))
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
@@ -2344,12 +2417,14 @@ impl Database {
         let mut latest_timestamp: Option<String> = None;
 
         // Check notes with > (exclusive)
+        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
         let note_count: i64 = self.conn.query_row(
             r#"
             SELECT COUNT(*) FROM notes
-            WHERE modified_at > ? OR created_at > ?
+            WHERE sync_received_at > CAST(strftime('%s', ?) AS INTEGER)
+               OR (sync_received_at IS NULL AND (modified_at > ? OR created_at > ?))
             "#,
-            params![since_ts, since_ts],
+            params![since_ts, since_ts, since_ts],
             |row| row.get(0),
         )?;
 
@@ -2358,12 +2433,13 @@ impl Database {
                 r#"
                 SELECT id, created_at, content, modified_at, deleted_at
                 FROM notes
-                WHERE modified_at > ? OR created_at > ?
-                ORDER BY COALESCE(modified_at, created_at)
+                WHERE sync_received_at > CAST(strftime('%s', ?) AS INTEGER)
+                   OR (sync_received_at IS NULL AND (modified_at > ? OR created_at > ?))
+                ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', modified_at) AS INTEGER), CAST(strftime('%s', created_at) AS INTEGER))
                 LIMIT ?
                 "#,
             )?;
-            let rows = stmt.query_map(params![since_ts, since_ts, limit], |row| {
+            let rows = stmt.query_map(params![since_ts, since_ts, since_ts, limit], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
@@ -2409,18 +2485,20 @@ impl Database {
         }
 
         // Check audio_files with > (exclusive)
+        // Filter by sync_received_at if set, otherwise fall back to modified_at/imported_at
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
             let mut stmt = self.conn.prepare(
                 r#"
                 SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
                 FROM audio_files
-                WHERE modified_at > ? OR imported_at > ?
-                ORDER BY COALESCE(modified_at, imported_at)
+                WHERE sync_received_at > CAST(strftime('%s', ?) AS INTEGER)
+                   OR (sync_received_at IS NULL AND (modified_at > ? OR imported_at > ?))
+                ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, imported_at)) AS INTEGER))
                 LIMIT ?
                 "#,
             )?;
-            let rows = stmt.query_map(params![since_ts, since_ts, remaining], |row| {
+            let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
@@ -2450,18 +2528,20 @@ impl Database {
         }
 
         // Check note_attachments with > (exclusive)
+        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
             let mut stmt = self.conn.prepare(
                 r#"
                 SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
                 FROM note_attachments
-                WHERE modified_at > ? OR created_at > ?
-                ORDER BY COALESCE(modified_at, created_at)
+                WHERE sync_received_at > CAST(strftime('%s', ?) AS INTEGER)
+                   OR (sync_received_at IS NULL AND (modified_at > ? OR created_at > ?))
+                ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, created_at)) AS INTEGER))
                 LIMIT ?
                 "#,
             )?;
-            let rows = stmt.query_map(params![since_ts, since_ts, remaining], |row| {
+            let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
@@ -2703,6 +2783,7 @@ impl Database {
         content: &str,
         modified_at: Option<&str>,
         deleted_at: Option<&str>,
+        sync_received_at: Option<i64>,
     ) -> VoiceResult<bool> {
         let uuid = Uuid::parse_str(note_id)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
@@ -2716,14 +2797,14 @@ impl Database {
         if existing.is_some() {
             // Update existing note
             self.conn.execute(
-                "UPDATE notes SET content = ?, modified_at = ?, deleted_at = ? WHERE id = ?",
-                params![content, modified_at, deleted_at, uuid_bytes],
+                "UPDATE notes SET content = ?, modified_at = ?, deleted_at = ?, sync_received_at = ? WHERE id = ?",
+                params![content, modified_at, deleted_at, sync_received_at, uuid_bytes],
             )?;
         } else {
             // Insert new note
             self.conn.execute(
-                "INSERT INTO notes (id, created_at, content, modified_at, deleted_at) VALUES (?, ?, ?, ?, ?)",
-                params![uuid_bytes, created_at, content, modified_at, deleted_at],
+                "INSERT INTO notes (id, created_at, content, modified_at, deleted_at, sync_received_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![uuid_bytes, created_at, content, modified_at, deleted_at, sync_received_at],
             )?;
         }
 
@@ -2746,8 +2827,9 @@ impl Database {
         parent_id: Option<&str>,
         created_at: &str,
         modified_at: Option<&str>,
+        sync_received_at: Option<i64>,
     ) -> VoiceResult<bool> {
-        self.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, None)
+        self.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, None, sync_received_at)
     }
 
     /// Apply a sync tag change including deleted_at timestamp
@@ -2759,6 +2841,7 @@ impl Database {
         created_at: &str,
         modified_at: Option<&str>,
         deleted_at: Option<&str>,
+        sync_received_at: Option<i64>,
     ) -> VoiceResult<bool> {
         let uuid = Uuid::parse_str(tag_id)
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
@@ -2781,14 +2864,14 @@ impl Database {
         if existing.is_some() {
             // Update existing tag
             self.conn.execute(
-                "UPDATE tags SET name = ?, parent_id = ?, modified_at = ?, deleted_at = ? WHERE id = ?",
-                params![name, parent_bytes, modified_at, deleted_at, uuid_bytes],
+                "UPDATE tags SET name = ?, parent_id = ?, modified_at = ?, deleted_at = ?, sync_received_at = ? WHERE id = ?",
+                params![name, parent_bytes, modified_at, deleted_at, sync_received_at, uuid_bytes],
             )?;
         } else {
             // Insert new tag
             self.conn.execute(
-                "INSERT INTO tags (id, name, parent_id, created_at, modified_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?)",
-                params![uuid_bytes, name, parent_bytes, created_at, modified_at, deleted_at],
+                "INSERT INTO tags (id, name, parent_id, created_at, modified_at, deleted_at, sync_received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![uuid_bytes, name, parent_bytes, created_at, modified_at, deleted_at, sync_received_at],
             )?;
         }
         Ok(true)
@@ -2802,6 +2885,7 @@ impl Database {
         created_at: &str,
         modified_at: Option<&str>,
         deleted_at: Option<&str>,
+        sync_received_at: Option<i64>,
     ) -> VoiceResult<bool> {
         let note_uuid = Uuid::parse_str(note_id)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
@@ -2822,14 +2906,14 @@ impl Database {
         if existing.is_some() {
             // Update existing association
             self.conn.execute(
-                "UPDATE note_tags SET modified_at = ?, deleted_at = ? WHERE note_id = ? AND tag_id = ?",
-                params![modified_at, deleted_at, note_bytes, tag_bytes],
+                "UPDATE note_tags SET modified_at = ?, deleted_at = ?, sync_received_at = ? WHERE note_id = ? AND tag_id = ?",
+                params![modified_at, deleted_at, sync_received_at, note_bytes, tag_bytes],
             )?;
         } else {
             // Insert new association
             self.conn.execute(
-                "INSERT INTO note_tags (note_id, tag_id, created_at, modified_at, deleted_at) VALUES (?, ?, ?, ?, ?)",
-                params![note_bytes, tag_bytes, created_at, modified_at, deleted_at],
+                "INSERT INTO note_tags (note_id, tag_id, created_at, modified_at, deleted_at, sync_received_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![note_bytes, tag_bytes, created_at, modified_at, deleted_at, sync_received_at],
             )?;
         }
 
@@ -4262,6 +4346,7 @@ impl Database {
         created_at: &str,
         modified_at: Option<&str>,
         deleted_at: Option<&str>,
+        sync_received_at: Option<i64>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
@@ -4272,15 +4357,16 @@ impl Database {
 
         self.conn.execute(
             r#"
-            INSERT INTO note_attachments (id, note_id, attachment_id, attachment_type, created_at, device_id, modified_at, deleted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO note_attachments (id, note_id, attachment_id, attachment_type, created_at, device_id, modified_at, deleted_at, sync_received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 note_id = excluded.note_id,
                 attachment_id = excluded.attachment_id,
                 attachment_type = excluded.attachment_type,
                 modified_at = excluded.modified_at,
                 deleted_at = excluded.deleted_at,
-                device_id = excluded.device_id
+                device_id = excluded.device_id,
+                sync_received_at = excluded.sync_received_at
             "#,
             params![
                 id_uuid.as_bytes().to_vec(),
@@ -4291,6 +4377,7 @@ impl Database {
                 device_id.as_bytes().to_vec(),
                 modified_at,
                 deleted_at,
+                sync_received_at,
             ],
         )?;
 
@@ -4355,6 +4442,7 @@ impl Database {
         summary: Option<&str>,
         modified_at: Option<&str>,
         deleted_at: Option<&str>,
+        sync_received_at: Option<i64>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
@@ -4362,8 +4450,8 @@ impl Database {
 
         self.conn.execute(
             r#"
-            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 filename = excluded.filename,
                 file_created_at = excluded.file_created_at,
@@ -4371,7 +4459,8 @@ impl Database {
                 summary = excluded.summary,
                 modified_at = excluded.modified_at,
                 deleted_at = excluded.deleted_at,
-                device_id = excluded.device_id
+                device_id = excluded.device_id,
+                sync_received_at = excluded.sync_received_at
             "#,
             params![
                 id_uuid.as_bytes().to_vec(),
@@ -4383,6 +4472,7 @@ impl Database {
                 device_id.as_bytes().to_vec(),
                 modified_at,
                 deleted_at,
+                sync_received_at,
             ],
         )?;
 
@@ -4404,6 +4494,7 @@ impl Database {
         created_at: &str,
         modified_at: Option<&str>,
         deleted_at: Option<&str>,
+        sync_received_at: Option<i64>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
@@ -4414,8 +4505,8 @@ impl Database {
 
         self.conn.execute(
             r#"
-            INSERT INTO transcriptions (id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO transcriptions (id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at, sync_received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 audio_file_id = excluded.audio_file_id,
                 content = excluded.content,
@@ -4426,7 +4517,8 @@ impl Database {
                 state = excluded.state,
                 device_id = excluded.device_id,
                 modified_at = excluded.modified_at,
-                deleted_at = excluded.deleted_at
+                deleted_at = excluded.deleted_at,
+                sync_received_at = excluded.sync_received_at
             "#,
             params![
                 id_uuid.as_bytes().to_vec(),
@@ -4441,6 +4533,7 @@ impl Database {
                 created_at,
                 modified_at,
                 deleted_at,
+                sync_received_at,
             ],
         )?;
 
