@@ -93,10 +93,10 @@ pub fn get_local_device_id() -> Uuid {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteRow {
     pub id: String,
-    pub created_at: String,
+    pub created_at: i64,
     pub content: String,
-    pub modified_at: Option<String>,
-    pub deleted_at: Option<String>,
+    pub modified_at: Option<i64>,
+    pub deleted_at: Option<i64>,
     pub tag_names: Option<String>,
     pub display_cache: Option<String>,
     /// Cache for notes list pane display (JSON with date, marked, content_preview)
@@ -109,8 +109,8 @@ pub struct TagRow {
     pub id: String,
     pub name: String,
     pub parent_id: Option<String>,
-    pub created_at: Option<String>,
-    pub modified_at: Option<String>,
+    pub created_at: Option<i64>,
+    pub modified_at: Option<i64>,
 }
 
 /// NoteAttachment data returned from database queries (junction table)
@@ -120,24 +120,24 @@ pub struct NoteAttachmentRow {
     pub note_id: String,
     pub attachment_id: String,
     pub attachment_type: String,
-    pub created_at: String,
+    pub created_at: i64,
     pub device_id: String,
-    pub modified_at: Option<String>,
-    pub deleted_at: Option<String>,
+    pub modified_at: Option<i64>,
+    pub deleted_at: Option<i64>,
 }
 
 /// AudioFile data returned from database queries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioFileRow {
     pub id: String,
-    pub imported_at: String,
+    pub imported_at: i64,
     pub filename: String,
-    pub file_created_at: Option<String>,
+    pub file_created_at: Option<i64>,
     pub duration_seconds: Option<i64>,
     pub summary: Option<String>,
     pub device_id: String,
-    pub modified_at: Option<String>,
-    pub deleted_at: Option<String>,
+    pub modified_at: Option<i64>,
+    pub deleted_at: Option<i64>,
 }
 
 /// Transcription data returned from database queries
@@ -152,9 +152,9 @@ pub struct TranscriptionRow {
     pub service_response: Option<String>,
     pub state: String,
     pub device_id: String,
-    pub created_at: String,
-    pub modified_at: Option<String>,
-    pub deleted_at: Option<String>,
+    pub created_at: i64,
+    pub modified_at: Option<i64>,
+    pub deleted_at: Option<i64>,
 }
 
 /// Result of a tag change operation (add/remove tag from note)
@@ -206,6 +206,7 @@ impl Database {
         let mut db = Self { conn };
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
+        db.migrate_timestamps_to_unix()?;
         Ok(db)
     }
 
@@ -215,6 +216,7 @@ impl Database {
         let mut db = Self { conn };
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
+        db.migrate_timestamps_to_unix()?;
         Ok(db)
     }
 
@@ -223,12 +225,13 @@ impl Database {
         self.conn.execute_batch(
             r#"
             -- Create notes table with UUID7 BLOB primary key
+            -- All timestamps are Unix seconds (INTEGER) for timezone safety
             CREATE TABLE IF NOT EXISTS notes (
                 id BLOB PRIMARY KEY,
-                created_at DATETIME NOT NULL,
+                created_at INTEGER NOT NULL,
                 content TEXT NOT NULL,
-                modified_at DATETIME,
-                deleted_at DATETIME,
+                modified_at INTEGER,
+                deleted_at INTEGER,
                 sync_received_at INTEGER,
                 di_cache_note_pane_display TEXT,
                 di_cache_note_list_pane_display TEXT
@@ -239,9 +242,9 @@ impl Database {
                 id BLOB PRIMARY KEY,
                 name TEXT NOT NULL,
                 parent_id BLOB,
-                created_at DATETIME NOT NULL,
-                modified_at DATETIME,
-                deleted_at DATETIME,
+                created_at INTEGER NOT NULL,
+                modified_at INTEGER,
+                deleted_at INTEGER,
                 sync_received_at INTEGER,
                 FOREIGN KEY (parent_id) REFERENCES tags (id) ON DELETE CASCADE
             );
@@ -250,9 +253,9 @@ impl Database {
             CREATE TABLE IF NOT EXISTS note_tags (
                 note_id BLOB NOT NULL,
                 tag_id BLOB NOT NULL,
-                created_at DATETIME NOT NULL,
-                modified_at DATETIME,
-                deleted_at DATETIME,
+                created_at INTEGER NOT NULL,
+                modified_at INTEGER,
+                deleted_at INTEGER,
                 sync_received_at INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE,
                 FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE,
@@ -264,9 +267,9 @@ impl Database {
                 peer_id BLOB PRIMARY KEY,
                 peer_name TEXT,
                 peer_url TEXT NOT NULL,
-                last_sync_at DATETIME,
-                last_received_timestamp DATETIME,
-                last_sent_timestamp DATETIME,
+                last_sync_at INTEGER,
+                last_received_timestamp INTEGER,
+                last_sent_timestamp INTEGER,
                 certificate_fingerprint BLOB
             );
 
@@ -275,15 +278,15 @@ impl Database {
                 id BLOB PRIMARY KEY,
                 note_id BLOB NOT NULL,
                 local_content TEXT NOT NULL,
-                local_modified_at DATETIME NOT NULL,
+                local_modified_at INTEGER NOT NULL,
                 local_device_id BLOB,
                 local_device_name TEXT,
                 remote_content TEXT NOT NULL,
-                remote_modified_at DATETIME NOT NULL,
+                remote_modified_at INTEGER NOT NULL,
                 remote_device_id BLOB,
                 remote_device_name TEXT,
-                created_at DATETIME NOT NULL,
-                resolved_at DATETIME,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes(id)
             );
 
@@ -292,15 +295,15 @@ impl Database {
                 id BLOB PRIMARY KEY,
                 note_id BLOB NOT NULL,
                 surviving_content TEXT NOT NULL,
-                surviving_modified_at DATETIME NOT NULL,
+                surviving_modified_at INTEGER NOT NULL,
                 surviving_device_id BLOB,
                 surviving_device_name TEXT,
                 deleted_content TEXT,
-                deleted_at DATETIME NOT NULL,
+                deleted_at INTEGER NOT NULL,
                 deleting_device_id BLOB,
                 deleting_device_name TEXT,
-                created_at DATETIME NOT NULL,
-                resolved_at DATETIME,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes(id)
             );
 
@@ -309,15 +312,15 @@ impl Database {
                 id BLOB PRIMARY KEY,
                 tag_id BLOB NOT NULL,
                 local_name TEXT NOT NULL,
-                local_modified_at DATETIME NOT NULL,
+                local_modified_at INTEGER NOT NULL,
                 local_device_id BLOB,
                 local_device_name TEXT,
                 remote_name TEXT NOT NULL,
-                remote_modified_at DATETIME NOT NULL,
+                remote_modified_at INTEGER NOT NULL,
                 remote_device_id BLOB,
                 remote_device_name TEXT,
-                created_at DATETIME NOT NULL,
-                resolved_at DATETIME,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
                 FOREIGN KEY (tag_id) REFERENCES tags(id)
             );
 
@@ -326,15 +329,15 @@ impl Database {
                 id BLOB PRIMARY KEY,
                 tag_id BLOB NOT NULL,
                 local_parent_id BLOB,
-                local_modified_at DATETIME NOT NULL,
+                local_modified_at INTEGER NOT NULL,
                 local_device_id BLOB,
                 local_device_name TEXT,
                 remote_parent_id BLOB,
-                remote_modified_at DATETIME NOT NULL,
+                remote_modified_at INTEGER NOT NULL,
                 remote_device_id BLOB,
                 remote_device_name TEXT,
-                created_at DATETIME NOT NULL,
-                resolved_at DATETIME,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
                 FOREIGN KEY (tag_id) REFERENCES tags(id)
             );
 
@@ -344,14 +347,14 @@ impl Database {
                 tag_id BLOB NOT NULL,
                 surviving_name TEXT NOT NULL,
                 surviving_parent_id BLOB,
-                surviving_modified_at DATETIME NOT NULL,
+                surviving_modified_at INTEGER NOT NULL,
                 surviving_device_id BLOB,
                 surviving_device_name TEXT,
-                deleted_at DATETIME NOT NULL,
+                deleted_at INTEGER NOT NULL,
                 deleting_device_id BLOB,
                 deleting_device_name TEXT,
-                created_at DATETIME NOT NULL,
-                resolved_at DATETIME,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
                 FOREIGN KEY (tag_id) REFERENCES tags(id)
             );
 
@@ -360,18 +363,18 @@ impl Database {
                 id BLOB PRIMARY KEY,
                 note_id BLOB NOT NULL,
                 tag_id BLOB NOT NULL,
-                local_created_at DATETIME,
-                local_modified_at DATETIME,
-                local_deleted_at DATETIME,
+                local_created_at INTEGER,
+                local_modified_at INTEGER,
+                local_deleted_at INTEGER,
                 local_device_id BLOB,
                 local_device_name TEXT,
-                remote_created_at DATETIME,
-                remote_modified_at DATETIME,
-                remote_deleted_at DATETIME,
+                remote_created_at INTEGER,
+                remote_modified_at INTEGER,
+                remote_deleted_at INTEGER,
                 remote_device_id BLOB,
                 remote_device_name TEXT,
-                created_at DATETIME NOT NULL,
-                resolved_at DATETIME,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes(id),
                 FOREIGN KEY (tag_id) REFERENCES tags(id)
             );
@@ -386,8 +389,8 @@ impl Database {
                 operation TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 error_message TEXT NOT NULL,
-                created_at DATETIME NOT NULL,
-                resolved_at DATETIME,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
                 FOREIGN KEY (peer_id) REFERENCES sync_peers(peer_id)
             );
 
@@ -397,10 +400,10 @@ impl Database {
                 note_id BLOB NOT NULL,
                 attachment_id BLOB NOT NULL,
                 attachment_type TEXT NOT NULL,
-                created_at DATETIME NOT NULL,
+                created_at INTEGER NOT NULL,
                 device_id BLOB NOT NULL,
-                modified_at DATETIME,
-                deleted_at DATETIME,
+                modified_at INTEGER,
+                deleted_at INTEGER,
                 sync_received_at INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE
             );
@@ -408,14 +411,14 @@ impl Database {
             -- Create audio_files table
             CREATE TABLE IF NOT EXISTS audio_files (
                 id BLOB PRIMARY KEY,
-                imported_at DATETIME NOT NULL,
+                imported_at INTEGER NOT NULL,
                 filename TEXT NOT NULL,
-                file_created_at DATETIME,
+                file_created_at INTEGER,
                 duration_seconds INTEGER,
                 summary TEXT,
                 device_id BLOB NOT NULL,
-                modified_at DATETIME,
-                deleted_at DATETIME,
+                modified_at INTEGER,
+                deleted_at INTEGER,
                 sync_received_at INTEGER
             );
 
@@ -430,9 +433,9 @@ impl Database {
                 service_response TEXT,
                 state TEXT NOT NULL DEFAULT 'original !verified !verbatim !cleaned !polished',
                 device_id BLOB NOT NULL,
-                created_at DATETIME NOT NULL,
-                modified_at DATETIME,
-                deleted_at DATETIME,
+                created_at INTEGER NOT NULL,
+                modified_at INTEGER,
+                deleted_at INTEGER,
                 sync_received_at INTEGER,
                 FOREIGN KEY (audio_file_id) REFERENCES audio_files (id) ON DELETE CASCADE
             );
@@ -486,11 +489,11 @@ impl Database {
 
         // Insert system tags if they don't exist (OR IGNORE handles duplicates)
         self.conn.execute(
-            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, NULL, datetime('now'))",
+            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, NULL, strftime('%s', 'now'))",
             params![&system_bytes, SYSTEM_TAG_NAME],
         )?;
         self.conn.execute(
-            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, datetime('now'))",
+            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
             params![&marked_bytes, MARKED_TAG_NAME, &system_bytes],
         )?;
 
@@ -634,6 +637,499 @@ impl Database {
             }
         }
 
+        Ok(())
+    }
+
+    /// Migrate existing databases from TEXT datetime columns to INTEGER Unix timestamps.
+    ///
+    /// This converts all timestamp columns from "YYYY-MM-DD HH:MM:SS" TEXT format
+    /// to Unix seconds INTEGER format. This is a one-way migration.
+    ///
+    /// The migration recreates each table with the new schema because SQLite doesn't
+    /// support ALTER COLUMN to change types.
+    fn migrate_timestamps_to_unix(&mut self) -> VoiceResult<()> {
+        // Helper to check if a column is TEXT type (needs migration)
+        fn column_is_text(conn: &Connection, table: &str, column: &str) -> bool {
+            let sql = format!("PRAGMA table_info({})", table);
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                let rows = stmt.query_map([], |row| {
+                    let name: String = row.get(1)?;
+                    let col_type: String = row.get(2)?;
+                    Ok((name, col_type))
+                });
+                if let Ok(rows) = rows {
+                    for row in rows.flatten() {
+                        if row.0 == column {
+                            // Check if type contains TEXT, DATETIME, or similar string types
+                            let type_upper = row.1.to_uppercase();
+                            return type_upper.contains("TEXT")
+                                || type_upper.contains("DATETIME")
+                                || type_upper.contains("CHAR");
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        // Check if migration is needed by looking at notes.created_at type
+        if !column_is_text(&self.conn, "notes", "created_at") {
+            // Already migrated or new database with INTEGER columns
+            return Ok(());
+        }
+
+        tracing::info!("Migrating timestamps from TEXT to INTEGER (Unix seconds)...");
+
+        // Migrate each table in a transaction
+        let tx = self.conn.transaction()?;
+
+        // --- notes table ---
+        tx.execute_batch(r#"
+            CREATE TABLE notes_new (
+                id BLOB PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                modified_at INTEGER,
+                deleted_at INTEGER,
+                sync_received_at INTEGER,
+                di_cache_note_pane_display TEXT,
+                di_cache_note_list_pane_display TEXT
+            );
+            INSERT INTO notes_new SELECT
+                id,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                content,
+                CAST(strftime('%s', modified_at) AS INTEGER),
+                CAST(strftime('%s', deleted_at) AS INTEGER),
+                sync_received_at,
+                di_cache_note_pane_display,
+                di_cache_note_list_pane_display
+            FROM notes;
+            DROP TABLE notes;
+            ALTER TABLE notes_new RENAME TO notes;
+        "#)?;
+
+        // --- tags table ---
+        tx.execute_batch(r#"
+            CREATE TABLE tags_new (
+                id BLOB PRIMARY KEY,
+                name TEXT NOT NULL,
+                parent_id BLOB,
+                created_at INTEGER NOT NULL,
+                modified_at INTEGER,
+                deleted_at INTEGER,
+                sync_received_at INTEGER,
+                FOREIGN KEY (parent_id) REFERENCES tags_new (id) ON DELETE CASCADE
+            );
+            INSERT INTO tags_new SELECT
+                id,
+                name,
+                parent_id,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', modified_at) AS INTEGER),
+                CAST(strftime('%s', deleted_at) AS INTEGER),
+                sync_received_at
+            FROM tags;
+            DROP TABLE tags;
+            ALTER TABLE tags_new RENAME TO tags;
+        "#)?;
+
+        // --- note_tags table ---
+        tx.execute_batch(r#"
+            CREATE TABLE note_tags_new (
+                note_id BLOB NOT NULL,
+                tag_id BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                modified_at INTEGER,
+                deleted_at INTEGER,
+                sync_received_at INTEGER,
+                FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE,
+                FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE,
+                PRIMARY KEY (note_id, tag_id)
+            );
+            INSERT INTO note_tags_new SELECT
+                note_id,
+                tag_id,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', modified_at) AS INTEGER),
+                CAST(strftime('%s', deleted_at) AS INTEGER),
+                sync_received_at
+            FROM note_tags;
+            DROP TABLE note_tags;
+            ALTER TABLE note_tags_new RENAME TO note_tags;
+        "#)?;
+
+        // --- sync_peers table ---
+        tx.execute_batch(r#"
+            CREATE TABLE sync_peers_new (
+                peer_id BLOB PRIMARY KEY,
+                peer_name TEXT,
+                peer_url TEXT NOT NULL,
+                last_sync_at INTEGER,
+                last_received_timestamp INTEGER,
+                last_sent_timestamp INTEGER,
+                certificate_fingerprint BLOB
+            );
+            INSERT INTO sync_peers_new SELECT
+                peer_id,
+                peer_name,
+                peer_url,
+                CAST(strftime('%s', last_sync_at) AS INTEGER),
+                CAST(strftime('%s', last_received_timestamp) AS INTEGER),
+                CAST(strftime('%s', last_sent_timestamp) AS INTEGER),
+                certificate_fingerprint
+            FROM sync_peers;
+            DROP TABLE sync_peers;
+            ALTER TABLE sync_peers_new RENAME TO sync_peers;
+        "#)?;
+
+        // --- note_attachments table ---
+        tx.execute_batch(r#"
+            CREATE TABLE note_attachments_new (
+                id BLOB PRIMARY KEY,
+                note_id BLOB NOT NULL,
+                attachment_id BLOB NOT NULL,
+                attachment_type TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                device_id BLOB NOT NULL,
+                modified_at INTEGER,
+                deleted_at INTEGER,
+                sync_received_at INTEGER,
+                FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE
+            );
+            INSERT INTO note_attachments_new SELECT
+                id,
+                note_id,
+                attachment_id,
+                attachment_type,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                device_id,
+                CAST(strftime('%s', modified_at) AS INTEGER),
+                CAST(strftime('%s', deleted_at) AS INTEGER),
+                sync_received_at
+            FROM note_attachments;
+            DROP TABLE note_attachments;
+            ALTER TABLE note_attachments_new RENAME TO note_attachments;
+        "#)?;
+
+        // --- audio_files table ---
+        tx.execute_batch(r#"
+            CREATE TABLE audio_files_new (
+                id BLOB PRIMARY KEY,
+                imported_at INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                file_created_at INTEGER,
+                duration_seconds INTEGER,
+                summary TEXT,
+                device_id BLOB NOT NULL,
+                modified_at INTEGER,
+                deleted_at INTEGER,
+                sync_received_at INTEGER
+            );
+            INSERT INTO audio_files_new SELECT
+                id,
+                CAST(strftime('%s', imported_at) AS INTEGER),
+                filename,
+                CAST(strftime('%s', file_created_at) AS INTEGER),
+                duration_seconds,
+                summary,
+                device_id,
+                CAST(strftime('%s', modified_at) AS INTEGER),
+                CAST(strftime('%s', deleted_at) AS INTEGER),
+                sync_received_at
+            FROM audio_files;
+            DROP TABLE audio_files;
+            ALTER TABLE audio_files_new RENAME TO audio_files;
+        "#)?;
+
+        // --- transcriptions table ---
+        tx.execute_batch(r#"
+            CREATE TABLE transcriptions_new (
+                id BLOB PRIMARY KEY,
+                audio_file_id BLOB NOT NULL,
+                content TEXT NOT NULL,
+                content_segments TEXT,
+                service TEXT NOT NULL,
+                service_arguments TEXT,
+                service_response TEXT,
+                state TEXT NOT NULL DEFAULT 'original !verified !verbatim !cleaned !polished',
+                device_id BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                modified_at INTEGER,
+                deleted_at INTEGER,
+                sync_received_at INTEGER,
+                FOREIGN KEY (audio_file_id) REFERENCES audio_files (id) ON DELETE CASCADE
+            );
+            INSERT INTO transcriptions_new SELECT
+                id,
+                audio_file_id,
+                content,
+                content_segments,
+                service,
+                service_arguments,
+                service_response,
+                state,
+                device_id,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', modified_at) AS INTEGER),
+                CAST(strftime('%s', deleted_at) AS INTEGER),
+                sync_received_at
+            FROM transcriptions;
+            DROP TABLE transcriptions;
+            ALTER TABLE transcriptions_new RENAME TO transcriptions;
+        "#)?;
+
+        // --- Conflict tables ---
+        // conflicts_note_content
+        tx.execute_batch(r#"
+            CREATE TABLE conflicts_note_content_new (
+                id BLOB PRIMARY KEY,
+                note_id BLOB NOT NULL,
+                local_content TEXT NOT NULL,
+                local_modified_at INTEGER NOT NULL,
+                local_device_id BLOB,
+                local_device_name TEXT,
+                remote_content TEXT NOT NULL,
+                remote_modified_at INTEGER NOT NULL,
+                remote_device_id BLOB,
+                remote_device_name TEXT,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                FOREIGN KEY (note_id) REFERENCES notes(id)
+            );
+            INSERT INTO conflicts_note_content_new SELECT
+                id, note_id, local_content,
+                CAST(strftime('%s', local_modified_at) AS INTEGER),
+                local_device_id, local_device_name, remote_content,
+                CAST(strftime('%s', remote_modified_at) AS INTEGER),
+                remote_device_id, remote_device_name,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', resolved_at) AS INTEGER)
+            FROM conflicts_note_content;
+            DROP TABLE conflicts_note_content;
+            ALTER TABLE conflicts_note_content_new RENAME TO conflicts_note_content;
+        "#)?;
+
+        // conflicts_note_delete
+        tx.execute_batch(r#"
+            CREATE TABLE conflicts_note_delete_new (
+                id BLOB PRIMARY KEY,
+                note_id BLOB NOT NULL,
+                surviving_content TEXT NOT NULL,
+                surviving_modified_at INTEGER NOT NULL,
+                surviving_device_id BLOB,
+                surviving_device_name TEXT,
+                deleted_content TEXT,
+                deleted_at INTEGER NOT NULL,
+                deleting_device_id BLOB,
+                deleting_device_name TEXT,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                FOREIGN KEY (note_id) REFERENCES notes(id)
+            );
+            INSERT INTO conflicts_note_delete_new SELECT
+                id, note_id, surviving_content,
+                CAST(strftime('%s', surviving_modified_at) AS INTEGER),
+                surviving_device_id, surviving_device_name, deleted_content,
+                CAST(strftime('%s', deleted_at) AS INTEGER),
+                deleting_device_id, deleting_device_name,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', resolved_at) AS INTEGER)
+            FROM conflicts_note_delete;
+            DROP TABLE conflicts_note_delete;
+            ALTER TABLE conflicts_note_delete_new RENAME TO conflicts_note_delete;
+        "#)?;
+
+        // conflicts_tag_rename
+        tx.execute_batch(r#"
+            CREATE TABLE conflicts_tag_rename_new (
+                id BLOB PRIMARY KEY,
+                tag_id BLOB NOT NULL,
+                local_name TEXT NOT NULL,
+                local_modified_at INTEGER NOT NULL,
+                local_device_id BLOB,
+                local_device_name TEXT,
+                remote_name TEXT NOT NULL,
+                remote_modified_at INTEGER NOT NULL,
+                remote_device_id BLOB,
+                remote_device_name TEXT,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                FOREIGN KEY (tag_id) REFERENCES tags(id)
+            );
+            INSERT INTO conflicts_tag_rename_new SELECT
+                id, tag_id, local_name,
+                CAST(strftime('%s', local_modified_at) AS INTEGER),
+                local_device_id, local_device_name, remote_name,
+                CAST(strftime('%s', remote_modified_at) AS INTEGER),
+                remote_device_id, remote_device_name,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', resolved_at) AS INTEGER)
+            FROM conflicts_tag_rename;
+            DROP TABLE conflicts_tag_rename;
+            ALTER TABLE conflicts_tag_rename_new RENAME TO conflicts_tag_rename;
+        "#)?;
+
+        // conflicts_tag_parent
+        tx.execute_batch(r#"
+            CREATE TABLE conflicts_tag_parent_new (
+                id BLOB PRIMARY KEY,
+                tag_id BLOB NOT NULL,
+                local_parent_id BLOB,
+                local_modified_at INTEGER NOT NULL,
+                local_device_id BLOB,
+                local_device_name TEXT,
+                remote_parent_id BLOB,
+                remote_modified_at INTEGER NOT NULL,
+                remote_device_id BLOB,
+                remote_device_name TEXT,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                FOREIGN KEY (tag_id) REFERENCES tags(id)
+            );
+            INSERT INTO conflicts_tag_parent_new SELECT
+                id, tag_id, local_parent_id,
+                CAST(strftime('%s', local_modified_at) AS INTEGER),
+                local_device_id, local_device_name, remote_parent_id,
+                CAST(strftime('%s', remote_modified_at) AS INTEGER),
+                remote_device_id, remote_device_name,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', resolved_at) AS INTEGER)
+            FROM conflicts_tag_parent;
+            DROP TABLE conflicts_tag_parent;
+            ALTER TABLE conflicts_tag_parent_new RENAME TO conflicts_tag_parent;
+        "#)?;
+
+        // conflicts_tag_delete
+        tx.execute_batch(r#"
+            CREATE TABLE conflicts_tag_delete_new (
+                id BLOB PRIMARY KEY,
+                tag_id BLOB NOT NULL,
+                surviving_name TEXT NOT NULL,
+                surviving_parent_id BLOB,
+                surviving_modified_at INTEGER NOT NULL,
+                surviving_device_id BLOB,
+                surviving_device_name TEXT,
+                deleted_at INTEGER NOT NULL,
+                deleting_device_id BLOB,
+                deleting_device_name TEXT,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                FOREIGN KEY (tag_id) REFERENCES tags(id)
+            );
+            INSERT INTO conflicts_tag_delete_new SELECT
+                id, tag_id, surviving_name, surviving_parent_id,
+                CAST(strftime('%s', surviving_modified_at) AS INTEGER),
+                surviving_device_id, surviving_device_name,
+                CAST(strftime('%s', deleted_at) AS INTEGER),
+                deleting_device_id, deleting_device_name,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', resolved_at) AS INTEGER)
+            FROM conflicts_tag_delete;
+            DROP TABLE conflicts_tag_delete;
+            ALTER TABLE conflicts_tag_delete_new RENAME TO conflicts_tag_delete;
+        "#)?;
+
+        // conflicts_note_tag
+        tx.execute_batch(r#"
+            CREATE TABLE conflicts_note_tag_new (
+                id BLOB PRIMARY KEY,
+                note_id BLOB NOT NULL,
+                tag_id BLOB NOT NULL,
+                local_created_at INTEGER,
+                local_modified_at INTEGER,
+                local_deleted_at INTEGER,
+                local_device_id BLOB,
+                local_device_name TEXT,
+                remote_created_at INTEGER,
+                remote_modified_at INTEGER,
+                remote_deleted_at INTEGER,
+                remote_device_id BLOB,
+                remote_device_name TEXT,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                FOREIGN KEY (note_id) REFERENCES notes(id),
+                FOREIGN KEY (tag_id) REFERENCES tags(id)
+            );
+            INSERT INTO conflicts_note_tag_new SELECT
+                id, note_id, tag_id,
+                CAST(strftime('%s', local_created_at) AS INTEGER),
+                CAST(strftime('%s', local_modified_at) AS INTEGER),
+                CAST(strftime('%s', local_deleted_at) AS INTEGER),
+                local_device_id, local_device_name,
+                CAST(strftime('%s', remote_created_at) AS INTEGER),
+                CAST(strftime('%s', remote_modified_at) AS INTEGER),
+                CAST(strftime('%s', remote_deleted_at) AS INTEGER),
+                remote_device_id, remote_device_name,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', resolved_at) AS INTEGER)
+            FROM conflicts_note_tag;
+            DROP TABLE conflicts_note_tag;
+            ALTER TABLE conflicts_note_tag_new RENAME TO conflicts_note_tag;
+        "#)?;
+
+        // sync_failures
+        tx.execute_batch(r#"
+            CREATE TABLE sync_failures_new (
+                id BLOB PRIMARY KEY,
+                peer_id BLOB NOT NULL,
+                peer_name TEXT,
+                entity_type TEXT NOT NULL,
+                entity_id BLOB,
+                operation TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                FOREIGN KEY (peer_id) REFERENCES sync_peers(peer_id)
+            );
+            INSERT INTO sync_failures_new SELECT
+                id, peer_id, peer_name, entity_type, entity_id, operation, payload, error_message,
+                CAST(strftime('%s', created_at) AS INTEGER),
+                CAST(strftime('%s', resolved_at) AS INTEGER)
+            FROM sync_failures;
+            DROP TABLE sync_failures;
+            ALTER TABLE sync_failures_new RENAME TO sync_failures;
+        "#)?;
+
+        // Recreate all indexes
+        tx.execute_batch(r#"
+            CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at);
+            CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_notes_modified_at ON notes(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_notes_sync_received_at ON notes(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_tags_parent_id ON tags(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(LOWER(name));
+            CREATE INDEX IF NOT EXISTS idx_tags_modified_at ON tags(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_tags_sync_received_at ON tags(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_note_tags_note ON note_tags(note_id);
+            CREATE INDEX IF NOT EXISTS idx_note_tags_tag ON note_tags(tag_id);
+            CREATE INDEX IF NOT EXISTS idx_note_tags_created_at ON note_tags(created_at);
+            CREATE INDEX IF NOT EXISTS idx_note_tags_deleted_at ON note_tags(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_note_tags_modified_at ON note_tags(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_note_tags_search ON note_tags(note_id, tag_id, deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_note_tags_by_tag ON note_tags(tag_id, note_id, deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_note_tags_sync_received_at ON note_tags(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_note_id ON note_attachments(note_id);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_attachment_id ON note_attachments(attachment_id);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_type ON note_attachments(attachment_type);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_modified_at ON note_attachments(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_deleted_at ON note_attachments(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_note_attachments_sync_received_at ON note_attachments(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_audio_files_modified_at ON audio_files(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_audio_files_deleted_at ON audio_files(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_audio_files_sync_received_at ON audio_files(sync_received_at);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_audio_file_id ON transcriptions(audio_file_id);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_service ON transcriptions(service);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_created_at ON transcriptions(created_at);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_modified_at ON transcriptions(modified_at);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_deleted_at ON transcriptions(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_sync_received_at ON transcriptions(sync_received_at);
+        "#)?;
+
+        tx.commit()?;
+
+        tracing::info!("Timestamp migration completed successfully");
         Ok(())
     }
 
@@ -868,7 +1364,7 @@ impl Database {
         let uuid_bytes = note_id.as_bytes().to_vec();
 
         self.conn.execute(
-            "INSERT INTO notes (id, content, created_at) VALUES (?, ?, datetime('now'))",
+            "INSERT INTO notes (id, content, created_at) VALUES (?, ?, strftime('%s', 'now'))",
             params![uuid_bytes, content],
         )?;
 
@@ -898,7 +1394,7 @@ impl Database {
         let updated = self.conn.execute(
             r#"
             UPDATE notes
-            SET content = ?, modified_at = datetime('now')
+            SET content = ?, modified_at = strftime('%s', 'now')
             WHERE id = ? AND deleted_at IS NULL
             "#,
             params![content, uuid_bytes],
@@ -927,7 +1423,7 @@ impl Database {
         let deleted = self.conn.execute(
             r#"
             UPDATE notes
-            SET deleted_at = datetime('now'), modified_at = datetime('now')
+            SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now')
             WHERE id = ? AND deleted_at IS NULL
             "#,
             params![uuid_bytes],
@@ -1015,7 +1511,7 @@ impl Database {
 
         // 5. Update survivor's content
         self.conn.execute(
-            "UPDATE notes SET content = ?, modified_at = datetime('now') WHERE id = ?",
+            "UPDATE notes SET content = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
             params![&merged_content, &survivor_bytes],
         )?;
 
@@ -1043,7 +1539,7 @@ impl Database {
             if survivor_has_tag {
                 // Soft-delete the victim's association (duplicate)
                 self.conn.execute(
-                    "UPDATE note_tags SET deleted_at = datetime('now'), modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
+                    "UPDATE note_tags SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
                     params![&victim_bytes, &tag_bytes],
                 )?;
             } else {
@@ -1060,18 +1556,18 @@ impl Database {
                 if survivor_had_tag {
                     // Reactivate survivor's association
                     self.conn.execute(
-                        "UPDATE note_tags SET deleted_at = NULL, modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
+                        "UPDATE note_tags SET deleted_at = NULL, modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
                         params![&survivor_bytes, &tag_bytes],
                     )?;
                     // Soft-delete victim's association
                     self.conn.execute(
-                        "UPDATE note_tags SET deleted_at = datetime('now'), modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
+                        "UPDATE note_tags SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
                         params![&victim_bytes, &tag_bytes],
                     )?;
                 } else {
                     // Move the association to survivor
                     self.conn.execute(
-                        "UPDATE note_tags SET note_id = ?, modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
+                        "UPDATE note_tags SET note_id = ?, modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
                         params![&survivor_bytes, &victim_bytes, &tag_bytes],
                     )?;
                 }
@@ -1080,13 +1576,13 @@ impl Database {
 
         // 7. Move attachments from victim to survivor
         self.conn.execute(
-            "UPDATE note_attachments SET note_id = ?, modified_at = datetime('now') WHERE note_id = ? AND deleted_at IS NULL",
+            "UPDATE note_attachments SET note_id = ?, modified_at = strftime('%s', 'now') WHERE note_id = ? AND deleted_at IS NULL",
             params![&survivor_bytes, &victim_bytes],
         )?;
 
         // 8. Soft-delete the victim note
         self.conn.execute(
-            "UPDATE notes SET deleted_at = datetime('now'), modified_at = datetime('now') WHERE id = ?",
+            "UPDATE notes SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now') WHERE id = ?",
             params![&victim_bytes],
         )?;
 
@@ -1108,7 +1604,7 @@ impl Database {
         let deleted = self.conn.execute(
             r#"
             UPDATE tags
-            SET deleted_at = datetime('now'), modified_at = datetime('now')
+            SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now')
             WHERE id = ? AND deleted_at IS NULL
             "#,
             params![uuid_bytes],
@@ -1461,7 +1957,7 @@ impl Database {
         };
 
         self.conn.execute(
-            "INSERT INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, datetime('now'))",
+            "INSERT INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
             params![uuid_bytes, name, parent_bytes],
         )?;
 
@@ -1480,7 +1976,7 @@ impl Database {
         let uuid_bytes = uuid.as_bytes().to_vec();
 
         let updated = self.conn.execute(
-            "UPDATE tags SET name = ?, modified_at = datetime('now') WHERE id = ?",
+            "UPDATE tags SET name = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
             params![new_name, uuid_bytes],
         )?;
 
@@ -1531,7 +2027,7 @@ impl Database {
         };
 
         let updated = self.conn.execute(
-            "UPDATE tags SET parent_id = ?, modified_at = datetime('now') WHERE id = ?",
+            "UPDATE tags SET parent_id = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
             params![parent_bytes, tag_bytes],
         )?;
 
@@ -1602,12 +2098,12 @@ impl Database {
         let tag_bytes = tag_uuid.as_bytes().to_vec();
 
         // Check if association exists (including soft-deleted)
-        let existing: Option<Option<String>> = self
+        let existing: Option<Option<i64>> = self
             .conn
             .query_row(
                 "SELECT deleted_at FROM note_tags WHERE note_id = ? AND tag_id = ?",
                 params![&note_bytes, &tag_bytes],
-                |row| row.get::<_, Option<String>>(0),
+                |row| row.get::<_, Option<i64>>(0),
             )
             .optional()?;
 
@@ -1616,7 +2112,7 @@ impl Database {
                 if deleted_at.is_some() {
                     // Reactivate soft-deleted association
                     self.conn.execute(
-                        "UPDATE note_tags SET deleted_at = NULL, modified_at = datetime('now') WHERE note_id = ? AND tag_id = ?",
+                        "UPDATE note_tags SET deleted_at = NULL, modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
                         params![&note_bytes, &tag_bytes],
                     )?;
                     true
@@ -1628,7 +2124,7 @@ impl Database {
             None => {
                 // Create new association
                 self.conn.execute(
-                    "INSERT INTO note_tags (note_id, tag_id, created_at) VALUES (?, ?, datetime('now'))",
+                    "INSERT INTO note_tags (note_id, tag_id, created_at) VALUES (?, ?, strftime('%s', 'now'))",
                     params![&note_bytes, &tag_bytes],
                 )?;
                 true
@@ -1640,7 +2136,7 @@ impl Database {
         if changed {
             // Update the parent Note's modified_at to trigger sync
             self.conn.execute(
-                "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
+                "UPDATE notes SET modified_at = strftime('%s', 'now') WHERE id = ?",
                 params![note_bytes],
             )?;
             // Rebuild note pane cache (tags list changed)
@@ -1684,7 +2180,7 @@ impl Database {
         let tag_bytes = tag_uuid.as_bytes().to_vec();
 
         let updated = self.conn.execute(
-            "UPDATE note_tags SET deleted_at = datetime('now'), modified_at = datetime('now') WHERE note_id = ? AND tag_id = ? AND deleted_at IS NULL",
+            "UPDATE note_tags SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ? AND deleted_at IS NULL",
             params![&note_bytes, &tag_bytes],
         )?;
 
@@ -1694,7 +2190,7 @@ impl Database {
         // Update the parent Note's modified_at to trigger sync
         if changed {
             self.conn.execute(
-                "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
+                "UPDATE notes SET modified_at = strftime('%s', 'now') WHERE id = ?",
                 params![note_bytes],
             )?;
             // Rebuild note pane cache (tags list changed)
@@ -1829,12 +2325,12 @@ impl Database {
     // ============================================================================
 
     /// Get the last sync timestamp for a peer
-    pub fn get_peer_last_sync(&self, peer_device_id: &str) -> VoiceResult<Option<String>> {
+    pub fn get_peer_last_sync(&self, peer_device_id: &str) -> VoiceResult<Option<i64>> {
         let peer_uuid = Uuid::parse_str(peer_device_id)
             .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
         let peer_bytes = peer_uuid.as_bytes().to_vec();
 
-        let result: Option<Option<String>> = self
+        let result: Option<Option<i64>> = self
             .conn
             .query_row(
                 "SELECT last_sync_at FROM sync_peers WHERE peer_id = ?",
@@ -1856,10 +2352,10 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO sync_peers (peer_id, peer_name, peer_url, last_sync_at)
-            VALUES (?, ?, '', datetime('now'))
+            VALUES (?, ?, '', strftime('%s', 'now'))
             ON CONFLICT(peer_id) DO UPDATE SET
                 peer_name = COALESCE(excluded.peer_name, peer_name),
-                last_sync_at = datetime('now')
+                last_sync_at = strftime('%s', 'now')
             "#,
             params![peer_bytes, peer_name],
         )?;
@@ -1881,30 +2377,33 @@ impl Database {
     }
 
     /// Get all changes since a timestamp (for sync)
-    pub fn get_changes_since(&self, since: Option<&str>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<String>)> {
+    /// The `since` parameter is a Unix timestamp (seconds since epoch).
+    /// Returns changes where: sync_received_at >= since OR modified_at >= since OR created_at >= since
+    pub fn get_changes_since(&self, since: Option<i64>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<i64>)> {
         let mut changes = Vec::new();
-        let mut latest_timestamp: Option<String> = None;
+        let mut latest_timestamp: Option<i64> = None;
+
+        let since_ts: Option<i64> = since;
 
         // Get note changes
-        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
-        let note_rows: Vec<(Vec<u8>, String, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
+        // Fixed query: include entities where ANY timestamp is >= since (not just sync_received_at)
+        let note_rows: Vec<(Vec<u8>, i64, String, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
             let mut stmt = self.conn.prepare(
                 r#"
                 SELECT id, created_at, content, modified_at, deleted_at
                 FROM notes
-                WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
-                   OR (sync_received_at IS NULL AND (modified_at >= ? OR created_at >= ?))
-                ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', modified_at) AS INTEGER), CAST(strftime('%s', created_at) AS INTEGER))
+                WHERE sync_received_at >= ? OR modified_at >= ? OR created_at >= ?
+                ORDER BY COALESCE(sync_received_at, modified_at, created_at)
                 LIMIT ?
                 "#,
             )?;
-            let rows = stmt.query_map(params![since_ts, since_ts, since_ts, limit], |row| {
+            let rows = stmt.query_map(params![ts, ts, ts, limit], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1920,17 +2419,17 @@ impl Database {
             let rows = stmt.query_map(params![limit], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
         for (id_bytes, created_at, content, modified_at, deleted_at) in note_rows {
-            let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
+            let timestamp = modified_at.unwrap_or(created_at);
             let operation = if deleted_at.is_some() {
                 "delete"
             } else if modified_at.is_some() {
@@ -1944,14 +2443,14 @@ impl Database {
             change.insert("entity_type".to_string(), serde_json::Value::String("note".to_string()));
             change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
             change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-            change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+            change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
 
             let mut data = serde_json::Map::new();
             data.insert("id".to_string(), serde_json::Value::String(id_hex));
-            data.insert("created_at".to_string(), serde_json::Value::String(created_at));
+            data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
             data.insert("content".to_string(), serde_json::Value::String(content));
-            data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
+            data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
             change.insert("data".to_string(), serde_json::Value::Object(data));
 
             latest_timestamp = Some(timestamp);
@@ -1959,28 +2458,27 @@ impl Database {
         }
 
         // Get tag changes
-        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
+        // Fixed query: include entities where ANY timestamp is >= since
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
-            let tag_rows: Vec<(Vec<u8>, String, Option<Vec<u8>>, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
+            let tag_rows: Vec<(Vec<u8>, String, Option<Vec<u8>>, i64, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
                 let mut stmt = self.conn.prepare(
                     r#"
                     SELECT id, name, parent_id, created_at, modified_at, deleted_at
                     FROM tags
-                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
-                       OR (sync_received_at IS NULL AND (modified_at >= ? OR created_at >= ?))
-                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', modified_at) AS INTEGER), CAST(strftime('%s', created_at) AS INTEGER))
+                    WHERE sync_received_at >= ? OR modified_at >= ? OR created_at >= ?
+                    ORDER BY COALESCE(sync_received_at, modified_at, created_at)
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![ts, ts, ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1998,16 +2496,16 @@ impl Database {
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
 
             for (id_bytes, name, parent_id_bytes, created_at, modified_at, deleted_at) in tag_rows {
-                let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
+                let timestamp = modified_at.unwrap_or(created_at);
                 let operation = if deleted_at.is_some() {
                     "delete"
                 } else if modified_at.is_some() {
@@ -2023,18 +2521,18 @@ impl Database {
                 change.insert("entity_type".to_string(), serde_json::Value::String("tag".to_string()));
                 change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
                 change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
 
                 let mut data = serde_json::Map::new();
                 data.insert("id".to_string(), serde_json::Value::String(id_hex));
                 data.insert("name".to_string(), serde_json::Value::String(name));
                 data.insert("parent_id".to_string(), parent_id_hex.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("created_at".to_string(), serde_json::Value::String(created_at));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
                 change.insert("data".to_string(), serde_json::Value::Object(data));
 
-                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
                     latest_timestamp = Some(timestamp);
                 }
                 changes.push(change);
@@ -2042,27 +2540,26 @@ impl Database {
         }
 
         // Get note_tag changes
-        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
+        // Fixed query: include entities where ANY timestamp is >= since
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
-            let nt_rows: Vec<(Vec<u8>, Vec<u8>, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
+            let nt_rows: Vec<(Vec<u8>, Vec<u8>, i64, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
                 let mut stmt = self.conn.prepare(
                     r#"
                     SELECT note_id, tag_id, created_at, modified_at, deleted_at
                     FROM note_tags
-                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
-                       OR (sync_received_at IS NULL AND (created_at >= ? OR deleted_at >= ? OR modified_at >= ?))
-                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, deleted_at, created_at)) AS INTEGER))
+                    WHERE sync_received_at >= ? OR modified_at >= ? OR deleted_at >= ? OR created_at >= ?
+                    ORDER BY COALESCE(sync_received_at, modified_at, deleted_at, created_at)
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![ts, ts, ts, ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -2079,18 +2576,18 @@ impl Database {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
 
             for (note_id_bytes, tag_id_bytes, created_at, modified_at, deleted_at) in nt_rows {
-                let timestamp = modified_at.clone()
-                    .or_else(|| deleted_at.clone())
-                    .unwrap_or_else(|| created_at.clone());
+                let timestamp = modified_at
+                    .or(deleted_at)
+                    .unwrap_or(created_at);
 
                 let operation = if deleted_at.is_some() {
                     "delete"
@@ -2108,17 +2605,17 @@ impl Database {
                 change.insert("entity_type".to_string(), serde_json::Value::String("note_tag".to_string()));
                 change.insert("entity_id".to_string(), serde_json::Value::String(entity_id));
                 change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
 
                 let mut data = serde_json::Map::new();
                 data.insert("note_id".to_string(), serde_json::Value::String(note_id_hex));
                 data.insert("tag_id".to_string(), serde_json::Value::String(tag_id_hex));
-                data.insert("created_at".to_string(), serde_json::Value::String(created_at));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
                 change.insert("data".to_string(), serde_json::Value::Object(data));
 
-                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
                     latest_timestamp = Some(timestamp);
                 }
                 changes.push(change);
@@ -2126,29 +2623,28 @@ impl Database {
         }
 
         // Get audio_file changes
-        // Filter by sync_received_at if set, otherwise fall back to modified_at/imported_at
+        // Fixed query: include entities where ANY timestamp is >= since
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
-            let audio_rows: Vec<(Vec<u8>, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = if let Some(since_ts) = since {
+            let audio_rows: Vec<(Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
                 let mut stmt = self.conn.prepare(
                     r#"
                     SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
                     FROM audio_files
-                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
-                       OR (sync_received_at IS NULL AND (modified_at >= ? OR imported_at >= ?))
-                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, imported_at)) AS INTEGER))
+                    WHERE sync_received_at >= ? OR modified_at >= ? OR imported_at >= ?
+                    ORDER BY COALESCE(sync_received_at, modified_at, imported_at)
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![ts, ts, ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(3)?,
                         row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -2164,19 +2660,19 @@ impl Database {
                 let rows = stmt.query_map(params![remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(3)?,
                         row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
 
             for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at) in audio_rows {
-                let timestamp = modified_at.clone().unwrap_or_else(|| imported_at.clone());
+                let timestamp = modified_at.unwrap_or(imported_at);
                 let operation = if deleted_at.is_some() {
                     "delete"
                 } else if modified_at.is_some() {
@@ -2190,19 +2686,19 @@ impl Database {
                 change.insert("entity_type".to_string(), serde_json::Value::String("audio_file".to_string()));
                 change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
                 change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
 
                 let mut data = serde_json::Map::new();
                 data.insert("id".to_string(), serde_json::Value::String(id_hex));
-                data.insert("imported_at".to_string(), serde_json::Value::String(imported_at));
+                data.insert("imported_at".to_string(), serde_json::Value::Number(imported_at.into()));
                 data.insert("filename".to_string(), serde_json::Value::String(filename));
-                data.insert("file_created_at".to_string(), file_created_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("file_created_at".to_string(), file_created_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
                 data.insert("summary".to_string(), summary.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
                 change.insert("data".to_string(), serde_json::Value::Object(data));
 
-                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
                     latest_timestamp = Some(timestamp);
                 }
                 changes.push(change);
@@ -2210,29 +2706,28 @@ impl Database {
         }
 
         // Get note_attachment changes
-        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
+        // Fixed query: include entities where ANY timestamp is >= since
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
-            let na_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, String, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
+            let na_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, String, i64, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
                 let mut stmt = self.conn.prepare(
                     r#"
                     SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
                     FROM note_attachments
-                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
-                       OR (sync_received_at IS NULL AND (created_at >= ? OR deleted_at >= ? OR modified_at >= ?))
-                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, deleted_at, created_at)) AS INTEGER))
+                    WHERE sync_received_at >= ? OR modified_at >= ? OR deleted_at >= ? OR created_at >= ?
+                    ORDER BY COALESCE(sync_received_at, modified_at, deleted_at, created_at)
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![ts, ts, ts, ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -2251,18 +2746,18 @@ impl Database {
                         row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
 
             for (id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at) in na_rows {
-                let timestamp = modified_at.clone()
-                    .or_else(|| deleted_at.clone())
-                    .unwrap_or_else(|| created_at.clone());
+                let timestamp = modified_at
+                    .or(deleted_at)
+                    .unwrap_or(created_at);
 
                 let operation = if deleted_at.is_some() {
                     "delete"
@@ -2280,19 +2775,19 @@ impl Database {
                 change.insert("entity_type".to_string(), serde_json::Value::String("note_attachment".to_string()));
                 change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
                 change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
 
                 let mut data = serde_json::Map::new();
                 data.insert("id".to_string(), serde_json::Value::String(id_hex));
                 data.insert("note_id".to_string(), serde_json::Value::String(note_id_hex));
                 data.insert("attachment_id".to_string(), serde_json::Value::String(attachment_id_hex));
                 data.insert("attachment_type".to_string(), serde_json::Value::String(attachment_type));
-                data.insert("created_at".to_string(), serde_json::Value::String(created_at));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
                 change.insert("data".to_string(), serde_json::Value::Object(data));
 
-                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
                     latest_timestamp = Some(timestamp);
                 }
                 changes.push(change);
@@ -2300,21 +2795,20 @@ impl Database {
         }
 
         // Get transcription changes
-        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
+        // Fixed query: include entities where ANY timestamp is >= since
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
-            let transcription_rows: Vec<(Vec<u8>, Vec<u8>, String, Option<String>, String, Option<String>, Option<String>, String, Vec<u8>, String, Option<String>, Option<String>)> = if let Some(since_ts) = since {
+            let transcription_rows: Vec<(Vec<u8>, Vec<u8>, String, Option<String>, String, Option<String>, Option<String>, String, Vec<u8>, i64, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
                 let mut stmt = self.conn.prepare(
                     r#"
                     SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
                     FROM transcriptions
-                    WHERE sync_received_at >= CAST(strftime('%s', ?) AS INTEGER)
-                       OR (sync_received_at IS NULL AND (modified_at >= ? OR created_at >= ?))
-                    ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, created_at)) AS INTEGER))
+                    WHERE sync_received_at >= ? OR modified_at >= ? OR created_at >= ?
+                    ORDER BY COALESCE(sync_received_at, modified_at, created_at)
                     LIMIT ?
                     "#,
                 )?;
-                let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
+                let rows = stmt.query_map(params![ts, ts, ts, remaining], |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
@@ -2325,9 +2819,9 @@ impl Database {
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, Vec<u8>>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, Option<String>>(10)?,
-                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -2351,16 +2845,16 @@ impl Database {
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, Vec<u8>>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, Option<String>>(10)?,
-                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
 
             for (id_bytes, audio_file_id_bytes, content, content_segments, service, service_arguments, service_response, state, device_id_bytes, created_at, modified_at, deleted_at) in transcription_rows {
-                let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
+                let timestamp = modified_at.unwrap_or(created_at);
                 let operation = if deleted_at.is_some() {
                     "delete"
                 } else if modified_at.is_some() {
@@ -2377,7 +2871,7 @@ impl Database {
                 change.insert("entity_type".to_string(), serde_json::Value::String("transcription".to_string()));
                 change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
                 change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
+                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
 
                 let mut data = serde_json::Map::new();
                 data.insert("id".to_string(), serde_json::Value::String(id_hex));
@@ -2389,12 +2883,12 @@ impl Database {
                 data.insert("service_response".to_string(), service_response.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
                 data.insert("state".to_string(), serde_json::Value::String(state));
                 data.insert("device_id".to_string(), serde_json::Value::String(device_id_hex));
-                data.insert("created_at".to_string(), serde_json::Value::String(created_at));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
+                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
                 change.insert("data".to_string(), serde_json::Value::Object(data));
 
-                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
+                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
                     latest_timestamp = Some(timestamp);
                 }
                 changes.push(change);
@@ -2407,170 +2901,11 @@ impl Database {
     /// Get changes since a timestamp using exclusive comparison (>)
     /// This is used for checking unsynced changes where we want to exclude
     /// items that were synced at exactly the sync timestamp.
-    pub fn get_changes_since_exclusive(&self, since: Option<&str>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<String>)> {
-        let since_ts = match since {
-            Some(ts) => ts,
-            None => return self.get_changes_since(None, limit),
-        };
-
-        let mut changes = Vec::new();
-        let mut latest_timestamp: Option<String> = None;
-
-        // Check notes with > (exclusive)
-        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
-        let note_count: i64 = self.conn.query_row(
-            r#"
-            SELECT COUNT(*) FROM notes
-            WHERE sync_received_at > CAST(strftime('%s', ?) AS INTEGER)
-               OR (sync_received_at IS NULL AND (modified_at > ? OR created_at > ?))
-            "#,
-            params![since_ts, since_ts, since_ts],
-            |row| row.get(0),
-        )?;
-
-        if note_count > 0 {
-            let mut stmt = self.conn.prepare(
-                r#"
-                SELECT id, created_at, content, modified_at, deleted_at
-                FROM notes
-                WHERE sync_received_at > CAST(strftime('%s', ?) AS INTEGER)
-                   OR (sync_received_at IS NULL AND (modified_at > ? OR created_at > ?))
-                ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', modified_at) AS INTEGER), CAST(strftime('%s', created_at) AS INTEGER))
-                LIMIT ?
-                "#,
-            )?;
-            let rows = stmt.query_map(params![since_ts, since_ts, since_ts, limit], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            })?;
-
-            for row in rows {
-                let (id_bytes, created_at, content, modified_at, deleted_at) = row?;
-                let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
-                let operation = if deleted_at.is_some() {
-                    "delete"
-                } else if modified_at.is_some() {
-                    "update"
-                } else {
-                    "create"
-                };
-
-                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-                let mut change = HashMap::new();
-                change.insert("entity_type".to_string(), serde_json::Value::String("note".to_string()));
-                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
-                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
-
-                let mut data = serde_json::Map::new();
-                data.insert("id".to_string(), serde_json::Value::String(id_hex));
-                data.insert("created_at".to_string(), serde_json::Value::String(created_at));
-                data.insert("content".to_string(), serde_json::Value::String(content));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                change.insert("data".to_string(), serde_json::Value::Object(data));
-
-                latest_timestamp = Some(timestamp);
-                changes.push(change);
-
-                if changes.len() >= limit as usize {
-                    return Ok((changes, latest_timestamp));
-                }
-            }
-        }
-
-        // Check audio_files with > (exclusive)
-        // Filter by sync_received_at if set, otherwise fall back to modified_at/imported_at
-        let remaining = limit - changes.len() as i64;
-        if remaining > 0 {
-            let mut stmt = self.conn.prepare(
-                r#"
-                SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
-                FROM audio_files
-                WHERE sync_received_at > CAST(strftime('%s', ?) AS INTEGER)
-                   OR (sync_received_at IS NULL AND (modified_at > ? OR imported_at > ?))
-                ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, imported_at)) AS INTEGER))
-                LIMIT ?
-                "#,
-            )?;
-            let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            })?;
-
-            for row in rows {
-                let (id_bytes, imported_at, _filename, _file_created_at, _summary, modified_at, deleted_at) = row?;
-                let timestamp = modified_at.clone().unwrap_or_else(|| imported_at.clone());
-
-                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-                let mut change = HashMap::new();
-                change.insert("entity_type".to_string(), serde_json::Value::String("audio_file".to_string()));
-                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex));
-                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
-
-                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
-                    latest_timestamp = Some(timestamp);
-                }
-                changes.push(change);
-            }
-        }
-
-        // Check note_attachments with > (exclusive)
-        // Filter by sync_received_at if set, otherwise fall back to modified_at/created_at
-        let remaining = limit - changes.len() as i64;
-        if remaining > 0 {
-            let mut stmt = self.conn.prepare(
-                r#"
-                SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
-                FROM note_attachments
-                WHERE sync_received_at > CAST(strftime('%s', ?) AS INTEGER)
-                   OR (sync_received_at IS NULL AND (modified_at > ? OR created_at > ?))
-                ORDER BY COALESCE(sync_received_at, CAST(strftime('%s', COALESCE(modified_at, created_at)) AS INTEGER))
-                LIMIT ?
-                "#,
-            )?;
-            let rows = stmt.query_map(params![since_ts, since_ts, since_ts, remaining], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            })?;
-
-            for row in rows {
-                let (id_bytes, _note_id_bytes, _attachment_id_bytes, _attachment_type, created_at, modified_at, _deleted_at) = row?;
-                let timestamp = modified_at.clone().unwrap_or_else(|| created_at.clone());
-
-                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-                let mut change = HashMap::new();
-                change.insert("entity_type".to_string(), serde_json::Value::String("note_attachment".to_string()));
-                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex));
-                change.insert("timestamp".to_string(), serde_json::Value::String(timestamp.clone()));
-
-                if latest_timestamp.is_none() || timestamp > *latest_timestamp.as_ref().unwrap() {
-                    latest_timestamp = Some(timestamp);
-                }
-                changes.push(change);
-            }
-        }
-
-        Ok((changes, latest_timestamp))
+    pub fn get_changes_since_exclusive(&self, since: Option<i64>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<i64>)> {
+        // For exclusive comparison (>), we use get_changes_since with since + 1
+        // This is equivalent to > since (i.e., >= since + 1)
+        let adjusted_since = since.map(|ts| ts + 1);
+        self.get_changes_since(adjusted_since, limit)
     }
 
     /// Get changes since a timestamp, returning SyncChange structs.
@@ -2578,9 +2913,9 @@ impl Database {
     /// This is the primary method for sync_server to use.
     pub fn get_changes_since_as_sync_changes(
         &self,
-        since: Option<&str>,
+        since: Option<i64>,
         limit: i64,
-    ) -> VoiceResult<(Vec<SyncChange>, Option<String>)> {
+    ) -> VoiceResult<(Vec<SyncChange>, Option<i64>)> {
         // Use exclusive comparison (>) for incremental sync
         let (changes, latest_timestamp) = if since.is_some() {
             self.get_changes_since_exclusive(since, limit)?
@@ -2595,7 +2930,7 @@ impl Database {
                 let entity_type = c.get("entity_type")?.as_str()?.to_string();
                 let entity_id = c.get("entity_id")?.as_str()?.to_string();
                 let operation = c.get("operation")?.as_str().unwrap_or("create").to_string();
-                let timestamp = c.get("timestamp")?.as_str()?.to_string();
+                let timestamp = c.get("timestamp")?.as_i64()?;
                 let data = c.get("data").cloned().unwrap_or(serde_json::Value::Null);
 
                 Some(SyncChange {
@@ -2624,10 +2959,10 @@ impl Database {
         let note_rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         })?;
 
@@ -2636,10 +2971,10 @@ impl Database {
             let (id_bytes, created_at, content, modified_at, deleted_at) = row?;
             let mut note = HashMap::new();
             note.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
-            note.insert("created_at".to_string(), serde_json::Value::String(created_at));
+            note.insert("created_at".to_string(), serde_json::json!(created_at));
             note.insert("content".to_string(), serde_json::Value::String(content));
-            note.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            note.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            note.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
+            note.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             notes.push(note);
         }
         result.insert("notes".to_string(), notes);
@@ -2653,9 +2988,9 @@ impl Database {
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<Vec<u8>>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         })?;
 
@@ -2666,9 +3001,9 @@ impl Database {
             tag.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
             tag.insert("name".to_string(), serde_json::Value::String(name));
             tag.insert("parent_id".to_string(), parent_id_bytes.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            tag.insert("created_at".to_string(), serde_json::Value::String(created_at));
-            tag.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            tag.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            tag.insert("created_at".to_string(), serde_json::json!(created_at));
+            tag.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
+            tag.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             tags.push(tag);
         }
         result.insert("tags".to_string(), tags);
@@ -2681,9 +3016,9 @@ impl Database {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         })?;
 
@@ -2693,9 +3028,9 @@ impl Database {
             let mut nt = HashMap::new();
             nt.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default()));
             nt.insert("tag_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&tag_id_bytes).unwrap_or_default()));
-            nt.insert("created_at".to_string(), serde_json::Value::String(created_at));
-            nt.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            nt.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            nt.insert("created_at".to_string(), serde_json::json!(created_at));
+            nt.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
+            nt.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             note_tags.push(nt);
         }
         result.insert("note_tags".to_string(), note_tags);
@@ -2707,14 +3042,14 @@ impl Database {
         let af_rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(3)?,
                 row.get::<_, Option<f64>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Vec<u8>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
             ))
         })?;
 
@@ -2723,14 +3058,14 @@ impl Database {
             let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at) = row?;
             let mut af = HashMap::new();
             af.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
-            af.insert("imported_at".to_string(), serde_json::Value::String(imported_at));
+            af.insert("imported_at".to_string(), serde_json::json!(imported_at));
             af.insert("filename".to_string(), serde_json::Value::String(filename));
-            af.insert("file_created_at".to_string(), file_created_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            af.insert("file_created_at".to_string(), file_created_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             af.insert("duration_seconds".to_string(), duration_seconds.map_or(serde_json::Value::Null, |d| serde_json::json!(d)));
             af.insert("summary".to_string(), summary.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             af.insert("device_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default()));
-            af.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            af.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            af.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
+            af.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             audio_files.push(af);
         }
         result.insert("audio_files".to_string(), audio_files);
@@ -2745,10 +3080,10 @@ impl Database {
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, i64>(4)?,
                 row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
             ))
         })?;
 
@@ -2760,10 +3095,10 @@ impl Database {
             na.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default()));
             na.insert("attachment_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&attachment_id_bytes).unwrap_or_default()));
             na.insert("attachment_type".to_string(), serde_json::Value::String(attachment_type));
-            na.insert("created_at".to_string(), serde_json::Value::String(created_at));
+            na.insert("created_at".to_string(), serde_json::json!(created_at));
             na.insert("device_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default()));
-            na.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            na.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            na.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
+            na.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             note_attachments.push(na);
         }
         result.insert("note_attachments".to_string(), note_attachments);
@@ -2779,10 +3114,10 @@ impl Database {
     pub fn apply_sync_note(
         &self,
         note_id: &str,
-        created_at: &str,
+        created_at: i64,
         content: &str,
-        modified_at: Option<&str>,
-        deleted_at: Option<&str>,
+        modified_at: Option<i64>,
+        deleted_at: Option<i64>,
         sync_received_at: Option<i64>,
     ) -> VoiceResult<bool> {
         let uuid = Uuid::parse_str(note_id)
@@ -2825,8 +3160,8 @@ impl Database {
         tag_id: &str,
         name: &str,
         parent_id: Option<&str>,
-        created_at: &str,
-        modified_at: Option<&str>,
+        created_at: i64,
+        modified_at: Option<i64>,
         sync_received_at: Option<i64>,
     ) -> VoiceResult<bool> {
         self.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, None, sync_received_at)
@@ -2838,9 +3173,9 @@ impl Database {
         tag_id: &str,
         name: &str,
         parent_id: Option<&str>,
-        created_at: &str,
-        modified_at: Option<&str>,
-        deleted_at: Option<&str>,
+        created_at: i64,
+        modified_at: Option<i64>,
+        deleted_at: Option<i64>,
         sync_received_at: Option<i64>,
     ) -> VoiceResult<bool> {
         let uuid = Uuid::parse_str(tag_id)
@@ -2882,9 +3217,9 @@ impl Database {
         &self,
         note_id: &str,
         tag_id: &str,
-        created_at: &str,
-        modified_at: Option<&str>,
-        deleted_at: Option<&str>,
+        created_at: i64,
+        modified_at: Option<i64>,
+        deleted_at: Option<i64>,
         sync_received_at: Option<i64>,
     ) -> VoiceResult<bool> {
         let note_uuid = Uuid::parse_str(note_id)
@@ -2934,7 +3269,7 @@ impl Database {
         let uuid = validate_note_id(note_id)?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
-        let result: Option<(Vec<u8>, String, String, Option<String>, Option<String>)> = self.conn
+        let result: Option<(Vec<u8>, i64, String, Option<i64>, Option<i64>)> = self.conn
             .query_row(
                 "SELECT id, created_at, content, modified_at, deleted_at FROM notes WHERE id = ?",
                 params![uuid_bytes],
@@ -2952,10 +3287,10 @@ impl Database {
             Some((id_bytes, created_at, content, modified_at, deleted_at)) => {
                 let mut note = HashMap::new();
                 note.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
-                note.insert("created_at".to_string(), serde_json::Value::String(created_at));
+                note.insert("created_at".to_string(), serde_json::json!(created_at));
                 note.insert("content".to_string(), serde_json::Value::String(content));
-                note.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                note.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                note.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
+                note.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
                 Ok(Some(note))
             }
             None => Ok(None),
@@ -2967,7 +3302,7 @@ impl Database {
         let uuid = validate_tag_id(tag_id)?;
         let uuid_bytes = uuid.as_bytes().to_vec();
 
-        let result: Option<(Vec<u8>, String, Option<Vec<u8>>, String, Option<String>)> = self.conn
+        let result: Option<(Vec<u8>, String, Option<Vec<u8>>, i64, Option<i64>)> = self.conn
             .query_row(
                 "SELECT id, name, parent_id, created_at, modified_at FROM tags WHERE id = ?",
                 params![uuid_bytes],
@@ -2987,8 +3322,8 @@ impl Database {
                 tag.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
                 tag.insert("name".to_string(), serde_json::Value::String(name));
                 tag.insert("parent_id".to_string(), parent_id_bytes.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                tag.insert("created_at".to_string(), serde_json::Value::String(created_at));
-                tag.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                tag.insert("created_at".to_string(), serde_json::json!(created_at));
+                tag.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
                 Ok(Some(tag))
             }
             None => Ok(None),
@@ -3004,7 +3339,7 @@ impl Database {
         let note_bytes = note_uuid.as_bytes().to_vec();
         let tag_bytes = tag_uuid.as_bytes().to_vec();
 
-        let result: Option<(Vec<u8>, Vec<u8>, String, Option<String>, Option<String>)> = self.conn
+        let result: Option<(Vec<u8>, Vec<u8>, i64, Option<i64>, Option<i64>)> = self.conn
             .query_row(
                 "SELECT note_id, tag_id, created_at, modified_at, deleted_at FROM note_tags WHERE note_id = ? AND tag_id = ?",
                 params![note_bytes, tag_bytes],
@@ -3023,9 +3358,9 @@ impl Database {
                 let mut nt = HashMap::new();
                 nt.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default()));
                 nt.insert("tag_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&tag_id_bytes).unwrap_or_default()));
-                nt.insert("created_at".to_string(), serde_json::Value::String(created_at));
-                nt.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                nt.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                nt.insert("created_at".to_string(), serde_json::json!(created_at));
+                nt.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
+                nt.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
                 Ok(Some(nt))
             }
             None => Ok(None),
@@ -3037,11 +3372,11 @@ impl Database {
         &self,
         note_id: &str,
         local_content: &str,
-        local_modified_at: &str,
+        local_modified_at: i64,
         local_device_id: Option<&str>,
         local_device_name: Option<&str>,
         remote_content: &str,
-        remote_modified_at: &str,
+        remote_modified_at: i64,
         remote_device_id: Option<&str>,
         remote_device_name: Option<&str>,
     ) -> VoiceResult<String> {
@@ -3064,7 +3399,7 @@ impl Database {
             INSERT INTO conflicts_note_content
             (id, note_id, local_content, local_modified_at, local_device_id, local_device_name,
              remote_content, remote_modified_at, remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             "#,
             params![
                 conflict_bytes,
@@ -3088,11 +3423,11 @@ impl Database {
         &self,
         note_id: &str,
         surviving_content: &str,
-        surviving_modified_at: &str,
+        surviving_modified_at: i64,
         surviving_device_id: Option<&str>,
         surviving_device_name: Option<&str>,
         deleted_content: Option<&str>,
-        deleted_at: &str,
+        deleted_at: i64,
         deleting_device_id: Option<&str>,
         deleting_device_name: Option<&str>,
     ) -> VoiceResult<String> {
@@ -3116,7 +3451,7 @@ impl Database {
             (id, note_id, surviving_content, surviving_modified_at, surviving_device_id,
              surviving_device_name, deleted_content, deleted_at, deleting_device_id,
              deleting_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             "#,
             params![
                 conflict_bytes,
@@ -3140,11 +3475,11 @@ impl Database {
         &self,
         tag_id: &str,
         local_name: &str,
-        local_modified_at: &str,
+        local_modified_at: i64,
         local_device_id: Option<&str>,
         local_device_name: Option<&str>,
         remote_name: &str,
-        remote_modified_at: &str,
+        remote_modified_at: i64,
         remote_device_id: Option<&str>,
         remote_device_name: Option<&str>,
     ) -> VoiceResult<String> {
@@ -3167,7 +3502,7 @@ impl Database {
             INSERT INTO conflicts_tag_rename
             (id, tag_id, local_name, local_modified_at, local_device_id, local_device_name,
              remote_name, remote_modified_at, remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             "#,
             params![
                 conflict_bytes,
@@ -3191,14 +3526,14 @@ impl Database {
         &self,
         note_id: &str,
         tag_id: &str,
-        local_created_at: Option<&str>,
-        local_modified_at: Option<&str>,
-        local_deleted_at: Option<&str>,
+        local_created_at: Option<i64>,
+        local_modified_at: Option<i64>,
+        local_deleted_at: Option<i64>,
         local_device_id: Option<&str>,
         local_device_name: Option<&str>,
-        remote_created_at: Option<&str>,
-        remote_modified_at: Option<&str>,
-        remote_deleted_at: Option<&str>,
+        remote_created_at: Option<i64>,
+        remote_modified_at: Option<i64>,
+        remote_deleted_at: Option<i64>,
         remote_device_id: Option<&str>,
         remote_device_name: Option<&str>,
     ) -> VoiceResult<String> {
@@ -3226,7 +3561,7 @@ impl Database {
              local_created_at, local_modified_at, local_deleted_at, local_device_id, local_device_name,
              remote_created_at, remote_modified_at, remote_deleted_at, remote_device_id, remote_device_name,
              created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             "#,
             params![
                 conflict_bytes,
@@ -3253,11 +3588,11 @@ impl Database {
         &self,
         tag_id: &str,
         local_parent_id: Option<&str>,
-        local_modified_at: &str,
+        local_modified_at: i64,
         local_device_id: Option<&str>,
         local_device_name: Option<&str>,
         remote_parent_id: Option<&str>,
-        remote_modified_at: &str,
+        remote_modified_at: i64,
         remote_device_id: Option<&str>,
         remote_device_name: Option<&str>,
     ) -> VoiceResult<String> {
@@ -3287,7 +3622,7 @@ impl Database {
             INSERT INTO conflicts_tag_parent
             (id, tag_id, local_parent_id, local_modified_at, local_device_id, local_device_name,
              remote_parent_id, remote_modified_at, remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             "#,
             params![
                 conflict_bytes,
@@ -3312,10 +3647,10 @@ impl Database {
         tag_id: &str,
         surviving_name: &str,
         surviving_parent_id: Option<&str>,
-        surviving_modified_at: &str,
+        surviving_modified_at: i64,
         surviving_device_id: Option<&str>,
         surviving_device_name: Option<&str>,
-        deleted_at: &str,
+        deleted_at: i64,
         deleting_device_id: Option<&str>,
         deleting_device_name: Option<&str>,
     ) -> VoiceResult<String> {
@@ -3344,7 +3679,7 @@ impl Database {
             (id, tag_id, surviving_name, surviving_parent_id, surviving_modified_at,
              surviving_device_id, surviving_device_name,
              deleted_at, deleting_device_id, deleting_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             "#,
             params![
                 conflict_bytes,
@@ -3449,15 +3784,15 @@ impl Database {
             let id: Vec<u8> = row.get(0)?;
             let note_id: Vec<u8> = row.get(1)?;
             let local_content: String = row.get(2)?;
-            let local_modified_at: String = row.get(3)?;
+            let local_modified_at: i64 = row.get(3)?;
             let local_device_id: Option<Vec<u8>> = row.get(4)?;
             let local_device_name: Option<String> = row.get(5)?;
             let remote_content: String = row.get(6)?;
-            let remote_modified_at: String = row.get(7)?;
+            let remote_modified_at: i64 = row.get(7)?;
             let remote_device_id: Option<Vec<u8>> = row.get(8)?;
             let remote_device_name: Option<String> = row.get(9)?;
-            let created_at: String = row.get(10)?;
-            let resolved_at: Option<String> = row.get(11)?;
+            let created_at: i64 = row.get(10)?;
+            let resolved_at: Option<i64> = row.get(11)?;
 
             Ok((id, note_id, local_content, local_modified_at, local_device_id,
                 local_device_name, remote_content, remote_modified_at,
@@ -3474,15 +3809,15 @@ impl Database {
             conflict.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id).unwrap_or_default()));
             conflict.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id).unwrap_or_default()));
             conflict.insert("local_content".to_string(), serde_json::Value::String(local_content));
-            conflict.insert("local_modified_at".to_string(), serde_json::Value::String(local_modified_at));
+            conflict.insert("local_modified_at".to_string(), serde_json::json!(local_modified_at));
             conflict.insert("local_device_id".to_string(), local_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("local_device_name".to_string(), local_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("remote_content".to_string(), serde_json::Value::String(remote_content));
-            conflict.insert("remote_modified_at".to_string(), serde_json::Value::String(remote_modified_at));
+            conflict.insert("remote_modified_at".to_string(), serde_json::json!(remote_modified_at));
             conflict.insert("remote_device_id".to_string(), remote_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("remote_device_name".to_string(), remote_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::Value::String(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
+            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             conflicts.push(conflict);
         }
 
@@ -3508,15 +3843,15 @@ impl Database {
             let id: Vec<u8> = row.get(0)?;
             let note_id: Vec<u8> = row.get(1)?;
             let surviving_content: String = row.get(2)?;
-            let surviving_modified_at: String = row.get(3)?;
+            let surviving_modified_at: i64 = row.get(3)?;
             let surviving_device_id: Option<Vec<u8>> = row.get(4)?;
             let surviving_device_name: Option<String> = row.get(5)?;
             let deleted_content: Option<String> = row.get(6)?;
-            let deleted_at: String = row.get(7)?;
+            let deleted_at: i64 = row.get(7)?;
             let deleting_device_id: Option<Vec<u8>> = row.get(8)?;
             let deleting_device_name: Option<String> = row.get(9)?;
-            let created_at: String = row.get(10)?;
-            let resolved_at: Option<String> = row.get(11)?;
+            let created_at: i64 = row.get(10)?;
+            let resolved_at: Option<i64> = row.get(11)?;
 
             Ok((id, note_id, surviving_content, surviving_modified_at,
                 surviving_device_id, surviving_device_name, deleted_content, deleted_at,
@@ -3533,15 +3868,15 @@ impl Database {
             conflict.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id).unwrap_or_default()));
             conflict.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id).unwrap_or_default()));
             conflict.insert("surviving_content".to_string(), serde_json::Value::String(surviving_content));
-            conflict.insert("surviving_modified_at".to_string(), serde_json::Value::String(surviving_modified_at));
+            conflict.insert("surviving_modified_at".to_string(), serde_json::json!(surviving_modified_at));
             conflict.insert("surviving_device_id".to_string(), surviving_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("surviving_device_name".to_string(), surviving_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("deleted_content".to_string(), deleted_content.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("deleted_at".to_string(), serde_json::Value::String(deleted_at));
+            conflict.insert("deleted_at".to_string(), serde_json::json!(deleted_at));
             conflict.insert("deleting_device_id".to_string(), deleting_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("deleting_device_name".to_string(), deleting_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::Value::String(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
+            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             conflicts.push(conflict);
         }
 
@@ -3567,15 +3902,15 @@ impl Database {
             let id: Vec<u8> = row.get(0)?;
             let tag_id: Vec<u8> = row.get(1)?;
             let local_name: String = row.get(2)?;
-            let local_modified_at: String = row.get(3)?;
+            let local_modified_at: i64 = row.get(3)?;
             let local_device_id: Option<Vec<u8>> = row.get(4)?;
             let local_device_name: Option<String> = row.get(5)?;
             let remote_name: String = row.get(6)?;
-            let remote_modified_at: String = row.get(7)?;
+            let remote_modified_at: i64 = row.get(7)?;
             let remote_device_id: Option<Vec<u8>> = row.get(8)?;
             let remote_device_name: Option<String> = row.get(9)?;
-            let created_at: String = row.get(10)?;
-            let resolved_at: Option<String> = row.get(11)?;
+            let created_at: i64 = row.get(10)?;
+            let resolved_at: Option<i64> = row.get(11)?;
 
             Ok((id, tag_id, local_name, local_modified_at, local_device_id,
                 local_device_name, remote_name, remote_modified_at,
@@ -3592,15 +3927,15 @@ impl Database {
             conflict.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id).unwrap_or_default()));
             conflict.insert("tag_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&tag_id).unwrap_or_default()));
             conflict.insert("local_name".to_string(), serde_json::Value::String(local_name));
-            conflict.insert("local_modified_at".to_string(), serde_json::Value::String(local_modified_at));
+            conflict.insert("local_modified_at".to_string(), serde_json::json!(local_modified_at));
             conflict.insert("local_device_id".to_string(), local_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("local_device_name".to_string(), local_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("remote_name".to_string(), serde_json::Value::String(remote_name));
-            conflict.insert("remote_modified_at".to_string(), serde_json::Value::String(remote_modified_at));
+            conflict.insert("remote_modified_at".to_string(), serde_json::json!(remote_modified_at));
             conflict.insert("remote_device_id".to_string(), remote_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("remote_device_name".to_string(), remote_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::Value::String(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
+            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             conflicts.push(conflict);
         }
 
@@ -3626,15 +3961,15 @@ impl Database {
             let id: Vec<u8> = row.get(0)?;
             let tag_id: Vec<u8> = row.get(1)?;
             let local_parent_id: Option<Vec<u8>> = row.get(2)?;
-            let local_modified_at: String = row.get(3)?;
+            let local_modified_at: i64 = row.get(3)?;
             let local_device_id: Option<Vec<u8>> = row.get(4)?;
             let local_device_name: Option<String> = row.get(5)?;
             let remote_parent_id: Option<Vec<u8>> = row.get(6)?;
-            let remote_modified_at: String = row.get(7)?;
+            let remote_modified_at: i64 = row.get(7)?;
             let remote_device_id: Option<Vec<u8>> = row.get(8)?;
             let remote_device_name: Option<String> = row.get(9)?;
-            let created_at: String = row.get(10)?;
-            let resolved_at: Option<String> = row.get(11)?;
+            let created_at: i64 = row.get(10)?;
+            let resolved_at: Option<i64> = row.get(11)?;
 
             Ok((id, tag_id, local_parent_id, local_modified_at, local_device_id,
                 local_device_name, remote_parent_id, remote_modified_at,
@@ -3651,15 +3986,15 @@ impl Database {
             conflict.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id).unwrap_or_default()));
             conflict.insert("tag_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&tag_id).unwrap_or_default()));
             conflict.insert("local_parent_id".to_string(), local_parent_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("local_modified_at".to_string(), serde_json::Value::String(local_modified_at));
+            conflict.insert("local_modified_at".to_string(), serde_json::json!(local_modified_at));
             conflict.insert("local_device_id".to_string(), local_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("local_device_name".to_string(), local_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("remote_parent_id".to_string(), remote_parent_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("remote_modified_at".to_string(), serde_json::Value::String(remote_modified_at));
+            conflict.insert("remote_modified_at".to_string(), serde_json::json!(remote_modified_at));
             conflict.insert("remote_device_id".to_string(), remote_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("remote_device_name".to_string(), remote_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::Value::String(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
+            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             conflicts.push(conflict);
         }
 
@@ -3688,14 +4023,14 @@ impl Database {
             let tag_id: Vec<u8> = row.get(1)?;
             let surviving_name: String = row.get(2)?;
             let surviving_parent_id: Option<Vec<u8>> = row.get(3)?;
-            let surviving_modified_at: String = row.get(4)?;
+            let surviving_modified_at: i64 = row.get(4)?;
             let surviving_device_id: Option<Vec<u8>> = row.get(5)?;
             let surviving_device_name: Option<String> = row.get(6)?;
-            let deleted_at: String = row.get(7)?;
+            let deleted_at: i64 = row.get(7)?;
             let deleting_device_id: Option<Vec<u8>> = row.get(8)?;
             let deleting_device_name: Option<String> = row.get(9)?;
-            let created_at: String = row.get(10)?;
-            let resolved_at: Option<String> = row.get(11)?;
+            let created_at: i64 = row.get(10)?;
+            let resolved_at: Option<i64> = row.get(11)?;
 
             Ok((id, tag_id, surviving_name, surviving_parent_id, surviving_modified_at,
                 surviving_device_id, surviving_device_name,
@@ -3713,14 +4048,14 @@ impl Database {
             conflict.insert("tag_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&tag_id).unwrap_or_default()));
             conflict.insert("surviving_name".to_string(), serde_json::Value::String(surviving_name));
             conflict.insert("surviving_parent_id".to_string(), surviving_parent_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("surviving_modified_at".to_string(), serde_json::Value::String(surviving_modified_at));
+            conflict.insert("surviving_modified_at".to_string(), serde_json::json!(surviving_modified_at));
             conflict.insert("surviving_device_id".to_string(), surviving_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("surviving_device_name".to_string(), surviving_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("deleted_at".to_string(), serde_json::Value::String(deleted_at));
+            conflict.insert("deleted_at".to_string(), serde_json::json!(deleted_at));
             conflict.insert("deleting_device_id".to_string(), deleting_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             conflict.insert("deleting_device_name".to_string(), deleting_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::Value::String(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
+            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             conflicts.push(conflict);
         }
 
@@ -3747,13 +4082,13 @@ impl Database {
 
         // Update the note content
         self.conn.execute(
-            "UPDATE notes SET content = ?, modified_at = datetime('now') WHERE id = ?",
+            "UPDATE notes SET content = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
             params![new_content, &note_id],
         )?;
 
         // Mark conflict as resolved
         self.conn.execute(
-            "UPDATE conflicts_note_content SET resolved_at = datetime('now') WHERE id = ?",
+            "UPDATE conflicts_note_content SET resolved_at = strftime('%s', 'now') WHERE id = ?",
             params![conflict_bytes],
         )?;
 
@@ -3786,7 +4121,7 @@ impl Database {
         if restore_note {
             // Restore the note with surviving content
             self.conn.execute(
-                "UPDATE notes SET content = ?, deleted_at = NULL, modified_at = datetime('now') WHERE id = ?",
+                "UPDATE notes SET content = ?, deleted_at = NULL, modified_at = strftime('%s', 'now') WHERE id = ?",
                 params![surviving_content, &note_id],
             )?;
         }
@@ -3794,7 +4129,7 @@ impl Database {
 
         // Mark conflict as resolved
         self.conn.execute(
-            "UPDATE conflicts_note_delete SET resolved_at = datetime('now') WHERE id = ?",
+            "UPDATE conflicts_note_delete SET resolved_at = strftime('%s', 'now') WHERE id = ?",
             params![conflict_bytes],
         )?;
 
@@ -3828,13 +4163,13 @@ impl Database {
 
         // Update the tag name
         self.conn.execute(
-            "UPDATE tags SET name = ?, modified_at = datetime('now') WHERE id = ?",
+            "UPDATE tags SET name = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
             params![new_name, tag_id],
         )?;
 
         // Mark conflict as resolved
         self.conn.execute(
-            "UPDATE conflicts_tag_rename SET resolved_at = datetime('now') WHERE id = ?",
+            "UPDATE conflicts_tag_rename SET resolved_at = strftime('%s', 'now') WHERE id = ?",
             params![conflict_bytes],
         )?;
 
@@ -3845,20 +4180,20 @@ impl Database {
 
     fn row_to_note(&self, row: &Row) -> rusqlite::Result<NoteRow> {
         let id_bytes: Vec<u8> = row.get(0)?;
-        let created_at: String = row.get(1)?;
+        let created_at: i64 = row.get(1)?;
         let content: String = row.get(2)?;
-        let modified_at: Option<String> = row.get(3)?;
-        let deleted_at: Option<String> = row.get(4)?;
+        let modified_at: Option<i64> = row.get(3)?;
+        let deleted_at: Option<i64> = row.get(4)?;
         let tag_names: Option<String> = row.get(5)?;
         let display_cache: Option<String> = row.get(6)?;
         let list_display_cache: Option<String> = row.get(7)?;
 
         Ok(NoteRow {
             id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
-            created_at: parse_sqlite_datetime(&created_at),
+            created_at,
             content,
-            modified_at: modified_at.map(|s| parse_sqlite_datetime(&s)),
-            deleted_at: deleted_at.map(|s| parse_sqlite_datetime(&s)),
+            modified_at,
+            deleted_at,
             tag_names,
             display_cache,
             list_display_cache,
@@ -3869,15 +4204,15 @@ impl Database {
         let id_bytes: Vec<u8> = row.get(0)?;
         let name: String = row.get(1)?;
         let parent_id_bytes: Option<Vec<u8>> = row.get(2)?;
-        let created_at: Option<String> = row.get(3)?;
-        let modified_at: Option<String> = row.get(4)?;
+        let created_at: Option<i64> = row.get(3)?;
+        let modified_at: Option<i64> = row.get(4)?;
 
         Ok(TagRow {
             id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
             name,
             parent_id: parent_id_bytes.and_then(|b| uuid_bytes_to_hex(&b)),
-            created_at: created_at.map(|s| parse_sqlite_datetime(&s)),
-            modified_at: modified_at.map(|s| parse_sqlite_datetime(&s)),
+            created_at,
+            modified_at,
         })
     }
 
@@ -3903,7 +4238,7 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO note_attachments (id, note_id, attachment_id, attachment_type, created_at, device_id)
-            VALUES (?, ?, ?, ?, datetime('now'), ?)
+            VALUES (?, ?, ?, ?, strftime('%s', 'now'), ?)
             "#,
             params![
                 association_id.as_bytes().to_vec(),
@@ -3916,7 +4251,7 @@ impl Database {
 
         // Update the parent Note's modified_at to trigger sync
         self.conn.execute(
-            "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
+            "UPDATE notes SET modified_at = strftime('%s', 'now') WHERE id = ?",
             params![note_bytes],
         )?;
 
@@ -3946,7 +4281,7 @@ impl Database {
         let updated = self.conn.execute(
             r#"
             UPDATE note_attachments
-            SET deleted_at = datetime('now'), modified_at = datetime('now'), device_id = ?
+            SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now'), device_id = ?
             WHERE id = ? AND deleted_at IS NULL
             "#,
             params![device_id.as_bytes().to_vec(), uuid_bytes],
@@ -3956,7 +4291,7 @@ impl Database {
         if updated > 0 {
             if let Some(note_id) = note_bytes {
                 self.conn.execute(
-                    "UPDATE notes SET modified_at = datetime('now') WHERE id = ?",
+                    "UPDATE notes SET modified_at = strftime('%s', 'now') WHERE id = ?",
                     params![&note_id],
                 )?;
                 // Rebuild display cache for the note
@@ -4024,20 +4359,20 @@ impl Database {
         let note_id_bytes: Vec<u8> = row.get(1)?;
         let attachment_id_bytes: Vec<u8> = row.get(2)?;
         let attachment_type: String = row.get(3)?;
-        let created_at: String = row.get(4)?;
+        let created_at: i64 = row.get(4)?;
         let device_id_bytes: Vec<u8> = row.get(5)?;
-        let modified_at: Option<String> = row.get(6)?;
-        let deleted_at: Option<String> = row.get(7)?;
+        let modified_at: Option<i64> = row.get(6)?;
+        let deleted_at: Option<i64> = row.get(7)?;
 
         Ok(NoteAttachmentRow {
             id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
             note_id: uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default(),
             attachment_id: uuid_bytes_to_hex(&attachment_id_bytes).unwrap_or_default(),
             attachment_type,
-            created_at: parse_sqlite_datetime(&created_at),
+            created_at,
             device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
-            modified_at: modified_at.map(|s| parse_sqlite_datetime(&s)),
-            deleted_at: deleted_at.map(|s| parse_sqlite_datetime(&s)),
+            modified_at,
+            deleted_at,
         })
     }
 
@@ -4049,7 +4384,7 @@ impl Database {
     pub fn create_audio_file(
         &self,
         filename: &str,
-        file_created_at: Option<&str>,
+        file_created_at: Option<i64>,
     ) -> VoiceResult<String> {
         self.create_audio_file_with_duration(filename, file_created_at, None)
     }
@@ -4058,7 +4393,7 @@ impl Database {
     pub fn create_audio_file_with_duration(
         &self,
         filename: &str,
-        file_created_at: Option<&str>,
+        file_created_at: Option<i64>,
         duration_seconds: Option<i64>,
     ) -> VoiceResult<String> {
         let audio_file_id = Uuid::now_v7();
@@ -4068,7 +4403,7 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, device_id)
-            VALUES (?, datetime('now'), ?, ?, ?, ?)
+            VALUES (?, strftime('%s', 'now'), ?, ?, ?, ?)
             "#,
             params![
                 uuid_bytes,
@@ -4175,7 +4510,7 @@ impl Database {
         let updated = self.conn.execute(
             r#"
             UPDATE audio_files
-            SET summary = ?, modified_at = datetime('now'), device_id = ?
+            SET summary = ?, modified_at = strftime('%s', 'now'), device_id = ?
             WHERE id = ? AND deleted_at IS NULL
             "#,
             params![summary, device_id.as_bytes().to_vec(), uuid_bytes],
@@ -4204,7 +4539,7 @@ impl Database {
         let updated = self.conn.execute(
             r#"
             UPDATE audio_files
-            SET deleted_at = datetime('now'), modified_at = datetime('now'), device_id = ?
+            SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now'), device_id = ?
             WHERE id = ? AND deleted_at IS NULL
             "#,
             params![device_id.as_bytes().to_vec(), uuid_bytes],
@@ -4231,7 +4566,7 @@ impl Database {
         let updated = self.conn.execute(
             r#"
             UPDATE audio_files
-            SET duration_seconds = ?, modified_at = datetime('now'), device_id = ?
+            SET duration_seconds = ?, modified_at = strftime('%s', 'now'), device_id = ?
             WHERE id = ? AND deleted_at IS NULL
             "#,
             params![duration_seconds, device_id.as_bytes().to_vec(), uuid_bytes],
@@ -4267,25 +4602,25 @@ impl Database {
 
     fn row_to_audio_file(&self, row: &Row) -> rusqlite::Result<AudioFileRow> {
         let id_bytes: Vec<u8> = row.get(0)?;
-        let imported_at: String = row.get(1)?;
+        let imported_at: i64 = row.get(1)?;
         let filename: String = row.get(2)?;
-        let file_created_at: Option<String> = row.get(3)?;
+        let file_created_at: Option<i64> = row.get(3)?;
         let duration_seconds: Option<i64> = row.get(4)?;
         let summary: Option<String> = row.get(5)?;
         let device_id_bytes: Vec<u8> = row.get(6)?;
-        let modified_at: Option<String> = row.get(7)?;
-        let deleted_at: Option<String> = row.get(8)?;
+        let modified_at: Option<i64> = row.get(7)?;
+        let deleted_at: Option<i64> = row.get(8)?;
 
         Ok(AudioFileRow {
             id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
-            imported_at: parse_sqlite_datetime(&imported_at),
+            imported_at,
             filename,
-            file_created_at: file_created_at.map(|s| parse_sqlite_datetime(&s)),
+            file_created_at,
             duration_seconds,
             summary,
             device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
-            modified_at: modified_at.map(|s| parse_sqlite_datetime(&s)),
-            deleted_at: deleted_at.map(|s| parse_sqlite_datetime(&s)),
+            modified_at,
+            deleted_at,
         })
     }
 
@@ -4312,10 +4647,10 @@ impl Database {
             let note_id_bytes: Vec<u8> = row.get(1)?;
             let attachment_id_bytes: Vec<u8> = row.get(2)?;
             let attachment_type: String = row.get(3)?;
-            let created_at: String = row.get(4)?;
+            let created_at: i64 = row.get(4)?;
             let device_id_bytes: Vec<u8> = row.get(5)?;
-            let modified_at: Option<String> = row.get(6)?;
-            let deleted_at: Option<String> = row.get(7)?;
+            let modified_at: Option<i64> = row.get(6)?;
+            let deleted_at: Option<i64> = row.get(7)?;
 
             Ok(serde_json::json!({
                 "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -4343,9 +4678,9 @@ impl Database {
         note_id: &str,
         attachment_id: &str,
         attachment_type: &str,
-        created_at: &str,
-        modified_at: Option<&str>,
-        deleted_at: Option<&str>,
+        created_at: i64,
+        modified_at: Option<i64>,
+        deleted_at: Option<i64>,
         sync_received_at: Option<i64>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
@@ -4404,13 +4739,13 @@ impl Database {
 
         let result = stmt.query_row([uuid_bytes], |row| {
             let id_bytes: Vec<u8> = row.get(0)?;
-            let imported_at: String = row.get(1)?;
+            let imported_at: i64 = row.get(1)?;
             let filename: String = row.get(2)?;
-            let file_created_at: Option<String> = row.get(3)?;
+            let file_created_at: Option<i64> = row.get(3)?;
             let summary: Option<String> = row.get(4)?;
             let device_id_bytes: Vec<u8> = row.get(5)?;
-            let modified_at: Option<String> = row.get(6)?;
-            let deleted_at: Option<String> = row.get(7)?;
+            let modified_at: Option<i64> = row.get(6)?;
+            let deleted_at: Option<i64> = row.get(7)?;
 
             Ok(serde_json::json!({
                 "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -4435,13 +4770,13 @@ impl Database {
     pub fn apply_sync_audio_file(
         &self,
         id: &str,
-        imported_at: &str,
+        imported_at: i64,
         filename: &str,
-        file_created_at: Option<&str>,
+        file_created_at: Option<i64>,
         duration_seconds: Option<i64>,
         summary: Option<&str>,
-        modified_at: Option<&str>,
-        deleted_at: Option<&str>,
+        modified_at: Option<i64>,
+        deleted_at: Option<i64>,
         sync_received_at: Option<i64>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
@@ -4491,9 +4826,9 @@ impl Database {
         service_response: Option<&str>,
         state: &str,
         device_id: &str,
-        created_at: &str,
-        modified_at: Option<&str>,
-        deleted_at: Option<&str>,
+        created_at: i64,
+        modified_at: Option<i64>,
+        deleted_at: Option<i64>,
         sync_received_at: Option<i64>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
@@ -4564,9 +4899,9 @@ impl Database {
             let service_response: Option<String> = row.get(6)?;
             let state: String = row.get(7)?;
             let device_id_bytes: Vec<u8> = row.get(8)?;
-            let created_at: String = row.get(9)?;
-            let modified_at: Option<String> = row.get(10)?;
-            let deleted_at: Option<String> = row.get(11)?;
+            let created_at: i64 = row.get(9)?;
+            let modified_at: Option<i64> = row.get(10)?;
+            let deleted_at: Option<i64> = row.get(11)?;
 
             Ok(serde_json::json!({
                 "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -4608,7 +4943,7 @@ impl Database {
     ) -> VoiceResult<String> {
         let id = Uuid::now_v7();
         let device_id = get_local_device_id();
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = Utc::now().timestamp();
         let state = state.unwrap_or(DEFAULT_TRANSCRIPTION_STATE);
 
         let audio_file_uuid = Uuid::parse_str(audio_file_id)
@@ -4877,8 +5212,8 @@ impl Database {
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let note_bytes = note_uuid.as_bytes().to_vec();
 
-        // 1. Get note's created_at and content
-        let (created_at, content): (String, String) = self.conn.query_row(
+        // 1. Get note's created_at (Unix timestamp) and content
+        let (created_at, content): (i64, String) = self.conn.query_row(
             "SELECT created_at, content FROM notes WHERE id = ? AND deleted_at IS NULL",
             params![&note_bytes],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -4942,8 +5277,12 @@ impl Database {
         }
 
         // 6. Build JSON cache
+        // Format Unix timestamp as local time for display
+        let date_display = chrono::DateTime::from_timestamp(created_at, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
         let cache = serde_json::json!({
-            "date": parse_sqlite_datetime(&created_at),
+            "date": date_display,
             "marked": is_marked,
             "content_preview": content_preview,
             "duration_seconds": total_duration,
@@ -5533,7 +5872,7 @@ mod tests {
         let note_raw = db.get_note_raw(&note_id).unwrap();
         assert!(note_raw.is_some());
         let note_data = note_raw.unwrap();
-        let deleted_at = note_data.get("deleted_at").and_then(|v| v.as_str());
+        let deleted_at = note_data.get("deleted_at").and_then(|v| v.as_i64());
         assert!(deleted_at.is_some(), "deleted note should have deleted_at in raw data");
     }
 

@@ -20,7 +20,6 @@ use crate::config::Config;
 use crate::database::Database;
 use crate::error::{VoiceError, VoiceResult};
 use crate::models::SyncChange;
-use crate::validation::{normalize_datetime, normalize_datetime_optional};
 use crate::UUID_SHORT_LEN;
 
 /// Result of a sync operation
@@ -74,8 +73,8 @@ struct HandshakeResponse {
     device_id: String,
     device_name: String,
     protocol_version: String,
-    last_sync_timestamp: Option<String>,
-    server_timestamp: Option<String>,
+    last_sync_timestamp: Option<i64>,
+    server_timestamp: Option<i64>,
     #[serde(default)]
     supports_audiofiles: bool,
 }
@@ -84,8 +83,8 @@ struct HandshakeResponse {
 #[derive(Debug, Deserialize)]
 struct SyncBatchResponse {
     changes: Vec<SyncChange>,
-    from_timestamp: Option<String>,
-    to_timestamp: Option<String>,
+    from_timestamp: Option<i64>,
+    to_timestamp: Option<i64>,
     device_id: String,
     device_name: Option<String>,
     is_complete: bool,
@@ -118,7 +117,7 @@ struct FullSyncResponse {
     transcriptions: Option<Vec<serde_json::Value>>,
     device_id: String,
     device_name: Option<String>,
-    timestamp: String,
+    timestamp: i64,
 }
 
 /// Sync client
@@ -178,14 +177,14 @@ impl SyncClient {
         // This ensures that if either side has reset timestamps, we sync everything
         let local_last_sync = self.get_local_last_sync(peer_id);
         let last_sync = Self::older_timestamp(local_last_sync, handshake.last_sync_timestamp);
-        let clock_skew = self.calculate_clock_skew(handshake.server_timestamp.as_deref());
+        let clock_skew = self.calculate_clock_skew(handshake.server_timestamp);
 
         // Adjust pull timestamp for clock skew
-        let adjusted_since = self.adjust_timestamp_for_skew(last_sync.as_deref(), clock_skew);
+        let adjusted_since = self.adjust_timestamp_for_skew(last_sync, clock_skew);
 
         // Step 1b: Gather local changes BEFORE applying pull
         // This prevents the pull from overwriting local changes before they're pushed
-        let local_changes_to_push = match self.get_changes_since(last_sync.as_deref()) {
+        let local_changes_to_push = match self.get_changes_since(last_sync) {
             Ok(changes) => changes,
             Err(e) => {
                 result.errors.push(format!("Failed to get local changes: {}", e));
@@ -194,7 +193,7 @@ impl SyncClient {
         };
 
         // Step 2: Pull changes
-        let pulled_changes = match self.pull_changes(peer_url, adjusted_since.as_deref()).await {
+        let pulled_changes = match self.pull_changes(peer_url, adjusted_since).await {
             Ok((applied, conflicts, changes, errors)) => {
                 result.pulled = applied;
                 result.conflicts += conflicts;
@@ -297,11 +296,11 @@ impl SyncClient {
         // Use the OLDER of local and server timestamps (NULL = infinitely old)
         let local_last_sync = self.get_local_last_sync(peer_id);
         let last_sync = Self::older_timestamp(local_last_sync, handshake.last_sync_timestamp);
-        let clock_skew = self.calculate_clock_skew(handshake.server_timestamp.as_deref());
-        let adjusted_since = self.adjust_timestamp_for_skew(last_sync.as_deref(), clock_skew);
+        let clock_skew = self.calculate_clock_skew(handshake.server_timestamp);
+        let adjusted_since = self.adjust_timestamp_for_skew(last_sync, clock_skew);
 
         // Pull
-        let pulled_changes = match self.pull_changes(peer_url, adjusted_since.as_deref()).await {
+        let pulled_changes = match self.pull_changes(peer_url, adjusted_since).await {
             Ok((applied, conflicts, changes, errors)) => {
                 result.pulled = applied;
                 result.conflicts = conflicts;
@@ -370,7 +369,7 @@ impl SyncClient {
 
         // Push
         let pushed_changes = match self
-            .push_changes(peer_url, handshake.last_sync_timestamp.as_deref())
+            .push_changes(peer_url, handshake.last_sync_timestamp)
             .await
         {
             Ok((applied, conflicts, changes)) => {
@@ -626,13 +625,13 @@ impl SyncClient {
     async fn pull_changes(
         &self,
         peer_url: &str,
-        since: Option<&str>,
+        since: Option<i64>,
     ) -> VoiceResult<(i64, i64, Vec<SyncChange>, Vec<String>)> {
         let url = match since {
             Some(ts) => format!(
                 "{}/sync/changes?since={}",
                 peer_url,
-                urlencoding::encode(ts)
+                ts
             ),
             None => format!("{}/sync/changes", peer_url),
         };
@@ -675,7 +674,7 @@ impl SyncClient {
     async fn push_changes(
         &self,
         peer_url: &str,
-        since: Option<&str>,
+        since: Option<i64>,
     ) -> VoiceResult<(i64, i64, Vec<SyncChange>)> {
         // Get local changes
         let changes = self.get_changes_since(since)?;
@@ -723,13 +722,13 @@ impl SyncClient {
         let mut errors = Vec::new();
 
         // Get last sync timestamp with this peer (use device_id as peer_id for self-tracking)
-        let last_sync_at: Option<String> = None; // For pull, we don't use last_sync filtering here
+        let last_sync_at: Option<i64> = None; // For pull, we don't use last_sync filtering here
 
         for change in changes {
             let result = match change.entity_type.as_str() {
-                "note" => self.apply_note_change(&db, change, last_sync_at.as_deref()),
-                "tag" => self.apply_tag_change(&db, change, last_sync_at.as_deref()),
-                "note_tag" => self.apply_note_tag_change(&db, change, last_sync_at.as_deref()),
+                "note" => self.apply_note_change(&db, change, last_sync_at),
+                "tag" => self.apply_tag_change(&db, change, last_sync_at),
+                "note_tag" => self.apply_note_tag_change(&db, change, last_sync_at),
                 "audio_file" => self.apply_audio_file_change(&db, change),
                 "note_attachment" => self.apply_note_attachment_change(&db, change),
                 "transcription" => self.apply_transcription_change(&db, change),
@@ -756,29 +755,25 @@ impl SyncClient {
         &self,
         db: &Database,
         change: &SyncChange,
-        last_sync_at: Option<&str>,
+        last_sync_at: Option<i64>,
     ) -> VoiceResult<bool> {
         use crate::merge::merge_content;
 
         let note_id = &change.entity_id;
         let data = &change.data;
 
-        // Normalize timestamps from incoming data (handles ISO 8601 with 'T' separator)
-        let created_at_raw = data["created_at"].as_str().unwrap_or("");
-        let created_at_normalized = normalize_datetime(created_at_raw);
-        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
+        // Parse timestamps from incoming data as integers
+        let created_at = data["created_at"].as_i64().unwrap_or(0);
         let content = data["content"].as_str().unwrap_or("");
-        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
-        let modified_at = modified_at_normalized.as_deref();
-        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
-        let deleted_at = deleted_at_normalized.as_deref();
+        let modified_at = data["modified_at"].as_i64();
+        let deleted_at = data["deleted_at"].as_i64();
 
         // Check if local note exists and compare timestamps
         if let Ok(Some(existing)) = db.get_note_raw(note_id) {
             let local_modified = existing.get("modified_at")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_i64());
             let local_deleted = existing.get("deleted_at")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_i64());
             let local_content = existing.get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
@@ -808,11 +803,11 @@ impl SyncClient {
                     let _ = db.create_note_delete_conflict(
                         note_id,
                         content,                                 // surviving content (remote)
-                        modified_at.unwrap_or(""),
+                        modified_at.unwrap_or(0),
                         Some(change.device_id.as_str()),         // surviving_device_id
                         change.device_name.as_deref(),           // surviving_device_name
                         Some(local_content),                     // deleted content
-                        local_deleted.unwrap_or(""),
+                        local_deleted.unwrap_or(0),
                         Some(&self.device_id),                   // deleting_device_id (local)
                         Some(&self.device_name),                 // deleting_device_name (local)
                     );
@@ -826,11 +821,11 @@ impl SyncClient {
                     let _ = db.create_note_delete_conflict(
                         note_id,
                         local_content,                           // surviving content (local)
-                        local_modified.unwrap_or(""),
+                        local_modified.unwrap_or(0),
                         Some(&self.device_id),                   // surviving_device_id (local)
                         Some(&self.device_name),                 // surviving_device_name (local)
                         Some(content),                           // deleted content
-                        deleted_at.unwrap_or(""),
+                        deleted_at.unwrap_or(0),
                         Some(change.device_id.as_str()),         // deleting_device_id
                         change.device_name.as_deref(),           // deleting_device_name
                     );
@@ -871,8 +866,8 @@ impl SyncClient {
 
                         let merge_result = merge_content(local_content, content, "LOCAL", "REMOTE");
                         // Use the newer timestamp for the merged content
-                        let new_modified = if it > lt { it } else { lt };
-                        db.apply_sync_note(note_id, created_at, &merge_result.content, Some(new_modified), deleted_at, None)?;
+                        let new_modified = if it > lt { Some(it) } else { Some(lt) };
+                        db.apply_sync_note(note_id, created_at, &merge_result.content, new_modified, deleted_at, None)?;
                         return Ok(true);
                     }
                 }
@@ -888,21 +883,17 @@ impl SyncClient {
         &self,
         db: &Database,
         change: &SyncChange,
-        last_sync_at: Option<&str>,
+        last_sync_at: Option<i64>,
     ) -> VoiceResult<bool> {
         let tag_id = &change.entity_id;
         let data = &change.data;
 
         let name = data["name"].as_str().unwrap_or("");
         let parent_id = data["parent_id"].as_str();
-        // Normalize timestamps from incoming data
-        let created_at_raw = data["created_at"].as_str().unwrap_or("");
-        let created_at_normalized = normalize_datetime(created_at_raw);
-        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
-        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
-        let modified_at = modified_at_normalized.as_deref();
-        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
-        let deleted_at = deleted_at_normalized.as_deref();
+        // Parse timestamps from incoming data as integers
+        let created_at = data["created_at"].as_i64().unwrap_or(0);
+        let modified_at = data["modified_at"].as_i64();
+        let deleted_at = data["deleted_at"].as_i64();
 
         // Check if local tag exists for conflict detection
         if let Ok(Some(existing)) = db.get_tag_raw(tag_id) {
@@ -912,9 +903,9 @@ impl SyncClient {
             let local_parent_id = existing.get("parent_id")
                 .and_then(|v| v.as_str());
             let local_modified = existing.get("modified_at")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_i64());
             let local_deleted = existing.get("deleted_at")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_i64());
             let _local_device_id = existing.get("device_id")
                 .and_then(|v| v.as_str());
 
@@ -940,10 +931,10 @@ impl SyncClient {
                         tag_id,
                         local_name, // surviving
                         local_parent_id,
-                        local_modified.unwrap_or(""),
+                        local_modified.unwrap_or(0),
                         Some(&self.device_id),
                         Some(&self.device_name),
-                        deleted_at.unwrap_or(""),
+                        deleted_at.unwrap_or(0),
                         Some(change.device_id.as_str()),
                         change.device_name.as_deref(),
                     );
@@ -956,10 +947,10 @@ impl SyncClient {
                         tag_id,
                         name, // surviving (remote)
                         parent_id,
-                        modified_at.unwrap_or(""),
+                        modified_at.unwrap_or(0),
                         Some(change.device_id.as_str()),
                         change.device_name.as_deref(),
-                        local_deleted.unwrap_or(""),
+                        local_deleted.unwrap_or(0),
                         Some(&self.device_id),
                         Some(&self.device_name),
                     );
@@ -1034,7 +1025,7 @@ impl SyncClient {
         &self,
         db: &Database,
         change: &SyncChange,
-        _last_sync_at: Option<&str>,
+        _last_sync_at: Option<i64>,
     ) -> VoiceResult<bool> {
         // Parse entity_id (format: "note_id:tag_id")
         let parts: Vec<&str> = change.entity_id.split(':').collect();
@@ -1047,14 +1038,10 @@ impl SyncClient {
         let tag_id = parts[1];
         let data = &change.data;
 
-        // Normalize timestamps from incoming data
-        let created_at_raw = data["created_at"].as_str().unwrap_or("");
-        let created_at_normalized = normalize_datetime(created_at_raw);
-        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
-        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
-        let modified_at = modified_at_normalized.as_deref();
-        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
-        let deleted_at = deleted_at_normalized.as_deref();
+        // Parse timestamps from incoming data as integers
+        let created_at = data["created_at"].as_i64().unwrap_or(0);
+        let modified_at = data["modified_at"].as_i64();
+        let deleted_at = data["deleted_at"].as_i64();
 
         tracing::trace!(
             "note_tag: note={}... tag={}... created={} modified={:?} deleted={:?}",
@@ -1070,9 +1057,9 @@ impl SyncClient {
 
         // Check if local note_tag exists and compare timestamps
         if let Ok(Some(existing)) = db.get_note_tag_raw(note_id, tag_id) {
-            let local_modified = existing.get("modified_at").and_then(|v| v.as_str());
-            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_str());
-            let local_created = existing.get("created_at").and_then(|v| v.as_str());
+            let local_modified = existing.get("modified_at").and_then(|v| v.as_i64());
+            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_i64());
+            let local_created = existing.get("created_at").and_then(|v| v.as_i64());
             let local_time = local_deleted.or(local_modified).or(local_created);
 
             tracing::trace!(
@@ -1113,19 +1100,14 @@ impl SyncClient {
         let audio_id = &change.entity_id;
         let data = &change.data;
 
-        // Normalize timestamps from incoming data
-        let imported_at_raw = data["imported_at"].as_str().unwrap_or("");
-        let imported_at_normalized = normalize_datetime(imported_at_raw);
-        let imported_at = imported_at_normalized.as_deref().unwrap_or(imported_at_raw);
+        // Parse timestamps from incoming data as integers
+        let imported_at = data["imported_at"].as_i64().unwrap_or(0);
         let filename = data["filename"].as_str().unwrap_or("");
-        let file_created_at_normalized = normalize_datetime_optional(data["file_created_at"].as_str());
-        let file_created_at = file_created_at_normalized.as_deref();
+        let file_created_at = data["file_created_at"].as_i64();
         let duration_seconds = data["duration_seconds"].as_i64();
         let summary = data["summary"].as_str();
-        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
-        let modified_at = modified_at_normalized.as_deref();
-        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
-        let deleted_at = deleted_at_normalized.as_deref();
+        let modified_at = data["modified_at"].as_i64();
+        let deleted_at = data["deleted_at"].as_i64();
 
         db.apply_sync_audio_file(
             audio_id,
@@ -1152,14 +1134,10 @@ impl SyncClient {
         let note_id = data["note_id"].as_str().unwrap_or("");
         let attachment_id = data["attachment_id"].as_str().unwrap_or("");
         let attachment_type = data["attachment_type"].as_str().unwrap_or("");
-        // Normalize timestamps from incoming data
-        let created_at_raw = data["created_at"].as_str().unwrap_or("");
-        let created_at_normalized = normalize_datetime(created_at_raw);
-        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
-        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
-        let modified_at = modified_at_normalized.as_deref();
-        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
-        let deleted_at = deleted_at_normalized.as_deref();
+        // Parse timestamps from incoming data as integers
+        let created_at = data["created_at"].as_i64().unwrap_or(0);
+        let modified_at = data["modified_at"].as_i64();
+        let deleted_at = data["deleted_at"].as_i64();
 
         db.apply_sync_note_attachment(
             attachment_link_id,
@@ -1190,14 +1168,10 @@ impl SyncClient {
         let service_response = data["service_response"].as_str();
         let state = data["state"].as_str().unwrap_or(crate::database::DEFAULT_TRANSCRIPTION_STATE);
         let device_id = data["device_id"].as_str().unwrap_or("");
-        // Normalize timestamps from incoming data
-        let created_at_raw = data["created_at"].as_str().unwrap_or("");
-        let created_at_normalized = normalize_datetime(created_at_raw);
-        let created_at = created_at_normalized.as_deref().unwrap_or(created_at_raw);
-        let modified_at_normalized = normalize_datetime_optional(data["modified_at"].as_str());
-        let modified_at = modified_at_normalized.as_deref();
-        let deleted_at_normalized = normalize_datetime_optional(data["deleted_at"].as_str());
-        let deleted_at = deleted_at_normalized.as_deref();
+        // Parse timestamps from incoming data as integers
+        let created_at = data["created_at"].as_i64().unwrap_or(0);
+        let modified_at = data["modified_at"].as_i64();
+        let deleted_at = data["deleted_at"].as_i64();
 
         db.apply_sync_transcription(
             transcription_id,
@@ -1217,7 +1191,7 @@ impl SyncClient {
         Ok(true)
     }
 
-    fn get_changes_since(&self, since: Option<&str>) -> VoiceResult<Vec<SyncChange>> {
+    fn get_changes_since(&self, since: Option<i64>) -> VoiceResult<Vec<SyncChange>> {
         let db = self.db.lock().unwrap();
         let (changes, _) = db.get_changes_since(since, 10000)?;
 
@@ -1228,7 +1202,7 @@ impl SyncClient {
                 let entity_type = c.get("entity_type")?.as_str()?.to_string();
                 let entity_id = c.get("entity_id")?.as_str()?.to_string();
                 let operation = c.get("operation")?.as_str()?.to_string();
-                let timestamp = c.get("timestamp")?.as_str()?.to_string();
+                let timestamp = c.get("timestamp")?.as_i64()?;
                 let data = c.get("data")?.clone();
 
                 Some(SyncChange {
@@ -1248,46 +1222,38 @@ impl SyncClient {
 
     /// Return the older of two timestamps, treating None as infinitely old.
     /// If either is None, returns None (meaning "sync everything").
-    /// If both are Some, returns the lexicographically smaller (older) timestamp.
-    fn older_timestamp(a: Option<String>, b: Option<String>) -> Option<String> {
+    /// If both are Some, returns the smaller (older) timestamp.
+    fn older_timestamp(a: Option<i64>, b: Option<i64>) -> Option<i64> {
         match (a, b) {
             (None, _) | (_, None) => None,
             (Some(ts_a), Some(ts_b)) => {
-                // Timestamps are in "YYYY-MM-DD HH:MM:SS" format, so lexicographic comparison works
                 Some(std::cmp::min(ts_a, ts_b))
             }
         }
     }
 
-    fn calculate_clock_skew(&self, server_timestamp: Option<&str>) -> f64 {
-        if let Some(ts) = server_timestamp {
-            if let Ok(server_time) = DateTime::parse_from_rfc3339(ts) {
-                let local_time = Utc::now();
-                return (server_time.timestamp() - local_time.timestamp()) as f64;
-            }
+    fn calculate_clock_skew(&self, server_timestamp: Option<i64>) -> f64 {
+        if let Some(server_ts) = server_timestamp {
+            let local_time = Utc::now().timestamp();
+            return (server_ts - local_time) as f64;
         }
         0.0
     }
 
-    fn adjust_timestamp_for_skew(&self, timestamp: Option<&str>, clock_skew: f64) -> Option<String> {
+    fn adjust_timestamp_for_skew(&self, timestamp: Option<i64>, clock_skew: f64) -> Option<i64> {
         let ts = timestamp?;
 
-        if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
-            // Always go back at least 2 seconds for race conditions
-            let base_adjustment = 2.0;
-            // Add 2x skew if significant (> 1 second)
-            let skew_adjustment = if clock_skew.abs() > 1.0 {
-                2.0 * clock_skew.abs()
-            } else {
-                0.0
-            };
-            let total_adjustment = base_adjustment + skew_adjustment;
+        // Always go back at least 2 seconds for race conditions
+        let base_adjustment = 2;
+        // Add 2x skew if significant (> 1 second)
+        let skew_adjustment = if clock_skew.abs() > 1.0 {
+            (2.0 * clock_skew.abs()) as i64
+        } else {
+            0
+        };
+        let total_adjustment = base_adjustment + skew_adjustment;
 
-            let adjusted = dt - chrono::Duration::seconds(total_adjustment as i64);
-            return Some(adjusted.format("%Y-%m-%d %H:%M:%S").to_string());
-        }
-
-        Some(ts.to_string())
+        Some(ts - total_adjustment)
     }
 
     fn update_peer_sync_time(&self, peer_id: &str) -> VoiceResult<()> {
@@ -1297,18 +1263,18 @@ impl SyncClient {
         let db = self.db.lock().unwrap();
         let conn = db.connection();
 
-        // Try to update existing record
+        // Try to update existing record (use Unix timestamp)
         let updated = conn.execute(
-            "UPDATE sync_peers SET last_sync_at = datetime('now') WHERE peer_id = ?",
+            "UPDATE sync_peers SET last_sync_at = strftime('%s', 'now') WHERE peer_id = ?",
             [&peer_bytes],
         )?;
 
         if updated == 0 {
-            // Insert new record
+            // Insert new record (use Unix timestamp)
             let config = self.config.lock().unwrap();
             if let Some(peer) = config.get_peer(peer_id) {
                 conn.execute(
-                    "INSERT INTO sync_peers (peer_id, peer_name, peer_url, last_sync_at) VALUES (?, ?, ?, datetime('now'))",
+                    "INSERT INTO sync_peers (peer_id, peer_name, peer_url, last_sync_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
                     rusqlite::params![peer_bytes, peer.peer_name, peer.peer_url],
                 )?;
             }
@@ -1318,7 +1284,7 @@ impl SyncClient {
     }
 
     /// Get the local record of when we last synced with a peer
-    fn get_local_last_sync(&self, peer_id: &str) -> Option<String> {
+    fn get_local_last_sync(&self, peer_id: &str) -> Option<i64> {
         let peer_uuid = Uuid::parse_str(peer_id).ok()?;
         let peer_bytes = peer_uuid.as_bytes().to_vec();
 
@@ -1328,19 +1294,19 @@ impl SyncClient {
         conn.query_row(
             "SELECT last_sync_at FROM sync_peers WHERE peer_id = ?",
             [&peer_bytes],
-            |row| row.get::<_, Option<String>>(0),
+            |row| row.get::<_, Option<i64>>(0),
         )
         .ok()
         .flatten()
     }
 
     /// Debug: public version of get_local_last_sync
-    pub fn debug_get_local_last_sync(&self, peer_id: &str) -> Option<String> {
+    pub fn debug_get_local_last_sync(&self, peer_id: &str) -> Option<i64> {
         self.get_local_last_sync(peer_id)
     }
 
     /// Debug: public version of get_changes_since
-    pub fn debug_get_changes_since(&self, since: Option<&str>) -> VoiceResult<Vec<SyncChange>> {
+    pub fn debug_get_changes_since(&self, since: Option<i64>) -> VoiceResult<Vec<SyncChange>> {
         self.get_changes_since(since)
     }
 
@@ -1380,9 +1346,8 @@ impl SyncClient {
                 let timestamp = note
                     .get("modified_at")
                     .or_else(|| note.get("created_at"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
 
                 changes.push(SyncChange {
                     entity_type: "note".to_string(),
@@ -1402,9 +1367,8 @@ impl SyncClient {
                 let timestamp = tag
                     .get("modified_at")
                     .or_else(|| tag.get("created_at"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
 
                 changes.push(SyncChange {
                     entity_type: "tag".to_string(),
@@ -1427,9 +1391,8 @@ impl SyncClient {
                 let timestamp = note_tag
                     .get("modified_at")
                     .or_else(|| note_tag.get("created_at"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
 
                 changes.push(SyncChange {
                     entity_type: "note_tag".to_string(),
@@ -1450,9 +1413,8 @@ impl SyncClient {
                     let timestamp = audio
                         .get("modified_at")
                         .or_else(|| audio.get("imported_at"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
 
                     changes.push(SyncChange {
                         entity_type: "audio_file".to_string(),
@@ -1474,9 +1436,8 @@ impl SyncClient {
                     let timestamp = attachment
                         .get("modified_at")
                         .or_else(|| attachment.get("created_at"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
 
                     changes.push(SyncChange {
                         entity_type: "note_attachment".to_string(),
@@ -1498,9 +1459,8 @@ impl SyncClient {
                     let timestamp = transcription
                         .get("modified_at")
                         .or_else(|| transcription.get("created_at"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
 
                     changes.push(SyncChange {
                         entity_type: "transcription".to_string(),
@@ -2026,12 +1986,15 @@ mod tests {
         }
 
         #[test]
-        fn test_calculate_clock_skew_invalid_timestamp() {
+        fn test_calculate_clock_skew_with_timestamp() {
             let (db, config, _temp_dir) = create_test_db_and_config();
             let client = SyncClient::new(db, config).unwrap();
 
-            let skew = client.calculate_clock_skew(Some("invalid"));
-            assert_eq!(skew, 0.0);
+            // Server timestamp 100 seconds ahead of local
+            let server_ts = Utc::now().timestamp() + 100;
+            let skew = client.calculate_clock_skew(Some(server_ts));
+            // Skew should be close to 100 (may vary slightly due to timing)
+            assert!(skew > 99.0 && skew < 101.0);
         }
 
         #[test]
@@ -2049,14 +2012,12 @@ mod tests {
             let client = SyncClient::new(db, config).unwrap();
 
             // With small skew (< 1s), only apply 2 second base adjustment
-            let result = client.adjust_timestamp_for_skew(
-                Some("2025-01-01T12:00:10+00:00"),
-                0.5,
-            );
+            let ts = 1735689610; // 2025-01-01 12:00:10 UTC
+            let result = client.adjust_timestamp_for_skew(Some(ts), 0.5);
             assert!(result.is_some());
             // Should be at least 2 seconds earlier
             let adjusted = result.unwrap();
-            assert!(adjusted.contains("2025-01-01"));
+            assert_eq!(adjusted, ts - 2); // Only base adjustment
         }
 
         #[test]
@@ -2065,14 +2026,12 @@ mod tests {
             let client = SyncClient::new(db, config).unwrap();
 
             // With large skew (> 1s), apply base + 2x skew adjustment
-            let result = client.adjust_timestamp_for_skew(
-                Some("2025-01-01T12:00:10+00:00"),
-                5.0,
-            );
+            let ts = 1735689610; // 2025-01-01 12:00:10 UTC
+            let result = client.adjust_timestamp_for_skew(Some(ts), 5.0);
             assert!(result.is_some());
-            // Should be adjusted back significantly
+            // Should be adjusted back by 2 + 2*5 = 12 seconds
             let adjusted = result.unwrap();
-            assert!(adjusted.contains("2025-01-01"));
+            assert_eq!(adjusted, ts - 12);
         }
     }
 
@@ -2162,7 +2121,7 @@ mod tests {
             let client = SyncClient::new(db, config).unwrap();
 
             // Use far future timestamp - should return no changes
-            let changes = client.get_changes_since(Some("2099-01-01 00:00:00")).unwrap();
+            let changes = client.get_changes_since(Some(4102444800)).unwrap(); // 2099-01-01
             assert!(changes.is_empty());
         }
     }
@@ -2184,7 +2143,7 @@ mod tests {
                 transcriptions: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
-                timestamp: "2025-01-01 00:00:00".to_string(),
+                timestamp: 1735689600, // 2025-01-01 00:00:00 UTC
             };
 
             let changes = client.convert_full_sync_to_changes(&full_sync);
@@ -2199,7 +2158,7 @@ mod tests {
             let note = serde_json::json!({
                 "id": "00000000000070008000000000000001",
                 "content": "Test note",
-                "created_at": "2025-01-01 00:00:00"
+                "created_at": 1735689600
             });
 
             let full_sync = FullSyncResponse {
@@ -2211,7 +2170,7 @@ mod tests {
                 transcriptions: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
-                timestamp: "2025-01-01 00:00:00".to_string(),
+                timestamp: 1735689600,
             };
 
             let changes = client.convert_full_sync_to_changes(&full_sync);
@@ -2228,7 +2187,7 @@ mod tests {
             let audio_file = serde_json::json!({
                 "id": "00000000000070008000000000000002",
                 "filename": "test.mp3",
-                "imported_at": "2025-01-01 00:00:00"
+                "imported_at": 1735689600
             });
 
             let full_sync = FullSyncResponse {
@@ -2240,7 +2199,7 @@ mod tests {
                 transcriptions: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
-                timestamp: "2025-01-01 00:00:00".to_string(),
+                timestamp: 1735689600,
             };
 
             let changes = client.convert_full_sync_to_changes(&full_sync);

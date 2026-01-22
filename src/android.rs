@@ -6,11 +6,25 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use chrono::DateTime;
+
 use crate::config::Config;
 use crate::database::Database;
 use crate::search;
 use crate::sync_client::SyncClient;
 use crate::UUID_SHORT_LEN;
+
+/// Format a Unix timestamp (i64) to "YYYY-MM-DD HH:MM:SS" string for display.
+fn format_timestamp(ts: i64) -> String {
+    DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+/// Format an optional Unix timestamp to an optional string.
+fn format_timestamp_opt(ts: Option<i64>) -> Option<String> {
+    ts.map(format_timestamp)
+}
 
 /// Error type exposed to Kotlin via UniFFI
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -213,9 +227,9 @@ impl VoiceClient {
             .map(|n| NoteData {
                 id: n.id,
                 content: n.content,
-                created_at: n.created_at,
-                modified_at: n.modified_at,
-                deleted_at: n.deleted_at,
+                created_at: format_timestamp(n.created_at),
+                modified_at: format_timestamp_opt(n.modified_at),
+                deleted_at: format_timestamp_opt(n.deleted_at),
                 list_display_cache: n.list_display_cache,
             })
             .collect())
@@ -454,10 +468,10 @@ impl VoiceClient {
                 note_id: a.note_id,
                 attachment_id: a.attachment_id,
                 attachment_type: a.attachment_type,
-                created_at: a.created_at,
+                created_at: format_timestamp(a.created_at),
                 device_id: a.device_id,
-                modified_at: a.modified_at,
-                deleted_at: a.deleted_at,
+                modified_at: format_timestamp_opt(a.modified_at),
+                deleted_at: format_timestamp_opt(a.deleted_at),
             })
             .collect())
     }
@@ -471,13 +485,13 @@ impl VoiceClient {
             .into_iter()
             .map(|a| AudioFileData {
                 id: a.id,
-                imported_at: a.imported_at,
+                imported_at: format_timestamp(a.imported_at),
                 filename: a.filename,
-                file_created_at: a.file_created_at,
+                file_created_at: format_timestamp_opt(a.file_created_at),
                 summary: a.summary,
                 device_id: a.device_id,
-                modified_at: a.modified_at,
-                deleted_at: a.deleted_at,
+                modified_at: format_timestamp_opt(a.modified_at),
+                deleted_at: format_timestamp_opt(a.deleted_at),
             })
             .collect())
     }
@@ -489,13 +503,13 @@ impl VoiceClient {
 
         Ok(audio_file.map(|a| AudioFileData {
             id: a.id,
-            imported_at: a.imported_at,
+            imported_at: format_timestamp(a.imported_at),
             filename: a.filename,
-            file_created_at: a.file_created_at,
+            file_created_at: format_timestamp_opt(a.file_created_at),
             summary: a.summary,
             device_id: a.device_id,
-            modified_at: a.modified_at,
-            deleted_at: a.deleted_at,
+            modified_at: format_timestamp_opt(a.modified_at),
+            deleted_at: format_timestamp_opt(a.deleted_at),
         }))
     }
 
@@ -509,13 +523,13 @@ impl VoiceClient {
             .filter(|a| a.deleted_at.is_none())
             .map(|a| AudioFileData {
                 id: a.id,
-                imported_at: a.imported_at,
+                imported_at: format_timestamp(a.imported_at),
                 filename: a.filename,
-                file_created_at: a.file_created_at,
+                file_created_at: format_timestamp_opt(a.file_created_at),
                 summary: a.summary,
                 device_id: a.device_id,
-                modified_at: a.modified_at,
-                deleted_at: a.deleted_at,
+                modified_at: format_timestamp_opt(a.modified_at),
+                deleted_at: format_timestamp_opt(a.deleted_at),
             })
             .collect())
     }
@@ -740,9 +754,9 @@ impl VoiceClient {
                 service_response: t.service_response,
                 state: t.state,
                 device_id: t.device_id,
-                created_at: t.created_at,
-                modified_at: t.modified_at,
-                deleted_at: t.deleted_at,
+                created_at: format_timestamp(t.created_at),
+                modified_at: format_timestamp_opt(t.modified_at),
+                deleted_at: format_timestamp_opt(t.deleted_at),
             })
             .collect())
     }
@@ -762,9 +776,9 @@ impl VoiceClient {
             service_response: t.service_response,
             state: t.state,
             device_id: t.device_id,
-            created_at: t.created_at,
-            modified_at: t.modified_at,
-            deleted_at: t.deleted_at,
+            created_at: format_timestamp(t.created_at),
+            modified_at: format_timestamp_opt(t.modified_at),
+            deleted_at: format_timestamp_opt(t.deleted_at),
         }))
     }
 
@@ -829,8 +843,8 @@ impl VoiceClient {
                 id: t.id,
                 name: t.name,
                 parent_id: t.parent_id,
-                created_at: t.created_at,
-                modified_at: t.modified_at,
+                created_at: format_timestamp(t.created_at),
+                modified_at: format_timestamp_opt(t.modified_at),
             })
             .collect())
     }
@@ -846,8 +860,8 @@ impl VoiceClient {
                 id: t.id,
                 name: t.name,
                 parent_id: t.parent_id,
-                created_at: t.created_at,
-                modified_at: t.modified_at,
+                created_at: format_timestamp(t.created_at),
+                modified_at: format_timestamp_opt(t.modified_at),
             })
             .collect())
     }
@@ -983,9 +997,9 @@ impl VoiceClient {
                 .map(|n| NoteData {
                     id: n.id,
                     content: n.content,
-                    created_at: n.created_at,
-                    modified_at: n.modified_at,
-                    deleted_at: n.deleted_at,
+                    created_at: format_timestamp(n.created_at),
+                    modified_at: format_timestamp_opt(n.modified_at),
+                    deleted_at: format_timestamp_opt(n.deleted_at),
                     list_display_cache: n.list_display_cache,
                 })
                 .collect(),
@@ -1017,9 +1031,9 @@ impl VoiceClient {
             .map(|n| NoteData {
                 id: n.id,
                 content: n.content,
-                created_at: n.created_at,
-                modified_at: n.modified_at,
-                deleted_at: n.deleted_at,
+                created_at: format_timestamp(n.created_at),
+                modified_at: format_timestamp_opt(n.modified_at),
+                deleted_at: format_timestamp_opt(n.deleted_at),
                 list_display_cache: n.list_display_cache,
             })
             .collect())

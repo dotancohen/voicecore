@@ -346,8 +346,8 @@ pub struct SyncChange {
     pub operation: String,
     /// Full entity data as JSON
     pub data: serde_json::Value,
-    /// Timestamp of the change
-    pub timestamp: String,
+    /// Timestamp of the change (Unix seconds)
+    pub timestamp: i64,
     /// ID of the device that made this change
     pub device_id: String,
     /// Name of the device that made this change

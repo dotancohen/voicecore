@@ -632,9 +632,10 @@ mod tests {
         let languages = transcription.get("preferred_languages").unwrap();
         assert!(languages.as_array().unwrap().is_empty());
 
-        // Default whisper config
-        let whisper = transcription.get("providers").unwrap().get("whisper").unwrap();
-        assert!(whisper.get("model_path").unwrap().is_null());
+        // Default providers should be empty object
+        let providers = transcription.get("providers").unwrap();
+        assert!(providers.is_object());
+        assert!(providers.as_object().unwrap().is_empty());
     }
 
     #[test]

@@ -29,7 +29,6 @@ use crate::error::VoiceResult;
 use crate::merge::merge_content;
 use crate::models::SyncChange;
 use crate::UUID_SHORT_LEN;
-use crate::validation::validate_datetime_optional;
 
 /// Server shutdown handle
 static SHUTDOWN_TX: OnceLock<Mutex<Option<oneshot::Sender<()>>>> = OnceLock::new();
@@ -57,22 +56,22 @@ struct HandshakeResponse {
     device_id: String,
     device_name: String,
     protocol_version: String,
-    last_sync_timestamp: Option<String>,
-    server_timestamp: String,
+    last_sync_timestamp: Option<i64>,
+    server_timestamp: i64,
     supports_audiofiles: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChangesQuery {
-    since: Option<String>,
+    since: Option<i64>,
     limit: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChangesResponse {
     changes: Vec<SyncChange>,
-    from_timestamp: Option<String>,
-    to_timestamp: Option<String>,
+    from_timestamp: Option<i64>,
+    to_timestamp: Option<i64>,
     device_id: String,
     device_name: String,
     is_complete: bool,
@@ -145,7 +144,7 @@ async fn handshake(
         device_name: state.device_name.clone(),
         protocol_version: "1.0".to_string(),
         last_sync_timestamp: last_sync,
-        server_timestamp: Utc::now().to_rfc3339(),
+        server_timestamp: Utc::now().timestamp(),
         supports_audiofiles,
     };
 
@@ -162,7 +161,7 @@ async fn get_changes(
     // Get changes from database
     let (changes, latest_timestamp) = {
         let db = state.db.lock().unwrap();
-        match db.get_changes_since_as_sync_changes(query.since.as_deref(), limit) {
+        match db.get_changes_since_as_sync_changes(query.since, limit) {
             Ok(result) => result,
             Err(e) => {
                 tracing::error!("Failed to get changes: {}", e);
@@ -310,9 +309,7 @@ async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
     if let Some(obj) = data.as_object_mut() {
         obj.insert("device_id".to_string(), serde_json::Value::String(state.device_id.clone()));
         obj.insert("device_name".to_string(), serde_json::Value::String(state.device_name.clone()));
-        obj.insert("timestamp".to_string(), serde_json::Value::String(
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
-        ));
+        obj.insert("timestamp".to_string(), serde_json::json!(chrono::Utc::now().timestamp()));
     }
 
     Json(data).into_response()
@@ -438,7 +435,7 @@ async fn upload_audio_file(
 
 // Helper functions
 
-fn get_peer_last_sync(db: &Arc<Mutex<Database>>, peer_id: &str) -> Option<String> {
+fn get_peer_last_sync(db: &Arc<Mutex<Database>>, peer_id: &str) -> Option<i64> {
     let peer_uuid = Uuid::parse_str(peer_id).ok()?;
     let peer_bytes = peer_uuid.as_bytes().to_vec();
 
@@ -448,9 +445,10 @@ fn get_peer_last_sync(db: &Arc<Mutex<Database>>, peer_id: &str) -> Option<String
     conn.query_row(
         "SELECT last_sync_at FROM sync_peers WHERE peer_id = ?",
         [peer_bytes],
-        |row| row.get(0),
+        |row| row.get::<_, Option<i64>>(0),
     )
     .ok()
+    .flatten()
 }
 
 
@@ -477,12 +475,12 @@ fn apply_sync_changes(
 
     for change in changes {
         let result = match change.entity_type.as_str() {
-            "note" => apply_note_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
-            "tag" => apply_tag_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
-            "note_tag" => apply_note_tag_change(&db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
-            "note_attachment" => apply_note_attachment_change(&db, change, last_sync_at.as_deref(), sync_received_at),
-            "audio_file" => apply_audio_file_change(&db, change, last_sync_at.as_deref(), sync_received_at),
-            "transcription" => apply_transcription_change(&db, change, last_sync_at.as_deref(), sync_received_at),
+            "note" => apply_note_change(&db, change, last_sync_at, local_device_id, local_device_name, sync_received_at),
+            "tag" => apply_tag_change(&db, change, last_sync_at, local_device_id, local_device_name, sync_received_at),
+            "note_tag" => apply_note_tag_change(&db, change, last_sync_at, local_device_id, local_device_name, sync_received_at),
+            "note_attachment" => apply_note_attachment_change(&db, change, last_sync_at, sync_received_at),
+            "audio_file" => apply_audio_file_change(&db, change, last_sync_at, sync_received_at),
+            "transcription" => apply_transcription_change(&db, change, last_sync_at, sync_received_at),
             _ => {
                 tracing::warn!("Unknown entity type: {}", change.entity_type);
                 errors.push(format!("Unknown entity type: {}", change.entity_type));
@@ -546,7 +544,7 @@ enum ApplyResult {
 fn apply_note_change(
     db: &Database,
     change: &SyncChange,
-    last_sync_at: Option<&str>,
+    last_sync_at: Option<i64>,
     local_device_id: Option<&str>,
     local_device_name: Option<&str>,
     sync_received_at: i64,
@@ -556,11 +554,7 @@ fn apply_note_change(
     let remote_device_id = &change.device_id;
     let remote_device_name = change.device_name.as_deref();
 
-    // Validate datetime format for all incoming timestamps
-    // This prevents malformed dates like "2025-1-1" which break string comparisons
-    validate_datetime_optional(data["created_at"].as_str(), "note.created_at")?;
-    validate_datetime_optional(data["modified_at"].as_str(), "note.modified_at")?;
-    validate_datetime_optional(data["deleted_at"].as_str(), "note.deleted_at")?;
+    // Timestamps are now i64 (Unix seconds) - no string validation needed
 
     let existing = db.get_note_raw(note_id)?;
 
@@ -568,19 +562,19 @@ fn apply_note_change(
         "create" => {
             // Check if existing note is deleted - if so, treat as conflict/resurrection
             if let Some(ref existing) = existing {
-                let local_deleted = existing.get("deleted_at").and_then(|v| v.as_str()).is_some();
+                let local_deleted = existing.get("deleted_at").and_then(|v| v.as_i64()).is_some();
                 if local_deleted {
                     // Remote is creating (with deleted_at=None), local has deleted
                     // This is "local deleted, remote edited" scenario - resurrect with conflict
                     let remote_content = data["content"].as_str().unwrap_or("");
-                    let modified_at = data["modified_at"].as_str();
-                    let local_deleted_at = existing.get("deleted_at").and_then(|v| v.as_str()).unwrap_or("");
+                    let modified_at = data["modified_at"].as_i64();
+                    let local_deleted_at = existing.get("deleted_at").and_then(|v| v.as_i64()).unwrap_or(0);
 
                     // Create delete conflict for tracking
                     db.create_note_delete_conflict(
                         note_id,
                         remote_content,                          // surviving_content
-                        modified_at.unwrap_or(""),               // surviving_modified_at
+                        modified_at.unwrap_or(0),                // surviving_modified_at
                         Some(remote_device_id.as_str()),         // surviving_device_id
                         remote_device_name,                      // surviving_device_name
                         None,                                    // deleted_content
@@ -592,7 +586,7 @@ fn apply_note_change(
                     // Resurrect the note with remote content
                     db.apply_sync_note(
                         note_id,
-                        data["created_at"].as_str().unwrap_or(""),
+                        data["created_at"].as_i64().unwrap_or(0),
                         remote_content,
                         modified_at,
                         None,  // Clear deleted_at to resurrect
@@ -606,19 +600,19 @@ fn apply_note_change(
             }
             db.apply_sync_note(
                 note_id,
-                data["created_at"].as_str().unwrap_or(""),
+                data["created_at"].as_i64().unwrap_or(0),
                 data["content"].as_str().unwrap_or(""),
-                data["modified_at"].as_str(),
-                data["deleted_at"].as_str(),
+                data["modified_at"].as_i64(),
+                data["deleted_at"].as_i64(),
                 Some(sync_received_at),
             )?;
             Ok(ApplyResult::Applied)
         }
         "update" | "delete" => {
-            let created_at = data["created_at"].as_str().unwrap_or("");
+            let created_at = data["created_at"].as_i64().unwrap_or(0);
             let remote_content = data["content"].as_str().unwrap_or("");
-            let modified_at = data["modified_at"].as_str();
-            let deleted_at = data["deleted_at"].as_str();
+            let modified_at = data["modified_at"].as_i64();
+            let deleted_at = data["deleted_at"].as_i64();
 
             if existing.is_none() {
                 db.apply_sync_note(note_id, created_at, remote_content, modified_at, deleted_at, Some(sync_received_at))?;
@@ -630,9 +624,9 @@ fn apply_note_change(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let local_modified_at = existing.get("modified_at")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_i64());
             let local_deleted_at = existing.get("deleted_at")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_i64());
 
             // Check if local changed since last sync
             let local_time = local_modified_at.or(local_deleted_at);
@@ -680,11 +674,11 @@ fn apply_note_change(
                     db.create_note_delete_conflict(
                         note_id,
                         remote_content,                          // surviving_content
-                        modified_at.unwrap_or(""),               // surviving_modified_at
+                        modified_at.unwrap_or(0),                // surviving_modified_at
                         Some(remote_device_id.as_str()),         // surviving_device_id
                         remote_device_name,                      // surviving_device_name
                         None,                                    // deleted_content
-                        local_deleted_at.unwrap_or(""),          // deleted_at
+                        local_deleted_at.unwrap_or(0),           // deleted_at
                         local_device_id,                         // deleting_device_id (local)
                         local_device_name,                       // deleting_device_name (local)
                     )?;
@@ -704,11 +698,11 @@ fn apply_note_change(
                     db.create_note_delete_conflict(
                         note_id,
                         local_content,                           // surviving_content
-                        local_modified_at.unwrap_or(""),         // surviving_modified_at
+                        local_modified_at.unwrap_or(0),          // surviving_modified_at
                         local_device_id,                         // surviving_device_id (local)
                         local_device_name,                       // surviving_device_name (local)
                         None,                                    // deleted_content
-                        deleted_at.unwrap_or(""),                // deleted_at
+                        deleted_at.unwrap_or(0),                 // deleted_at
                         Some(remote_device_id.as_str()),         // deleting_device_id
                         remote_device_name,                      // deleting_device_name
                     )?;
@@ -729,23 +723,23 @@ fn apply_note_change(
                         "REMOTE",
                     );
                     let merged_content = &merge_result.content;
-                    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    let now = Utc::now().timestamp();
 
                     // Create conflict record for resolution tracking
                     db.create_note_content_conflict(
                         note_id,
                         local_content,
-                        local_modified_at.unwrap_or(""),
+                        local_modified_at.unwrap_or(0),
                         local_device_id,
                         local_device_name,
                         remote_content,
-                        modified_at.unwrap_or(""),
+                        modified_at.unwrap_or(0),
                         Some(remote_device_id.as_str()),
                         remote_device_name,
                     )?;
 
                     // Apply merged content to note
-                    db.apply_sync_note(note_id, created_at, merged_content, Some(&now), deleted_at, Some(sync_received_at))?;
+                    db.apply_sync_note(note_id, created_at, merged_content, Some(now), deleted_at, Some(sync_received_at))?;
                     return Ok(ApplyResult::Conflict);
                 }
                 // Both deleted - no conflict, just apply
@@ -761,7 +755,7 @@ fn apply_note_change(
 fn apply_tag_change(
     db: &Database,
     change: &SyncChange,
-    last_sync_at: Option<&str>,
+    last_sync_at: Option<i64>,
     local_device_id: Option<&str>,
     local_device_name: Option<&str>,
     sync_received_at: i64,
@@ -771,11 +765,7 @@ fn apply_tag_change(
     let remote_device_id = &change.device_id;
     let remote_device_name = change.device_name.as_deref();
 
-    // Validate datetime format for all incoming timestamps
-    // This prevents malformed dates like "2025-1-1" which break string comparisons
-    validate_datetime_optional(data["created_at"].as_str(), "tag.created_at")?;
-    validate_datetime_optional(data["modified_at"].as_str(), "tag.modified_at")?;
-    validate_datetime_optional(data["deleted_at"].as_str(), "tag.deleted_at")?;
+    // Timestamps are now i64 (Unix seconds) - no string validation needed
 
     let existing = db.get_tag_raw(tag_id)?;
 
@@ -788,8 +778,8 @@ fn apply_tag_change(
                 tag_id,
                 data["name"].as_str().unwrap_or(""),
                 data["parent_id"].as_str(),
-                data["created_at"].as_str().unwrap_or(""),
-                data["modified_at"].as_str(),
+                data["created_at"].as_i64().unwrap_or(0),
+                data["modified_at"].as_i64(),
                 Some(sync_received_at),
             )?;
             Ok(ApplyResult::Applied)
@@ -797,8 +787,8 @@ fn apply_tag_change(
         "update" => {
             let remote_name = data["name"].as_str().unwrap_or("");
             let remote_parent_id = data["parent_id"].as_str();
-            let created_at = data["created_at"].as_str().unwrap_or("");
-            let modified_at = data["modified_at"].as_str();
+            let created_at = data["created_at"].as_i64().unwrap_or(0);
+            let modified_at = data["modified_at"].as_i64();
 
             if existing.is_none() {
                 db.apply_sync_tag(tag_id, remote_name, remote_parent_id, created_at, modified_at, Some(sync_received_at))?;
@@ -812,7 +802,7 @@ fn apply_tag_change(
             let local_parent_id = existing.get("parent_id")
                 .and_then(|v| v.as_str());
             let local_modified_at = existing.get("modified_at")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_i64());
 
             // Check if local changed since last sync
             let local_changed = if let Some(last) = last_sync_at {
@@ -848,11 +838,11 @@ fn apply_tag_change(
                     db.create_tag_rename_conflict(
                         tag_id,
                         local_name,
-                        local_modified_at.unwrap_or(""),
+                        local_modified_at.unwrap_or(0),
                         local_device_id,
                         local_device_name,
                         remote_name,
-                        modified_at.unwrap_or(""),
+                        modified_at.unwrap_or(0),
                         Some(remote_device_id.as_str()),
                         remote_device_name,
                     )?;
@@ -867,11 +857,11 @@ fn apply_tag_change(
                     db.create_tag_parent_conflict(
                         tag_id,
                         local_parent_id,
-                        local_modified_at.unwrap_or(""),
+                        local_modified_at.unwrap_or(0),
                         local_device_id,
                         local_device_name,
                         remote_parent_id,
-                        modified_at.unwrap_or(""),
+                        modified_at.unwrap_or(0),
                         Some(remote_device_id.as_str()),
                         remote_device_name,
                     )?;
@@ -881,9 +871,9 @@ fn apply_tag_change(
                 }
             }
 
-            let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let now = Utc::now().timestamp();
             let final_modified = if has_name_conflict || has_parent_conflict {
-                Some(now.as_str())
+                Some(now)
             } else {
                 modified_at
             };
@@ -897,9 +887,9 @@ fn apply_tag_change(
         }
         "delete" => {
             // Tag deletion handling
-            let deleted_at = data["deleted_at"].as_str()
-                .or_else(|| data["modified_at"].as_str())
-                .unwrap_or("");
+            let deleted_at = data["deleted_at"].as_i64()
+                .or_else(|| data["modified_at"].as_i64())
+                .unwrap_or(0);
 
             if existing.is_none() {
                 // Tag doesn't exist locally - nothing to delete
@@ -913,7 +903,7 @@ fn apply_tag_change(
             let local_parent_id = existing.get("parent_id")
                 .and_then(|v| v.as_str());
             let local_modified_at = existing.get("modified_at")
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_i64());
 
             // Check if local changed since last sync
             let local_changed = if let Some(last) = last_sync_at {
@@ -936,7 +926,7 @@ fn apply_tag_change(
                     tag_id,
                     local_name,                          // surviving_name
                     local_parent_id,                     // surviving_parent_id
-                    local_modified_at.unwrap_or(""),     // surviving_modified_at
+                    local_modified_at.unwrap_or(0),      // surviving_modified_at
                     local_device_id,                     // surviving_device_id (local)
                     local_device_name,                   // surviving_device_name (local)
                     deleted_at,                          // deleted_at
@@ -948,8 +938,8 @@ fn apply_tag_change(
 
             // No local changes - safe to delete (soft delete with original timestamp)
             let local_created_at = existing.get("created_at")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             db.apply_sync_tag_with_deleted(tag_id, local_name, local_parent_id, local_created_at, Some(deleted_at), Some(deleted_at), Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
@@ -960,7 +950,7 @@ fn apply_tag_change(
 fn apply_note_tag_change(
     db: &Database,
     change: &SyncChange,
-    last_sync_at: Option<&str>,
+    last_sync_at: Option<i64>,
     local_device_id: Option<&str>,
     local_device_name: Option<&str>,
     sync_received_at: i64,
@@ -985,17 +975,13 @@ fn apply_note_tag_change(
         change.operation
     );
 
-    // Validate datetime format for all incoming timestamps
-    // This prevents malformed dates like "2025-1-1" which break string comparisons
-    validate_datetime_optional(data["created_at"].as_str(), "note_tag.created_at")?;
-    validate_datetime_optional(data["modified_at"].as_str(), "note_tag.modified_at")?;
-    validate_datetime_optional(data["deleted_at"].as_str(), "note_tag.deleted_at")?;
+    // Timestamps are now i64 (Unix seconds) - no string validation needed
 
     // Determine the timestamp of this incoming change
     let incoming_time = if change.operation == "delete" {
-        data["deleted_at"].as_str().or_else(|| data["modified_at"].as_str())
+        data["deleted_at"].as_i64().or_else(|| data["modified_at"].as_i64())
     } else {
-        data["modified_at"].as_str().or_else(|| data["created_at"].as_str())
+        data["modified_at"].as_i64().or_else(|| data["created_at"].as_i64())
     };
 
     // If this change happened before or at last_sync, skip it
@@ -1008,16 +994,16 @@ fn apply_note_tag_change(
     let existing = db.get_note_tag_raw(note_id, tag_id)?;
 
     // Extract incoming timestamps first (needed for local_changed calculation)
-    let created_at = data["created_at"].as_str().unwrap_or("");
-    let modified_at = data["modified_at"].as_str();
-    let deleted_at = data["deleted_at"].as_str();
+    let created_at = data["created_at"].as_i64().unwrap_or(0);
+    let modified_at = data["modified_at"].as_i64();
+    let deleted_at = data["deleted_at"].as_i64();
 
     // Determine if local changed since last_sync
     let local_changed = if let Some(ref ex) = existing {
         let local_time = ex.get("modified_at")
-            .and_then(|v| v.as_str())
-            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
-            .or_else(|| ex.get("created_at").and_then(|v| v.as_str()));
+            .and_then(|v| v.as_i64())
+            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_i64()))
+            .or_else(|| ex.get("created_at").and_then(|v| v.as_i64()));
         let incoming_time = modified_at.or(deleted_at);
 
         if let Some(last) = last_sync_at {
@@ -1038,14 +1024,14 @@ fn apply_note_tag_change(
     match change.operation.as_str() {
         "create" => {
             if let Some(ref ex) = existing {
-                if ex.get("deleted_at").and_then(|v| v.as_str()).is_none() {
+                if ex.get("deleted_at").and_then(|v| v.as_i64()).is_none() {
                     // Already active
                     return Ok(ApplyResult::Skipped);
                 }
                 // Local is deleted, remote wants active - reactivate
-                let ex_created_at = ex.get("created_at").and_then(|v| v.as_str()).unwrap_or(created_at);
-                let local_modified_at = ex.get("modified_at").and_then(|v| v.as_str());
-                let local_deleted_at = ex.get("deleted_at").and_then(|v| v.as_str());
+                let ex_created_at = ex.get("created_at").and_then(|v| v.as_i64()).unwrap_or(created_at);
+                let local_modified_at = ex.get("modified_at").and_then(|v| v.as_i64());
+                let local_deleted_at = ex.get("deleted_at").and_then(|v| v.as_i64());
 
                 if local_changed {
                     // Create conflict record: local deleted, remote wants to reactivate
@@ -1079,14 +1065,14 @@ fn apply_note_tag_change(
                 return Ok(ApplyResult::Applied);
             }
             let ex = existing.unwrap();
-            if ex.get("deleted_at").and_then(|v| v.as_str()).is_some() {
+            if ex.get("deleted_at").and_then(|v| v.as_i64()).is_some() {
                 return Ok(ApplyResult::Skipped); // Already deleted
             }
             // Local is active, remote wants to delete
             if local_changed {
                 // Both changed - favor preservation (keep active)
-                let ex_created_at = ex.get("created_at").and_then(|v| v.as_str());
-                let local_modified_at = ex.get("modified_at").and_then(|v| v.as_str());
+                let ex_created_at = ex.get("created_at").and_then(|v| v.as_i64());
+                let local_modified_at = ex.get("modified_at").and_then(|v| v.as_i64());
                 db.create_note_tag_conflict(
                     note_id,
                     tag_id,
@@ -1104,7 +1090,7 @@ fn apply_note_tag_change(
                 return Ok(ApplyResult::Conflict);
             }
             // Apply the delete
-            let ex_created_at = ex.get("created_at").and_then(|v| v.as_str()).unwrap_or(created_at);
+            let ex_created_at = ex.get("created_at").and_then(|v| v.as_i64()).unwrap_or(created_at);
             db.apply_sync_note_tag(note_id, tag_id, ex_created_at, modified_at, deleted_at, Some(sync_received_at))?;
             Ok(ApplyResult::Applied)
         }
@@ -1117,14 +1103,14 @@ fn apply_note_tag_change(
 
             let ex = existing.unwrap();
             let remote_deleted = deleted_at.is_some();
-            let local_deleted = ex.get("deleted_at").and_then(|v| v.as_str()).is_some();
-            let ex_created_at = ex.get("created_at").and_then(|v| v.as_str()).unwrap_or(created_at);
+            let local_deleted = ex.get("deleted_at").and_then(|v| v.as_i64()).is_some();
+            let ex_created_at = ex.get("created_at").and_then(|v| v.as_i64()).unwrap_or(created_at);
 
             if !remote_deleted && local_deleted {
                 // Remote reactivated, local still deleted - reactivate
                 if local_changed {
-                    let local_modified_at = ex.get("modified_at").and_then(|v| v.as_str());
-                    let local_deleted_at = ex.get("deleted_at").and_then(|v| v.as_str());
+                    let local_modified_at = ex.get("modified_at").and_then(|v| v.as_i64());
+                    let local_deleted_at = ex.get("deleted_at").and_then(|v| v.as_i64());
                     db.create_note_tag_conflict(
                         note_id,
                         tag_id,
@@ -1147,7 +1133,7 @@ fn apply_note_tag_change(
             if remote_deleted && !local_deleted {
                 // Remote wants to delete, local is active
                 if local_changed {
-                    let local_modified_at = ex.get("modified_at").and_then(|v| v.as_str());
+                    let local_modified_at = ex.get("modified_at").and_then(|v| v.as_i64());
                     db.create_note_tag_conflict(
                         note_id,
                         tag_id,
@@ -1179,22 +1165,19 @@ fn apply_note_tag_change(
 fn apply_note_attachment_change(
     db: &Database,
     change: &SyncChange,
-    last_sync_at: Option<&str>,
+    last_sync_at: Option<i64>,
     sync_received_at: i64,
 ) -> VoiceResult<ApplyResult> {
     let attachment_assoc_id = &change.entity_id;
     let data = &change.data;
 
-    // Validate datetime format for all incoming timestamps
-    validate_datetime_optional(data["created_at"].as_str(), "note_attachment.created_at")?;
-    validate_datetime_optional(data["modified_at"].as_str(), "note_attachment.modified_at")?;
-    validate_datetime_optional(data["deleted_at"].as_str(), "note_attachment.deleted_at")?;
+    // Timestamps are now i64 (Unix seconds) - no string validation needed
 
     // Determine the timestamp of this incoming change
     let incoming_time = if change.operation == "delete" {
-        data["deleted_at"].as_str().or_else(|| data["modified_at"].as_str())
+        data["deleted_at"].as_i64().or_else(|| data["modified_at"].as_i64())
     } else {
-        data["modified_at"].as_str().or_else(|| data["created_at"].as_str())
+        data["modified_at"].as_i64().or_else(|| data["created_at"].as_i64())
     };
 
     // If this change happened before or at last_sync, skip it
@@ -1206,21 +1189,21 @@ fn apply_note_attachment_change(
 
     let existing = db.get_note_attachment_raw(attachment_assoc_id)?;
 
-    // Extract incoming timestamps first (needed for local_changed calculation)
+    // Extract incoming data
     let id = data["id"].as_str().unwrap_or("");
     let note_id = data["note_id"].as_str().unwrap_or("");
     let attachment_id = data["attachment_id"].as_str().unwrap_or("");
     let attachment_type = data["attachment_type"].as_str().unwrap_or("");
-    let created_at = data["created_at"].as_str().unwrap_or("");
-    let modified_at = data["modified_at"].as_str();
-    let deleted_at = data["deleted_at"].as_str();
+    let created_at = data["created_at"].as_i64().unwrap_or(0);
+    let modified_at = data["modified_at"].as_i64();
+    let deleted_at = data["deleted_at"].as_i64();
 
     // Determine if local changed since last_sync
     let local_changed = if let Some(ref ex) = existing {
         let local_time = ex.get("modified_at")
-            .and_then(|v| v.as_str())
-            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
-            .or_else(|| ex.get("created_at").and_then(|v| v.as_str()));
+            .and_then(|v| v.as_i64())
+            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_i64()))
+            .or_else(|| ex.get("created_at").and_then(|v| v.as_i64()));
         let incoming_time = modified_at.or(deleted_at);
 
         if let Some(last) = last_sync_at {
@@ -1241,7 +1224,7 @@ fn apply_note_attachment_change(
     match change.operation.as_str() {
         "create" => {
             if let Some(ref ex) = existing {
-                if ex.get("deleted_at").and_then(|v| v.as_str()).is_none() {
+                if ex.get("deleted_at").and_then(|v| v.as_i64()).is_none() {
                     // Already active
                     return Ok(ApplyResult::Skipped);
                 }
@@ -1260,7 +1243,7 @@ fn apply_note_attachment_change(
                 return Ok(ApplyResult::Applied);
             }
             let ex = existing.unwrap();
-            if ex.get("deleted_at").and_then(|v| v.as_str()).is_some() {
+            if ex.get("deleted_at").and_then(|v| v.as_i64()).is_some() {
                 return Ok(ApplyResult::Skipped); // Already deleted
             }
             // Local is active, remote wants to delete
@@ -1280,7 +1263,7 @@ fn apply_note_attachment_change(
 
             let ex = existing.unwrap();
             let remote_deleted = deleted_at.is_some();
-            let local_deleted = ex.get("deleted_at").and_then(|v| v.as_str()).is_some();
+            let local_deleted = ex.get("deleted_at").and_then(|v| v.as_i64()).is_some();
 
             if !remote_deleted && local_deleted {
                 // Remote reactivated, local still deleted - reactivate
@@ -1308,23 +1291,19 @@ fn apply_note_attachment_change(
 fn apply_audio_file_change(
     db: &Database,
     change: &SyncChange,
-    last_sync_at: Option<&str>,
+    last_sync_at: Option<i64>,
     sync_received_at: i64,
 ) -> VoiceResult<ApplyResult> {
     let audio_file_id = &change.entity_id;
     let data = &change.data;
 
-    // Validate datetime format for all incoming timestamps
-    validate_datetime_optional(data["imported_at"].as_str(), "audio_file.imported_at")?;
-    validate_datetime_optional(data["file_created_at"].as_str(), "audio_file.file_created_at")?;
-    validate_datetime_optional(data["modified_at"].as_str(), "audio_file.modified_at")?;
-    validate_datetime_optional(data["deleted_at"].as_str(), "audio_file.deleted_at")?;
+    // Timestamps are now i64 (Unix seconds) - no string validation needed
 
     // Determine the timestamp of this incoming change
     let incoming_time = if change.operation == "delete" {
-        data["deleted_at"].as_str().or_else(|| data["modified_at"].as_str())
+        data["deleted_at"].as_i64().or_else(|| data["modified_at"].as_i64())
     } else {
-        data["modified_at"].as_str().or_else(|| data["imported_at"].as_str())
+        data["modified_at"].as_i64().or_else(|| data["imported_at"].as_i64())
     };
 
     // If this change happened before or at last_sync, skip it
@@ -1336,22 +1315,22 @@ fn apply_audio_file_change(
 
     let existing = db.get_audio_file_raw(audio_file_id)?;
 
-    // Extract incoming timestamps first (needed for local_changed calculation)
+    // Extract incoming data
     let id = data["id"].as_str().unwrap_or("");
-    let imported_at = data["imported_at"].as_str().unwrap_or("");
+    let imported_at = data["imported_at"].as_i64().unwrap_or(0);
     let filename = data["filename"].as_str().unwrap_or("");
-    let file_created_at = data["file_created_at"].as_str();
+    let file_created_at = data["file_created_at"].as_i64();
     let duration_seconds = data["duration_seconds"].as_i64();
     let summary = data["summary"].as_str();
-    let modified_at = data["modified_at"].as_str();
-    let deleted_at = data["deleted_at"].as_str();
+    let modified_at = data["modified_at"].as_i64();
+    let deleted_at = data["deleted_at"].as_i64();
 
     // Determine if local changed since last_sync
     let local_changed = if let Some(ref ex) = existing {
         let local_time = ex.get("modified_at")
-            .and_then(|v| v.as_str())
-            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
-            .or_else(|| ex.get("imported_at").and_then(|v| v.as_str()));
+            .and_then(|v| v.as_i64())
+            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_i64()))
+            .or_else(|| ex.get("imported_at").and_then(|v| v.as_i64()));
         let incoming_time = modified_at.or(deleted_at);
 
         if let Some(last) = last_sync_at {
@@ -1384,7 +1363,7 @@ fn apply_audio_file_change(
             }
 
             let existing = existing.unwrap();
-            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_str()).is_some();
+            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_i64()).is_some();
             let remote_deleted = deleted_at.is_some();
 
             // Audio files are simpler - no content conflicts (metadata + binary)
@@ -1416,22 +1395,19 @@ fn apply_audio_file_change(
 fn apply_transcription_change(
     db: &Database,
     change: &SyncChange,
-    last_sync_at: Option<&str>,
+    last_sync_at: Option<i64>,
     sync_received_at: i64,
 ) -> VoiceResult<ApplyResult> {
     let transcription_id = &change.entity_id;
     let data = &change.data;
 
-    // Validate datetime format for all incoming timestamps
-    validate_datetime_optional(data["created_at"].as_str(), "transcription.created_at")?;
-    validate_datetime_optional(data["modified_at"].as_str(), "transcription.modified_at")?;
-    validate_datetime_optional(data["deleted_at"].as_str(), "transcription.deleted_at")?;
+    // Timestamps are now i64 (Unix seconds) - no string validation needed
 
     // Determine the timestamp of this incoming change
     let incoming_time = if change.operation == "delete" {
-        data["deleted_at"].as_str().or_else(|| data["modified_at"].as_str())
+        data["deleted_at"].as_i64().or_else(|| data["modified_at"].as_i64())
     } else {
-        data["modified_at"].as_str().or_else(|| data["created_at"].as_str())
+        data["modified_at"].as_i64().or_else(|| data["created_at"].as_i64())
     };
 
     // If this change happened before or at last_sync, skip it
@@ -1453,16 +1429,16 @@ fn apply_transcription_change(
     let service_response = data["service_response"].as_str();
     let state = data["state"].as_str().unwrap_or(crate::database::DEFAULT_TRANSCRIPTION_STATE);
     let device_id = data["device_id"].as_str().unwrap_or("");
-    let created_at = data["created_at"].as_str().unwrap_or("");
-    let modified_at = data["modified_at"].as_str();
-    let deleted_at = data["deleted_at"].as_str();
+    let created_at = data["created_at"].as_i64().unwrap_or(0);
+    let modified_at = data["modified_at"].as_i64();
+    let deleted_at = data["deleted_at"].as_i64();
 
     // Determine if local changed since last_sync
     let local_changed = if let Some(ref ex) = existing {
         let local_time = ex.get("modified_at")
-            .and_then(|v| v.as_str())
-            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_str()))
-            .or_else(|| ex.get("created_at").and_then(|v| v.as_str()));
+            .and_then(|v| v.as_i64())
+            .or_else(|| ex.get("deleted_at").and_then(|v| v.as_i64()))
+            .or_else(|| ex.get("created_at").and_then(|v| v.as_i64()));
         let incoming_time = modified_at.or(deleted_at);
 
         if let Some(last) = last_sync_at {
@@ -1493,7 +1469,7 @@ fn apply_transcription_change(
             }
 
             let existing = existing.unwrap();
-            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_str()).is_some();
+            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_i64()).is_some();
             let remote_deleted = deleted_at.is_some();
 
             // If both deleted, apply
@@ -1532,10 +1508,10 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
     )?;
     let note_rows = stmt.query_map([], |row| {
         let id_bytes: Vec<u8> = row.get(0)?;
-        let created_at: String = row.get(1)?;
+        let created_at: i64 = row.get(1)?;
         let content: String = row.get(2)?;
-        let modified_at: Option<String> = row.get(3)?;
-        let deleted_at: Option<String> = row.get(4)?;
+        let modified_at: Option<i64> = row.get(3)?;
+        let deleted_at: Option<i64> = row.get(4)?;
         Ok((id_bytes, created_at, content, modified_at, deleted_at))
     })?;
 
@@ -1560,8 +1536,8 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
         let id_bytes: Vec<u8> = row.get(0)?;
         let name: String = row.get(1)?;
         let parent_id_bytes: Option<Vec<u8>> = row.get(2)?;
-        let created_at: Option<String> = row.get(3)?;
-        let modified_at: Option<String> = row.get(4)?;
+        let created_at: Option<i64> = row.get(3)?;
+        let modified_at: Option<i64> = row.get(4)?;
         Ok((id_bytes, name, parent_id_bytes, created_at, modified_at))
     })?;
 
@@ -1588,9 +1564,9 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
     let note_tag_rows = stmt.query_map([], |row| {
         let note_id_bytes: Vec<u8> = row.get(0)?;
         let tag_id_bytes: Vec<u8> = row.get(1)?;
-        let created_at: String = row.get(2)?;
-        let modified_at: Option<String> = row.get(3)?;
-        let deleted_at: Option<String> = row.get(4)?;
+        let created_at: i64 = row.get(2)?;
+        let modified_at: Option<i64> = row.get(3)?;
+        let deleted_at: Option<i64> = row.get(4)?;
         Ok((note_id_bytes, tag_id_bytes, created_at, modified_at, deleted_at))
     })?;
 
@@ -1617,9 +1593,9 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
         let note_id_bytes: Vec<u8> = row.get(1)?;
         let attachment_id_bytes: Vec<u8> = row.get(2)?;
         let attachment_type: String = row.get(3)?;
-        let created_at: String = row.get(4)?;
-        let modified_at: Option<String> = row.get(5)?;
-        let deleted_at: Option<String> = row.get(6)?;
+        let created_at: i64 = row.get(4)?;
+        let modified_at: Option<i64> = row.get(5)?;
+        let deleted_at: Option<i64> = row.get(6)?;
         Ok((id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at))
     })?;
 
@@ -1646,13 +1622,13 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
     )?;
     let audio_file_rows = stmt.query_map([], |row| {
         let id_bytes: Vec<u8> = row.get(0)?;
-        let imported_at: String = row.get(1)?;
+        let imported_at: i64 = row.get(1)?;
         let filename: String = row.get(2)?;
-        let file_created_at: Option<String> = row.get(3)?;
+        let file_created_at: Option<i64> = row.get(3)?;
         let duration_seconds: Option<f64> = row.get(4)?;
         let summary: Option<String> = row.get(5)?;
-        let modified_at: Option<String> = row.get(6)?;
-        let deleted_at: Option<String> = row.get(7)?;
+        let modified_at: Option<i64> = row.get(6)?;
+        let deleted_at: Option<i64> = row.get(7)?;
         Ok((id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at))
     })?;
 
@@ -1686,9 +1662,9 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
         let service_response: Option<String> = row.get(6)?;
         let state: String = row.get(7)?;
         let device_id_bytes: Vec<u8> = row.get(8)?;
-        let created_at: String = row.get(9)?;
-        let modified_at: Option<String> = row.get(10)?;
-        let deleted_at: Option<String> = row.get(11)?;
+        let created_at: i64 = row.get(9)?;
+        let modified_at: Option<i64> = row.get(10)?;
+        let deleted_at: Option<i64> = row.get(11)?;
         Ok((id_bytes, audio_file_id_bytes, content, content_segments, service, service_arguments, service_response, state, device_id_bytes, created_at, modified_at, deleted_at))
     })?;
 
@@ -1768,12 +1744,12 @@ pub fn apply_changes_from_peer(
 
     for change in sorted_changes {
         let result = match change.entity_type.as_str() {
-            "note" => apply_note_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
-            "tag" => apply_tag_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
-            "note_tag" => apply_note_tag_change(db, change, last_sync_at.as_deref(), local_device_id, local_device_name, sync_received_at),
-            "note_attachment" => apply_note_attachment_change(db, change, last_sync_at.as_deref(), sync_received_at),
-            "audio_file" => apply_audio_file_change(db, change, last_sync_at.as_deref(), sync_received_at),
-            "transcription" => apply_transcription_change(db, change, last_sync_at.as_deref(), sync_received_at),
+            "note" => apply_note_change(db, change, last_sync_at, local_device_id, local_device_name, sync_received_at),
+            "tag" => apply_tag_change(db, change, last_sync_at, local_device_id, local_device_name, sync_received_at),
+            "note_tag" => apply_note_tag_change(db, change, last_sync_at, local_device_id, local_device_name, sync_received_at),
+            "note_attachment" => apply_note_attachment_change(db, change, last_sync_at, sync_received_at),
+            "audio_file" => apply_audio_file_change(db, change, last_sync_at, sync_received_at),
+            "transcription" => apply_transcription_change(db, change, last_sync_at, sync_received_at),
             _ => {
                 errors.push(format!("Unknown entity type: {}", change.entity_type));
                 continue;
@@ -1896,9 +1872,8 @@ mod tests {
         let timestamp = data.get("modified_at")
             .or_else(|| data.get("deleted_at"))
             .or_else(|| data.get("created_at"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("2025-01-01 00:00:00")
-            .to_string();
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1735689600); // 2025-01-01 00:00:00 UTC
 
         SyncChange {
             entity_type: entity_type.to_string(),
@@ -1934,9 +1909,9 @@ mod tests {
             "update",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "Remote edited content",
-                "modified_at": "2025-01-01 12:00:00",
+                "modified_at": 1735732800,
                 "deleted_at": null,
             }),
             "00000000000070008000000000000099",
@@ -1983,16 +1958,16 @@ mod tests {
             "update",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "Remote edited content",
-                "modified_at": "2025-01-01 12:00:00",
+                "modified_at": 1735732800,
                 "deleted_at": null,
             }),
             "00000000000070008000000000000099",
         );
 
         // Apply with last_sync before the remote change (local unchanged)
-        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 06:00:00"), None, None, 0).unwrap();
+        let result = apply_note_change(&db, &remote_change, Some(1735711200), None, None, 0).unwrap();
 
         // Should apply cleanly
         assert_eq!(result, ApplyResult::Applied);
@@ -2025,10 +2000,10 @@ mod tests {
             "delete",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "Original content",
                 "modified_at": null,
-                "deleted_at": "2025-01-01 12:00:00",
+                "deleted_at": 1735732800,
             }),
             "00000000000070008000000000000099",
         );
@@ -2068,9 +2043,9 @@ mod tests {
             "update",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "Remote made important edits",
-                "modified_at": "2025-01-01 12:00:00",
+                "modified_at": 1735732800,
                 "deleted_at": null,
             }),
             "00000000000070008000000000000099",
@@ -2104,10 +2079,10 @@ mod tests {
             "delete",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "To be deleted",
                 "modified_at": null,
-                "deleted_at": "2025-01-01 12:00:00",
+                "deleted_at": 1735732800,
             }),
             "00000000000070008000000000000099",
         );
@@ -2143,8 +2118,8 @@ mod tests {
                 "id": tag_id,
                 "name": "remote_renamed",
                 "parent_id": null,
-                "created_at": "2025-01-01 00:00:00",
-                "modified_at": "2025-01-01 12:00:00",
+                "created_at": 1735689600,
+                "modified_at": 1735732800,
             }),
             "00000000000070008000000000000099",
         );
@@ -2183,8 +2158,8 @@ mod tests {
                 "id": tag_id,
                 "name": "agreed_name",  // Same name!
                 "parent_id": null,
-                "created_at": "2025-01-01 00:00:00",
-                "modified_at": "2025-01-01 12:00:00",
+                "created_at": 1735689600,
+                "modified_at": 1735732800,
             }),
             "00000000000070008000000000000099",
         );
@@ -2221,8 +2196,8 @@ mod tests {
             serde_json::json!({
                 "note_id": note_id,
                 "tag_id": tag_id,
-                "created_at": "2025-01-01 00:00:00",
-                "modified_at": "2099-01-01 12:00:00",  // Future time for the reactivation
+                "created_at": 1735689600_i64,
+                "modified_at": 4102401200_i64,  // Future time for the reactivation (2099-12-31)
                 "deleted_at": null,  // Reactivated!
             }),
             "00000000000070008000000000000099",
@@ -2230,7 +2205,7 @@ mod tests {
 
         // Use a far-future last_sync so local operations are considered "before last_sync"
         // This simulates: local deleted before last sync, then remote reactivates
-        let result = apply_note_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00"), None, None, 0).unwrap();
+        let result = apply_note_tag_change(&db, &remote_change, Some(4102358400), None, None, 0).unwrap();
 
         // Should apply since local hasn't changed since last_sync
         assert_eq!(result, ApplyResult::Applied);
@@ -2262,9 +2237,9 @@ mod tests {
             "update",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "Remote trying to overwrite",
-                "modified_at": "2025-01-01 12:00:00",
+                "modified_at": 1735732800,
                 "deleted_at": null,
             }),
             "00000000000070008000000000000099",
@@ -2317,9 +2292,9 @@ mod tests {
             "update",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "Remote edit",
-                "modified_at": "2025-01-01 12:00:00",
+                "modified_at": 1735732800,
                 "deleted_at": null,
             }),
             "00000000000070008000000000000099",
@@ -2353,16 +2328,16 @@ mod tests {
             "update",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "Old remote content",
-                "modified_at": "2025-01-01 06:00:00",  // Before last_sync
+                "modified_at": 1735711200,  // Before last_sync (2025-01-01 06:00:00 UTC)
                 "deleted_at": null,
             }),
             "00000000000070008000000000000099",
         );
 
-        // last_sync is AFTER the remote change
-        let result = apply_note_change(&db, &remote_change, Some("2025-01-01 12:00:00"), None, None, 0).unwrap();
+        // last_sync is AFTER the remote change (2025-01-01 12:00:00 UTC)
+        let result = apply_note_change(&db, &remote_change, Some(1735732800), None, None, 0).unwrap();
 
         assert_eq!(result, ApplyResult::Skipped, "Old changes should be skipped");
 
@@ -2396,9 +2371,9 @@ mod tests {
                 "update",
                 serde_json::json!({
                     "id": note1_id,
-                    "created_at": "2025-01-01 00:00:00",
+                    "created_at": 1735689600,
                     "content": "Note 1 remote edit",
-                    "modified_at": "2025-01-01 12:00:00",
+                    "modified_at": 1735732800,
                     "deleted_at": null,
                 }),
                 "00000000000070008000000000000099",
@@ -2409,9 +2384,9 @@ mod tests {
                 "update",
                 serde_json::json!({
                     "id": note2_id,
-                    "created_at": "2025-01-01 00:00:00",
+                    "created_at": 1735689600,
                     "content": "Note 2 remote edit",
-                    "modified_at": "2025-01-01 12:00:00",
+                    "modified_at": 1735732800,
                     "deleted_at": null,
                 }),
                 "00000000000070008000000000000099",
@@ -2448,10 +2423,10 @@ mod tests {
         let parent_b = db.create_tag("parent_b", None).unwrap();
         let child_tag = db.create_tag("child", None).unwrap();
 
-        // Local moves child to parent_a
-        db.apply_sync_tag(&child_tag, "child", Some(&parent_a), "", Some("2025-12-24 10:00:00"), None).unwrap();
+        // Local moves child to parent_a (1735776000 = 2025-01-02 00:00:00 UTC - later than remote)
+        db.apply_sync_tag(&child_tag, "child", Some(&parent_a), 1735689600, Some(1735776000), None).unwrap();
 
-        // Remote tries to move child to parent_b
+        // Remote tries to move child to parent_b (at an earlier time)
         let remote_change = make_sync_change(
             "tag",
             &child_tag,
@@ -2460,8 +2435,8 @@ mod tests {
                 "id": child_tag,
                 "name": "child",
                 "parent_id": parent_b,
-                "created_at": "2025-01-01 00:00:00",
-                "modified_at": "2025-01-01 12:00:00",
+                "created_at": 1735689600_i64,
+                "modified_at": 1735732800_i64,
             }),
             "00000000000070008000000000000099",
         );
@@ -2492,8 +2467,8 @@ mod tests {
         let parent = db.create_tag("parent", None).unwrap();
         let child = db.create_tag("child", None).unwrap();
 
-        // Local moves to parent
-        db.apply_sync_tag(&child, "child", Some(&parent), "", Some("2025-12-24 10:00:00"), None).unwrap();
+        // Local moves to parent (1735038000 = 2024-12-24 10:00:00 UTC)
+        db.apply_sync_tag(&child, "child", Some(&parent), 1735038000, Some(1735038000), None).unwrap();
 
         // Remote also moves to same parent
         let remote_change = make_sync_change(
@@ -2504,8 +2479,8 @@ mod tests {
                 "id": child,
                 "name": "child",
                 "parent_id": parent,
-                "created_at": "2025-01-01 00:00:00",
-                "modified_at": "2025-01-01 12:00:00",
+                "created_at": 1735689600,
+                "modified_at": 1735732800,
             }),
             "00000000000070008000000000000099",
         );
@@ -2538,7 +2513,7 @@ mod tests {
             "delete",
             serde_json::json!({
                 "id": tag_id,
-                "deleted_at": "2025-01-01 12:00:00",
+                "deleted_at": 1735732800,
             }),
             "00000000000070008000000000000099",
         );
@@ -2575,13 +2550,13 @@ mod tests {
             "delete",
             serde_json::json!({
                 "id": tag_id,
-                "deleted_at": "2099-01-01 12:00:00",
+                "deleted_at": 4102401200_i64,  // 2099 far future
             }),
             "00000000000070008000000000000099",
         );
 
         // Use far-future last_sync so local appears unchanged
-        let result = apply_tag_change(&db, &remote_change, Some("2099-01-01 00:00:00"), None, None, 0).unwrap();
+        let result = apply_tag_change(&db, &remote_change, Some(4102358400), None, None, 0).unwrap();
 
         // Should apply
         assert_eq!(result, ApplyResult::Applied);
@@ -2613,9 +2588,9 @@ mod tests {
             "update",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "Same final content",  // Identical!
-                "modified_at": "2025-01-01 12:00:00",
+                "modified_at": 1735732800,
                 "deleted_at": null,
             }),
             "00000000000070008000000000000099",
@@ -2650,9 +2625,9 @@ mod tests {
             "update",
             serde_json::json!({
                 "id": note_id,
-                "created_at": "2025-01-01 00:00:00",
+                "created_at": 1735689600,
                 "content": "Remote version",  // Different!
-                "modified_at": "2025-01-01 12:00:00",
+                "modified_at": 1735732800,
                 "deleted_at": null,
             }),
             "00000000000070008000000000000099",
@@ -2690,7 +2665,7 @@ mod tests {
                 "create",
                 serde_json::json!({
                     "id": note1_id,
-                    "created_at": "2025-01-01 00:00:00",
+                    "created_at": 1735689600,
                     "content": "Note 1 - should be created",
                     "modified_at": null,
                     "deleted_at": null,
@@ -2712,7 +2687,7 @@ mod tests {
                 "create",
                 serde_json::json!({
                     "id": note2_id,
-                    "created_at": "2025-01-01 00:00:00",
+                    "created_at": 1735689600,
                     "content": "Note 2 - should be created despite earlier error",
                     "modified_at": null,
                     "deleted_at": null,
@@ -2734,7 +2709,7 @@ mod tests {
                 "create",
                 serde_json::json!({
                     "id": note3_id,
-                    "created_at": "2025-01-01 00:00:00",
+                    "created_at": 1735689600,
                     "content": "Note 3 - should be created despite multiple errors",
                     "modified_at": null,
                     "deleted_at": null,
@@ -2798,53 +2773,19 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_datetime_is_rejected() {
-        // Malformed datetimes like "2025-1-1" (non-zero-padded) must be rejected
-        // because string comparisons would break (e.g., "2025-1-1" < "2025-12-01" is wrong)
+    fn test_integer_timestamp_works() {
+        // Verify i64 timestamps work correctly
         let (db, _temp) = create_test_db();
 
-        // Create a change with malformed datetime (missing zero-padding)
-        // Note: We construct SyncChange manually with the malformed timestamp
-        let malformed_change = SyncChange {
-            entity_type: "note".to_string(),
-            entity_id: "00000000000000000000000000000001".to_string(),
-            operation: "create".to_string(),
-            data: serde_json::json!({
-                "content": "Test note",
-                "created_at": "2025-1-1 0:0:0",  // WRONG: should be "2025-01-01 00:00:00"
-            }),
-            timestamp: "2025-1-1 0:0:0".to_string(),
-            device_id: "device123".to_string(),
-            device_name: Some("Test Device".to_string()),
-        };
-
-        // Apply should reject the malformed datetime
-        let result = apply_note_change(&db, &malformed_change, None, None, None, 0);
-
-        assert!(result.is_err(), "Malformed datetime should cause an error");
-        let err = result.unwrap_err();
-        let err_str = err.to_string();
-        assert!(
-            err_str.contains("datetime") || err_str.contains("19 characters"),
-            "Error should mention datetime format issue: {}",
-            err_str
-        );
-    }
-
-    #[test]
-    fn test_valid_datetime_is_accepted() {
-        // Properly formatted datetimes should be accepted
-        let (db, _temp) = create_test_db();
-
-        // Create a change with properly formatted datetime
+        // Create a change with properly formatted integer timestamps
         let valid_change = make_sync_change(
             "note",
             "00000000000000000000000000000001",
             "create",
             serde_json::json!({
                 "content": "Test note",
-                "created_at": "2025-01-01 00:00:00",  // CORRECT: zero-padded
-                "modified_at": "2025-12-31 23:59:59",
+                "created_at": 1735689600,  // 2025-01-01 00:00:00 UTC
+                "modified_at": 1767225599,  // 2025-12-31 23:59:59 UTC
             }),
             "device123",
         );
@@ -2852,8 +2793,8 @@ mod tests {
         // Apply should succeed
         let result = apply_note_change(&db, &valid_change, None, None, None, 0);
 
-        assert!(result.is_ok(), "Valid datetime should be accepted: {:?}", result);
-        assert_eq!(result.unwrap(), ApplyResult::Applied, "Valid datetime should be applied");
+        assert!(result.is_ok(), "Valid i64 timestamp should be accepted: {:?}", result);
+        assert_eq!(result.unwrap(), ApplyResult::Applied, "Valid i64 timestamp should be applied");
     }
 
     // =========================================================================
@@ -2878,7 +2819,7 @@ mod tests {
         // Sync the note to Instance B (simulating initial sync)
         instance_b.apply_sync_note(
             &note_id,
-            &note.created_at,
+            note.created_at,
             &note.content,
             None,
             None,
@@ -2912,9 +2853,9 @@ mod tests {
         // Extract data from the change to apply to Instance B
         let change = delete_change.unwrap();
         let data = change.get("data").unwrap();
-        let deleted_at = data.get("deleted_at").and_then(|v| v.as_str());
-        let modified_at = data.get("modified_at").and_then(|v| v.as_str());
-        let created_at = data.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let deleted_at = data.get("deleted_at").and_then(|v| v.as_i64());
+        let modified_at = data.get("modified_at").and_then(|v| v.as_i64());
+        let created_at = data.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
         let content = data.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
         // Apply the delete to Instance B
@@ -2951,7 +2892,7 @@ mod tests {
             &tag_id,
             &tag.name,
             None,
-            tag.created_at.as_deref().unwrap_or(""),
+            tag.created_at.unwrap_or(0),
             None,
             None,
         ).unwrap();
@@ -2983,9 +2924,9 @@ mod tests {
         // Extract data from the change to apply to Instance B
         let change = delete_change.unwrap();
         let data = change.get("data").unwrap();
-        let deleted_at = data.get("deleted_at").and_then(|v| v.as_str());
-        let modified_at = data.get("modified_at").and_then(|v| v.as_str());
-        let created_at = data.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let deleted_at = data.get("deleted_at").and_then(|v| v.as_i64());
+        let modified_at = data.get("modified_at").and_then(|v| v.as_i64());
+        let created_at = data.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
         let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let parent_id = data.get("parent_id").and_then(|v| v.as_str());
 
@@ -3131,10 +3072,10 @@ mod tests {
 
         // Create a note and audio file on Instance A
         let note_id = instance_a.create_note("Note with audio").unwrap();
-        let audio_id = instance_a.create_audio_file("recording.mp3", Some("2025-01-01 12:00:00")).unwrap();
+        let audio_id = instance_a.create_audio_file("recording.mp3", Some(1735732800)).unwrap();
 
         // Attach audio to note
-        let attachment_id = instance_a.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
+        let _attachment_id = instance_a.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
 
         // Get changes from Instance A
         let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
@@ -3161,10 +3102,10 @@ mod tests {
         let note_data = note_change.unwrap().get("data").unwrap();
         instance_b.apply_sync_note(
             &note_id,
-            note_data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+            note_data.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
             note_data.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-            note_data.get("modified_at").and_then(|v| v.as_str()),
-            note_data.get("deleted_at").and_then(|v| v.as_str()),
+            note_data.get("modified_at").and_then(|v| v.as_i64()),
+            note_data.get("deleted_at").and_then(|v| v.as_i64()),
             None,
         ).unwrap();
 
@@ -3172,13 +3113,13 @@ mod tests {
         let audio_data = audio_change.unwrap().get("data").unwrap();
         instance_b.apply_sync_audio_file(
             &audio_id,
-            audio_data.get("imported_at").and_then(|v| v.as_str()).unwrap_or(""),
+            audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0),
             audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
-            audio_data.get("file_created_at").and_then(|v| v.as_str()),
+            audio_data.get("file_created_at").and_then(|v| v.as_i64()),
             audio_data.get("duration_seconds").and_then(|v| v.as_i64()),
             audio_data.get("summary").and_then(|v| v.as_str()),
-            audio_data.get("modified_at").and_then(|v| v.as_str()),
-            audio_data.get("deleted_at").and_then(|v| v.as_str()),
+            audio_data.get("modified_at").and_then(|v| v.as_i64()),
+            audio_data.get("deleted_at").and_then(|v| v.as_i64()),
             None,
         ).unwrap();
 
@@ -3190,9 +3131,9 @@ mod tests {
             att_data.get("note_id").and_then(|v| v.as_str()).unwrap_or(""),
             att_data.get("attachment_id").and_then(|v| v.as_str()).unwrap_or(""),
             att_data.get("attachment_type").and_then(|v| v.as_str()).unwrap_or(""),
-            att_data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
-            att_data.get("modified_at").and_then(|v| v.as_str()),
-            att_data.get("deleted_at").and_then(|v| v.as_str()),
+            att_data.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+            att_data.get("modified_at").and_then(|v| v.as_i64()),
+            att_data.get("deleted_at").and_then(|v| v.as_i64()),
             None,
         ).unwrap();
 
@@ -3235,10 +3176,10 @@ mod tests {
                     let id = change.get("entity_id").and_then(|v| v.as_str()).unwrap();
                     instance_b.apply_sync_note(
                         id,
-                        data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
                         data.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                        data.get("modified_at").and_then(|v| v.as_str()),
-                        data.get("deleted_at").and_then(|v| v.as_str()),
+                        data.get("modified_at").and_then(|v| v.as_i64()),
+                        data.get("deleted_at").and_then(|v| v.as_i64()),
                         None,
                     ).unwrap();
                 }
@@ -3246,13 +3187,13 @@ mod tests {
                     let id = change.get("entity_id").and_then(|v| v.as_str()).unwrap();
                     instance_b.apply_sync_audio_file(
                         id,
-                        data.get("imported_at").and_then(|v| v.as_str()).unwrap_or(""),
+                        data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0),
                         data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
-                        data.get("file_created_at").and_then(|v| v.as_str()),
+                        data.get("file_created_at").and_then(|v| v.as_i64()),
                         data.get("duration_seconds").and_then(|v| v.as_i64()),
                         data.get("summary").and_then(|v| v.as_str()),
-                        data.get("modified_at").and_then(|v| v.as_str()),
-                        data.get("deleted_at").and_then(|v| v.as_str()),
+                        data.get("modified_at").and_then(|v| v.as_i64()),
+                        data.get("deleted_at").and_then(|v| v.as_i64()),
                         None,
                     ).unwrap();
                 }
@@ -3263,9 +3204,9 @@ mod tests {
                         data.get("note_id").and_then(|v| v.as_str()).unwrap_or(""),
                         data.get("attachment_id").and_then(|v| v.as_str()).unwrap_or(""),
                         data.get("attachment_type").and_then(|v| v.as_str()).unwrap_or(""),
-                        data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
-                        data.get("modified_at").and_then(|v| v.as_str()),
-                        data.get("deleted_at").and_then(|v| v.as_str()),
+                        data.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+                        data.get("modified_at").and_then(|v| v.as_i64()),
+                        data.get("deleted_at").and_then(|v| v.as_i64()),
                         None,
                     ).unwrap();
                 }
@@ -3300,9 +3241,9 @@ mod tests {
             data.get("note_id").and_then(|v| v.as_str()).unwrap_or(""),
             data.get("attachment_id").and_then(|v| v.as_str()).unwrap_or(""),
             data.get("attachment_type").and_then(|v| v.as_str()).unwrap_or(""),
-            data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
-            data.get("modified_at").and_then(|v| v.as_str()),
-            data.get("deleted_at").and_then(|v| v.as_str()),
+            data.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+            data.get("modified_at").and_then(|v| v.as_i64()),
+            data.get("deleted_at").and_then(|v| v.as_i64()),
             None,
         ).unwrap();
 
@@ -3347,13 +3288,13 @@ mod tests {
         let audio_data = audio_change.get("data").unwrap();
         instance_b.apply_sync_audio_file(
             &audio_id,
-            audio_data.get("imported_at").and_then(|v| v.as_str()).unwrap_or(""),
+            audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0),
             audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
-            audio_data.get("file_created_at").and_then(|v| v.as_str()),
+            audio_data.get("file_created_at").and_then(|v| v.as_i64()),
             audio_data.get("duration_seconds").and_then(|v| v.as_i64()),
             audio_data.get("summary").and_then(|v| v.as_str()),
-            audio_data.get("modified_at").and_then(|v| v.as_str()),
-            audio_data.get("deleted_at").and_then(|v| v.as_str()),
+            audio_data.get("modified_at").and_then(|v| v.as_i64()),
+            audio_data.get("deleted_at").and_then(|v| v.as_i64()),
             None,
         ).unwrap();
 
@@ -3375,9 +3316,9 @@ mod tests {
             trans_data.get("service_response").and_then(|v| v.as_str()),
             trans_data.get("state").and_then(|v| v.as_str()).unwrap_or(""),
             trans_data.get("device_id").and_then(|v| v.as_str()).unwrap_or(""),
-            trans_data.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
-            trans_data.get("modified_at").and_then(|v| v.as_str()),
-            trans_data.get("deleted_at").and_then(|v| v.as_str()),
+            trans_data.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+            trans_data.get("modified_at").and_then(|v| v.as_i64()),
+            trans_data.get("deleted_at").and_then(|v| v.as_i64()),
             None,
         ).unwrap();
 
@@ -3486,13 +3427,13 @@ mod tests {
         ).unwrap();
 
         // Record the current time as our "last sync"
-        let last_sync = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let last_sync = chrono::Utc::now().timestamp();
 
         // Wait a moment to ensure the modification timestamp is later
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Modify the transcription (simulate changing state to "verified")
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = chrono::Utc::now().timestamp();
         let device_id = "00000000000000000000000000000000";  // Dummy device ID for test
         db.apply_sync_transcription(
             &transcription_id,
@@ -3504,14 +3445,14 @@ mod tests {
             None,
             "verified",  // Changed state
             device_id,
-            &now,  // created_at
-            Some(&now),  // modified_at
+            now,  // created_at
+            Some(now),  // modified_at
             None,  // deleted_at
             None,  // sync_received_at - None for local operations
         ).unwrap();
 
         // Get changes since last sync
-        let (changes, _) = db.get_changes_since(Some(&last_sync), 1000).unwrap();
+        let (changes, _) = db.get_changes_since(Some(last_sync), 1000).unwrap();
 
         // Find the transcription change
         let trans_change = changes.iter().find(|c| {
