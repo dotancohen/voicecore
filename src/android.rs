@@ -673,7 +673,7 @@ impl VoiceClient {
 
         // Get peer's last sync time
         let peer_id = cfg.peers().first().map(|p| p.peer_id.as_str());
-        let last_sync = match peer_id {
+        let last_sync: Option<i64> = match peer_id {
             Some(id) => db.get_peer_last_sync(id).ok().flatten(),
             None => return Ok(false),
         };
@@ -685,7 +685,7 @@ impl VoiceClient {
         };
 
         // Check if there are changes since last sync
-        let (changes, _) = db.get_changes_since(Some(&last_sync), 1)
+        let (changes, _) = db.get_changes_since(Some(last_sync), 1)
             .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
 
         Ok(!changes.is_empty())
@@ -705,16 +705,16 @@ impl VoiceClient {
             info.push_str(&format!("Peer ID: {}...\n", &peer.peer_id[..UUID_SHORT_LEN.min(peer.peer_id.len())]));
 
             if let Ok(Some(last_sync)) = db.get_peer_last_sync(&peer.peer_id) {
-                info.push_str(&format!("Last sync: {}\n", last_sync));
+                info.push_str(&format!("Last sync: {} ({})\n", last_sync, format_timestamp(last_sync)));
 
                 // Check changes with >= (current behavior)
-                if let Ok((changes, _)) = db.get_changes_since(Some(&last_sync), 10) {
+                if let Ok((changes, _)) = db.get_changes_since(Some(last_sync), 10) {
                     info.push_str(&format!("Changes (>=): {}\n", changes.len()));
 
                     // Show details of first few changes
                     for (i, change) in changes.iter().take(3).enumerate() {
                         if let Some(entity_type) = change.get("entity_type").and_then(|v| v.as_str()) {
-                            if let Some(timestamp) = change.get("timestamp").and_then(|v| v.as_str()) {
+                            if let Some(timestamp) = change.get("timestamp").and_then(|v| v.as_i64()) {
                                 info.push_str(&format!("  [{}] {}: {}\n", i, entity_type, timestamp));
                             }
                         }
@@ -722,7 +722,7 @@ impl VoiceClient {
                 }
 
                 // Check changes with > (exclusive)
-                if let Ok((changes, _)) = db.get_changes_since_exclusive(Some(&last_sync), 10) {
+                if let Ok((changes, _)) = db.get_changes_since_exclusive(Some(last_sync), 10) {
                     info.push_str(&format!("Changes (>): {}\n", changes.len()));
                 }
             } else {
@@ -843,7 +843,7 @@ impl VoiceClient {
                 id: t.id,
                 name: t.name,
                 parent_id: t.parent_id,
-                created_at: format_timestamp(t.created_at),
+                created_at: format_timestamp_opt(t.created_at),
                 modified_at: format_timestamp_opt(t.modified_at),
             })
             .collect())
@@ -860,7 +860,7 @@ impl VoiceClient {
                 id: t.id,
                 name: t.name,
                 parent_id: t.parent_id,
-                created_at: format_timestamp(t.created_at),
+                created_at: format_timestamp_opt(t.created_at),
                 modified_at: format_timestamp_opt(t.modified_at),
             })
             .collect())
