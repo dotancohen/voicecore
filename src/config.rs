@@ -212,7 +212,7 @@ impl Config {
         fs::create_dir_all(&config_dir)?;
         let config_file = config_dir.join("config.json");
 
-        let data = if config_file.exists() {
+        let mut data = if config_file.exists() {
             match fs::read_to_string(&config_file) {
                 Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
                     let mut default = ConfigData::default();
@@ -230,6 +230,11 @@ impl Config {
             default.database_file = config_dir.join("notes.db").to_string_lossy().to_string();
             default
         };
+
+        // Ensure database_file is set even if config.json exists but doesn't have it
+        if data.database_file.is_empty() {
+            data.database_file = config_dir.join("notes.db").to_string_lossy().to_string();
+        }
 
         let mut config = Self {
             config_dir,

@@ -340,13 +340,13 @@ impl<'a> ConflictManager<'a> {
 
         // Update the note
         conn.execute(
-            "UPDATE notes SET content = ?, modified_at = datetime('now') WHERE id = ?",
+            "UPDATE notes SET content = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
             params![new_content, note_id_bytes],
         )?;
 
         // Mark conflict as resolved
         conn.execute(
-            "UPDATE conflicts_note_content SET resolved_at = datetime('now') WHERE id = ?",
+            "UPDATE conflicts_note_content SET resolved_at = strftime('%s', 'now') WHERE id = ?",
             [conflict_id_bytes],
         )?;
 
@@ -377,7 +377,7 @@ impl<'a> ConflictManager<'a> {
             ResolutionChoice::KeepBoth => {
                 // Restore the note with surviving content
                 conn.execute(
-                    "UPDATE notes SET content = ?, deleted_at = NULL, modified_at = datetime('now') WHERE id = ?",
+                    "UPDATE notes SET content = ?, deleted_at = NULL, modified_at = strftime('%s', 'now') WHERE id = ?",
                     params![surviving_content, note_id_bytes],
                 )?;
             }
@@ -394,7 +394,7 @@ impl<'a> ConflictManager<'a> {
 
         // Mark conflict as resolved
         conn.execute(
-            "UPDATE conflicts_note_delete SET resolved_at = datetime('now') WHERE id = ?",
+            "UPDATE conflicts_note_delete SET resolved_at = strftime('%s', 'now') WHERE id = ?",
             [conflict_id_bytes],
         )?;
 
@@ -434,13 +434,13 @@ impl<'a> ConflictManager<'a> {
 
         // Update the tag
         conn.execute(
-            "UPDATE tags SET name = ?, modified_at = datetime('now') WHERE id = ?",
+            "UPDATE tags SET name = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
             params![new_name, tag_id_bytes],
         )?;
 
         // Mark conflict as resolved
         conn.execute(
-            "UPDATE conflicts_tag_rename SET resolved_at = datetime('now') WHERE id = ?",
+            "UPDATE conflicts_tag_rename SET resolved_at = strftime('%s', 'now') WHERE id = ?",
             [conflict_id_bytes],
         )?;
 

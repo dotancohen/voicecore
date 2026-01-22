@@ -5060,7 +5060,7 @@ impl Database {
     pub fn delete_transcription(&self, transcription_id: &str) -> VoiceResult<bool> {
         let id_uuid = Uuid::parse_str(transcription_id)
             .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = Utc::now().timestamp();
 
         // Get the audio_file_id before deleting (for cache rebuild)
         let audio_file_id: Option<String> = self.conn.query_row(
@@ -5105,7 +5105,7 @@ impl Database {
     ) -> VoiceResult<bool> {
         let id_uuid = Uuid::parse_str(transcription_id)
             .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = Utc::now().timestamp();
 
         // If state is provided, update it; otherwise keep existing
         let count = if let Some(state) = state {
@@ -5636,7 +5636,8 @@ impl Database {
             .map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
         let audio_bytes = audio_uuid.as_bytes().to_vec();
 
-        let audio: Option<(String, String, Option<String>, Option<String>)> = self.conn.query_row(
+        // Note: imported_at and file_created_at are INTEGER (Unix timestamps)
+        let audio: Option<(String, i64, Option<i64>, Option<String>)> = self.conn.query_row(
             r#"
             SELECT filename, imported_at, file_created_at, summary
             FROM audio_files
@@ -5692,7 +5693,8 @@ impl Database {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let service: String = row.get(1)?;
                 let state: String = row.get(2)?;
-                let created_at: String = row.get(3)?;
+                // created_at is INTEGER (Unix timestamp)
+                let created_at: i64 = row.get(3)?;
                 let content: String = row.get(4)?;
 
                 // Truncate content to first 200 characters for preview
