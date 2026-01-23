@@ -1376,6 +1376,67 @@ impl Database {
         Ok(note_id_hex)
     }
 
+    /// Create a new note with a specific timestamp
+    ///
+    /// If `created_at` is provided (Unix timestamp), it will be used as the note's creation time.
+    /// If `created_at` is None, the current time is used.
+    pub fn create_note_with_timestamp(
+        &self,
+        content: &str,
+        created_at: Option<i64>,
+    ) -> VoiceResult<String> {
+        let note_id = Uuid::now_v7();
+        let uuid_bytes = note_id.as_bytes().to_vec();
+
+        match created_at {
+            Some(ts) => {
+                self.conn.execute(
+                    "INSERT INTO notes (id, content, created_at) VALUES (?, ?, ?)",
+                    params![uuid_bytes, content, ts],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO notes (id, content, created_at) VALUES (?, ?, strftime('%s', 'now'))",
+                    params![uuid_bytes, content],
+                )?;
+            }
+        }
+
+        let note_id_hex = note_id.simple().to_string();
+
+        // Rebuild list cache for the new note
+        let _ = self.rebuild_note_list_cache(&note_id_hex);
+
+        Ok(note_id_hex)
+    }
+
+    /// Import an audio file, creating all necessary records in one operation.
+    ///
+    /// This creates:
+    /// 1. An AudioFile record
+    /// 2. A Note record (with created_at = file_created_at if provided)
+    /// 3. A NoteAttachment linking them
+    ///
+    /// Returns (note_id, audio_file_id) as hex strings.
+    pub fn import_audio_file(
+        &self,
+        filename: &str,
+        file_created_at: Option<i64>,
+        duration_seconds: Option<i64>,
+    ) -> VoiceResult<(String, String)> {
+        // 1. Create audio file record
+        let audio_file_id = self.create_audio_file_with_duration(filename, file_created_at, duration_seconds)?;
+
+        // 2. Create note with file's creation date (empty content)
+        let note_id = self.create_note_with_timestamp("", file_created_at)?;
+
+        // 3. Attach audio file to note
+        self.attach_to_note(&note_id, &audio_file_id, "audio_file")?;
+
+        Ok((note_id, audio_file_id))
+    }
+
     /// Update a note's content (accepts ID or ID prefix)
     pub fn update_note(&self, note_id: &str, content: &str) -> VoiceResult<bool> {
         // Use try_resolve to return false if not found (instead of error)
@@ -5937,5 +5998,66 @@ mod tests {
         let results = db.search_notes(None, Some(&tag_groups)).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, note1_id);
+    }
+
+    #[test]
+    fn test_import_audio_file() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Import an audio file with metadata
+        let file_created_at = Some(1700000000); // Nov 14, 2023
+        let duration_seconds = Some(120); // 2 minutes
+        let (note_id, audio_file_id) = db
+            .import_audio_file("recording.m4a", file_created_at, duration_seconds)
+            .unwrap();
+
+        // Verify the note was created
+        let note = db.get_note(&note_id).unwrap().unwrap();
+        assert_eq!(note.content, ""); // Empty content for imported audio
+        assert_eq!(note.created_at, file_created_at.unwrap()); // Uses file creation date
+
+        // Verify the audio file was created
+        let audio_file = db.get_audio_file(&audio_file_id).unwrap().unwrap();
+        assert_eq!(audio_file.filename, "recording.m4a");
+        assert_eq!(audio_file.file_created_at, file_created_at);
+        assert_eq!(audio_file.duration_seconds, duration_seconds);
+
+        // Verify the attachment was created
+        let attachments = db.get_audio_files_for_note(&note_id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, audio_file_id);
+    }
+
+    #[test]
+    fn test_import_audio_file_without_metadata() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Import without file creation date or duration
+        let (note_id, audio_file_id) = db
+            .import_audio_file("voice_memo.mp3", None, None)
+            .unwrap();
+
+        // Verify the note was created with current timestamp
+        let note = db.get_note(&note_id).unwrap().unwrap();
+        assert!(note.created_at > 0); // Has a timestamp
+
+        // Verify the audio file was created
+        let audio_file = db.get_audio_file(&audio_file_id).unwrap().unwrap();
+        assert_eq!(audio_file.filename, "voice_memo.mp3");
+        assert!(audio_file.file_created_at.is_none());
+        assert!(audio_file.duration_seconds.is_none());
+    }
+
+    #[test]
+    fn test_create_note_with_timestamp() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Create note with specific timestamp
+        let timestamp = Some(1600000000); // Sep 13, 2020
+        let note_id = db.create_note_with_timestamp("Test content", timestamp).unwrap();
+
+        let note = db.get_note(&note_id).unwrap().unwrap();
+        assert_eq!(note.content, "Test content");
+        assert_eq!(note.created_at, timestamp.unwrap());
     }
 }

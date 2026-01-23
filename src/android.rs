@@ -177,6 +177,15 @@ pub struct SyncServerConfig {
     pub device_name: String,
 }
 
+/// Result of importing an audio file
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ImportAudioResultData {
+    /// The ID of the created note
+    pub note_id: String,
+    /// The ID of the created audio file record
+    pub audio_file_id: String,
+}
+
 /// Generate a new UUID7 device ID
 #[uniffi::export]
 pub fn generate_device_id() -> String {
@@ -1037,5 +1046,55 @@ impl VoiceClient {
                 list_display_cache: n.list_display_cache,
             })
             .collect())
+    }
+
+    // =========================================================================
+    // Audio Import Methods
+    // =========================================================================
+
+    /// Import an audio file, creating all necessary database records.
+    ///
+    /// This creates:
+    /// 1. An AudioFile record
+    /// 2. A Note record (with created_at = file_created_at if provided)
+    /// 3. A NoteAttachment linking them
+    ///
+    /// The Note's created_at will be set to file_created_at (the file's filesystem date).
+    ///
+    /// # Arguments
+    /// * `filename` - Original filename of the audio file
+    /// * `file_created_at` - Unix timestamp of when the file was created (optional)
+    /// * `duration_seconds` - Duration of the audio file in seconds (optional)
+    ///
+    /// # Returns
+    /// ImportAudioResultData with note_id and audio_file_id
+    pub fn import_audio_file(
+        &self,
+        filename: String,
+        file_created_at: Option<i64>,
+        duration_seconds: Option<i64>,
+    ) -> Result<ImportAudioResultData, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let (note_id, audio_file_id) = db
+            .import_audio_file(&filename, file_created_at, duration_seconds)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })?;
+
+        Ok(ImportAudioResultData {
+            note_id,
+            audio_file_id,
+        })
+    }
+
+    /// Create a new note with empty content
+    ///
+    /// Returns the ID of the created note as a hex string.
+    pub fn create_note(&self, content: String) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.create_note(&content)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
     }
 }

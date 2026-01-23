@@ -51,5 +51,6 @@ pub use models::{
 // Re-export Android types when uniffi feature is enabled
 #[cfg(feature = "uniffi")]
 pub use android::{
-    generate_device_id, NoteData, SyncResultData, SyncServerConfig, VoiceClient, VoiceCoreError,
+    generate_device_id, ImportAudioResultData, NoteData, SyncResultData, SyncServerConfig,
+    VoiceClient, VoiceCoreError,
 };
