@@ -4,16 +4,16 @@
 //! - AWS S3
 //! - DigitalOcean Spaces (via custom endpoint)
 //! - MinIO (via custom endpoint)
+//! - Backblaze B2 (via S3-compatible API)
 //! - Other S3-compatible services
+//!
+//! Uses the `rust-s3` crate which is much lighter than aws-sdk-s3.
 
 use std::path::Path;
-use std::time::Duration;
 
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::{Credentials, Region};
-use aws_sdk_s3::presigning::PresigningConfig;
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
+use s3::bucket::Bucket;
+use s3::creds::Credentials;
+use s3::region::Region;
 
 use crate::file_storage::{DownloadUrl, FileStorageError, FileStorageService, UploadResult};
 
@@ -37,11 +37,10 @@ pub struct S3Config {
 
 /// S3-based file storage service.
 ///
-/// Implements the `FileStorageService` trait using AWS SDK for Rust.
+/// Implements the `FileStorageService` trait using the rust-s3 crate.
 /// Supports AWS S3 and S3-compatible services.
 pub struct S3StorageService {
-    client: Client,
-    bucket: String,
+    bucket: Box<Bucket>,
     prefix: Option<String>,
 }
 
@@ -54,7 +53,7 @@ impl S3StorageService {
     /// # Returns
     /// * `Ok(S3StorageService)` - Ready to use storage service
     /// * `Err(FileStorageError)` - If configuration is invalid
-    pub async fn new(config: S3Config) -> Result<Self, FileStorageError> {
+    pub fn new(config: S3Config) -> Result<Self, FileStorageError> {
         if config.bucket.is_empty() {
             return Err(FileStorageError::Config("bucket name is required".to_string()));
         }
@@ -66,33 +65,35 @@ impl S3StorageService {
         }
 
         let credentials = Credentials::new(
-            &config.access_key_id,
-            &config.secret_access_key,
+            Some(&config.access_key_id),
+            Some(&config.secret_access_key),
+            None, // security token
             None, // session token
-            None, // expiration
-            "voice-config",
-        );
+            None, // profile
+        )
+        .map_err(|e| FileStorageError::Config(format!("Invalid credentials: {}", e)))?;
 
-        let region = Region::new(config.region.clone());
+        let region = if let Some(endpoint) = &config.endpoint {
+            Region::Custom {
+                region: config.region.clone(),
+                endpoint: endpoint.clone(),
+            }
+        } else {
+            config.region.parse().map_err(|e| {
+                FileStorageError::Config(format!("Invalid region '{}': {}", config.region, e))
+            })?
+        };
 
-        let mut sdk_config_builder = aws_sdk_s3::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .credentials_provider(credentials)
-            .region(region);
+        let mut bucket = Bucket::new(&config.bucket, region, credentials)
+            .map_err(|e| FileStorageError::Config(format!("Failed to create bucket: {}", e)))?;
 
-        // Add custom endpoint for S3-compatible services
-        if let Some(endpoint) = &config.endpoint {
-            sdk_config_builder = sdk_config_builder
-                .endpoint_url(endpoint)
-                .force_path_style(true); // Required for most S3-compatible services
+        // Use path style for S3-compatible services (MinIO, DigitalOcean Spaces, etc.)
+        if config.endpoint.is_some() {
+            bucket = bucket.with_path_style();
         }
 
-        let sdk_config = sdk_config_builder.build();
-        let client = Client::from_conf(sdk_config);
-
         Ok(Self {
-            client,
-            bucket: config.bucket,
+            bucket,
             prefix: config.prefix,
         })
     }
@@ -120,31 +121,30 @@ impl FileStorageService for S3StorageService {
         remote_key: &str,
     ) -> Result<UploadResult, FileStorageError> {
         // Read the file
-        let body = ByteStream::from_path(local_path)
+        let data = tokio::fs::read(local_path)
             .await
             .map_err(|e| FileStorageError::LocalFile(format!("Failed to read file: {}", e)))?;
 
-        // Get file size
-        let metadata = tokio::fs::metadata(local_path)
-            .await
-            .map_err(|e| FileStorageError::LocalFile(format!("Failed to get file metadata: {}", e)))?;
-        let size_bytes = metadata.len();
-
+        let size_bytes = data.len() as u64;
         let full_key = self.full_key(remote_key);
 
         // Upload to S3
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&full_key)
-            .body(body)
-            .send()
+        let response = self
+            .bucket
+            .put_object(&full_key, &data)
             .await
             .map_err(|e| FileStorageError::Upload(format!("S3 upload failed: {}", e)))?;
 
+        if response.status_code() != 200 {
+            return Err(FileStorageError::Upload(format!(
+                "S3 upload failed with status {}",
+                response.status_code()
+            )));
+        }
+
         tracing::info!(
             key = %full_key,
-            bucket = %self.bucket,
+            bucket = %self.bucket.name(),
             size_bytes = size_bytes,
             "Uploaded file to S3"
         );
@@ -157,21 +157,16 @@ impl FileStorageService for S3StorageService {
     }
 
     async fn get_download_url(&self, storage_key: &str) -> Result<DownloadUrl, FileStorageError> {
-        // Pre-signed URLs are valid for 1 hour
-        let expires_in = Duration::from_secs(3600);
-        let presigning_config = PresigningConfig::expires_in(expires_in)
-            .map_err(|e| FileStorageError::DownloadUrl(format!("Invalid expiration: {}", e)))?;
+        // Pre-signed URLs are valid for 1 hour (3600 seconds)
+        let expiry_secs = 3600u32;
 
-        let presigned = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(storage_key)
-            .presigned(presigning_config)
+        let url = self
+            .bucket
+            .presign_get(storage_key, expiry_secs, None)
             .await
             .map_err(|e| FileStorageError::DownloadUrl(format!("Failed to generate URL: {}", e)))?;
 
-        let expires_at = chrono::Utc::now().timestamp() + 3600;
+        let expires_at = chrono::Utc::now().timestamp() + i64::from(expiry_secs);
 
         tracing::debug!(
             key = %storage_key,
@@ -179,24 +174,27 @@ impl FileStorageService for S3StorageService {
             "Generated pre-signed download URL"
         );
 
-        Ok(DownloadUrl {
-            url: presigned.uri().to_string(),
-            expires_at,
-        })
+        Ok(DownloadUrl { url, expires_at })
     }
 
     async fn delete(&self, storage_key: &str) -> Result<(), FileStorageError> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(storage_key)
-            .send()
+        let response = self
+            .bucket
+            .delete_object(storage_key)
             .await
             .map_err(|e| FileStorageError::Network(format!("Failed to delete object: {}", e)))?;
 
+        // S3 returns 204 for successful delete
+        if response.status_code() != 204 {
+            return Err(FileStorageError::Network(format!(
+                "Delete failed with status {}",
+                response.status_code()
+            )));
+        }
+
         tracing::info!(
             key = %storage_key,
-            bucket = %self.bucket,
+            bucket = %self.bucket.name(),
             "Deleted file from S3"
         );
 
@@ -204,24 +202,22 @@ impl FileStorageService for S3StorageService {
     }
 
     async fn exists(&self, storage_key: &str) -> Result<bool, FileStorageError> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(storage_key)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(err) => {
-                // Check if it's a "not found" error
-                let service_err = err.as_service_error();
-                if service_err.is_some() && service_err.unwrap().is_not_found() {
+        let result = self.bucket.head_object(storage_key).await;
+
+        match result {
+            Ok((_, code)) => {
+                // 200 means object exists
+                Ok(code == 200)
+            }
+            Err(e) => {
+                // Check if it's a 404 (not found) error
+                let err_str = e.to_string();
+                if err_str.contains("404") || err_str.contains("Not Found") {
                     Ok(false)
                 } else {
                     Err(FileStorageError::Network(format!(
                         "Failed to check if object exists: {}",
-                        err
+                        e
                     )))
                 }
             }
@@ -239,8 +235,6 @@ mod tests {
 
     #[test]
     fn test_full_key_with_prefix() {
-        // We can't easily test the full S3StorageService without mocking AWS,
-        // but we can test the key generation logic by checking the config structure
         let config = S3Config {
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
@@ -269,5 +263,32 @@ mod tests {
             config.endpoint,
             Some("https://nyc3.digitaloceanspaces.com".to_string())
         );
+    }
+
+    #[test]
+    fn test_full_key_generation() {
+        // Test with prefix
+        let service = S3StorageService {
+            bucket: Bucket::new(
+                "test",
+                "us-east-1".parse().unwrap(),
+                Credentials::new(Some("key"), Some("secret"), None, None, None).unwrap(),
+            )
+            .unwrap(),
+            prefix: Some("audio/".to_string()),
+        };
+        assert_eq!(service.full_key("test.mp3"), "audio/test.mp3");
+
+        // Test without prefix
+        let service_no_prefix = S3StorageService {
+            bucket: Bucket::new(
+                "test",
+                "us-east-1".parse().unwrap(),
+                Credentials::new(Some("key"), Some("secret"), None, None, None).unwrap(),
+            )
+            .unwrap(),
+            prefix: None,
+        };
+        assert_eq!(service_no_prefix.full_key("test.mp3"), "test.mp3");
     }
 }
