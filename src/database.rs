@@ -6637,4 +6637,5 @@ mod tests {
         assert_eq!(config.provider, "none");
         assert!(!config.is_enabled());
     }
+
 }
