@@ -182,6 +182,170 @@ pub fn generate_storage_key(prefix: Option<&str>, audio_file_id: &str, filename:
     }
 }
 
+/// Result of uploading pending audio files to cloud storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadPendingResult {
+    /// Number of files successfully uploaded
+    pub uploaded: usize,
+    /// Number of files that failed to upload
+    pub failed: usize,
+    /// Error messages for failed uploads
+    pub errors: Vec<String>,
+}
+
+/// Upload all pending audio files to cloud storage.
+///
+/// This function:
+/// 1. Gets the file storage config from the database
+/// 2. Creates an S3 storage service
+/// 3. Gets all audio files with storage_provider = NULL
+/// 4. Uploads each file to S3
+/// 5. Updates the database with storage info
+///
+/// # Arguments
+/// * `db` - Database connection
+/// * `audiofile_directory` - Directory where audio files are stored locally
+///
+/// # Returns
+/// * `Ok(UploadPendingResult)` - Summary of uploads
+/// * `Err(FileStorageError)` - If storage is not configured or initialization fails
+#[cfg(feature = "file-storage")]
+pub async fn upload_pending_audio_files(
+    db: &crate::database::Database,
+    audiofile_directory: &Path,
+) -> Result<UploadPendingResult, FileStorageError> {
+    use crate::file_storage_s3::{S3Config, S3StorageService};
+
+    // Get file storage config from database
+    let storage_config = db
+        .get_file_storage_config_struct()
+        .map_err(|e| FileStorageError::Config(format!("Failed to get storage config: {}", e)))?;
+
+    if !storage_config.is_enabled() {
+        return Err(FileStorageError::Config(
+            "Cloud storage is not enabled. Use 'storage configure-s3' first.".to_string(),
+        ));
+    }
+
+    if storage_config.provider != "s3" {
+        return Err(FileStorageError::Config(format!(
+            "Unsupported storage provider: {}. Only 's3' is currently supported.",
+            storage_config.provider
+        )));
+    }
+
+    // Extract S3 config
+    let bucket = storage_config
+        .s3_bucket()
+        .ok_or_else(|| FileStorageError::Config("S3 bucket not configured".to_string()))?;
+    let region = storage_config
+        .s3_region()
+        .ok_or_else(|| FileStorageError::Config("S3 region not configured".to_string()))?;
+    let access_key_id = storage_config
+        .s3_access_key_id()
+        .ok_or_else(|| FileStorageError::Config("S3 access_key_id not configured".to_string()))?;
+    let secret_access_key = storage_config.s3_secret_access_key().ok_or_else(|| {
+        FileStorageError::Config("S3 secret_access_key not configured".to_string())
+    })?;
+    let prefix = storage_config.s3_prefix().map(String::from);
+    let endpoint = storage_config.s3_endpoint().map(String::from);
+
+    // Create S3 service
+    let s3_config = S3Config {
+        bucket: bucket.to_string(),
+        region: region.to_string(),
+        access_key_id: access_key_id.to_string(),
+        secret_access_key: secret_access_key.to_string(),
+        prefix: prefix.clone(),
+        endpoint,
+    };
+
+    let storage = S3StorageService::new(s3_config)?;
+
+    // Get pending audio files
+    let pending_files = db
+        .get_audio_files_pending_upload()
+        .map_err(|e| FileStorageError::Config(format!("Failed to get pending files: {}", e)))?;
+
+    tracing::info!(
+        count = pending_files.len(),
+        "Found audio files pending upload"
+    );
+
+    let mut uploaded = 0;
+    let mut failed = 0;
+    let mut errors = Vec::new();
+
+    for audio_file in pending_files {
+        // Determine local file path
+        let extension = audio_file
+            .filename
+            .rsplit('.')
+            .next()
+            .unwrap_or("bin");
+        let local_filename = format!("{}.{}", audio_file.id, extension);
+        let local_path = audiofile_directory.join(&local_filename);
+
+        if !local_path.exists() {
+            let msg = format!(
+                "Audio file {} not found at {}",
+                audio_file.id,
+                local_path.display()
+            );
+            tracing::warn!("{}", msg);
+            errors.push(msg);
+            failed += 1;
+            continue;
+        }
+
+        // Generate storage key
+        let storage_key = generate_storage_key(prefix.as_deref(), &audio_file.id, &audio_file.filename);
+
+        tracing::info!(
+            audio_id = %audio_file.id,
+            filename = %audio_file.filename,
+            storage_key = %storage_key,
+            "Uploading audio file to S3"
+        );
+
+        // Upload to S3
+        match storage.upload(&local_path, &storage_key).await {
+            Ok(result) => {
+                // Update database with storage info
+                if let Err(e) = db.update_audio_file_storage(&audio_file.id, &result.provider, &result.storage_key) {
+                    let msg = format!(
+                        "Uploaded {} but failed to update database: {}",
+                        audio_file.id, e
+                    );
+                    tracing::error!("{}", msg);
+                    errors.push(msg);
+                    failed += 1;
+                } else {
+                    tracing::info!(
+                        audio_id = %audio_file.id,
+                        storage_key = %result.storage_key,
+                        size_bytes = result.size_bytes,
+                        "Successfully uploaded audio file"
+                    );
+                    uploaded += 1;
+                }
+            }
+            Err(e) => {
+                let msg = format!("Failed to upload {}: {}", audio_file.id, e);
+                tracing::error!("{}", msg);
+                errors.push(msg);
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(UploadPendingResult {
+        uploaded,
+        failed,
+        errors,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
