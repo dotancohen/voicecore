@@ -1108,6 +1108,9 @@ impl SyncClient {
         let summary = data["summary"].as_str();
         let modified_at = data["modified_at"].as_i64();
         let deleted_at = data["deleted_at"].as_i64();
+        let storage_provider = data["storage_provider"].as_str();
+        let storage_key = data["storage_key"].as_str();
+        let storage_uploaded_at = data["storage_uploaded_at"].as_i64();
 
         db.apply_sync_audio_file(
             audio_id,
@@ -1119,6 +1122,9 @@ impl SyncClient {
             modified_at,
             deleted_at,
             None,  // sync_received_at - None for client-side operations
+            storage_provider,
+            storage_key,
+            storage_uploaded_at,
         )?;
         Ok(true)
     }

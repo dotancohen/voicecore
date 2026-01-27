@@ -20,6 +20,10 @@ pub mod config;
 pub mod conflicts;
 pub mod database;
 pub mod error;
+#[cfg(feature = "file-storage")]
+pub mod file_storage;
+#[cfg(feature = "file-storage")]
+pub mod file_storage_s3;
 pub mod merge;
 pub mod models;
 pub mod search;
@@ -48,8 +52,17 @@ pub use models::{
     AttachmentType, AudioFile, Note, NoteAttachment, NoteTag, Tag, AUDIO_FILE_FORMATS,
 };
 
+// Re-export file storage types when feature is enabled
+#[cfg(feature = "file-storage")]
+pub use file_storage::{
+    generate_storage_key, DownloadUrl, FileStorageError, FileStorageService, UploadResult,
+};
+#[cfg(feature = "file-storage")]
+pub use file_storage_s3::S3StorageService;
+
 // Re-export Android types when uniffi feature is enabled
 #[cfg(feature = "uniffi")]
 pub use android::{
-    generate_device_id, NoteData, SyncResultData, SyncServerConfig, VoiceClient, VoiceCoreError,
+    generate_device_id, ImportAudioResultData, NoteData, SyncResultData, SyncServerConfig,
+    VoiceClient, VoiceCoreError,
 };

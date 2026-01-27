@@ -102,6 +102,89 @@ impl Default for SyncConfig {
     }
 }
 
+/// Cloud file storage configuration
+///
+/// NOTE: This is kept in config.rs for backwards compatibility during migration.
+/// New code should use Database::get_file_storage_config() which stores the
+/// config in the database for sync between devices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileStorageConfig {
+    /// Storage provider: "s3", "none" (local only)
+    #[serde(default = "default_file_storage_provider")]
+    pub provider: String,
+    /// Provider-specific configuration as JSON
+    /// For S3: { "bucket": "...", "region": "...", "access_key_id": "...", "secret_access_key": "...", "prefix": "...", "endpoint": "..." }
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+fn default_file_storage_provider() -> String {
+    "none".to_string()
+}
+
+impl Default for FileStorageConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_file_storage_provider(),
+            config: serde_json::Value::Null,
+        }
+    }
+}
+
+impl FileStorageConfig {
+    /// Create an S3 storage configuration
+    pub fn s3(
+        bucket: &str,
+        region: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        prefix: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Self {
+        Self {
+            provider: "s3".to_string(),
+            config: serde_json::json!({
+                "bucket": bucket,
+                "region": region,
+                "access_key_id": access_key_id,
+                "secret_access_key": secret_access_key,
+                "prefix": prefix,
+                "endpoint": endpoint,
+            }),
+        }
+    }
+
+    /// Check if storage is configured (not "none")
+    pub fn is_enabled(&self) -> bool {
+        self.provider != "none"
+    }
+
+    /// Get S3-specific config fields (if provider is "s3")
+    pub fn s3_bucket(&self) -> Option<&str> {
+        self.config.get("bucket").and_then(|v| v.as_str())
+    }
+
+    pub fn s3_region(&self) -> Option<&str> {
+        self.config.get("region").and_then(|v| v.as_str())
+    }
+
+    pub fn s3_access_key_id(&self) -> Option<&str> {
+        self.config.get("access_key_id").and_then(|v| v.as_str())
+    }
+
+    pub fn s3_secret_access_key(&self) -> Option<&str> {
+        self.config.get("secret_access_key").and_then(|v| v.as_str())
+    }
+
+    pub fn s3_prefix(&self) -> Option<&str> {
+        self.config.get("prefix").and_then(|v| v.as_str())
+    }
+
+    pub fn s3_endpoint(&self) -> Option<&str> {
+        self.config.get("endpoint").and_then(|v| v.as_str())
+    }
+}
+
 fn default_transcription_config() -> serde_json::Value {
     serde_json::json!({
         "preferred_languages": [],
@@ -141,6 +224,9 @@ pub struct ConfigData {
     /// Transcription configuration (stored as generic JSON - voicecore doesn't interpret this)
     #[serde(default = "default_transcription_config")]
     pub transcription: serde_json::Value,
+    /// Cloud file storage configuration
+    #[serde(default)]
+    pub file_storage: FileStorageConfig,
 }
 
 fn generate_device_id() -> String {
@@ -175,6 +261,7 @@ impl Default for ConfigData {
             server_certificate_fingerprint: None,
             audiofile_directory: None,
             transcription: default_transcription_config(),
+            file_storage: FileStorageConfig::default(),
         }
     }
 }
@@ -460,6 +547,27 @@ impl Config {
         self.save()
     }
 
+    /// Get the file storage configuration
+    pub fn file_storage(&self) -> &FileStorageConfig {
+        &self.data.file_storage
+    }
+
+    /// Check if cloud file storage is enabled
+    pub fn is_file_storage_enabled(&self) -> bool {
+        self.data.file_storage.provider != "none"
+    }
+
+    /// Get the file storage provider name
+    pub fn file_storage_provider(&self) -> &str {
+        &self.data.file_storage.provider
+    }
+
+    /// Set the file storage configuration
+    pub fn set_file_storage(&mut self, config: FileStorageConfig) -> VoiceResult<()> {
+        self.data.file_storage = config;
+        self.save()
+    }
+
     /// Get a configuration value
     pub fn get(&self, key: &str) -> Option<String> {
         match key {
@@ -697,6 +805,70 @@ mod tests {
                     .as_str().unwrap(),
                 "/models/whisper.bin"
             );
+        }
+    }
+
+    #[test]
+    fn test_file_storage_config_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        assert_eq!(config.file_storage_provider(), "none");
+        assert!(!config.is_file_storage_enabled());
+        assert!(config.file_storage().s3_bucket().is_none());
+    }
+
+    #[test]
+    fn test_file_storage_config_s3() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        let storage_config = FileStorageConfig::s3(
+            "my-bucket",
+            "us-east-1",
+            "AKIATEST",
+            "secret123",
+            Some("audio/"),
+            None,
+        );
+
+        config.set_file_storage(storage_config).unwrap();
+
+        assert_eq!(config.file_storage_provider(), "s3");
+        assert!(config.is_file_storage_enabled());
+
+        let storage = config.file_storage();
+        assert_eq!(storage.s3_bucket(), Some("my-bucket"));
+        assert_eq!(storage.s3_region(), Some("us-east-1"));
+        assert_eq!(storage.s3_prefix(), Some("audio/"));
+    }
+
+    #[test]
+    fn test_file_storage_config_persistence() {
+        let temp_dir = TempDir::new().unwrap();
+
+        {
+            let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let storage_config = FileStorageConfig::s3(
+                "test-bucket",
+                "eu-west-1",
+                "key",
+                "secret",
+                None,
+                Some("https://custom.endpoint.com"),
+            );
+            config.set_file_storage(storage_config).unwrap();
+        }
+
+        {
+            let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            assert_eq!(config.file_storage_provider(), "s3");
+            assert!(config.is_file_storage_enabled());
+
+            let storage = config.file_storage();
+            assert_eq!(storage.s3_bucket(), Some("test-bucket"));
+            assert_eq!(storage.s3_region(), Some("eu-west-1"));
+            assert_eq!(storage.s3_endpoint(), Some("https://custom.endpoint.com"));
         }
     }
 }

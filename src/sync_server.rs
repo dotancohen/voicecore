@@ -1324,6 +1324,9 @@ fn apply_audio_file_change(
     let summary = data["summary"].as_str();
     let modified_at = data["modified_at"].as_i64();
     let deleted_at = data["deleted_at"].as_i64();
+    let storage_provider = data["storage_provider"].as_str();
+    let storage_key = data["storage_key"].as_str();
+    let storage_uploaded_at = data["storage_uploaded_at"].as_i64();
 
     // Determine if local changed since last_sync
     let local_changed = if let Some(ref ex) = existing {
@@ -1353,12 +1356,12 @@ fn apply_audio_file_change(
             if existing.is_some() {
                 return Ok(ApplyResult::Skipped);
             }
-            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
+            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at), storage_provider, storage_key, storage_uploaded_at)?;
             Ok(ApplyResult::Applied)
         }
         "update" | "delete" => {
             if existing.is_none() {
-                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at), storage_provider, storage_key, storage_uploaded_at)?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1369,7 +1372,7 @@ fn apply_audio_file_change(
             // Audio files are simpler - no content conflicts (metadata + binary)
             // If both deleted, apply
             if local_deleted && remote_deleted {
-                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at), storage_provider, storage_key, storage_uploaded_at)?;
                 return Ok(ApplyResult::Applied);
             }
 
@@ -1380,12 +1383,12 @@ fn apply_audio_file_change(
 
             // If local deleted but remote has updates (reactivation or edit)
             if local_deleted && !remote_deleted {
-                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
+                db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at), storage_provider, storage_key, storage_uploaded_at)?;
                 return Ok(if local_changed { ApplyResult::Conflict } else { ApplyResult::Applied });
             }
 
             // Otherwise apply the update
-            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at))?;
+            db.apply_sync_audio_file(id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, Some(sync_received_at), storage_provider, storage_key, storage_uploaded_at)?;
             Ok(ApplyResult::Applied)
         }
         _ => Ok(ApplyResult::Skipped),
@@ -1618,7 +1621,7 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
     // Get all audio_files
     let mut audio_files = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at FROM audio_files",
+        "SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at FROM audio_files",
     )?;
     let audio_file_rows = stmt.query_map([], |row| {
         let id_bytes: Vec<u8> = row.get(0)?;
@@ -1629,11 +1632,14 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
         let summary: Option<String> = row.get(5)?;
         let modified_at: Option<i64> = row.get(6)?;
         let deleted_at: Option<i64> = row.get(7)?;
-        Ok((id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at))
+        let storage_provider: Option<String> = row.get(8)?;
+        let storage_key: Option<String> = row.get(9)?;
+        let storage_uploaded_at: Option<i64> = row.get(10)?;
+        Ok((id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at))
     })?;
 
     for row in audio_file_rows {
-        let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at) = row?;
+        let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at) = row?;
         let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
         audio_files.push(serde_json::json!({
             "id": id_hex,
@@ -1644,6 +1650,9 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
             "summary": summary,
             "modified_at": modified_at,
             "deleted_at": deleted_at,
+            "storage_provider": storage_provider,
+            "storage_key": storage_key,
+            "storage_uploaded_at": storage_uploaded_at,
         }));
     }
 
@@ -3121,6 +3130,9 @@ mod tests {
             audio_data.get("modified_at").and_then(|v| v.as_i64()),
             audio_data.get("deleted_at").and_then(|v| v.as_i64()),
             None,
+            audio_data.get("storage_provider").and_then(|v| v.as_str()),
+            audio_data.get("storage_key").and_then(|v| v.as_str()),
+            audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
         ).unwrap();
 
         // Apply attachment to Instance B
@@ -3195,6 +3207,9 @@ mod tests {
                         data.get("modified_at").and_then(|v| v.as_i64()),
                         data.get("deleted_at").and_then(|v| v.as_i64()),
                         None,
+                        data.get("storage_provider").and_then(|v| v.as_str()),
+                        data.get("storage_key").and_then(|v| v.as_str()),
+                        data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
                     ).unwrap();
                 }
                 "note_attachment" => {
@@ -3296,6 +3311,9 @@ mod tests {
             audio_data.get("modified_at").and_then(|v| v.as_i64()),
             audio_data.get("deleted_at").and_then(|v| v.as_i64()),
             None,
+            audio_data.get("storage_provider").and_then(|v| v.as_str()),
+            audio_data.get("storage_key").and_then(|v| v.as_str()),
+            audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
         ).unwrap();
 
         // Find and apply transcription

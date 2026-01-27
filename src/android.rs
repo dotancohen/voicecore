@@ -98,6 +98,12 @@ pub struct AudioFileData {
     pub device_id: String,
     pub modified_at: Option<String>,
     pub deleted_at: Option<String>,
+    /// Cloud storage provider ("s3", "backblaze", etc.) or None for local-only
+    pub storage_provider: Option<String>,
+    /// Object key/path in cloud storage
+    pub storage_key: Option<String>,
+    /// Unix timestamp when file was uploaded to cloud storage (as formatted string)
+    pub storage_uploaded_at: Option<String>,
 }
 
 /// A note-attachment association from the database
@@ -175,6 +181,15 @@ pub struct SyncServerConfig {
     pub server_peer_id: String,
     pub device_id: String,
     pub device_name: String,
+}
+
+/// Result of importing an audio file
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ImportAudioResultData {
+    /// The ID of the created note
+    pub note_id: String,
+    /// The ID of the created audio file record
+    pub audio_file_id: String,
 }
 
 /// Generate a new UUID7 device ID
@@ -492,6 +507,9 @@ impl VoiceClient {
                 device_id: a.device_id,
                 modified_at: format_timestamp_opt(a.modified_at),
                 deleted_at: format_timestamp_opt(a.deleted_at),
+                storage_provider: a.storage_provider,
+                storage_key: a.storage_key,
+                storage_uploaded_at: format_timestamp_opt(a.storage_uploaded_at),
             })
             .collect())
     }
@@ -510,6 +528,9 @@ impl VoiceClient {
             device_id: a.device_id,
             modified_at: format_timestamp_opt(a.modified_at),
             deleted_at: format_timestamp_opt(a.deleted_at),
+            storage_provider: a.storage_provider,
+            storage_key: a.storage_key,
+            storage_uploaded_at: format_timestamp_opt(a.storage_uploaded_at),
         }))
     }
 
@@ -530,6 +551,9 @@ impl VoiceClient {
                 device_id: a.device_id,
                 modified_at: format_timestamp_opt(a.modified_at),
                 deleted_at: format_timestamp_opt(a.deleted_at),
+                storage_provider: a.storage_provider,
+                storage_key: a.storage_key,
+                storage_uploaded_at: format_timestamp_opt(a.storage_uploaded_at),
             })
             .collect())
     }
@@ -573,6 +597,124 @@ impl VoiceClient {
         } else {
             Ok(None)
         }
+    }
+
+    // =========================================================================
+    // Cloud Storage Methods
+    // =========================================================================
+
+    /// Get audio files that need to be uploaded to cloud storage.
+    ///
+    /// Returns files where storage_provider is NULL (not yet uploaded).
+    pub fn get_audio_files_pending_upload(&self) -> Result<Vec<AudioFileData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let audio_files = db.get_audio_files_pending_upload()?;
+
+        Ok(audio_files
+            .into_iter()
+            .map(|a| AudioFileData {
+                id: a.id,
+                imported_at: format_timestamp(a.imported_at),
+                filename: a.filename,
+                file_created_at: format_timestamp_opt(a.file_created_at),
+                summary: a.summary,
+                device_id: a.device_id,
+                modified_at: format_timestamp_opt(a.modified_at),
+                deleted_at: format_timestamp_opt(a.deleted_at),
+                storage_provider: a.storage_provider,
+                storage_key: a.storage_key,
+                storage_uploaded_at: format_timestamp_opt(a.storage_uploaded_at),
+            })
+            .collect())
+    }
+
+    /// Update an audio file's cloud storage information after successful upload.
+    ///
+    /// # Arguments
+    /// * `audio_file_id` - The audio file ID
+    /// * `storage_provider` - The storage provider name (e.g., "s3", "backblaze")
+    /// * `storage_key` - The object key/path in cloud storage
+    ///
+    /// # Returns
+    /// True if the audio file was updated, false if not found.
+    pub fn update_audio_file_storage(
+        &self,
+        audio_file_id: String,
+        storage_provider: String,
+        storage_key: String,
+    ) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.update_audio_file_storage(&audio_file_id, &storage_provider, &storage_key)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Clear an audio file's cloud storage information.
+    ///
+    /// This marks the file as local-only (not uploaded to cloud).
+    ///
+    /// # Returns
+    /// True if the audio file was updated, false if not found.
+    pub fn clear_audio_file_storage(&self, audio_file_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.clear_audio_file_storage(&audio_file_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Get the file storage configuration from the database.
+    ///
+    /// Returns the configuration as JSON string, or None if not configured.
+    pub fn get_file_storage_config(&self) -> Result<Option<String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let config = db.get_file_storage_config()
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })?;
+        Ok(config.map(|c| c.to_string()))
+    }
+
+    /// Set the file storage configuration in the database.
+    ///
+    /// # Arguments
+    /// * `provider` - The storage provider ("s3", "none", etc.)
+    /// * `config` - Optional JSON string with provider-specific configuration
+    pub fn set_file_storage_config(&self, provider: String, config: Option<String>) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let config_value: Option<serde_json::Value> = config
+            .map(|c| serde_json::from_str(&c))
+            .transpose()
+            .map_err(|e| VoiceCoreError::Database {
+                msg: format!("Invalid JSON: {}", e),
+            })?;
+        db.set_file_storage_config(&provider, config_value.as_ref())
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Get the file storage provider name.
+    ///
+    /// Returns "none" if not configured.
+    pub fn get_file_storage_provider(&self) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let config = db.get_file_storage_config_struct()
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })?;
+        Ok(config.provider)
+    }
+
+    /// Check if file storage is enabled (provider is not "none").
+    pub fn is_file_storage_enabled(&self) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let config = db.get_file_storage_config_struct()
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })?;
+        Ok(config.is_enabled())
     }
 
     /// Update a note's content
@@ -1037,5 +1179,55 @@ impl VoiceClient {
                 list_display_cache: n.list_display_cache,
             })
             .collect())
+    }
+
+    // =========================================================================
+    // Audio Import Methods
+    // =========================================================================
+
+    /// Import an audio file, creating all necessary database records.
+    ///
+    /// This creates:
+    /// 1. An AudioFile record
+    /// 2. A Note record (with created_at = file_created_at if provided)
+    /// 3. A NoteAttachment linking them
+    ///
+    /// The Note's created_at will be set to file_created_at (the file's filesystem date).
+    ///
+    /// # Arguments
+    /// * `filename` - Original filename of the audio file
+    /// * `file_created_at` - Unix timestamp of when the file was created (optional)
+    /// * `duration_seconds` - Duration of the audio file in seconds (optional)
+    ///
+    /// # Returns
+    /// ImportAudioResultData with note_id and audio_file_id
+    pub fn import_audio_file(
+        &self,
+        filename: String,
+        file_created_at: Option<i64>,
+        duration_seconds: Option<i64>,
+    ) -> Result<ImportAudioResultData, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let (note_id, audio_file_id) = db
+            .import_audio_file(&filename, file_created_at, duration_seconds)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })?;
+
+        Ok(ImportAudioResultData {
+            note_id,
+            audio_file_id,
+        })
+    }
+
+    /// Create a new note with empty content
+    ///
+    /// Returns the ID of the created note as a hex string.
+    pub fn create_note(&self, content: String) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.create_note(&content)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
     }
 }

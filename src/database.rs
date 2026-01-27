@@ -138,6 +138,12 @@ pub struct AudioFileRow {
     pub device_id: String,
     pub modified_at: Option<i64>,
     pub deleted_at: Option<i64>,
+    /// Cloud storage provider ("s3", "backblaze", etc.) or None for local-only
+    pub storage_provider: Option<String>,
+    /// Object key/path in cloud storage
+    pub storage_key: Option<String>,
+    /// Unix timestamp when file was uploaded to cloud storage
+    pub storage_uploaded_at: Option<i64>,
 }
 
 /// Transcription data returned from database queries
@@ -207,6 +213,8 @@ impl Database {
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
         db.migrate_timestamps_to_unix()?;
+        db.migrate_add_storage_columns()?;
+        db.migrate_add_file_storage_config_table()?;
         Ok(db)
     }
 
@@ -217,6 +225,8 @@ impl Database {
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
         db.migrate_timestamps_to_unix()?;
+        db.migrate_add_storage_columns()?;
+        db.migrate_add_file_storage_config_table()?;
         Ok(db)
     }
 
@@ -419,7 +429,11 @@ impl Database {
                 device_id BLOB NOT NULL,
                 modified_at INTEGER,
                 deleted_at INTEGER,
-                sync_received_at INTEGER
+                sync_received_at INTEGER,
+                -- Cloud storage fields
+                storage_provider TEXT,     -- "s3", "backblaze", etc. NULL = local only
+                storage_key TEXT,          -- Object key/path in cloud storage
+                storage_uploaded_at INTEGER -- When file was uploaded to cloud
             );
 
             -- Create transcriptions table
@@ -438,6 +452,17 @@ impl Database {
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
                 FOREIGN KEY (audio_file_id) REFERENCES audio_files (id) ON DELETE CASCADE
+            );
+
+            -- Create file_storage_config table (single-row config that syncs between devices)
+            -- Uses a fixed ID ("default") since there's only one config
+            CREATE TABLE IF NOT EXISTS file_storage_config (
+                id TEXT PRIMARY KEY DEFAULT 'default',
+                provider TEXT NOT NULL DEFAULT 'none',
+                config TEXT,
+                modified_at INTEGER,
+                device_id BLOB,
+                sync_received_at INTEGER
             );
 
             -- Create indexes
@@ -463,18 +488,15 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_note_attachments_deleted_at ON note_attachments(deleted_at);
             CREATE INDEX IF NOT EXISTS idx_audio_files_modified_at ON audio_files(modified_at);
             CREATE INDEX IF NOT EXISTS idx_audio_files_deleted_at ON audio_files(deleted_at);
+            -- Note: idx_audio_files_storage_provider is created in migrate_add_storage_columns
             CREATE INDEX IF NOT EXISTS idx_transcriptions_audio_file_id ON transcriptions(audio_file_id);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_service ON transcriptions(service);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_created_at ON transcriptions(created_at);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_modified_at ON transcriptions(modified_at);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_deleted_at ON transcriptions(deleted_at);
-            -- Indexes for sync_received_at (used by get_changes_since for sync)
-            CREATE INDEX IF NOT EXISTS idx_notes_sync_received_at ON notes(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_tags_sync_received_at ON tags(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_note_tags_sync_received_at ON note_tags(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_note_attachments_sync_received_at ON note_attachments(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_audio_files_sync_received_at ON audio_files(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_transcriptions_sync_received_at ON transcriptions(sync_received_at);
+            -- Note: sync_received_at indexes are created in migrate_add_sync_received_at
+            -- Note: idx_audio_files_storage_provider is created in migrate_add_storage_columns
+            -- Note: idx_file_storage_config_sync_received_at is created in migrate_add_file_storage_config_table
             "#,
         )?;
 
@@ -697,7 +719,7 @@ impl Database {
             );
             INSERT INTO notes_new SELECT
                 id,
-                CAST(strftime('%s', created_at) AS INTEGER),
+                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
                 content,
                 CAST(strftime('%s', modified_at) AS INTEGER),
                 CAST(strftime('%s', deleted_at) AS INTEGER),
@@ -725,7 +747,7 @@ impl Database {
                 id,
                 name,
                 parent_id,
-                CAST(strftime('%s', created_at) AS INTEGER),
+                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
                 CAST(strftime('%s', modified_at) AS INTEGER),
                 CAST(strftime('%s', deleted_at) AS INTEGER),
                 sync_received_at
@@ -750,7 +772,7 @@ impl Database {
             INSERT INTO note_tags_new SELECT
                 note_id,
                 tag_id,
-                CAST(strftime('%s', created_at) AS INTEGER),
+                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
                 CAST(strftime('%s', modified_at) AS INTEGER),
                 CAST(strftime('%s', deleted_at) AS INTEGER),
                 sync_received_at
@@ -802,7 +824,7 @@ impl Database {
                 note_id,
                 attachment_id,
                 attachment_type,
-                CAST(strftime('%s', created_at) AS INTEGER),
+                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
                 device_id,
                 CAST(strftime('%s', modified_at) AS INTEGER),
                 CAST(strftime('%s', deleted_at) AS INTEGER),
@@ -828,7 +850,7 @@ impl Database {
             );
             INSERT INTO audio_files_new SELECT
                 id,
-                CAST(strftime('%s', imported_at) AS INTEGER),
+                COALESCE(CAST(strftime('%s', imported_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
                 filename,
                 CAST(strftime('%s', file_created_at) AS INTEGER),
                 duration_seconds,
@@ -870,7 +892,7 @@ impl Database {
                 service_response,
                 state,
                 device_id,
-                CAST(strftime('%s', created_at) AS INTEGER),
+                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
                 CAST(strftime('%s', modified_at) AS INTEGER),
                 CAST(strftime('%s', deleted_at) AS INTEGER),
                 sync_received_at
@@ -880,9 +902,14 @@ impl Database {
         "#)?;
 
         // --- Conflict tables ---
+        // Conflict tables are temporary data that gets regenerated during sync.
+        // Drop and recreate them with the current schema rather than trying to migrate data.
+        // This avoids issues with schema changes over time.
+
         // conflicts_note_content
         tx.execute_batch(r#"
-            CREATE TABLE conflicts_note_content_new (
+            DROP TABLE IF EXISTS conflicts_note_content;
+            CREATE TABLE conflicts_note_content (
                 id BLOB PRIMARY KEY,
                 note_id BLOB NOT NULL,
                 local_content TEXT NOT NULL,
@@ -897,22 +924,12 @@ impl Database {
                 resolved_at INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes(id)
             );
-            INSERT INTO conflicts_note_content_new SELECT
-                id, note_id, local_content,
-                CAST(strftime('%s', local_modified_at) AS INTEGER),
-                local_device_id, local_device_name, remote_content,
-                CAST(strftime('%s', remote_modified_at) AS INTEGER),
-                remote_device_id, remote_device_name,
-                CAST(strftime('%s', created_at) AS INTEGER),
-                CAST(strftime('%s', resolved_at) AS INTEGER)
-            FROM conflicts_note_content;
-            DROP TABLE conflicts_note_content;
-            ALTER TABLE conflicts_note_content_new RENAME TO conflicts_note_content;
         "#)?;
 
         // conflicts_note_delete
         tx.execute_batch(r#"
-            CREATE TABLE conflicts_note_delete_new (
+            DROP TABLE IF EXISTS conflicts_note_delete;
+            CREATE TABLE conflicts_note_delete (
                 id BLOB PRIMARY KEY,
                 note_id BLOB NOT NULL,
                 surviving_content TEXT NOT NULL,
@@ -927,22 +944,12 @@ impl Database {
                 resolved_at INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes(id)
             );
-            INSERT INTO conflicts_note_delete_new SELECT
-                id, note_id, surviving_content,
-                CAST(strftime('%s', surviving_modified_at) AS INTEGER),
-                surviving_device_id, surviving_device_name, deleted_content,
-                CAST(strftime('%s', deleted_at) AS INTEGER),
-                deleting_device_id, deleting_device_name,
-                CAST(strftime('%s', created_at) AS INTEGER),
-                CAST(strftime('%s', resolved_at) AS INTEGER)
-            FROM conflicts_note_delete;
-            DROP TABLE conflicts_note_delete;
-            ALTER TABLE conflicts_note_delete_new RENAME TO conflicts_note_delete;
         "#)?;
 
         // conflicts_tag_rename
         tx.execute_batch(r#"
-            CREATE TABLE conflicts_tag_rename_new (
+            DROP TABLE IF EXISTS conflicts_tag_rename;
+            CREATE TABLE conflicts_tag_rename (
                 id BLOB PRIMARY KEY,
                 tag_id BLOB NOT NULL,
                 local_name TEXT NOT NULL,
@@ -957,22 +964,12 @@ impl Database {
                 resolved_at INTEGER,
                 FOREIGN KEY (tag_id) REFERENCES tags(id)
             );
-            INSERT INTO conflicts_tag_rename_new SELECT
-                id, tag_id, local_name,
-                CAST(strftime('%s', local_modified_at) AS INTEGER),
-                local_device_id, local_device_name, remote_name,
-                CAST(strftime('%s', remote_modified_at) AS INTEGER),
-                remote_device_id, remote_device_name,
-                CAST(strftime('%s', created_at) AS INTEGER),
-                CAST(strftime('%s', resolved_at) AS INTEGER)
-            FROM conflicts_tag_rename;
-            DROP TABLE conflicts_tag_rename;
-            ALTER TABLE conflicts_tag_rename_new RENAME TO conflicts_tag_rename;
         "#)?;
 
         // conflicts_tag_parent
         tx.execute_batch(r#"
-            CREATE TABLE conflicts_tag_parent_new (
+            DROP TABLE IF EXISTS conflicts_tag_parent;
+            CREATE TABLE conflicts_tag_parent (
                 id BLOB PRIMARY KEY,
                 tag_id BLOB NOT NULL,
                 local_parent_id BLOB,
@@ -987,22 +984,12 @@ impl Database {
                 resolved_at INTEGER,
                 FOREIGN KEY (tag_id) REFERENCES tags(id)
             );
-            INSERT INTO conflicts_tag_parent_new SELECT
-                id, tag_id, local_parent_id,
-                CAST(strftime('%s', local_modified_at) AS INTEGER),
-                local_device_id, local_device_name, remote_parent_id,
-                CAST(strftime('%s', remote_modified_at) AS INTEGER),
-                remote_device_id, remote_device_name,
-                CAST(strftime('%s', created_at) AS INTEGER),
-                CAST(strftime('%s', resolved_at) AS INTEGER)
-            FROM conflicts_tag_parent;
-            DROP TABLE conflicts_tag_parent;
-            ALTER TABLE conflicts_tag_parent_new RENAME TO conflicts_tag_parent;
         "#)?;
 
         // conflicts_tag_delete
         tx.execute_batch(r#"
-            CREATE TABLE conflicts_tag_delete_new (
+            DROP TABLE IF EXISTS conflicts_tag_delete;
+            CREATE TABLE conflicts_tag_delete (
                 id BLOB PRIMARY KEY,
                 tag_id BLOB NOT NULL,
                 surviving_name TEXT NOT NULL,
@@ -1017,22 +1004,12 @@ impl Database {
                 resolved_at INTEGER,
                 FOREIGN KEY (tag_id) REFERENCES tags(id)
             );
-            INSERT INTO conflicts_tag_delete_new SELECT
-                id, tag_id, surviving_name, surviving_parent_id,
-                CAST(strftime('%s', surviving_modified_at) AS INTEGER),
-                surviving_device_id, surviving_device_name,
-                CAST(strftime('%s', deleted_at) AS INTEGER),
-                deleting_device_id, deleting_device_name,
-                CAST(strftime('%s', created_at) AS INTEGER),
-                CAST(strftime('%s', resolved_at) AS INTEGER)
-            FROM conflicts_tag_delete;
-            DROP TABLE conflicts_tag_delete;
-            ALTER TABLE conflicts_tag_delete_new RENAME TO conflicts_tag_delete;
         "#)?;
 
         // conflicts_note_tag
         tx.execute_batch(r#"
-            CREATE TABLE conflicts_note_tag_new (
+            DROP TABLE IF EXISTS conflicts_note_tag;
+            CREATE TABLE conflicts_note_tag (
                 id BLOB PRIMARY KEY,
                 note_id BLOB NOT NULL,
                 tag_id BLOB NOT NULL,
@@ -1051,21 +1028,6 @@ impl Database {
                 FOREIGN KEY (note_id) REFERENCES notes(id),
                 FOREIGN KEY (tag_id) REFERENCES tags(id)
             );
-            INSERT INTO conflicts_note_tag_new SELECT
-                id, note_id, tag_id,
-                CAST(strftime('%s', local_created_at) AS INTEGER),
-                CAST(strftime('%s', local_modified_at) AS INTEGER),
-                CAST(strftime('%s', local_deleted_at) AS INTEGER),
-                local_device_id, local_device_name,
-                CAST(strftime('%s', remote_created_at) AS INTEGER),
-                CAST(strftime('%s', remote_modified_at) AS INTEGER),
-                CAST(strftime('%s', remote_deleted_at) AS INTEGER),
-                remote_device_id, remote_device_name,
-                CAST(strftime('%s', created_at) AS INTEGER),
-                CAST(strftime('%s', resolved_at) AS INTEGER)
-            FROM conflicts_note_tag;
-            DROP TABLE conflicts_note_tag;
-            ALTER TABLE conflicts_note_tag_new RENAME TO conflicts_note_tag;
         "#)?;
 
         // sync_failures
@@ -1130,6 +1092,101 @@ impl Database {
         tx.commit()?;
 
         tracing::info!("Timestamp migration completed successfully");
+        Ok(())
+    }
+
+    /// Migrate existing databases to add cloud storage columns to audio_files.
+    ///
+    /// This adds three columns for tracking cloud storage state:
+    /// - storage_provider: "s3", "backblaze", etc. (NULL = local only)
+    /// - storage_key: Object key/path in cloud storage
+    /// - storage_uploaded_at: Unix timestamp when file was uploaded
+    ///
+    /// This is idempotent - it checks if columns exist before adding them.
+    fn migrate_add_storage_columns(&mut self) -> VoiceResult<()> {
+        // Helper to check if a column exists in a table
+        fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+            let sql = format!("PRAGMA table_info({})", table);
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let rows = stmt.query_map([], |row| {
+                let name: String = row.get(1)?;
+                Ok(name)
+            }).unwrap();
+            for row in rows {
+                if let Ok(name) = row {
+                    if name == column {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        // Add storage_provider column if it doesn't exist
+        if !column_exists(&self.conn, "audio_files", "storage_provider") {
+            self.conn.execute(
+                "ALTER TABLE audio_files ADD COLUMN storage_provider TEXT",
+                [],
+            )?;
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audio_files_storage_provider ON audio_files(storage_provider)",
+                [],
+            )?;
+            tracing::info!("Added storage_provider column to audio_files");
+        }
+
+        // Add storage_key column if it doesn't exist
+        if !column_exists(&self.conn, "audio_files", "storage_key") {
+            self.conn.execute(
+                "ALTER TABLE audio_files ADD COLUMN storage_key TEXT",
+                [],
+            )?;
+            tracing::info!("Added storage_key column to audio_files");
+        }
+
+        // Add storage_uploaded_at column if it doesn't exist
+        if !column_exists(&self.conn, "audio_files", "storage_uploaded_at") {
+            self.conn.execute(
+                "ALTER TABLE audio_files ADD COLUMN storage_uploaded_at INTEGER",
+                [],
+            )?;
+            tracing::info!("Added storage_uploaded_at column to audio_files");
+        }
+
+        Ok(())
+    }
+
+    /// Migrate existing databases to add file_storage_config table.
+    ///
+    /// This table stores cloud file storage configuration that syncs between devices.
+    /// Uses a single row with id="default".
+    ///
+    /// This is idempotent - it checks if the table exists before creating it.
+    fn migrate_add_file_storage_config_table(&mut self) -> VoiceResult<()> {
+        // Check if table already exists
+        let table_exists: bool = self.conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='file_storage_config'",
+            [],
+            |_| Ok(true),
+        ).unwrap_or(false);
+
+        if !table_exists {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS file_storage_config (
+                    id TEXT PRIMARY KEY DEFAULT 'default',
+                    provider TEXT NOT NULL DEFAULT 'none',
+                    config TEXT,
+                    modified_at INTEGER,
+                    device_id BLOB,
+                    sync_received_at INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_file_storage_config_sync_received_at ON file_storage_config(sync_received_at);
+                "#,
+            )?;
+            tracing::info!("Created file_storage_config table");
+        }
+
         Ok(())
     }
 
@@ -1374,6 +1431,67 @@ impl Database {
         let _ = self.rebuild_note_list_cache(&note_id_hex);
 
         Ok(note_id_hex)
+    }
+
+    /// Create a new note with a specific timestamp
+    ///
+    /// If `created_at` is provided (Unix timestamp), it will be used as the note's creation time.
+    /// If `created_at` is None, the current time is used.
+    pub fn create_note_with_timestamp(
+        &self,
+        content: &str,
+        created_at: Option<i64>,
+    ) -> VoiceResult<String> {
+        let note_id = Uuid::now_v7();
+        let uuid_bytes = note_id.as_bytes().to_vec();
+
+        match created_at {
+            Some(ts) => {
+                self.conn.execute(
+                    "INSERT INTO notes (id, content, created_at) VALUES (?, ?, ?)",
+                    params![uuid_bytes, content, ts],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO notes (id, content, created_at) VALUES (?, ?, strftime('%s', 'now'))",
+                    params![uuid_bytes, content],
+                )?;
+            }
+        }
+
+        let note_id_hex = note_id.simple().to_string();
+
+        // Rebuild list cache for the new note
+        let _ = self.rebuild_note_list_cache(&note_id_hex);
+
+        Ok(note_id_hex)
+    }
+
+    /// Import an audio file, creating all necessary records in one operation.
+    ///
+    /// This creates:
+    /// 1. An AudioFile record
+    /// 2. A Note record (with created_at = file_created_at if provided)
+    /// 3. A NoteAttachment linking them
+    ///
+    /// Returns (note_id, audio_file_id) as hex strings.
+    pub fn import_audio_file(
+        &self,
+        filename: &str,
+        file_created_at: Option<i64>,
+        duration_seconds: Option<i64>,
+    ) -> VoiceResult<(String, String)> {
+        // 1. Create audio file record
+        let audio_file_id = self.create_audio_file_with_duration(filename, file_created_at, duration_seconds)?;
+
+        // 2. Create note with file's creation date (empty content)
+        let note_id = self.create_note_with_timestamp("", file_created_at)?;
+
+        // 3. Attach audio file to note
+        self.attach_to_note(&note_id, &audio_file_id, "audio_file")?;
+
+        Ok((note_id, audio_file_id))
     }
 
     /// Update a note's content (accepts ID or ID prefix)
@@ -2626,10 +2744,11 @@ impl Database {
         // Fixed query: include entities where ANY timestamp is >= since
         let remaining = limit - changes.len() as i64;
         if remaining > 0 {
-            let audio_rows: Vec<(Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
+            let audio_rows: Vec<(Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>)> = if let Some(ts) = since_ts {
                 let mut stmt = self.conn.prepare(
                     r#"
-                    SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
+                    SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at,
+                           storage_provider, storage_key, storage_uploaded_at
                     FROM audio_files
                     WHERE sync_received_at >= ? OR modified_at >= ? OR imported_at >= ?
                     ORDER BY COALESCE(sync_received_at, modified_at, imported_at)
@@ -2645,13 +2764,17 @@ impl Database {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<i64>>(5)?,
                         row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             } else {
                 let mut stmt = self.conn.prepare(
                     r#"
-                    SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at
+                    SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at,
+                           storage_provider, storage_key, storage_uploaded_at
                     FROM audio_files
                     ORDER BY COALESCE(modified_at, imported_at)
                     LIMIT ?
@@ -2666,12 +2789,15 @@ impl Database {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<i64>>(5)?,
                         row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
 
-            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at) in audio_rows {
+            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at) in audio_rows {
                 let timestamp = modified_at.unwrap_or(imported_at);
                 let operation = if deleted_at.is_some() {
                     "delete"
@@ -2696,6 +2822,9 @@ impl Database {
                 data.insert("summary".to_string(), summary.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
                 data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
                 data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
+                data.insert("storage_provider".to_string(), storage_provider.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("storage_key".to_string(), storage_key.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("storage_uploaded_at".to_string(), storage_uploaded_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
                 change.insert("data".to_string(), serde_json::Value::Object(data));
 
                 if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
@@ -3037,7 +3166,8 @@ impl Database {
 
         // Get all audio_files
         let mut stmt = self.conn.prepare(
-            r#"SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at FROM audio_files"#
+            r#"SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
+                      storage_provider, storage_key, storage_uploaded_at FROM audio_files"#
         )?;
         let af_rows = stmt.query_map([], |row| {
             Ok((
@@ -3050,12 +3180,15 @@ impl Database {
                 row.get::<_, Vec<u8>>(6)?,
                 row.get::<_, Option<i64>>(7)?,
                 row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
             ))
         })?;
 
         let mut audio_files = Vec::new();
         for row in af_rows {
-            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at) = row?;
+            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at) = row?;
             let mut af = HashMap::new();
             af.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
             af.insert("imported_at".to_string(), serde_json::json!(imported_at));
@@ -3066,6 +3199,9 @@ impl Database {
             af.insert("device_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default()));
             af.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             af.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
+            af.insert("storage_provider".to_string(), storage_provider.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            af.insert("storage_key".to_string(), storage_key.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+            af.insert("storage_uploaded_at".to_string(), storage_uploaded_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             audio_files.push(af);
         }
         result.insert("audio_files".to_string(), audio_files);
@@ -4430,7 +4566,8 @@ impl Database {
 
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at
+            SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
+                   storage_provider, storage_key, storage_uploaded_at
             FROM audio_files
             WHERE id = ?
             "#,
@@ -4458,7 +4595,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT af.id, af.imported_at, af.filename, af.file_created_at, af.duration_seconds,
-                   af.summary, af.device_id, af.modified_at, af.deleted_at
+                   af.summary, af.device_id, af.modified_at, af.deleted_at,
+                   af.storage_provider, af.storage_key, af.storage_uploaded_at
             FROM audio_files af
             INNER JOIN note_attachments na ON af.id = na.attachment_id
             WHERE na.note_id = ?
@@ -4482,7 +4620,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, imported_at, filename, file_created_at, duration_seconds,
-                   summary, device_id, modified_at, deleted_at
+                   summary, device_id, modified_at, deleted_at,
+                   storage_provider, storage_key, storage_uploaded_at
             FROM audio_files
             ORDER BY imported_at DESC
             "#,
@@ -4585,7 +4724,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, imported_at, filename, file_created_at, duration_seconds,
-                   summary, device_id, modified_at, deleted_at
+                   summary, device_id, modified_at, deleted_at,
+                   storage_provider, storage_key, storage_uploaded_at
             FROM audio_files
             WHERE duration_seconds IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -4610,6 +4750,9 @@ impl Database {
         let device_id_bytes: Vec<u8> = row.get(6)?;
         let modified_at: Option<i64> = row.get(7)?;
         let deleted_at: Option<i64> = row.get(8)?;
+        let storage_provider: Option<String> = row.get(9)?;
+        let storage_key: Option<String> = row.get(10)?;
+        let storage_uploaded_at: Option<i64> = row.get(11)?;
 
         Ok(AudioFileRow {
             id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -4621,7 +4764,243 @@ impl Database {
             device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
             modified_at,
             deleted_at,
+            storage_provider,
+            storage_key,
+            storage_uploaded_at,
         })
+    }
+
+    // ========================================================================
+    // Cloud Storage operations for AudioFile
+    // ========================================================================
+
+    /// Get all audio files that need to be uploaded to cloud storage.
+    ///
+    /// Returns files where storage_provider is NULL (not yet uploaded).
+    /// Excludes deleted files.
+    pub fn get_audio_files_pending_upload(&self) -> VoiceResult<Vec<AudioFileRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, imported_at, filename, file_created_at, duration_seconds,
+                   summary, device_id, modified_at, deleted_at,
+                   storage_provider, storage_key, storage_uploaded_at
+            FROM audio_files
+            WHERE storage_provider IS NULL AND deleted_at IS NULL
+            ORDER BY imported_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| self.row_to_audio_file(row))?;
+        let mut audio_files = Vec::new();
+        for audio_file in rows {
+            audio_files.push(audio_file?);
+        }
+        Ok(audio_files)
+    }
+
+    /// Update an audio file's cloud storage information after successful upload.
+    ///
+    /// This marks the file as uploaded to the specified cloud provider.
+    pub fn update_audio_file_storage(
+        &self,
+        audio_file_id: &str,
+        storage_provider: &str,
+        storage_key: &str,
+    ) -> VoiceResult<bool> {
+        let resolved_id = match self.try_resolve_audio_file_id(audio_file_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+        let device_id = get_local_device_id();
+
+        let updated = self.conn.execute(
+            r#"
+            UPDATE audio_files
+            SET storage_provider = ?,
+                storage_key = ?,
+                storage_uploaded_at = strftime('%s', 'now'),
+                modified_at = strftime('%s', 'now'),
+                device_id = ?
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![storage_provider, storage_key, device_id.as_bytes().to_vec(), uuid_bytes],
+        )?;
+
+        Ok(updated > 0)
+    }
+
+    /// Clear an audio file's cloud storage information.
+    ///
+    /// This marks the file as local-only (not uploaded to cloud).
+    pub fn clear_audio_file_storage(&self, audio_file_id: &str) -> VoiceResult<bool> {
+        let resolved_id = match self.try_resolve_audio_file_id(audio_file_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+        let device_id = get_local_device_id();
+
+        let updated = self.conn.execute(
+            r#"
+            UPDATE audio_files
+            SET storage_provider = NULL,
+                storage_key = NULL,
+                storage_uploaded_at = NULL,
+                modified_at = strftime('%s', 'now'),
+                device_id = ?
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![device_id.as_bytes().to_vec(), uuid_bytes],
+        )?;
+
+        Ok(updated > 0)
+    }
+
+    // ========================================================================
+    // File Storage Configuration
+    // ========================================================================
+
+    /// Get the file storage configuration from the database.
+    ///
+    /// Returns None if no configuration has been set yet.
+    pub fn get_file_storage_config(&self) -> VoiceResult<Option<serde_json::Value>> {
+        let result = self.conn.query_row(
+            "SELECT provider, config, modified_at, device_id FROM file_storage_config WHERE id = 'default'",
+            [],
+            |row| {
+                let provider: String = row.get(0)?;
+                let config: Option<String> = row.get(1)?;
+                let modified_at: Option<i64> = row.get(2)?;
+                let device_id_bytes: Option<Vec<u8>> = row.get(3)?;
+
+                let config_value: serde_json::Value = config
+                    .and_then(|c| serde_json::from_str(&c).ok())
+                    .unwrap_or(serde_json::Value::Null);
+
+                Ok(serde_json::json!({
+                    "provider": provider,
+                    "config": config_value,
+                    "modified_at": modified_at,
+                    "device_id": device_id_bytes.and_then(|b| uuid_bytes_to_hex(&b)),
+                }))
+            },
+        );
+
+        match result {
+            Ok(val) => Ok(Some(val)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(VoiceError::Database(e)),
+        }
+    }
+
+    /// Set the file storage configuration in the database.
+    ///
+    /// This uses INSERT OR REPLACE to create or update the single config row.
+    pub fn set_file_storage_config(
+        &self,
+        provider: &str,
+        config: Option<&serde_json::Value>,
+    ) -> VoiceResult<()> {
+        let device_id = get_local_device_id();
+        let config_json = config.map(|c| c.to_string());
+
+        self.conn.execute(
+            r#"
+            INSERT INTO file_storage_config (id, provider, config, modified_at, device_id)
+            VALUES ('default', ?, ?, strftime('%s', 'now'), ?)
+            ON CONFLICT(id) DO UPDATE SET
+                provider = excluded.provider,
+                config = excluded.config,
+                modified_at = excluded.modified_at,
+                device_id = excluded.device_id
+            "#,
+            params![provider, config_json, device_id.as_bytes().to_vec()],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get file storage config as FileStorageConfig struct (for use with config.rs types).
+    ///
+    /// Returns a FileStorageConfig that can be used directly with the S3 storage service.
+    pub fn get_file_storage_config_struct(&self) -> VoiceResult<crate::config::FileStorageConfig> {
+        match self.get_file_storage_config()? {
+            Some(val) => {
+                let provider = val.get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("none")
+                    .to_string();
+                let config = val.get("config")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                Ok(crate::config::FileStorageConfig { provider, config })
+            }
+            None => Ok(crate::config::FileStorageConfig::default()),
+        }
+    }
+
+    /// Apply file storage config from sync.
+    ///
+    /// This is used when receiving configuration from another device via sync.
+    /// Uses LWW (Last Writer Wins) based on modified_at timestamp.
+    pub fn apply_sync_file_storage_config(
+        &self,
+        provider: &str,
+        config: Option<&serde_json::Value>,
+        modified_at: Option<i64>,
+        device_id: Option<&str>,
+        sync_received_at: Option<i64>,
+    ) -> VoiceResult<()> {
+        let device_id_bytes = device_id
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .map(|u| u.as_bytes().to_vec());
+        let config_json = config.map(|c| c.to_string());
+
+        // Check if we have existing config and compare timestamps
+        let existing = self.conn.query_row(
+            "SELECT modified_at FROM file_storage_config WHERE id = 'default'",
+            [],
+            |row| {
+                let existing_modified_at: Option<i64> = row.get(0)?;
+                Ok(existing_modified_at)
+            },
+        );
+
+        let should_update = match existing {
+            Ok(existing_modified_at) => {
+                // LWW: Only update if incoming is newer or same
+                match (modified_at, existing_modified_at) {
+                    (Some(incoming), Some(existing)) => incoming >= existing,
+                    (Some(_), None) => true,
+                    (None, _) => true,
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => true,
+            Err(e) => return Err(VoiceError::Database(e)),
+        };
+
+        if should_update {
+            self.conn.execute(
+                r#"
+                INSERT INTO file_storage_config (id, provider, config, modified_at, device_id, sync_received_at)
+                VALUES ('default', ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    provider = excluded.provider,
+                    config = excluded.config,
+                    modified_at = excluded.modified_at,
+                    device_id = excluded.device_id,
+                    sync_received_at = excluded.sync_received_at
+                "#,
+                params![provider, config_json, modified_at, device_id_bytes, sync_received_at],
+            )?;
+        }
+
+        Ok(())
     }
 
     // ========================================================================
@@ -4731,7 +5110,8 @@ impl Database {
 
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at
+            SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at,
+                   storage_provider, storage_key, storage_uploaded_at
             FROM audio_files
             WHERE id = ?
             "#,
@@ -4746,6 +5126,9 @@ impl Database {
             let device_id_bytes: Vec<u8> = row.get(5)?;
             let modified_at: Option<i64> = row.get(6)?;
             let deleted_at: Option<i64> = row.get(7)?;
+            let storage_provider: Option<String> = row.get(8)?;
+            let storage_key: Option<String> = row.get(9)?;
+            let storage_uploaded_at: Option<i64> = row.get(10)?;
 
             Ok(serde_json::json!({
                 "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -4756,6 +5139,9 @@ impl Database {
                 "device_id": uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
                 "modified_at": modified_at,
                 "deleted_at": deleted_at,
+                "storage_provider": storage_provider,
+                "storage_key": storage_key,
+                "storage_uploaded_at": storage_uploaded_at,
             }))
         });
 
@@ -4778,6 +5164,9 @@ impl Database {
         modified_at: Option<i64>,
         deleted_at: Option<i64>,
         sync_received_at: Option<i64>,
+        storage_provider: Option<&str>,
+        storage_key: Option<&str>,
+        storage_uploaded_at: Option<i64>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
@@ -4785,8 +5174,8 @@ impl Database {
 
         self.conn.execute(
             r#"
-            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 filename = excluded.filename,
                 file_created_at = excluded.file_created_at,
@@ -4795,7 +5184,10 @@ impl Database {
                 modified_at = excluded.modified_at,
                 deleted_at = excluded.deleted_at,
                 device_id = excluded.device_id,
-                sync_received_at = excluded.sync_received_at
+                sync_received_at = excluded.sync_received_at,
+                storage_provider = excluded.storage_provider,
+                storage_key = excluded.storage_key,
+                storage_uploaded_at = excluded.storage_uploaded_at
             "#,
             params![
                 id_uuid.as_bytes().to_vec(),
@@ -4808,6 +5200,9 @@ impl Database {
                 modified_at,
                 deleted_at,
                 sync_received_at,
+                storage_provider,
+                storage_key,
+                storage_uploaded_at,
             ],
         )?;
 
@@ -5937,5 +6332,309 @@ mod tests {
         let results = db.search_notes(None, Some(&tag_groups)).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, note1_id);
+    }
+
+    #[test]
+    fn test_import_audio_file() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Import an audio file with metadata
+        let file_created_at = Some(1700000000); // Nov 14, 2023
+        let duration_seconds = Some(120); // 2 minutes
+        let (note_id, audio_file_id) = db
+            .import_audio_file("recording.m4a", file_created_at, duration_seconds)
+            .unwrap();
+
+        // Verify the note was created
+        let note = db.get_note(&note_id).unwrap().unwrap();
+        assert_eq!(note.content, ""); // Empty content for imported audio
+        assert_eq!(note.created_at, file_created_at.unwrap()); // Uses file creation date
+
+        // Verify the audio file was created
+        let audio_file = db.get_audio_file(&audio_file_id).unwrap().unwrap();
+        assert_eq!(audio_file.filename, "recording.m4a");
+        assert_eq!(audio_file.file_created_at, file_created_at);
+        assert_eq!(audio_file.duration_seconds, duration_seconds);
+
+        // Verify the attachment was created
+        let attachments = db.get_audio_files_for_note(&note_id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, audio_file_id);
+    }
+
+    #[test]
+    fn test_import_audio_file_without_metadata() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Import without file creation date or duration
+        let (note_id, audio_file_id) = db
+            .import_audio_file("voice_memo.mp3", None, None)
+            .unwrap();
+
+        // Verify the note was created with current timestamp
+        let note = db.get_note(&note_id).unwrap().unwrap();
+        assert!(note.created_at > 0); // Has a timestamp
+
+        // Verify the audio file was created
+        let audio_file = db.get_audio_file(&audio_file_id).unwrap().unwrap();
+        assert_eq!(audio_file.filename, "voice_memo.mp3");
+        assert!(audio_file.file_created_at.is_none());
+        assert!(audio_file.duration_seconds.is_none());
+    }
+
+    #[test]
+    fn test_create_note_with_timestamp() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Create note with specific timestamp
+        let timestamp = Some(1600000000); // Sep 13, 2020
+        let note_id = db.create_note_with_timestamp("Test content", timestamp).unwrap();
+
+        let note = db.get_note(&note_id).unwrap().unwrap();
+        assert_eq!(note.content, "Test content");
+        assert_eq!(note.created_at, timestamp.unwrap());
+    }
+
+    // =========================================================================
+    // Cloud Storage Tests
+    // =========================================================================
+
+    #[test]
+    fn test_audio_file_storage_columns_default_null() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Create audio file
+        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+
+        // Verify storage columns are NULL by default
+        let audio = db.get_audio_file(&audio_id).unwrap().unwrap();
+        assert!(audio.storage_provider.is_none());
+        assert!(audio.storage_key.is_none());
+        assert!(audio.storage_uploaded_at.is_none());
+    }
+
+    #[test]
+    fn test_update_audio_file_storage() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Create audio file
+        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+
+        // Update storage info
+        let updated = db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3").unwrap();
+        assert!(updated);
+
+        // Verify storage info was set
+        let audio = db.get_audio_file(&audio_id).unwrap().unwrap();
+        assert_eq!(audio.storage_provider, Some("s3".to_string()));
+        assert_eq!(audio.storage_key, Some("audio/test.mp3".to_string()));
+        assert!(audio.storage_uploaded_at.is_some());
+        assert!(audio.modified_at.is_some());
+    }
+
+    #[test]
+    fn test_clear_audio_file_storage() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Create audio file and set storage
+        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+        db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3").unwrap();
+
+        // Verify storage is set
+        let audio = db.get_audio_file(&audio_id).unwrap().unwrap();
+        assert!(audio.storage_provider.is_some());
+
+        // Clear storage
+        let cleared = db.clear_audio_file_storage(&audio_id).unwrap();
+        assert!(cleared);
+
+        // Verify storage is cleared
+        let audio = db.get_audio_file(&audio_id).unwrap().unwrap();
+        assert!(audio.storage_provider.is_none());
+        assert!(audio.storage_key.is_none());
+        assert!(audio.storage_uploaded_at.is_none());
+    }
+
+    #[test]
+    fn test_get_audio_files_pending_upload() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Create some audio files
+        let audio_id1 = db.create_audio_file("file1.mp3", None).unwrap();
+        let audio_id2 = db.create_audio_file("file2.mp3", None).unwrap();
+        let audio_id3 = db.create_audio_file("file3.mp3", None).unwrap();
+
+        // Upload one of them
+        db.update_audio_file_storage(&audio_id2, "s3", "audio/file2.mp3").unwrap();
+
+        // Get pending uploads
+        let pending = db.get_audio_files_pending_upload().unwrap();
+        assert_eq!(pending.len(), 2);
+
+        // Verify the uploaded file is not in the list
+        let pending_ids: Vec<_> = pending.iter().map(|a| a.id.as_str()).collect();
+        assert!(pending_ids.contains(&audio_id1.as_str()));
+        assert!(!pending_ids.contains(&audio_id2.as_str()));
+        assert!(pending_ids.contains(&audio_id3.as_str()));
+    }
+
+    #[test]
+    fn test_audio_file_storage_syncs_correctly() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Create audio file with storage info via sync
+        let audio_id = uuid::Uuid::now_v7().simple().to_string();
+        db.apply_sync_audio_file(
+            &audio_id,
+            1700000000,  // imported_at
+            "synced.mp3",
+            None,        // file_created_at
+            None,        // duration_seconds
+            None,        // summary
+            Some(1700000001), // modified_at
+            None,        // deleted_at
+            None,        // sync_received_at
+            Some("s3"),  // storage_provider
+            Some("audio/synced.mp3"), // storage_key
+            Some(1700000002), // storage_uploaded_at
+        ).unwrap();
+
+        // Verify storage info was applied
+        let audio = db.get_audio_file(&audio_id).unwrap().unwrap();
+        assert_eq!(audio.storage_provider, Some("s3".to_string()));
+        assert_eq!(audio.storage_key, Some("audio/synced.mp3".to_string()));
+        assert_eq!(audio.storage_uploaded_at, Some(1700000002));
+    }
+
+    #[test]
+    fn test_get_changes_since_includes_storage_fields() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Create audio file with storage info
+        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+        db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3").unwrap();
+
+        // Get changes
+        let (changes, _) = db.get_changes_since(None, 100).unwrap();
+
+        // Find the audio_file change
+        let audio_change = changes.iter().find(|c| {
+            c.get("entity_type").and_then(|v| v.as_str()) == Some("audio_file")
+        });
+
+        assert!(audio_change.is_some());
+        let data = audio_change.unwrap().get("data").unwrap();
+        assert_eq!(data.get("storage_provider").and_then(|v| v.as_str()), Some("s3"));
+        assert_eq!(data.get("storage_key").and_then(|v| v.as_str()), Some("audio/test.mp3"));
+        assert!(data.get("storage_uploaded_at").and_then(|v| v.as_i64()).is_some());
+    }
+
+    #[test]
+    fn test_file_storage_config_get_none() {
+        let db = Database::new_in_memory().unwrap();
+
+        // No config set yet
+        let config = db.get_file_storage_config().unwrap();
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_file_storage_config_set_and_get() {
+        let db = Database::new_in_memory().unwrap();
+
+        let s3_config = serde_json::json!({
+            "bucket": "my-bucket",
+            "region": "us-east-1",
+            "access_key_id": "AKIATEST",
+            "secret_access_key": "secret123",
+        });
+
+        db.set_file_storage_config("s3", Some(&s3_config)).unwrap();
+
+        let config = db.get_file_storage_config().unwrap().unwrap();
+        assert_eq!(config.get("provider").and_then(|v| v.as_str()), Some("s3"));
+
+        let stored_config = config.get("config").unwrap();
+        assert_eq!(
+            stored_config.get("bucket").and_then(|v| v.as_str()),
+            Some("my-bucket")
+        );
+        assert_eq!(
+            stored_config.get("region").and_then(|v| v.as_str()),
+            Some("us-east-1")
+        );
+    }
+
+    #[test]
+    fn test_file_storage_config_update() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Set initial config
+        let s3_config = serde_json::json!({
+            "bucket": "bucket-1",
+            "region": "us-east-1",
+        });
+        db.set_file_storage_config("s3", Some(&s3_config)).unwrap();
+
+        // Update config
+        let new_config = serde_json::json!({
+            "bucket": "bucket-2",
+            "region": "eu-west-1",
+        });
+        db.set_file_storage_config("s3", Some(&new_config)).unwrap();
+
+        let config = db.get_file_storage_config().unwrap().unwrap();
+        let stored_config = config.get("config").unwrap();
+        assert_eq!(
+            stored_config.get("bucket").and_then(|v| v.as_str()),
+            Some("bucket-2")
+        );
+        assert_eq!(
+            stored_config.get("region").and_then(|v| v.as_str()),
+            Some("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn test_file_storage_config_struct() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Default when no config
+        let config = db.get_file_storage_config_struct().unwrap();
+        assert_eq!(config.provider, "none");
+
+        // Set S3 config
+        let s3_config = serde_json::json!({
+            "bucket": "test-bucket",
+            "region": "us-west-2",
+            "access_key_id": "AKIATEST",
+            "secret_access_key": "secret",
+            "prefix": "audio/",
+        });
+        db.set_file_storage_config("s3", Some(&s3_config)).unwrap();
+
+        let config = db.get_file_storage_config_struct().unwrap();
+        assert_eq!(config.provider, "s3");
+        assert_eq!(config.s3_bucket(), Some("test-bucket"));
+        assert_eq!(config.s3_region(), Some("us-west-2"));
+        assert_eq!(config.s3_prefix(), Some("audio/"));
+    }
+
+    #[test]
+    fn test_file_storage_config_disable() {
+        let db = Database::new_in_memory().unwrap();
+
+        // Set S3 config
+        let s3_config = serde_json::json!({
+            "bucket": "test-bucket",
+        });
+        db.set_file_storage_config("s3", Some(&s3_config)).unwrap();
+
+        // Disable by setting to "none"
+        db.set_file_storage_config("none", None).unwrap();
+
+        let config = db.get_file_storage_config_struct().unwrap();
+        assert_eq!(config.provider, "none");
+        assert!(!config.is_enabled());
     }
 }

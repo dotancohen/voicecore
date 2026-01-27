@@ -12,17 +12,23 @@ name = "voicecore"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["server", "desktop"]
+default = ["server", "desktop", "file-storage"]
 # Server components (axum, tower) - not needed on mobile
 server = ["dep:axum", "dep:tower", "dep:tower-http"]
 # Desktop features (hostname detection, config dir detection)
 desktop = ["dep:hostname", "dep:dirs"]
 # UniFFI bindings for mobile (Android/iOS)
 uniffi = ["dep:uniffi"]
+# Cloud file storage (S3, Backblaze B2, etc.)
+file-storage = ["dep:aws-sdk-s3", "dep:aws-config"]
 
 [dependencies]
 # Async runtime - use lighter features for mobile
-tokio = { version = "1.42", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1.42", features = ["rt", "sync", "time", "macros", "fs"] }
+
+# Cloud storage (optional - for file_storage feature)
+aws-sdk-s3 = { version = "1.0", optional = true }
+aws-config = { version = "1.0", optional = true }
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled", "blob"] }
