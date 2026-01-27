@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -1787,9 +1787,13 @@ pub fn create_router(
     db: Arc<Mutex<Database>>,
     config: Arc<Mutex<Config>>,
 ) -> Router {
-    let (device_id, device_name) = {
+    let (device_id, device_name, max_body_size) = {
         let cfg = config.lock().unwrap();
-        (cfg.device_id_hex().to_string(), cfg.device_name().to_string())
+        (
+            cfg.device_id_hex().to_string(),
+            cfg.device_name().to_string(),
+            cfg.max_sync_file_size_bytes() as usize,
+        )
     };
 
     let state = AppState {
@@ -1799,6 +1803,11 @@ pub fn create_router(
         device_name,
     };
 
+    tracing::info!(
+        "Sync server body limit: {} MB",
+        max_body_size / 1024 / 1024
+    );
+
     Router::new()
         .route("/sync/handshake", post(handshake))
         .route("/sync/changes", get(get_changes))
@@ -1807,6 +1816,8 @@ pub fn create_router(
         .route("/sync/status", get(status))
         .route("/sync/audio/:audio_id/file", get(download_audio_file))
         .route("/sync/audio/:audio_id/file", post(upload_audio_file))
+        // Body limit is configurable via sync.max_sync_file_size_mb in config
+        .layer(DefaultBodyLimit::max(max_body_size))
         .with_state(state)
 }
 

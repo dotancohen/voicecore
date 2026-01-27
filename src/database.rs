@@ -29,11 +29,23 @@ pub const SYSTEM_TAG_NAME: &str = "_system";
 /// Marked tag name - child of _system, used for starring/bookmarking notes
 pub const MARKED_TAG_NAME: &str = "_marked";
 
+/// Nonsynced tag name - child of _system, parent of tags for non-synced items
+pub const NONSYNCED_TAG_NAME: &str = "_nonsynced";
+
+/// Too-big tag name - child of _nonsynced, for files too large to sync
+pub const TOO_BIG_TAG_NAME: &str = "_too-big";
+
 /// Deterministic UUID for _system tag - same on all devices to prevent duplicates during sync.
 pub const SYSTEM_TAG_UUID: &str = "a1b2c3d4-0000-5000-8000-000000000001";
 
 /// Deterministic UUID for _marked tag - same on all devices to prevent duplicates during sync.
 pub const MARKED_TAG_UUID: &str = "a1b2c3d4-0000-5000-8000-000000000002";
+
+/// Deterministic UUID for _nonsynced tag - same on all devices to prevent duplicates during sync.
+pub const NONSYNCED_TAG_UUID: &str = "a1b2c3d4-0000-5000-8000-000000000003";
+
+/// Deterministic UUID for _too-big tag - same on all devices to prevent duplicates during sync.
+pub const TOO_BIG_TAG_UUID: &str = "a1b2c3d4-0000-5000-8000-000000000004";
 
 // =============================================================================
 // Cache Registry - All di_cache_* fields in the database
@@ -506,17 +518,35 @@ impl Database {
             .map_err(|e| VoiceError::Other(format!("Invalid SYSTEM_TAG_UUID: {}", e)))?;
         let marked_uuid = Uuid::parse_str(MARKED_TAG_UUID)
             .map_err(|e| VoiceError::Other(format!("Invalid MARKED_TAG_UUID: {}", e)))?;
+        let nonsynced_uuid = Uuid::parse_str(NONSYNCED_TAG_UUID)
+            .map_err(|e| VoiceError::Other(format!("Invalid NONSYNCED_TAG_UUID: {}", e)))?;
+        let too_big_uuid = Uuid::parse_str(TOO_BIG_TAG_UUID)
+            .map_err(|e| VoiceError::Other(format!("Invalid TOO_BIG_TAG_UUID: {}", e)))?;
         let system_bytes = system_uuid.as_bytes().to_vec();
         let marked_bytes = marked_uuid.as_bytes().to_vec();
+        let nonsynced_bytes = nonsynced_uuid.as_bytes().to_vec();
+        let too_big_bytes = too_big_uuid.as_bytes().to_vec();
 
         // Insert system tags if they don't exist (OR IGNORE handles duplicates)
+        // _system (root)
         self.conn.execute(
             "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, NULL, strftime('%s', 'now'))",
             params![&system_bytes, SYSTEM_TAG_NAME],
         )?;
+        // _system/_marked
         self.conn.execute(
             "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
             params![&marked_bytes, MARKED_TAG_NAME, &system_bytes],
+        )?;
+        // _system/_nonsynced
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
+            params![&nonsynced_bytes, NONSYNCED_TAG_NAME, &system_bytes],
+        )?;
+        // _system/_nonsynced/_too-big
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
+            params![&too_big_bytes, TOO_BIG_TAG_NAME, &nonsynced_bytes],
         )?;
 
         Ok(())
@@ -2430,6 +2460,68 @@ impl Database {
     pub fn get_system_tag_id_hex(&self) -> VoiceResult<String> {
         let bytes = self.get_system_tag_id()?;
         crate::validation::uuid_bytes_to_hex(&bytes)
+    }
+
+    // ============================================================================
+    // Non-synced file tagging methods
+    // ============================================================================
+
+    /// Get the _nonsynced tag ID (deterministic UUID, created at init)
+    fn get_nonsynced_tag_id(&self) -> VoiceResult<Vec<u8>> {
+        let uuid = Uuid::parse_str(NONSYNCED_TAG_UUID)
+            .map_err(|e| VoiceError::Other(format!("Invalid NONSYNCED_TAG_UUID: {}", e)))?;
+        Ok(uuid.as_bytes().to_vec())
+    }
+
+    /// Get the _too-big tag ID (deterministic UUID, created at init)
+    fn get_too_big_tag_id(&self) -> VoiceResult<Vec<u8>> {
+        let uuid = Uuid::parse_str(TOO_BIG_TAG_UUID)
+            .map_err(|e| VoiceError::Other(format!("Invalid TOO_BIG_TAG_UUID: {}", e)))?;
+        Ok(uuid.as_bytes().to_vec())
+    }
+
+    /// Get the _too-big tag ID as hex string
+    pub fn get_too_big_tag_id_hex(&self) -> VoiceResult<String> {
+        let bytes = self.get_too_big_tag_id()?;
+        crate::validation::uuid_bytes_to_hex(&bytes)
+    }
+
+    /// Check if a note is tagged as too-big to sync
+    pub fn is_note_too_big_to_sync(&self, note_id: &str) -> VoiceResult<bool> {
+        let resolved_note_id = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+
+        let too_big_tag_id = self.get_too_big_tag_id()?;
+
+        let note_uuid = Uuid::parse_str(&resolved_note_id)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
+        let note_bytes = note_uuid.as_bytes().to_vec();
+
+        let is_too_big: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM note_tags WHERE note_id = ? AND tag_id = ? AND deleted_at IS NULL",
+            params![&note_bytes, &too_big_tag_id],
+            |row| row.get(0),
+        )?;
+
+        Ok(is_too_big)
+    }
+
+    /// Tag a note as too-big to sync (add the _too-big tag)
+    pub fn tag_note_too_big(&self, note_id: &str) -> VoiceResult<bool> {
+        let too_big_tag_id = self.get_too_big_tag_id()?;
+        let too_big_tag_hex = crate::validation::uuid_bytes_to_hex(&too_big_tag_id)?;
+        let result = self.add_tag_to_note(note_id, &too_big_tag_hex)?;
+        Ok(result.changed)
+    }
+
+    /// Remove the too-big tag from a note
+    pub fn untag_note_too_big(&self, note_id: &str) -> VoiceResult<bool> {
+        let too_big_tag_id = self.get_too_big_tag_id()?;
+        let too_big_tag_hex = crate::validation::uuid_bytes_to_hex(&too_big_tag_id)?;
+        let result = self.remove_tag_from_note(note_id, &too_big_tag_hex)?;
+        Ok(result.changed)
     }
 
     /// Close the database connection
@@ -4615,6 +4707,37 @@ impl Database {
         Ok(audio_files)
     }
 
+    /// Get all note IDs that have an audio file attached (via note_attachments)
+    pub fn get_notes_for_audio_file(&self, audio_file_id: &str) -> VoiceResult<Vec<String>> {
+        let uuid = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT note_id
+            FROM note_attachments
+            WHERE attachment_id = ?
+              AND attachment_type = 'audio_file'
+              AND deleted_at IS NULL
+            "#,
+        )?;
+
+        let rows = stmt.query_map([uuid_bytes], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            let uuid = Uuid::from_slice(&bytes).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
+            })?;
+            Ok(uuid.simple().to_string())
+        })?;
+
+        let mut note_ids = Vec::new();
+        for note_id in rows {
+            note_ids.push(note_id?);
+        }
+        Ok(note_ids)
+    }
+
     /// Get all audio files from the database (including deleted ones)
     pub fn get_all_audio_files(&self) -> VoiceResult<Vec<AudioFileRow>> {
         let mut stmt = self.conn.prepare(
@@ -6219,12 +6342,14 @@ mod tests {
     fn test_create_database() {
         let db = Database::new_in_memory().unwrap();
         assert!(db.get_all_notes().unwrap().is_empty());
-        // Database has system tags (_system, _marked) by default
+        // Database has system tags (_system, _marked, _nonsynced, _too-big) by default
         let tags = db.get_all_tags().unwrap();
-        assert_eq!(tags.len(), 2);
+        assert_eq!(tags.len(), 4);
         let tag_names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
         assert!(tag_names.contains(&"_system"));
         assert!(tag_names.contains(&"_marked"));
+        assert!(tag_names.contains(&"_nonsynced"));
+        assert!(tag_names.contains(&"_too-big"));
     }
 
     #[test]

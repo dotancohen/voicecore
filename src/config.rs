@@ -86,10 +86,18 @@ pub struct SyncConfig {
     pub server_port: u16,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    /// Maximum file size in MB for sync uploads (default 100MB)
+    /// Files larger than this will be tagged as _system/_nonsynced/_too-big
+    #[serde(default = "default_max_sync_file_size_mb")]
+    pub max_sync_file_size_mb: u32,
 }
 
 fn default_server_port() -> u16 {
     8384
+}
+
+fn default_max_sync_file_size_mb() -> u32 {
+    100 // 100 MB default
 }
 
 impl Default for SyncConfig {
@@ -98,6 +106,7 @@ impl Default for SyncConfig {
             enabled: false,
             server_port: default_server_port(),
             peers: Vec::new(),
+            max_sync_file_size_mb: default_max_sync_file_size_mb(),
         }
     }
 }
@@ -400,6 +409,22 @@ impl Config {
     /// Set the sync server port
     pub fn set_sync_server_port(&mut self, port: u16) -> VoiceResult<()> {
         self.data.sync.server_port = port;
+        self.save()
+    }
+
+    /// Get the maximum sync file size in MB
+    pub fn max_sync_file_size_mb(&self) -> u32 {
+        self.data.sync.max_sync_file_size_mb
+    }
+
+    /// Get the maximum sync file size in bytes
+    pub fn max_sync_file_size_bytes(&self) -> u64 {
+        u64::from(self.data.sync.max_sync_file_size_mb) * 1024 * 1024
+    }
+
+    /// Set the maximum sync file size in MB
+    pub fn set_max_sync_file_size_mb(&mut self, size_mb: u32) -> VoiceResult<()> {
+        self.data.sync.max_sync_file_size_mb = size_mb;
         self.save()
     }
 

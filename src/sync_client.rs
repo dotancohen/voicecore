@@ -1827,6 +1827,12 @@ impl SyncClient {
     ) -> Vec<String> {
         let mut errors = Vec::new();
 
+        // Get max file size from config
+        let max_file_size = {
+            let cfg = self.config.lock().unwrap();
+            cfg.max_sync_file_size_bytes()
+        };
+
         for change in pushed_changes {
             // Only process audio_file creates/updates (not deletes)
             if change.entity_type != "audio_file" {
@@ -1855,6 +1861,54 @@ impl SyncClient {
                     audio_id,
                     source_path.display()
                 );
+                continue;
+            }
+
+            // Check file size
+            let file_size = match std::fs::metadata(&source_path) {
+                Ok(meta) => meta.len(),
+                Err(e) => {
+                    errors.push(format!("Failed to get file size for {}: {}", audio_id, e));
+                    continue;
+                }
+            };
+
+            // If file is too big, tag attached notes and skip upload
+            if file_size > max_file_size {
+                tracing::warn!(
+                    "Audio file {} is too large ({} bytes > {} max), tagging notes as _too-big",
+                    audio_id,
+                    file_size,
+                    max_file_size
+                );
+
+                // Tag all notes that have this audio file attached
+                if let Ok(db) = self.db.lock() {
+                    if let Ok(note_ids) = db.get_notes_for_audio_file(audio_id) {
+                        for note_id in note_ids {
+                            if let Err(e) = db.tag_note_too_big(&note_id) {
+                                tracing::error!(
+                                    "Failed to tag note {} as too-big: {}",
+                                    note_id,
+                                    e
+                                );
+                            } else {
+                                tracing::info!(
+                                    "Tagged note {} as _too-big due to large audio file {}",
+                                    note_id,
+                                    audio_id
+                                );
+                            }
+                        }
+                    }
+                }
+
+                errors.push(format!(
+                    "Audio file {} is too large to sync ({} MB > {} MB limit)",
+                    audio_id,
+                    file_size / 1024 / 1024,
+                    max_file_size / 1024 / 1024
+                ));
                 continue;
             }
 
@@ -2115,9 +2169,9 @@ mod tests {
             let (db, config, _temp_dir) = create_test_db_and_config();
             let client = SyncClient::new(db, config).unwrap();
 
-            // Empty db still has system tags (_system, _marked)
+            // Empty db still has system tags (_system, _marked, _nonsynced, _too-big)
             let changes = client.get_changes_since(None).unwrap();
-            assert_eq!(changes.len(), 2);
+            assert_eq!(changes.len(), 4);
             assert!(changes.iter().all(|c| c.entity_type == "tag"));
         }
 

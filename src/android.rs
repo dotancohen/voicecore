@@ -1090,6 +1090,60 @@ impl VoiceClient {
             })
     }
 
+    // =========================================================================
+    // Non-synced file tagging methods
+    // =========================================================================
+
+    /// Check if a note is tagged as too-big to sync
+    pub fn is_note_too_big_to_sync(&self, note_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.is_note_too_big_to_sync(&note_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Tag a note as too-big to sync (add the _system/_nonsynced/_too-big tag)
+    ///
+    /// Returns true if the tag was added, false if already tagged.
+    pub fn tag_note_too_big(&self, note_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.tag_note_too_big(&note_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Remove the too-big tag from a note
+    ///
+    /// Returns true if the tag was removed, false if not tagged.
+    pub fn untag_note_too_big(&self, note_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.untag_note_too_big(&note_id)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    // =========================================================================
+    // Sync configuration methods
+    // =========================================================================
+
+    /// Get the maximum sync file size in MB
+    pub fn get_max_sync_file_size_mb(&self) -> Result<u32, VoiceCoreError> {
+        let cfg = self.config.lock().unwrap();
+        Ok(cfg.max_sync_file_size_mb())
+    }
+
+    /// Set the maximum sync file size in MB
+    pub fn set_max_sync_file_size_mb(&self, size_mb: u32) -> Result<(), VoiceCoreError> {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.set_max_sync_file_size_mb(size_mb)
+            .map_err(|e| VoiceCoreError::Config {
+                msg: e.to_string(),
+            })
+    }
+
     /// Rebuild the list pane display cache for a single note
     ///
     /// The cache stores pre-computed data for the Notes List display:
