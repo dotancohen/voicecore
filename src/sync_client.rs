@@ -115,6 +115,7 @@ struct FullSyncResponse {
     audio_files: Option<Vec<serde_json::Value>>,
     note_attachments: Option<Vec<serde_json::Value>>,
     transcriptions: Option<Vec<serde_json::Value>>,
+    file_storage_config: Option<serde_json::Value>,
     device_id: String,
     device_name: Option<String>,
     timestamp: i64,
@@ -733,6 +734,7 @@ impl SyncClient {
                 "audio_file" => self.apply_audio_file_change(&db, change),
                 "note_attachment" => self.apply_note_attachment_change(&db, change),
                 "transcription" => self.apply_transcription_change(&db, change),
+                "file_storage_config" => self.apply_file_storage_config_change(&db, change),
                 _ => continue,
             };
 
@@ -1198,6 +1200,40 @@ impl SyncClient {
         Ok(true)
     }
 
+    fn apply_file_storage_config_change(
+        &self,
+        db: &Database,
+        change: &SyncChange,
+    ) -> VoiceResult<bool> {
+        let data = &change.data;
+
+        let provider = data["provider"].as_str().unwrap_or("none");
+        let config = data.get("config").and_then(|v| {
+            if v.is_null() {
+                None
+            } else {
+                Some(v.clone())
+            }
+        });
+        let modified_at = data["modified_at"].as_i64();
+        let device_id = data["device_id"].as_str();
+
+        db.apply_sync_file_storage_config(
+            provider,
+            config.as_ref(),
+            modified_at,
+            device_id,
+            None,  // sync_received_at - None for client-side operations
+        )?;
+
+        tracing::info!(
+            provider = provider,
+            "Applied file_storage_config from sync"
+        );
+
+        Ok(true)
+    }
+
     fn get_changes_since(&self, since: Option<i64>) -> VoiceResult<Vec<SyncChange>> {
         let db = self.db.lock().unwrap();
         let (changes, _) = db.get_changes_since(since, 10000)?;
@@ -1480,6 +1516,24 @@ impl SyncClient {
                     });
                 }
             }
+        }
+
+        // Convert file_storage_config (single entity)
+        if let Some(config) = &full_sync.file_storage_config {
+            let timestamp = config
+                .get("modified_at")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+
+            changes.push(SyncChange {
+                entity_type: "file_storage_config".to_string(),
+                entity_id: "default".to_string(),
+                operation: "update".to_string(),
+                data: config.clone(),
+                timestamp,
+                device_id: full_sync.device_id.clone(),
+                device_name: full_sync.device_name.clone(),
+            });
         }
 
         changes
@@ -2017,9 +2071,14 @@ impl SyncClient {
         };
 
         if !storage_config.is_enabled() {
-            tracing::debug!("Cloud storage not configured, skipping download");
-            return (0, Vec::new());
+            tracing::info!("Cloud storage not configured - cannot download files from cloud");
+            return (0, vec!["Cloud storage not configured. Configure S3 credentials on this device.".to_string()]);
         }
+
+        tracing::info!(
+            provider = %storage_config.provider,
+            "Cloud storage is configured, proceeding with download"
+        );
 
         if storage_config.provider != "s3" {
             return (0, vec![format!("Unsupported storage provider: {}", storage_config.provider)]);
@@ -2070,6 +2129,14 @@ impl SyncClient {
                 Err(e) => return (0, vec![format!("Failed to get audio files: {}", e)]),
             }
         };
+
+        let total_count = audio_files.len();
+        let cloud_count = audio_files.iter().filter(|f| f.storage_key.is_some()).count();
+        tracing::info!(
+            total = total_count,
+            in_cloud = cloud_count,
+            "Checking audio files for download"
+        );
 
         for audio_file in audio_files {
             // Skip files without cloud storage info
@@ -2440,6 +2507,7 @@ mod tests {
                 audio_files: None,
                 note_attachments: None,
                 transcriptions: None,
+                file_storage_config: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
                 timestamp: 1735689600, // 2025-01-01 00:00:00 UTC
@@ -2467,6 +2535,7 @@ mod tests {
                 audio_files: None,
                 note_attachments: None,
                 transcriptions: None,
+                file_storage_config: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
                 timestamp: 1735689600,
@@ -2496,6 +2565,7 @@ mod tests {
                 audio_files: Some(vec![audio_file]),
                 note_attachments: None,
                 transcriptions: None,
+                file_storage_config: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
                 timestamp: 1735689600,

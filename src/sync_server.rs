@@ -481,6 +481,7 @@ fn apply_sync_changes(
             "note_attachment" => apply_note_attachment_change(&db, change, last_sync_at, sync_received_at),
             "audio_file" => apply_audio_file_change(&db, change, last_sync_at, sync_received_at),
             "transcription" => apply_transcription_change(&db, change, last_sync_at, sync_received_at),
+            "file_storage_config" => apply_file_storage_config_change(&db, change, last_sync_at, sync_received_at),
             _ => {
                 tracing::warn!("Unknown entity type: {}", change.entity_type);
                 errors.push(format!("Unknown entity type: {}", change.entity_type));
@@ -1500,6 +1501,53 @@ fn apply_transcription_change(
     }
 }
 
+fn apply_file_storage_config_change(
+    db: &Database,
+    change: &SyncChange,
+    last_sync_at: Option<i64>,
+    sync_received_at: i64,
+) -> VoiceResult<ApplyResult> {
+    let data = &change.data;
+
+    // Determine the timestamp of this incoming change
+    let incoming_time = data["modified_at"].as_i64();
+
+    // If this change happened before or at last_sync, skip it
+    if let (Some(last), Some(incoming)) = (last_sync_at, incoming_time) {
+        if incoming <= last {
+            return Ok(ApplyResult::Skipped);
+        }
+    }
+
+    // Extract incoming data
+    let provider = data["provider"].as_str().unwrap_or("none");
+    let config = data.get("config").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            Some(v.clone())
+        }
+    });
+    let modified_at = data["modified_at"].as_i64();
+    let device_id = data["device_id"].as_str();
+
+    // Apply the config change (LWW for config - last writer wins)
+    db.apply_sync_file_storage_config(
+        provider,
+        config.as_ref(),
+        modified_at,
+        device_id,
+        Some(sync_received_at),
+    )?;
+
+    tracing::info!(
+        provider = provider,
+        "Applied file_storage_config from sync"
+    );
+
+    Ok(ApplyResult::Applied)
+}
+
 fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value> {
     let db = db.lock().unwrap();
     let conn = db.connection();
@@ -1698,6 +1746,29 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
         }));
     }
 
+    // Get file_storage_config (single row)
+    let file_storage_config: Option<serde_json::Value> = conn.query_row(
+        "SELECT provider, config, modified_at, device_id FROM file_storage_config WHERE id = 'default'",
+        [],
+        |row| {
+            let provider: String = row.get(0)?;
+            let config: Option<String> = row.get(1)?;
+            let modified_at: Option<i64> = row.get(2)?;
+            let device_id_bytes: Option<Vec<u8>> = row.get(3)?;
+            Ok((provider, config, modified_at, device_id_bytes))
+        },
+    ).ok().map(|(provider, config, modified_at, device_id_bytes)| {
+        let device_id_hex = device_id_bytes.and_then(|b| crate::validation::uuid_bytes_to_hex(&b).ok());
+        let config_val: Option<serde_json::Value> = config.and_then(|s| serde_json::from_str(&s).ok());
+        serde_json::json!({
+            "id": "default",
+            "provider": provider,
+            "config": config_val,
+            "modified_at": modified_at,
+            "device_id": device_id_hex,
+        })
+    });
+
     Ok(serde_json::json!({
         "notes": notes,
         "tags": tags,
@@ -1705,6 +1776,7 @@ fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value>
         "note_attachments": note_attachments,
         "audio_files": audio_files,
         "transcriptions": transcriptions,
+        "file_storage_config": file_storage_config,
     }))
 }
 
@@ -3367,6 +3439,7 @@ mod tests {
         "note_attachment",
         "audio_file",
         "transcription",
+        "file_storage_config",
     ];
 
     #[test]
@@ -3397,6 +3470,13 @@ mod tests {
             None,  // service_response
             None,  // state (uses default)
         ).unwrap();
+
+        // Create file_storage_config
+        let config_json = serde_json::json!({
+            "bucket": "test-bucket",
+            "region": "us-east-1",
+        });
+        db.set_file_storage_config("s3", Some(&config_json)).unwrap();
 
         // Get all changes
         let (changes, _) = db.get_changes_since(None, 1000).unwrap();

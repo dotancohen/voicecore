@@ -3116,6 +3116,78 @@ impl Database {
             }
         }
 
+        // Get file_storage_config changes
+        // This is a single-row config table that syncs S3 credentials between devices
+        let remaining = limit - changes.len() as i64;
+        if remaining > 0 {
+            let config_row: Option<(String, Option<String>, Option<i64>, Option<Vec<u8>>)> = if let Some(ts) = since_ts {
+                self.conn.query_row(
+                    r#"
+                    SELECT provider, config, modified_at, device_id
+                    FROM file_storage_config
+                    WHERE id = 'default' AND (sync_received_at >= ? OR modified_at >= ?)
+                    "#,
+                    params![ts, ts],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                        ))
+                    },
+                ).ok()
+            } else {
+                self.conn.query_row(
+                    r#"
+                    SELECT provider, config, modified_at, device_id
+                    FROM file_storage_config
+                    WHERE id = 'default'
+                    "#,
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                        ))
+                    },
+                ).ok()
+            };
+
+            if let Some((provider, config, modified_at, device_id_bytes)) = config_row {
+                let timestamp = modified_at.unwrap_or(0);
+                let device_id_hex = device_id_bytes.and_then(|b| uuid_bytes_to_hex(&b));
+
+                let mut change = HashMap::new();
+                change.insert("entity_type".to_string(), serde_json::Value::String("file_storage_config".to_string()));
+                change.insert("entity_id".to_string(), serde_json::Value::String("default".to_string()));
+                change.insert("operation".to_string(), serde_json::Value::String("update".to_string()));
+                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
+                if let Some(did) = &device_id_hex {
+                    change.insert("device_id".to_string(), serde_json::Value::String(did.clone()));
+                }
+
+                let mut data = serde_json::Map::new();
+                data.insert("id".to_string(), serde_json::Value::String("default".to_string()));
+                data.insert("provider".to_string(), serde_json::Value::String(provider));
+                data.insert("config".to_string(), config.map_or(serde_json::Value::Null, |s| {
+                    serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+                }));
+                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
+                if let Some(did) = device_id_hex {
+                    data.insert("device_id".to_string(), serde_json::Value::String(did));
+                }
+                change.insert("data".to_string(), serde_json::Value::Object(data));
+
+                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
+                    latest_timestamp = Some(timestamp);
+                }
+                changes.push(change);
+            }
+        }
+
         Ok((changes, latest_timestamp))
     }
 
