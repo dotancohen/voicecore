@@ -298,8 +298,8 @@ pub async fn upload_pending_audio_files(
             continue;
         }
 
-        // Generate storage key
-        let storage_key = generate_storage_key(prefix.as_deref(), &audio_file.id, &audio_file.filename);
+        // Generate storage key WITHOUT prefix - the S3 service adds prefix via full_key()
+        let storage_key = generate_storage_key(None, &audio_file.id, &audio_file.filename);
 
         tracing::info!(
             audio_id = %audio_file.id,

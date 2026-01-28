@@ -167,6 +167,25 @@ impl SyncClient {
         let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
 
+        // Step 0: Upload pending audio files to cloud storage FIRST
+        // This ensures storage_provider/storage_key are set in the DB before
+        // we gather local changes, so the metadata gets pushed to the server.
+        {
+            let audiofile_dir = {
+                let config = self.config.lock().unwrap();
+                config.audiofile_directory().map(std::path::PathBuf::from)
+            };
+            if let Some(dir) = audiofile_dir {
+                let (uploaded, cloud_errors) = self
+                    .upload_audio_files_to_cloud(&dir)
+                    .await;
+                if uploaded > 0 {
+                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
+                }
+                result.errors.extend(cloud_errors);
+            }
+        }
+
         // Step 1: Handshake
         let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
@@ -183,7 +202,7 @@ impl SyncClient {
         let adjusted_since = self.adjust_timestamp_for_skew(last_sync, clock_skew);
 
         // Step 1b: Gather local changes BEFORE applying pull
-        // This prevents the pull from overwriting local changes before they're pushed
+        // This now includes storage_provider/storage_key from the S3 upload in Step 0
         let local_changes_to_push = match self.get_changes_since(last_sync) {
             Ok(changes) => changes,
             Err(e) => {
@@ -193,7 +212,7 @@ impl SyncClient {
         };
 
         // Step 2: Pull changes
-        let pulled_changes = match self.pull_changes(peer_url, adjusted_since).await {
+        let _pulled_changes = match self.pull_changes(peer_url, adjusted_since).await {
             Ok((applied, conflicts, changes, errors)) => {
                 result.pulled = applied;
                 result.conflicts += conflicts;
@@ -213,7 +232,6 @@ impl SyncClient {
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
-                // Download audio files from cloud storage (S3)
                 let (downloaded, cloud_errors) = self
                     .download_audio_files_from_cloud(&dir)
                     .await;
@@ -224,10 +242,8 @@ impl SyncClient {
             }
         }
 
-        // Step 3: Push the pre-gathered local changes
-        // We use push_changes_with_data instead of push_changes to avoid re-gathering
-        // changes after the pull may have modified local state
-        let pushed_changes = if local_changes_to_push.is_empty() {
+        // Step 3: Push the pre-gathered local changes (includes storage metadata)
+        let _pushed_changes = if local_changes_to_push.is_empty() {
             Vec::new()
         } else {
             tracing::debug!("Pushing {} changes to server...", local_changes_to_push.len());
@@ -245,24 +261,6 @@ impl SyncClient {
                 }
             }
         };
-
-        // Step 3b: Upload audio files to cloud storage if configured
-        {
-            let audiofile_dir = {
-                let config = self.config.lock().unwrap();
-                config.audiofile_directory().map(std::path::PathBuf::from)
-            };
-            if let Some(dir) = audiofile_dir {
-                // Upload pending audio files to cloud storage (S3)
-                let (uploaded, cloud_errors) = self
-                    .upload_audio_files_to_cloud(&dir)
-                    .await;
-                if uploaded > 0 {
-                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
-                }
-                result.errors.extend(cloud_errors);
-            }
-        }
 
         // Update last sync time
         if let Err(e) = self.update_peer_sync_time(peer_id) {
@@ -359,14 +357,32 @@ impl SyncClient {
         let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
 
+        // Step 0: Upload pending audio files to cloud storage FIRST
+        // This ensures storage_provider/storage_key are included in the push
+        {
+            let audiofile_dir = {
+                let config = self.config.lock().unwrap();
+                config.audiofile_directory().map(std::path::PathBuf::from)
+            };
+            if let Some(dir) = audiofile_dir {
+                let (uploaded, cloud_errors) = self
+                    .upload_audio_files_to_cloud(&dir)
+                    .await;
+                if uploaded > 0 {
+                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
+                }
+                result.errors.extend(cloud_errors);
+            }
+        }
+
         // Handshake
         let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
 
-        // Push
-        let pushed_changes = match self
+        // Push (now includes storage metadata from Step 0)
+        let _pushed_changes = match self
             .push_changes(peer_url, handshake.last_sync_timestamp)
             .await
         {
@@ -381,24 +397,6 @@ impl SyncClient {
                 Vec::new()
             }
         };
-
-        // Upload audio files to cloud storage if configured
-        if result.success {
-            let audiofile_dir = {
-                let config = self.config.lock().unwrap();
-                config.audiofile_directory().map(std::path::PathBuf::from)
-            };
-            if let Some(dir) = audiofile_dir {
-                // Upload pending audio files to cloud storage (S3)
-                let (uploaded, cloud_errors) = self
-                    .upload_audio_files_to_cloud(&dir)
-                    .await;
-                if uploaded > 0 {
-                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
-                }
-                result.errors.extend(cloud_errors);
-            }
-        }
 
         // Update last sync time
         if result.success {
@@ -472,7 +470,25 @@ impl SyncClient {
             }
         }
 
-        // Step 5: Push all local changes (with since=None to get everything)
+        // Step 5: Upload pending audio files to cloud storage FIRST
+        // This ensures storage_provider/storage_key are included in the push
+        {
+            let audiofile_dir = {
+                let config = self.config.lock().unwrap();
+                config.audiofile_directory().map(std::path::PathBuf::from)
+            };
+            if let Some(dir) = audiofile_dir {
+                let (uploaded, cloud_errors) = self
+                    .upload_audio_files_to_cloud(&dir)
+                    .await;
+                if uploaded > 0 {
+                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
+                }
+                result.errors.extend(cloud_errors);
+            }
+        }
+
+        // Step 6: Push all local changes (now includes storage metadata from Step 5)
         let pushed_changes = match self.get_changes_since(None) {
             Ok(changes) => changes,
             Err(e) => {
@@ -489,24 +505,6 @@ impl SyncClient {
                 }
                 Err(e) => {
                     result.errors.push(format!("Push failed: {}", e));
-                }
-            }
-
-            // Step 6: Upload audio files to cloud storage
-            {
-                let audiofile_dir = {
-                    let config = self.config.lock().unwrap();
-                    config.audiofile_directory().map(std::path::PathBuf::from)
-                };
-                if let Some(dir) = audiofile_dir {
-                    // Upload pending audio files to cloud storage (S3)
-                    let (uploaded, cloud_errors) = self
-                        .upload_audio_files_to_cloud(&dir)
-                        .await;
-                    if uploaded > 0 {
-                        tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
-                    }
-                    result.errors.extend(cloud_errors);
                 }
             }
         }

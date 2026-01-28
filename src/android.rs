@@ -1284,4 +1284,122 @@ impl VoiceClient {
                 msg: e.to_string(),
             })
     }
+
+    // =========================================================================
+    // Cloud Storage Download Methods
+    // =========================================================================
+
+    /// Download missing audio files from cloud storage.
+    ///
+    /// This downloads all audio files that:
+    /// - Have storage_provider and storage_key set (uploaded to cloud)
+    /// - Don't exist locally in the audiofile directory
+    ///
+    /// # Returns
+    /// DownloadResultData with count of downloaded files and any errors
+    pub fn download_missing_audio_files(&self) -> Result<DownloadResultData, VoiceCoreError> {
+        #[cfg(feature = "file-storage")]
+        {
+            // Get audiofile directory
+            let audiofile_dir = {
+                let cfg = self.config.lock().unwrap();
+                cfg.audiofile_directory().map(|s| s.to_string())
+            };
+
+            let audiofile_dir = match audiofile_dir {
+                Some(d) => std::path::PathBuf::from(d),
+                None => {
+                    return Err(VoiceCoreError::Config {
+                        msg: "Audio file directory not configured".to_string(),
+                    });
+                }
+            };
+
+            // Create sync client
+            let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+
+            // Run download in tokio runtime
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| VoiceCoreError::Io {
+                    msg: format!("Failed to create runtime: {}", e),
+                })?;
+
+            let (downloaded, errors) = rt.block_on(async {
+                sync_client.download_audio_files_from_cloud(&audiofile_dir).await
+            });
+
+            Ok(DownloadResultData {
+                downloaded: downloaded as i32,
+                errors,
+            })
+        }
+
+        #[cfg(not(feature = "file-storage"))]
+        {
+            Ok(DownloadResultData {
+                downloaded: 0,
+                errors: vec!["File storage feature not enabled".to_string()],
+            })
+        }
+    }
+
+    /// Check if an audio file exists locally.
+    ///
+    /// Returns true if the file exists in the audiofile directory.
+    pub fn audio_file_exists_locally(&self, audio_file_id: String) -> Result<bool, VoiceCoreError> {
+        // Get audio file to determine extension
+        let audio_file = {
+            let db = self.db.lock().unwrap();
+            db.get_audio_file(&audio_file_id)?
+        };
+
+        let audio_file = match audio_file {
+            Some(a) => a,
+            None => return Ok(false),
+        };
+
+        // Get audiofile directory
+        let audiofile_dir = {
+            let cfg = self.config.lock().unwrap();
+            cfg.audiofile_directory().map(|s| s.to_string())
+        };
+
+        let audiofile_dir = match audiofile_dir {
+            Some(d) => d,
+            None => return Ok(false),
+        };
+
+        // Determine extension from filename
+        let ext = audio_file
+            .filename
+            .rsplit('.')
+            .next()
+            .unwrap_or("bin");
+
+        let path = std::path::Path::new(&audiofile_dir).join(format!("{}.{}", audio_file_id, ext));
+        Ok(path.exists())
+    }
+
+    /// Check if an audio file is available in cloud storage.
+    ///
+    /// Returns true if storage_provider and storage_key are set.
+    pub fn audio_file_in_cloud(&self, audio_file_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let audio_file = db.get_audio_file(&audio_file_id)?;
+
+        Ok(audio_file
+            .map(|a| a.storage_provider.is_some() && a.storage_key.is_some())
+            .unwrap_or(false))
+    }
+}
+
+/// Result of downloading audio files from cloud storage
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DownloadResultData {
+    /// Number of files successfully downloaded
+    pub downloaded: i32,
+    /// Error messages for any failed downloads
+    pub errors: Vec<String>,
 }
