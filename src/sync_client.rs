@@ -206,24 +206,21 @@ impl SyncClient {
             }
         };
 
-        // Step 2b: Download audio files if audiofile_directory is configured
+        // Step 2b: Download audio files from cloud storage if configured
         {
             let audiofile_dir = {
                 let config = self.config.lock().unwrap();
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
-                // Download audio files from pulled changes
-                let audio_errors = self
-                    .sync_audio_files_after_pull(peer_url, &pulled_changes, &dir)
+                // Download audio files from cloud storage (S3)
+                let (downloaded, cloud_errors) = self
+                    .download_audio_files_from_cloud(&dir)
                     .await;
-                result.errors.extend(audio_errors);
-
-                // Also download any missing audio files (handles failed previous downloads)
-                let missing_errors = self
-                    .download_missing_audio_files(peer_url, &dir)
-                    .await;
-                result.errors.extend(missing_errors);
+                if downloaded > 0 {
+                    tracing::info!("Downloaded {} audio files from cloud storage", downloaded);
+                }
+                result.errors.extend(cloud_errors);
             }
         }
 
@@ -249,17 +246,21 @@ impl SyncClient {
             }
         };
 
-        // Step 3b: Upload audio files if audiofile_directory is configured
+        // Step 3b: Upload audio files to cloud storage if configured
         {
             let audiofile_dir = {
                 let config = self.config.lock().unwrap();
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
-                let upload_errors = self
-                    .sync_audio_files_after_push(peer_url, &pushed_changes, &dir)
+                // Upload pending audio files to cloud storage (S3)
+                let (uploaded, cloud_errors) = self
+                    .upload_audio_files_to_cloud(&dir)
                     .await;
-                result.errors.extend(upload_errors);
+                if uploaded > 0 {
+                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
+                }
+                result.errors.extend(cloud_errors);
             }
         }
 
@@ -314,24 +315,21 @@ impl SyncClient {
             }
         };
 
-        // Download audio files if audiofile_directory is configured
+        // Download audio files from cloud storage if configured
         if result.success {
             let audiofile_dir = {
                 let config = self.config.lock().unwrap();
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
-                // Download audio files from pulled changes
-                let audio_errors = self
-                    .sync_audio_files_after_pull(&peer.peer_url, &pulled_changes, &dir)
+                // Download audio files from cloud storage (S3)
+                let (downloaded, cloud_errors) = self
+                    .download_audio_files_from_cloud(&dir)
                     .await;
-                result.errors.extend(audio_errors);
-
-                // Also download any missing audio files (handles failed previous downloads)
-                let missing_errors = self
-                    .download_missing_audio_files(&peer.peer_url, &dir)
-                    .await;
-                result.errors.extend(missing_errors);
+                if downloaded > 0 {
+                    tracing::info!("Downloaded {} audio files from cloud storage", downloaded);
+                }
+                result.errors.extend(cloud_errors);
             }
         }
 
@@ -384,17 +382,21 @@ impl SyncClient {
             }
         };
 
-        // Upload audio files if audiofile_directory is configured
+        // Upload audio files to cloud storage if configured
         if result.success {
             let audiofile_dir = {
                 let config = self.config.lock().unwrap();
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
-                let upload_errors = self
-                    .sync_audio_files_after_push(&peer.peer_url, &pushed_changes, &dir)
+                // Upload pending audio files to cloud storage (S3)
+                let (uploaded, cloud_errors) = self
+                    .upload_audio_files_to_cloud(&dir)
                     .await;
-                result.errors.extend(upload_errors);
+                if uploaded > 0 {
+                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
+                }
+                result.errors.extend(cloud_errors);
             }
         }
 
@@ -452,24 +454,21 @@ impl SyncClient {
             }
         }
 
-        // Step 4: Download audio files
+        // Step 4: Download audio files from cloud storage
         {
             let audiofile_dir = {
                 let config = self.config.lock().unwrap();
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
-                // Download audio files from pulled changes
-                let audio_errors = self
-                    .sync_audio_files_after_pull(peer_url, &pulled_changes, &dir)
+                // Download audio files from cloud storage (S3)
+                let (downloaded, cloud_errors) = self
+                    .download_audio_files_from_cloud(&dir)
                     .await;
-                result.errors.extend(audio_errors);
-
-                // Also download any missing audio files (handles failed previous downloads)
-                let missing_errors = self
-                    .download_missing_audio_files(peer_url, &dir)
-                    .await;
-                result.errors.extend(missing_errors);
+                if downloaded > 0 {
+                    tracing::info!("Downloaded {} audio files from cloud storage", downloaded);
+                }
+                result.errors.extend(cloud_errors);
             }
         }
 
@@ -493,17 +492,21 @@ impl SyncClient {
                 }
             }
 
-            // Step 6: Upload audio files
+            // Step 6: Upload audio files to cloud storage
             {
                 let audiofile_dir = {
                     let config = self.config.lock().unwrap();
                     config.audiofile_directory().map(std::path::PathBuf::from)
                 };
                 if let Some(dir) = audiofile_dir {
-                    let upload_errors = self
-                        .sync_audio_files_after_push(peer_url, &pushed_changes, &dir)
+                    // Upload pending audio files to cloud storage (S3)
+                    let (uploaded, cloud_errors) = self
+                        .upload_audio_files_to_cloud(&dir)
                         .await;
-                    result.errors.extend(upload_errors);
+                    if uploaded > 0 {
+                        tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
+                    }
+                    result.errors.extend(cloud_errors);
                 }
             }
         }
@@ -1921,6 +1924,244 @@ impl SyncClient {
         }
 
         errors
+    }
+
+    /// Upload pending audio files to cloud storage (S3).
+    ///
+    /// This is called during sync to upload any local files that haven't been
+    /// uploaded to cloud storage yet. Files are identified by having
+    /// storage_provider = NULL in the database.
+    ///
+    /// # Arguments
+    /// * `audiofile_directory` - Directory where audio files are stored locally
+    ///
+    /// # Returns
+    /// Tuple of (uploaded_count, error_messages)
+    #[cfg(feature = "file-storage")]
+    pub async fn upload_audio_files_to_cloud(
+        &self,
+        audiofile_directory: &std::path::Path,
+    ) -> (usize, Vec<String>) {
+        use crate::file_storage::{upload_pending_audio_files, FileStorageError};
+
+        // Check if cloud storage is configured
+        let is_enabled = {
+            let db = match self.db.lock() {
+                Ok(db) => db,
+                Err(_) => return (0, vec!["Failed to lock database".to_string()]),
+            };
+            match db.get_file_storage_config_struct() {
+                Ok(config) => config.is_enabled(),
+                Err(_) => false,
+            }
+        };
+
+        if !is_enabled {
+            tracing::debug!("Cloud storage not configured, skipping upload");
+            return (0, Vec::new());
+        }
+
+        // Use the file_storage module's upload function
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return (0, vec!["Failed to lock database".to_string()]),
+        };
+
+        match upload_pending_audio_files(&db, audiofile_directory).await {
+            Ok(result) => {
+                if result.uploaded > 0 {
+                    tracing::info!("Uploaded {} audio files to cloud storage", result.uploaded);
+                }
+                if result.failed > 0 {
+                    tracing::warn!("Failed to upload {} audio files to cloud storage", result.failed);
+                }
+                (result.uploaded, result.errors)
+            }
+            Err(e) => {
+                let msg = format!("Cloud storage upload failed: {}", e);
+                tracing::error!("{}", msg);
+                (0, vec![msg])
+            }
+        }
+    }
+
+    /// Download audio files from cloud storage (S3) that are missing locally.
+    ///
+    /// This is called during sync to download files that exist in the database
+    /// (with storage_provider set) but don't exist locally.
+    ///
+    /// # Arguments
+    /// * `audiofile_directory` - Directory to save audio files
+    ///
+    /// # Returns
+    /// Tuple of (downloaded_count, error_messages)
+    #[cfg(feature = "file-storage")]
+    pub async fn download_audio_files_from_cloud(
+        &self,
+        audiofile_directory: &std::path::Path,
+    ) -> (usize, Vec<String>) {
+        use crate::file_storage_s3::{S3Config, S3StorageService};
+        use crate::file_storage::FileStorageService;
+
+        let mut downloaded = 0;
+        let mut errors = Vec::new();
+
+        // Get storage config
+        let storage_config = {
+            let db = match self.db.lock() {
+                Ok(db) => db,
+                Err(_) => return (0, vec!["Failed to lock database".to_string()]),
+            };
+            match db.get_file_storage_config_struct() {
+                Ok(config) => config,
+                Err(e) => return (0, vec![format!("Failed to get storage config: {}", e)]),
+            }
+        };
+
+        if !storage_config.is_enabled() {
+            tracing::debug!("Cloud storage not configured, skipping download");
+            return (0, Vec::new());
+        }
+
+        if storage_config.provider != "s3" {
+            return (0, vec![format!("Unsupported storage provider: {}", storage_config.provider)]);
+        }
+
+        // Create S3 service
+        let bucket = match storage_config.s3_bucket() {
+            Some(b) => b.to_string(),
+            None => return (0, vec!["S3 bucket not configured".to_string()]),
+        };
+        let region = match storage_config.s3_region() {
+            Some(r) => r.to_string(),
+            None => return (0, vec!["S3 region not configured".to_string()]),
+        };
+        let access_key_id = match storage_config.s3_access_key_id() {
+            Some(k) => k.to_string(),
+            None => return (0, vec!["S3 access_key_id not configured".to_string()]),
+        };
+        let secret_access_key = match storage_config.s3_secret_access_key() {
+            Some(k) => k.to_string(),
+            None => return (0, vec!["S3 secret_access_key not configured".to_string()]),
+        };
+        let prefix = storage_config.s3_prefix().map(String::from);
+        let endpoint = storage_config.s3_endpoint().map(String::from);
+
+        let s3_config = S3Config {
+            bucket,
+            region,
+            access_key_id,
+            secret_access_key,
+            prefix: prefix.clone(),
+            endpoint,
+        };
+
+        let storage = match S3StorageService::new(s3_config) {
+            Ok(s) => s,
+            Err(e) => return (0, vec![format!("Failed to create S3 service: {}", e)]),
+        };
+
+        // Get audio files that have cloud storage info but are missing locally
+        let audio_files = {
+            let db = match self.db.lock() {
+                Ok(db) => db,
+                Err(_) => return (0, vec!["Failed to lock database".to_string()]),
+            };
+            match db.get_all_audio_files() {
+                Ok(files) => files,
+                Err(e) => return (0, vec![format!("Failed to get audio files: {}", e)]),
+            }
+        };
+
+        for audio_file in audio_files {
+            // Skip files without cloud storage info
+            let storage_key = match &audio_file.storage_key {
+                Some(key) => key.clone(),
+                None => continue,
+            };
+
+            // Skip files that already exist locally
+            let ext = audio_file.filename.rsplit('.').next().unwrap_or("bin");
+            let local_path = audiofile_directory.join(format!("{}.{}", audio_file.id, ext));
+            if local_path.exists() {
+                continue;
+            }
+
+            tracing::info!(
+                audio_id = %audio_file.id,
+                storage_key = %storage_key,
+                "Downloading audio file from cloud storage"
+            );
+
+            // Get pre-signed download URL
+            let download_url = match storage.get_download_url(&storage_key).await {
+                Ok(url) => url,
+                Err(e) => {
+                    errors.push(format!("Failed to get download URL for {}: {}", audio_file.id, e));
+                    continue;
+                }
+            };
+
+            // Download the file
+            let client = reqwest::Client::new();
+            let response = match client.get(&download_url.url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    errors.push(format!("Failed to download {}: {}", audio_file.id, e));
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                errors.push(format!(
+                    "Download failed for {}: HTTP {}",
+                    audio_file.id,
+                    response.status()
+                ));
+                continue;
+            }
+
+            let bytes = match response.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    errors.push(format!("Failed to read download response for {}: {}", audio_file.id, e));
+                    continue;
+                }
+            };
+
+            // Save to local file
+            if let Err(e) = tokio::fs::write(&local_path, &bytes).await {
+                errors.push(format!("Failed to save {} to {}: {}", audio_file.id, local_path.display(), e));
+                continue;
+            }
+
+            tracing::info!(
+                audio_id = %audio_file.id,
+                size_bytes = bytes.len(),
+                "Downloaded audio file from cloud storage"
+            );
+            downloaded += 1;
+        }
+
+        (downloaded, errors)
+    }
+
+    /// Stub for when file-storage feature is not enabled
+    #[cfg(not(feature = "file-storage"))]
+    pub async fn upload_audio_files_to_cloud(
+        &self,
+        _audiofile_directory: &std::path::Path,
+    ) -> (usize, Vec<String>) {
+        (0, Vec::new())
+    }
+
+    /// Stub for when file-storage feature is not enabled
+    #[cfg(not(feature = "file-storage"))]
+    pub async fn download_audio_files_from_cloud(
+        &self,
+        _audiofile_directory: &std::path::Path,
+    ) -> (usize, Vec<String>) {
+        (0, Vec::new())
     }
 }
 
