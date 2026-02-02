@@ -22,8 +22,10 @@ pub mod database;
 pub mod error;
 #[cfg(feature = "file-storage")]
 pub mod file_storage;
-#[cfg(feature = "file-storage")]
+#[cfg(all(feature = "file-storage", not(target_os = "android")))]
 pub mod file_storage_s3;
+#[cfg(all(feature = "file-storage", target_os = "android"))]
+pub mod file_storage_aws;
 pub mod merge;
 pub mod models;
 pub mod search;
@@ -57,8 +59,10 @@ pub use models::{
 pub use file_storage::{
     generate_storage_key, DownloadUrl, FileStorageError, FileStorageService, UploadResult,
 };
-#[cfg(feature = "file-storage")]
+#[cfg(all(feature = "file-storage", not(target_os = "android")))]
 pub use file_storage_s3::S3StorageService;
+#[cfg(all(feature = "file-storage", target_os = "android"))]
+pub use file_storage_aws::S3StorageService;
 
 // Re-export Android types when uniffi feature is enabled
 #[cfg(feature = "uniffi")]

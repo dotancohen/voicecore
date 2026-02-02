@@ -214,7 +214,10 @@ pub async fn upload_pending_audio_files(
     db: &crate::database::Database,
     audiofile_directory: &Path,
 ) -> Result<UploadPendingResult, FileStorageError> {
+    #[cfg(not(target_os = "android"))]
     use crate::file_storage_s3::{S3Config, S3StorageService};
+    #[cfg(target_os = "android")]
+    use crate::file_storage_aws::{S3Config, S3StorageService};
 
     // Get file storage config from database
     let storage_config = db

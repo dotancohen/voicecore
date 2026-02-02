@@ -2052,7 +2052,10 @@ impl SyncClient {
         &self,
         audiofile_directory: &std::path::Path,
     ) -> (usize, Vec<String>) {
+        #[cfg(not(target_os = "android"))]
         use crate::file_storage_s3::{S3Config, S3StorageService};
+        #[cfg(target_os = "android")]
+        use crate::file_storage_aws::{S3Config, S3StorageService};
         use crate::file_storage::FileStorageService;
 
         let mut downloaded = 0;
@@ -2167,9 +2170,8 @@ impl SyncClient {
                 }
             };
 
-            // Download the file
-            let client = reqwest::Client::new();
-            let response = match client.get(&download_url.url).send().await {
+            // Download the file using the existing client (properly configured for Android TLS)
+            let response = match self.client.get(&download_url.url).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     errors.push(format!("Failed to download {}: {}", audio_file.id, e));

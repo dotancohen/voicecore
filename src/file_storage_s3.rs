@@ -92,6 +92,14 @@ impl S3StorageService {
             bucket = bucket.with_path_style();
         }
 
+        tracing::info!(
+            bucket = %config.bucket,
+            region = %config.region,
+            prefix = ?config.prefix,
+            has_endpoint = config.endpoint.is_some(),
+            "Created S3 storage service"
+        );
+
         Ok(Self {
             bucket,
             prefix: config.prefix,
@@ -129,11 +137,26 @@ impl FileStorageService for S3StorageService {
         let full_key = self.full_key(remote_key);
 
         // Upload to S3
+        tracing::info!(
+            key = %full_key,
+            bucket = %self.bucket.name(),
+            size_bytes = size_bytes,
+            "Attempting S3 upload..."
+        );
+
         let response = self
             .bucket
             .put_object(&full_key, &data)
             .await
-            .map_err(|e| FileStorageError::Upload(format!("S3 upload failed: {}", e)))?;
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    key = %full_key,
+                    bucket = %self.bucket.name(),
+                    "S3 upload failed"
+                );
+                FileStorageError::Upload(format!("S3 upload failed: {}", e))
+            })?;
 
         if response.status_code() != 200 {
             return Err(FileStorageError::Upload(format!(
@@ -160,11 +183,24 @@ impl FileStorageService for S3StorageService {
         // Pre-signed URLs are valid for 1 hour (3600 seconds)
         let expiry_secs = 3600u32;
 
+        tracing::info!(
+            key = %storage_key,
+            bucket = %self.bucket.name(),
+            "Generating pre-signed download URL..."
+        );
+
         let url = self
             .bucket
             .presign_get(storage_key, expiry_secs, None)
             .await
-            .map_err(|e| FileStorageError::DownloadUrl(format!("Failed to generate URL: {}", e)))?;
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    key = %storage_key,
+                    "Failed to generate pre-signed URL"
+                );
+                FileStorageError::DownloadUrl(format!("Failed to generate URL: {}", e))
+            })?;
 
         let expires_at = chrono::Utc::now().timestamp() + i64::from(expiry_secs);
 
