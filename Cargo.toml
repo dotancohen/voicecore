@@ -21,15 +21,14 @@ desktop = ["dep:hostname", "dep:dirs"]
 uniffi = ["dep:uniffi"]
 # Cloud file storage (S3, Backblaze B2, etc.)
 # Using rust-s3 instead of aws-sdk-s3 for much faster compilation and smaller binary
-file-storage = ["dep:rust-s3"]
+# Note: rust-s3 used on desktop, aws-sdk-s3 on Android (target-specific)
+file-storage = []
 
 [dependencies]
+android_logger = "0.14" # Logging experiment
+
 # Async runtime - use lighter features for mobile
 tokio = { version = "1.42", features = ["rt", "sync", "time", "macros", "fs"] }
-
-# Cloud storage (optional - for file_storage feature)
-# rust-s3 is much lighter than aws-sdk-s3 (~15 deps vs ~150+)
-rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"], optional = true }
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled", "blob"] }
@@ -104,8 +103,11 @@ uniffi = { version = "0.28", features = ["build"] }
 [target.'cfg(not(target_os = "android"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 
-# Android: use ring (better cross-compilation support)
+# Android: use ring + AWS SDK (better TLS handling than rust-s3)
 [target.'cfg(target_os = "android")'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+aws-sdk-s3 = "1.65"
+aws-config = "1.5"
