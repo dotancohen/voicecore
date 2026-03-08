@@ -717,6 +717,35 @@ impl VoiceClient {
         Ok(config.is_enabled())
     }
 
+    /// Download a single audio file from cloud storage on demand.
+    ///
+    /// Returns the local file path as a string on success.
+    pub fn download_audio_file_from_cloud(&self, audio_file_id: String) -> Result<String, VoiceCoreError> {
+        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+
+        let audiofile_dir = {
+            let config = self.config.lock().unwrap();
+            config.audiofile_directory()
+                .map(PathBuf::from)
+                .ok_or_else(|| VoiceCoreError::Config {
+                    msg: "Audio file directory not configured".to_string(),
+                })?
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| VoiceCoreError::Io {
+                msg: format!("Failed to create runtime: {}", e),
+            })?;
+
+        let path = rt.block_on(
+            sync_client.download_single_audio_file_from_cloud(&audio_file_id, &audiofile_dir)
+        )?;
+
+        Ok(path.to_string_lossy().to_string())
+    }
+
     /// Update a note's content
     pub fn update_note(&self, note_id: String, content: String) -> Result<bool, VoiceCoreError> {
         let db = self.db.lock().unwrap();

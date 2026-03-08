@@ -226,8 +226,9 @@ impl SyncClient {
             }
         };
 
-        // Step 2b: Download audio files from cloud storage if configured
-        {
+        // Step 2b: Download audio files from peer or cloud
+        // When cloud storage is configured, skip eager download — files are fetched on demand
+        if !self.is_cloud_storage_enabled() {
             let audiofile_dir = {
                 let config = self.config.lock().unwrap();
                 config.audiofile_directory().map(std::path::PathBuf::from)
@@ -241,6 +242,8 @@ impl SyncClient {
                 }
                 result.errors.extend(cloud_errors);
             }
+        } else {
+            tracing::info!("Cloud storage enabled — skipping eager audio download (on-demand only)");
         }
 
         // Step 3: Push the pre-gathered local changes (includes storage metadata)
@@ -314,14 +317,13 @@ impl SyncClient {
             }
         };
 
-        // Download audio files from cloud storage if configured
-        if result.success {
+        // Download audio files — skip eager download when cloud storage is configured
+        if result.success && !self.is_cloud_storage_enabled() {
             let audiofile_dir = {
                 let config = self.config.lock().unwrap();
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
-                // Download audio files from cloud storage (S3)
                 let (downloaded, cloud_errors) = self
                     .download_audio_files_from_cloud(&dir)
                     .await;
@@ -330,6 +332,8 @@ impl SyncClient {
                 }
                 result.errors.extend(cloud_errors);
             }
+        } else if self.is_cloud_storage_enabled() {
+            tracing::info!("Cloud storage enabled — skipping eager audio download (on-demand only)");
         }
 
         // Update last sync time
@@ -453,14 +457,13 @@ impl SyncClient {
             }
         }
 
-        // Step 4: Download audio files from cloud storage
-        {
+        // Step 4: Download audio files — skip eager download when cloud storage is configured
+        if !self.is_cloud_storage_enabled() {
             let audiofile_dir = {
                 let config = self.config.lock().unwrap();
                 config.audiofile_directory().map(std::path::PathBuf::from)
             };
             if let Some(dir) = audiofile_dir {
-                // Download audio files from cloud storage (S3)
                 let (downloaded, cloud_errors) = self
                     .download_audio_files_from_cloud(&dir)
                     .await;
@@ -469,6 +472,8 @@ impl SyncClient {
                 }
                 result.errors.extend(cloud_errors);
             }
+        } else {
+            tracing::info!("Cloud storage enabled — skipping eager audio download (on-demand only)");
         }
 
         // Step 5: Upload pending audio files to cloud storage FIRST
@@ -1978,6 +1983,18 @@ impl SyncClient {
         errors
     }
 
+    /// Check if cloud storage (S3) is enabled in the file_storage_config.
+    pub fn is_cloud_storage_enabled(&self) -> bool {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+        match db.get_file_storage_config_struct() {
+            Ok(config) => config.is_enabled(),
+            Err(_) => false,
+        }
+    }
+
     /// Upload pending audio files to cloud storage (S3).
     ///
     /// This is called during sync to upload any local files that haven't been
@@ -1994,7 +2011,7 @@ impl SyncClient {
         &self,
         audiofile_directory: &std::path::Path,
     ) -> (usize, Vec<String>) {
-        use crate::file_storage::{upload_pending_audio_files, FileStorageError};
+        use crate::cloud_storage::{upload_pending_audio_files, FileStorageError};
 
         // Check if cloud storage is configured
         let is_enabled = {
@@ -2052,8 +2069,8 @@ impl SyncClient {
         &self,
         audiofile_directory: &std::path::Path,
     ) -> (usize, Vec<String>) {
-        use crate::file_storage_s3::{S3Config, S3StorageService};
-        use crate::file_storage::FileStorageService;
+        use crate::cloud_storage_s3::{S3Config, S3StorageService};
+        use crate::cloud_storage::FileStorageService;
 
         let mut downloaded = 0;
         let mut errors = Vec::new();
@@ -2209,6 +2226,147 @@ impl SyncClient {
         }
 
         (downloaded, errors)
+    }
+
+    /// Create an S3 storage service from the database config.
+    ///
+    /// Shared helper used by both bulk download and single-file download.
+    #[cfg(feature = "file-storage")]
+    fn create_s3_service(&self) -> Result<crate::cloud_storage_s3::S3StorageService, String> {
+        use crate::cloud_storage_s3::{S3Config, S3StorageService};
+
+        let storage_config = {
+            let db = self.db.lock().map_err(|_| "Failed to lock database".to_string())?;
+            db.get_file_storage_config_struct()
+                .map_err(|e| format!("Failed to get storage config: {}", e))?
+        };
+
+        if !storage_config.is_enabled() {
+            return Err("Cloud storage is not enabled".to_string());
+        }
+
+        if storage_config.provider != "s3" {
+            return Err(format!("Unsupported storage provider: {}", storage_config.provider));
+        }
+
+        let bucket = storage_config.s3_bucket()
+            .ok_or("S3 bucket not configured")?.to_string();
+        let region = storage_config.s3_region()
+            .ok_or("S3 region not configured")?.to_string();
+        let access_key_id = storage_config.s3_access_key_id()
+            .ok_or("S3 access_key_id not configured")?.to_string();
+        let secret_access_key = storage_config.s3_secret_access_key()
+            .ok_or("S3 secret_access_key not configured")?.to_string();
+        let prefix = storage_config.s3_prefix().map(String::from);
+        let endpoint = storage_config.s3_endpoint().map(String::from);
+
+        let s3_config = S3Config {
+            bucket,
+            region,
+            access_key_id,
+            secret_access_key,
+            prefix,
+            endpoint,
+        };
+
+        S3StorageService::new(s3_config)
+            .map_err(|e| format!("Failed to create S3 service: {}", e))
+    }
+
+    /// Download a single audio file from cloud storage on demand.
+    ///
+    /// Looks up the audio file in the database, checks if it already exists locally,
+    /// and if not, downloads it from S3 via a pre-signed URL.
+    ///
+    /// # Arguments
+    /// * `audio_file_id` - UUID of the audio file to download
+    /// * `audiofile_directory` - Directory where audio files are stored locally
+    ///
+    /// # Returns
+    /// Path to the local file on success
+    #[cfg(feature = "file-storage")]
+    pub async fn download_single_audio_file_from_cloud(
+        &self,
+        audio_file_id: &str,
+        audiofile_directory: &std::path::Path,
+    ) -> crate::error::VoiceResult<std::path::PathBuf> {
+        use crate::cloud_storage::FileStorageService;
+
+        // Look up the audio file in the database
+        let audio_file = {
+            let db = self.db.lock().map_err(|_| {
+                crate::error::VoiceError::DatabaseOperation("Failed to lock database".to_string())
+            })?;
+            db.get_audio_file(audio_file_id)?
+                .ok_or_else(|| crate::error::VoiceError::NotFound(
+                    format!("Audio file not found: {}", audio_file_id)
+                ))?
+        };
+
+        // Determine local path
+        let ext = audio_file.filename.rsplit('.').next().unwrap_or("bin");
+        let local_path = audiofile_directory.join(format!("{}.{}", audio_file.id, ext));
+
+        // Return immediately if the file already exists locally
+        if local_path.exists() {
+            tracing::debug!(audio_id = %audio_file_id, "Audio file already exists locally");
+            return Ok(local_path);
+        }
+
+        // Get storage key
+        let storage_key = audio_file.storage_key.as_ref().ok_or_else(|| {
+            crate::error::VoiceError::NotFound(format!(
+                "Audio file {} has no cloud storage key", audio_file_id
+            ))
+        })?;
+
+        tracing::info!(
+            audio_id = %audio_file_id,
+            storage_key = %storage_key,
+            "Downloading single audio file from cloud storage on demand"
+        );
+
+        // Create S3 service
+        let storage = self.create_s3_service().map_err(|e| {
+            crate::error::VoiceError::Sync(format!("Cloud storage error: {}", e))
+        })?;
+
+        // Get pre-signed download URL
+        let download_url = storage.get_download_url(storage_key).await.map_err(|e| {
+            crate::error::VoiceError::Sync(format!("Failed to get download URL: {}", e))
+        })?;
+
+        // Download the file
+        let client = reqwest::Client::new();
+        let response = client.get(&download_url.url).send().await.map_err(|e| {
+            crate::error::VoiceError::Sync(format!("Download failed: {}", e))
+        })?;
+
+        if !response.status().is_success() {
+            return Err(crate::error::VoiceError::Sync(format!(
+                "Download failed: HTTP {}", response.status()
+            )));
+        }
+
+        let bytes = response.bytes().await.map_err(|e| {
+            crate::error::VoiceError::Sync(format!("Failed to read download: {}", e))
+        })?;
+
+        // Save to local file
+        tokio::fs::write(&local_path, &bytes).await.map_err(|e| {
+            crate::error::VoiceError::Sync(format!(
+                "Failed to save to {}: {}", local_path.display(), e
+            ))
+        })?;
+
+        tracing::info!(
+            audio_id = %audio_file_id,
+            size_bytes = bytes.len(),
+            path = %local_path.display(),
+            "Downloaded audio file from cloud storage on demand"
+        );
+
+        Ok(local_path)
     }
 
     /// Stub for when file-storage feature is not enabled

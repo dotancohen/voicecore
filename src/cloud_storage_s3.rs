@@ -15,7 +15,7 @@ use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
 
-use crate::file_storage::{DownloadUrl, FileStorageError, FileStorageService, UploadResult};
+use crate::cloud_storage::{DownloadUrl, FileStorageError, FileStorageService, UploadResult};
 
 /// Configuration for S3 storage service.
 #[derive(Debug, Clone)]

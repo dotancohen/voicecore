@@ -82,7 +82,7 @@ impl From<std::io::Error> for FileStorageError {
 /// # Example
 ///
 /// ```ignore
-/// use voicecore::file_storage::{FileStorageService, UploadResult};
+/// use voicecore::cloud_storage::{FileStorageService, UploadResult};
 ///
 /// async fn upload_audio(storage: &dyn FileStorageService) -> Result<UploadResult, FileStorageError> {
 ///     storage.upload("/path/to/audio.mp3", "audio/019abc123.mp3").await
@@ -214,7 +214,7 @@ pub async fn upload_pending_audio_files(
     db: &crate::database::Database,
     audiofile_directory: &Path,
 ) -> Result<UploadPendingResult, FileStorageError> {
-    use crate::file_storage_s3::{S3Config, S3StorageService};
+    use crate::cloud_storage_s3::{S3Config, S3StorageService};
 
     // Get file storage config from database
     let storage_config = db

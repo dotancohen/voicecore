@@ -29,7 +29,7 @@ tokio = { version = "1.42", features = ["rt", "sync", "time", "macros", "fs"] }
 
 # Cloud storage (optional - for file_storage feature)
 # rust-s3 is much lighter than aws-sdk-s3 (~15 deps vs ~150+)
-rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"], optional = true }
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"], optional = true }
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled", "blob"] }

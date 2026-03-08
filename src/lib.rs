@@ -21,9 +21,9 @@ pub mod conflicts;
 pub mod database;
 pub mod error;
 #[cfg(feature = "file-storage")]
-pub mod file_storage;
+pub mod cloud_storage;
 #[cfg(feature = "file-storage")]
-pub mod file_storage_s3;
+pub mod cloud_storage_s3;
 pub mod merge;
 pub mod models;
 pub mod search;
@@ -54,11 +54,11 @@ pub use models::{
 
 // Re-export file storage types when feature is enabled
 #[cfg(feature = "file-storage")]
-pub use file_storage::{
+pub use cloud_storage::{
     generate_storage_key, DownloadUrl, FileStorageError, FileStorageService, UploadResult,
 };
 #[cfg(feature = "file-storage")]
-pub use file_storage_s3::S3StorageService;
+pub use cloud_storage_s3::S3StorageService;
 
 // Re-export Android types when uniffi feature is enabled
 #[cfg(feature = "uniffi")]
