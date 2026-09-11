@@ -11,6 +11,35 @@ use uuid::Uuid;
 /// Supported audio file formats for import.
 pub const AUDIO_FILE_FORMATS: &[&str] = &["mp3", "wav", "flac", "ogg", "opus", "m4a"];
 
+/// Extension used on disk and in cloud storage when a filename has no extension.
+pub const AUDIO_FILE_DEFAULT_EXTENSION: &str = "bin";
+
+/// Normalised extension for an audio file's original filename.
+///
+/// Every code path that derives an on-disk or cloud object name from the
+/// original filename MUST use this function so that all platforms agree.
+/// The extension is lowercased because the Python and Android importers write
+/// the local file with a lowercase extension regardless of the original case.
+/// A filename without an extension maps to [`AUDIO_FILE_DEFAULT_EXTENSION`].
+pub fn audio_file_extension(filename: &str) -> String {
+    match filename.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && !ext.contains('/') => {
+            ext.to_ascii_lowercase()
+        }
+        _ => AUDIO_FILE_DEFAULT_EXTENSION.to_string(),
+    }
+}
+
+/// Name of an audio file on disk: `{audio_id}.{ext}`.
+pub fn audio_stored_filename(audio_id: &str, filename: &str) -> String {
+    format!("{}.{}", audio_id, audio_file_extension(filename))
+}
+
+/// Full local path of an audio file: `{audiofile_directory}/{audio_id}.{ext}`.
+pub fn audio_local_path(audiofile_directory: &std::path::Path, audio_id: &str, filename: &str) -> std::path::PathBuf {
+    audiofile_directory.join(audio_stored_filename(audio_id, filename))
+}
+
 /// Represents a note in the system.
 ///
 /// Notes contain text content and metadata about creation, modification,
@@ -315,15 +344,14 @@ impl AudioFile {
         self.device_id.simple().to_string()
     }
 
-    /// Get the file extension from the filename
-    pub fn extension(&self) -> Option<&str> {
-        self.filename.rsplit('.').next()
+    /// Get the normalised (lowercase) file extension from the filename
+    pub fn extension(&self) -> String {
+        audio_file_extension(&self.filename)
     }
 
     /// Get the stored filename (uuid.extension)
     pub fn stored_filename(&self) -> String {
-        let ext = self.extension().unwrap_or("bin");
-        format!("{}.{}", self.id_hex(), ext)
+        audio_stored_filename(&self.id_hex(), &self.filename)
     }
 
     /// Check if the audio file is deleted
@@ -573,10 +601,32 @@ mod tests {
         let device_id = Uuid::now_v7();
 
         let mp3 = AudioFile::new("test.mp3".to_string(), None, device_id);
-        assert_eq!(mp3.extension(), Some("mp3"));
+        assert_eq!(mp3.extension(), "mp3");
 
         let flac = AudioFile::new("my.recording.flac".to_string(), None, device_id);
-        assert_eq!(flac.extension(), Some("flac"));
+        assert_eq!(flac.extension(), "flac");
+
+        let upper = AudioFile::new("REC.MP3".to_string(), None, device_id);
+        assert_eq!(upper.extension(), "mp3");
+    }
+
+    #[test]
+    fn test_audio_file_extension_helper() {
+        assert_eq!(audio_file_extension("a.mp3"), "mp3");
+        assert_eq!(audio_file_extension("A.MP3"), "mp3");
+        assert_eq!(audio_file_extension("my.recording.OGG"), "ogg");
+        assert_eq!(audio_file_extension("הקלטה.M4A"), "m4a");
+        assert_eq!(audio_file_extension("noextension"), "bin");
+        assert_eq!(audio_file_extension("trailingdot."), "bin");
+        assert_eq!(audio_file_extension(".hidden"), "bin");
+        assert_eq!(audio_file_extension(""), "bin");
+    }
+
+    #[test]
+    fn test_audio_stored_filename_and_path() {
+        assert_eq!(audio_stored_filename("0123abcd", "Voice Memo.WAV"), "0123abcd.wav");
+        let p = audio_local_path(std::path::Path::new("/tmp/audio"), "0123abcd", "x.Mp3");
+        assert_eq!(p, std::path::PathBuf::from("/tmp/audio/0123abcd.mp3"));
     }
 
     #[test]

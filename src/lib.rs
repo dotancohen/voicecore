@@ -22,18 +22,25 @@ pub mod database;
 pub mod error;
 #[cfg(feature = "file-storage")]
 pub mod file_storage;
-#[cfg(all(feature = "file-storage", not(target_os = "android")))]
+#[cfg(feature = "file-storage")]
 pub mod file_storage_s3;
-#[cfg(all(feature = "file-storage", target_os = "android"))]
-pub mod file_storage_aws;
 pub mod merge;
 pub mod models;
 pub mod search;
+pub mod timezone;
+pub mod sync_apply;
 pub mod sync_client;
 #[cfg(feature = "server")]
 pub mod sync_server;
 pub mod tls;
 pub mod validation;
+pub mod versions;
+
+#[cfg(test)]
+mod convergence_tests;
+
+#[cfg(test)]
+mod timezone_tests;
 
 /// Length of short UUID display (e.g., "019b8ffd5711" instead of full 32-char UUID)
 pub const UUID_SHORT_LEN: usize = 12;
@@ -59,10 +66,8 @@ pub use models::{
 pub use file_storage::{
     generate_storage_key, DownloadUrl, FileStorageError, FileStorageService, UploadResult,
 };
-#[cfg(all(feature = "file-storage", not(target_os = "android")))]
+#[cfg(feature = "file-storage")]
 pub use file_storage_s3::S3StorageService;
-#[cfg(all(feature = "file-storage", target_os = "android"))]
-pub use file_storage_aws::S3StorageService;
 
 // Re-export Android types when uniffi feature is enabled
 #[cfg(feature = "uniffi")]

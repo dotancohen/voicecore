@@ -90,6 +90,12 @@ pub struct SyncConfig {
     /// Files larger than this will be tagged as _system/_nonsynced/_too-big
     #[serde(default = "default_max_sync_file_size_mb")]
     pub max_sync_file_size_mb: u32,
+    /// When true, every sync also downloads every audio file that is in cloud
+    /// storage but missing locally, so this installation holds a complete copy
+    /// of all media (a backup of the cloud bucket). Local-only setting, never
+    /// synced to peers; intended for desktop and server installations only.
+    #[serde(default)]
+    pub mirror_audio_files: bool,
 }
 
 fn default_server_port() -> u16 {
@@ -107,6 +113,7 @@ impl Default for SyncConfig {
             server_port: default_server_port(),
             peers: Vec::new(),
             max_sync_file_size_mb: default_max_sync_file_size_mb(),
+            mirror_audio_files: false,
         }
     }
 }
@@ -343,6 +350,13 @@ impl Config {
             config.save()?;
         }
 
+        // Every version this process writes carries the device identity from
+        // the config, so a conflict can name the devices that disagreed.
+        if let Ok(uuid) = config.device_id() {
+            crate::database::set_local_device_id(uuid);
+        }
+        crate::database::set_local_device_name(config.device_name());
+
         Ok(config)
     }
 
@@ -382,6 +396,7 @@ impl Config {
     /// Set the device name
     pub fn set_device_name(&mut self, name: &str) -> VoiceResult<()> {
         self.data.device_name = name.to_string();
+        crate::database::set_local_device_name(name);
         self.save()
     }
 
@@ -425,6 +440,17 @@ impl Config {
     /// Set the maximum sync file size in MB
     pub fn set_max_sync_file_size_mb(&mut self, size_mb: u32) -> VoiceResult<()> {
         self.data.sync.max_sync_file_size_mb = size_mb;
+        self.save()
+    }
+
+    /// Whether this installation mirrors every cloud audio file locally on sync
+    pub fn mirror_audio_files(&self) -> bool {
+        self.data.sync.mirror_audio_files
+    }
+
+    /// Enable or disable mirroring of all cloud audio files on sync
+    pub fn set_mirror_audio_files(&mut self, enabled: bool) -> VoiceResult<()> {
+        self.data.sync.mirror_audio_files = enabled;
         self.save()
     }
 
@@ -830,6 +856,20 @@ mod tests {
                     .as_str().unwrap(),
                 "/models/whisper.bin"
             );
+        }
+    }
+
+    #[test]
+    fn test_mirror_audio_files_default_and_persistence() {
+        let temp_dir = TempDir::new().unwrap();
+        {
+            let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            assert!(!config.mirror_audio_files());
+            config.set_mirror_audio_files(true).unwrap();
+        }
+        {
+            let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            assert!(config.mirror_audio_files());
         }
     }
 

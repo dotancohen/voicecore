@@ -150,9 +150,14 @@ pub fn diff3_merge(base: &str, local: &str, remote: &str) -> MergeResult {
         return MergeResult::clean(local.to_string());
     }
 
-    // Both changed - need to do actual 3-way merge
-    // For now, use simple merge with conflict markers
-    merge_content(local, remote, "LOCAL", "REMOTE")
+    // Both changed: real three-way merge (clean when the edits do not overlap)
+    let merged = crate::versions::three_way_text_merge(base, local, remote);
+    if merged.conflict_kind.is_none() {
+        MergeResult::clean(merged.content)
+    } else {
+        let count = merged.content.matches("<<<<<<< ").count();
+        MergeResult::conflicted(merged.content, count.max(1))
+    }
 }
 
 /// Attempt automatic merge if possible.

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::database::Database;
 use crate::error::{VoiceError, VoiceResult};
-use crate::models::SyncChange;
+use crate::models::{audio_local_path, SyncChange};
 use crate::UUID_SHORT_LEN;
 
 /// Result of a sync operation
@@ -29,7 +29,11 @@ pub struct SyncResult {
     pub pulled: i64,
     pub pushed: i64,
     pub conflicts: i64,
+    /// Problems that made the sync incomplete or wrong (metadata level).
     pub errors: Vec<String>,
+    /// Problems that did not affect the metadata sync, e.g. a cloud storage
+    /// upload that could not be completed and will be retried next time.
+    pub warnings: Vec<String>,
 }
 
 impl SyncResult {
@@ -77,14 +81,27 @@ struct HandshakeResponse {
     server_timestamp: Option<i64>,
     #[serde(default)]
     supports_audiofiles: bool,
+    /// Identity of the peer's database; a change voids our cursors
+    #[serde(default)]
+    database_id: Option<String>,
+    /// End of the peer's feed at handshake time
+    #[serde(default)]
+    cursor: Option<i64>,
 }
 
 /// Sync batch response
 #[derive(Debug, Deserialize)]
 struct SyncBatchResponse {
     changes: Vec<SyncChange>,
+    #[allow(dead_code)]
     from_timestamp: Option<i64>,
+    #[allow(dead_code)]
     to_timestamp: Option<i64>,
+    #[serde(default)]
+    next_cursor: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    database_id: Option<String>,
     device_id: String,
     device_name: Option<String>,
     is_complete: bool,
@@ -106,7 +123,9 @@ struct ApplyResponse {
     errors: Vec<String>,
 }
 
-/// Full sync response (complete dataset from peer)
+/// Full sync response (complete dataset from peer). Kept for tools; the
+/// client now pages the cursor feed from zero instead (see initial_sync).
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct FullSyncResponse {
     notes: Vec<serde_json::Value>,
@@ -116,9 +135,39 @@ struct FullSyncResponse {
     note_attachments: Option<Vec<serde_json::Value>>,
     transcriptions: Option<Vec<serde_json::Value>>,
     file_storage_config: Option<serde_json::Value>,
+    field_versions: Option<Vec<serde_json::Value>>,
     device_id: String,
     device_name: Option<String>,
     timestamp: i64,
+    #[serde(default)]
+    cursor: Option<i64>,
+    #[serde(default)]
+    database_id: Option<String>,
+}
+
+/// Page size for the cursor feed, in both directions. Pages are fetched
+/// until the peer reports the feed complete, so this only bounds one request.
+const PULL_LIMIT: i64 = 10000;
+
+/// Safety cap on pages per direction per sync (10000 * 1000 changes).
+const MAX_PAGES: usize = 1000;
+
+/// What an incremental pull produced.
+struct PullOutcome {
+    applied: i64,
+    conflicts: i64,
+    changes: Vec<SyncChange>,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// Cursor state for one peer, as stored in `sync_peers`.
+#[derive(Debug, Clone, Default)]
+struct PeerCursors {
+    /// Our position in the peer's feed
+    received: i64,
+    /// Our own `seq` up to which the peer has everything
+    sent: i64,
 }
 
 /// Sync client
@@ -139,7 +188,8 @@ impl SyncClient {
         };
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            // A page can be a few megabytes over a slow link
+            .timeout(Duration::from_secs(180))
             .danger_accept_invalid_certs(true) // For TOFU - we verify fingerprints manually
             .build()
             .map_err(|e| VoiceError::Network(e.to_string()))?;
@@ -171,97 +221,38 @@ impl SyncClient {
         // Step 0: Upload pending audio files to cloud storage FIRST
         // This ensures storage_provider/storage_key are set in the DB before
         // we gather local changes, so the metadata gets pushed to the server.
-        {
-            let audiofile_dir = {
-                let config = self.config.lock().unwrap();
-                config.audiofile_directory().map(std::path::PathBuf::from)
-            };
-            if let Some(dir) = audiofile_dir {
-                let (uploaded, cloud_errors) = self
-                    .upload_audio_files_to_cloud(&dir)
-                    .await;
-                if uploaded > 0 {
-                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
-                }
-                result.errors.extend(cloud_errors);
-            }
-        }
+        // Cloud problems are warnings: the metadata sync must still proceed and
+        // the upload is retried on the next sync.
+        result.warnings.extend(self.upload_audio_files_to_cloud().await);
 
-        // Step 1: Handshake
+        // Step 1: Handshake, and find where we stand with this peer
         let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
+        let cursors = self.peer_cursors(peer_id, &handshake, &mut result);
 
-        // Use the OLDER of local and server timestamps (NULL = infinitely old)
-        // This ensures that if either side has reset timestamps, we sync everything
-        let local_last_sync = self.get_local_last_sync(peer_id);
-        let last_sync = Self::older_timestamp(local_last_sync, handshake.last_sync_timestamp);
-        let clock_skew = self.calculate_clock_skew(handshake.server_timestamp);
+        // Everything written locally up to here is what this sync pushes;
+        // whatever the pull writes is the peer's own data coming back.
+        let local_end = self.local_seq();
 
-        // Adjust pull timestamp for clock skew
-        let adjusted_since = self.adjust_timestamp_for_skew(last_sync, clock_skew);
+        // Step 2: Pull, page by page, saving the cursor after every page
+        let pull = self.pull_all(peer_url, peer_id, &peer.peer_name, cursors.received).await;
+        result.pulled = pull.applied;
+        result.conflicts += pull.conflicts;
+        result.errors.extend(pull.errors);
+        result.warnings.extend(pull.warnings);
 
-        // Step 1b: Gather local changes BEFORE applying pull
-        // This now includes storage_provider/storage_key from the S3 upload in Step 0
-        let local_changes_to_push = match self.get_changes_since(last_sync) {
-            Ok(changes) => changes,
-            Err(e) => {
-                result.errors.push(format!("Failed to get local changes: {}", e));
-                Vec::new()
-            }
-        };
+        // Step 2b: Mirror cloud audio files locally, only if this installation
+        // opted in. Everyone else downloads on demand.
+        result.warnings.extend(self.mirror_audio_files_from_cloud().await);
 
-        // Step 2: Pull changes
-        let _pulled_changes = match self.pull_changes(peer_url, adjusted_since).await {
-            Ok((applied, conflicts, changes, errors)) => {
-                result.pulled = applied;
-                result.conflicts += conflicts;
-                result.errors.extend(errors);
-                changes
-            }
-            Err(e) => {
-                result.errors.push(format!("Pull failed: {}", e));
-                Vec::new()
-            }
-        };
-
-        // Step 2b: Download audio files from cloud storage if configured
-        {
-            let audiofile_dir = {
-                let config = self.config.lock().unwrap();
-                config.audiofile_directory().map(std::path::PathBuf::from)
-            };
-            if let Some(dir) = audiofile_dir {
-                let (downloaded, cloud_errors) = self
-                    .download_audio_files_from_cloud(&dir)
-                    .await;
-                if downloaded > 0 {
-                    tracing::info!("Downloaded {} audio files from cloud storage", downloaded);
-                }
-                result.errors.extend(cloud_errors);
-            }
-        }
-
-        // Step 3: Push the pre-gathered local changes (includes storage metadata)
-        let _pushed_changes = if local_changes_to_push.is_empty() {
-            Vec::new()
-        } else {
-            tracing::debug!("Pushing {} changes to server...", local_changes_to_push.len());
-            match self.push_changes_with_data(peer_url, &local_changes_to_push).await {
-                Ok((applied, conflicts)) => {
-                    tracing::debug!("Server response: applied={}, conflicts={}", applied, conflicts);
-                    result.pushed = applied;
-                    result.conflicts += conflicts;
-                    local_changes_to_push
-                }
-                Err(e) => {
-                    tracing::warn!("Push error: {}", e);
-                    result.errors.push(format!("Push failed: {}", e));
-                    Vec::new()
-                }
-            }
-        };
+        // Step 3: Push our changes the peer has not seen, page by page
+        let (pushed, conflicts, errors, warnings) = self.push_all(peer_url, peer_id, cursors.sent, local_end).await;
+        result.pushed = pushed;
+        result.conflicts += conflicts;
+        result.errors.extend(errors);
+        result.warnings.extend(warnings);
 
         // Update last sync time
         if let Err(e) = self.update_peer_sync_time(peer_id) {
@@ -287,53 +278,24 @@ impl SyncClient {
         let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
 
-        // Handshake
         let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
+        let cursors = self.peer_cursors(peer_id, &handshake, &mut result);
 
-        // Use the OLDER of local and server timestamps (NULL = infinitely old)
-        let local_last_sync = self.get_local_last_sync(peer_id);
-        let last_sync = Self::older_timestamp(local_last_sync, handshake.last_sync_timestamp);
-        let clock_skew = self.calculate_clock_skew(handshake.server_timestamp);
-        let adjusted_since = self.adjust_timestamp_for_skew(last_sync, clock_skew);
+        let pull = self.pull_all(peer_url, peer_id, &peer.peer_name, cursors.received).await;
+        result.pulled = pull.applied;
+        result.conflicts = pull.conflicts;
+        result.errors.extend(pull.errors);
+        result.warnings.extend(pull.warnings);
 
-        // Pull
-        let pulled_changes = match self.pull_changes(peer_url, adjusted_since).await {
-            Ok((applied, conflicts, changes, errors)) => {
-                result.pulled = applied;
-                result.conflicts = conflicts;
-                result.errors.extend(errors);
-                changes
-            }
-            Err(e) => {
-                result.success = false;
-                result.errors.push(e.to_string());
-                Vec::new()
-            }
-        };
-
-        // Download audio files from cloud storage if configured
-        if result.success {
-            let audiofile_dir = {
-                let config = self.config.lock().unwrap();
-                config.audiofile_directory().map(std::path::PathBuf::from)
-            };
-            if let Some(dir) = audiofile_dir {
-                // Download audio files from cloud storage (S3)
-                let (downloaded, cloud_errors) = self
-                    .download_audio_files_from_cloud(&dir)
-                    .await;
-                if downloaded > 0 {
-                    tracing::info!("Downloaded {} audio files from cloud storage", downloaded);
-                }
-                result.errors.extend(cloud_errors);
-            }
+        // Mirror cloud audio files locally if this installation opted in
+        if result.errors.is_empty() {
+            result.warnings.extend(self.mirror_audio_files_from_cloud().await);
         }
 
-        // Update last sync time
-        if result.success {
+        if result.errors.is_empty() {
             if let Err(e) = self.update_peer_sync_time(peer_id) {
                 result.errors.push(format!("Failed to update sync time: {}", e));
             }
@@ -360,47 +322,22 @@ impl SyncClient {
 
         // Step 0: Upload pending audio files to cloud storage FIRST
         // This ensures storage_provider/storage_key are included in the push
-        {
-            let audiofile_dir = {
-                let config = self.config.lock().unwrap();
-                config.audiofile_directory().map(std::path::PathBuf::from)
-            };
-            if let Some(dir) = audiofile_dir {
-                let (uploaded, cloud_errors) = self
-                    .upload_audio_files_to_cloud(&dir)
-                    .await;
-                if uploaded > 0 {
-                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
-                }
-                result.errors.extend(cloud_errors);
-            }
-        }
+        result.warnings.extend(self.upload_audio_files_to_cloud().await);
 
-        // Handshake
         let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
+        let cursors = self.peer_cursors(peer_id, &handshake, &mut result);
+        let local_end = self.local_seq();
 
-        // Push (now includes storage metadata from Step 0)
-        let _pushed_changes = match self
-            .push_changes(peer_url, handshake.last_sync_timestamp)
-            .await
-        {
-            Ok((applied, conflicts, changes)) => {
-                result.pushed = applied;
-                result.conflicts = conflicts;
-                changes
-            }
-            Err(e) => {
-                result.success = false;
-                result.errors.push(e.to_string());
-                Vec::new()
-            }
-        };
+        let (pushed, conflicts, errors, warnings) = self.push_all(peer_url, peer_id, cursors.sent, local_end).await;
+        result.pushed = pushed;
+        result.conflicts = conflicts;
+        result.errors.extend(errors);
+        result.warnings.extend(warnings);
 
-        // Update last sync time
-        if result.success {
+        if result.errors.is_empty() {
             if let Err(e) = self.update_peer_sync_time(peer_id) {
                 result.errors.push(format!("Failed to update sync time: {}", e));
             }
@@ -413,7 +350,8 @@ impl SyncClient {
     /// Perform initial sync with a new peer (full dataset transfer)
     ///
     /// This is used for first-time sync when we need to get the complete
-    /// dataset from a peer rather than incremental changes.
+    /// dataset from a peer rather than incremental changes. Afterwards the
+    /// cursors point at the end of both feeds, so the next sync is incremental.
     pub async fn initial_sync(&self, peer_id: &str) -> SyncResult {
         let peer = {
             let config = self.config.lock().unwrap();
@@ -429,86 +367,38 @@ impl SyncClient {
         let mut result = SyncResult::success();
 
         // Step 1: Handshake
-        let _handshake = match self.handshake(peer_url).await {
+        let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
 
-        // Step 2: Get full dataset from peer
-        let full_sync = match self.get_full_sync(peer_url).await {
-            Ok(data) => data,
-            Err(e) => return SyncResult::failure(format!("Full sync failed: {}", e)),
-        };
-
-        // Step 3: Convert full sync data to changes and apply
-        let pulled_changes = self.convert_full_sync_to_changes(&full_sync);
-        match self.apply_changes(&pulled_changes) {
-            Ok((applied, conflicts, errors)) => {
-                result.pulled = applied;
-                result.conflicts = conflicts;
-                result.errors.extend(errors);
-            }
-            Err(e) => {
-                result.errors.push(format!("Failed to apply full sync: {}", e));
-            }
+        // Step 2: Pull the peer's whole feed from the beginning, page by
+        // page. (One JSON document for the whole dataset, as /sync/full
+        // returns, does not fit in memory for a large database; the paged
+        // feed is resumable and bounded.)
+        if let Err(e) = self.save_peer_cursors(peer_id, Some(0), Some(0), handshake.database_id.as_deref()) {
+            result.errors.push(format!("Failed to reset cursors: {}", e));
         }
+        let pull = self.pull_all(peer_url, peer_id, &peer.peer_name, 0).await;
+        result.pulled = pull.applied;
+        result.conflicts = pull.conflicts;
+        result.errors.extend(pull.errors);
+        result.warnings.extend(pull.warnings);
 
-        // Step 4: Download audio files from cloud storage
-        {
-            let audiofile_dir = {
-                let config = self.config.lock().unwrap();
-                config.audiofile_directory().map(std::path::PathBuf::from)
-            };
-            if let Some(dir) = audiofile_dir {
-                // Download audio files from cloud storage (S3)
-                let (downloaded, cloud_errors) = self
-                    .download_audio_files_from_cloud(&dir)
-                    .await;
-                if downloaded > 0 {
-                    tracing::info!("Downloaded {} audio files from cloud storage", downloaded);
-                }
-                result.errors.extend(cloud_errors);
-            }
-        }
+        // Step 4: Mirror cloud audio files locally if this installation opted in
+        result.warnings.extend(self.mirror_audio_files_from_cloud().await);
 
-        // Step 5: Upload pending audio files to cloud storage FIRST
+        // Step 5: Upload pending audio files to cloud storage
         // This ensures storage_provider/storage_key are included in the push
-        {
-            let audiofile_dir = {
-                let config = self.config.lock().unwrap();
-                config.audiofile_directory().map(std::path::PathBuf::from)
-            };
-            if let Some(dir) = audiofile_dir {
-                let (uploaded, cloud_errors) = self
-                    .upload_audio_files_to_cloud(&dir)
-                    .await;
-                if uploaded > 0 {
-                    tracing::info!("Uploaded {} audio files to cloud storage", uploaded);
-                }
-                result.errors.extend(cloud_errors);
-            }
-        }
+        result.warnings.extend(self.upload_audio_files_to_cloud().await);
 
-        // Step 6: Push all local changes (now includes storage metadata from Step 5)
-        let pushed_changes = match self.get_changes_since(None) {
-            Ok(changes) => changes,
-            Err(e) => {
-                result.errors.push(format!("Failed to get local changes: {}", e));
-                Vec::new()
-            }
-        };
-
-        if !pushed_changes.is_empty() {
-            match self.push_changes_with_data(peer_url, &pushed_changes).await {
-                Ok((applied, conflicts)) => {
-                    result.pushed = applied;
-                    result.conflicts += conflicts;
-                }
-                Err(e) => {
-                    result.errors.push(format!("Push failed: {}", e));
-                }
-            }
-        }
+        // Step 6: Push everything we have (the peer de-duplicates)
+        let local_end = self.local_seq();
+        let (pushed, conflicts, errors, warnings) = self.push_all(peer_url, peer_id, 0, local_end).await;
+        result.pushed = pushed;
+        result.conflicts += conflicts;
+        result.errors.extend(errors);
+        result.warnings.extend(warnings);
 
         // Step 7: Update sync timestamp
         if let Err(e) = self.update_peer_sync_time(peer_id) {
@@ -517,6 +407,194 @@ impl SyncClient {
 
         result.success = result.errors.is_empty();
         result
+    }
+
+    /// Where we stand with a peer. If the peer's database identity changed
+    /// (it was reset or replaced) both cursors restart from zero: everything
+    /// is exchanged again, which is safe because applying is idempotent.
+    fn peer_cursors(&self, peer_id: &str, handshake: &HandshakeResponse, result: &mut SyncResult) -> PeerCursors {
+        let (received, sent, known_db) = {
+            let db = self.db.lock().unwrap();
+            db.get_peer_cursors(peer_id).unwrap_or((0, 0, None))
+        };
+        match (&handshake.database_id, &known_db) {
+            (Some(now), Some(before)) if now != before => {
+                let msg = format!(
+                    "Peer {} has a new database ({} -> {}); exchanging everything again",
+                    &peer_id[..UUID_SHORT_LEN.min(peer_id.len())],
+                    &before[..UUID_SHORT_LEN.min(before.len())],
+                    &now[..UUID_SHORT_LEN.min(now.len())]
+                );
+                tracing::warn!("{}", msg);
+                result.warnings.push(msg);
+                let _ = self.save_peer_cursors(peer_id, Some(0), Some(0), Some(now));
+                PeerCursors { received: 0, sent: 0 }
+            }
+            (Some(now), None) => {
+                let _ = self.save_peer_cursors(peer_id, None, None, Some(now));
+                PeerCursors { received, sent }
+            }
+            _ => PeerCursors { received, sent },
+        }
+    }
+
+    fn local_seq(&self) -> i64 {
+        self.db.lock().ok().and_then(|db| db.current_seq().ok()).unwrap_or(0)
+    }
+
+    fn save_peer_cursors(&self, peer_id: &str, received: Option<i64>, sent: Option<i64>, database_id: Option<&str>) -> VoiceResult<()> {
+        let peer_name = {
+            let config = self.config.lock().unwrap();
+            config.get_peer(peer_id).map(|p| p.peer_name.clone())
+        };
+        let db = self.db.lock().unwrap();
+        db.set_peer_cursors(peer_id, peer_name.as_deref(), received, sent, database_id)
+    }
+
+    /// Pull every page after `cursor`, applying each and saving the cursor
+    /// before fetching the next, so an interrupted sync resumes where it stopped.
+    async fn pull_all(&self, peer_url: &str, peer_id: &str, peer_name: &str, mut cursor: i64) -> PullOutcome {
+        let mut outcome = PullOutcome { applied: 0, conflicts: 0, changes: Vec::new(), errors: Vec::new(), warnings: Vec::new() };
+        for page in 0..MAX_PAGES {
+            match self.pull_page(peer_url, peer_id, peer_name, cursor).await {
+                Ok((pull, next_cursor, complete)) => {
+                    outcome.applied += pull.applied;
+                    outcome.conflicts += pull.conflicts;
+                    outcome.changes.extend(pull.changes);
+                    outcome.errors.extend(pull.errors);
+                    outcome.warnings.extend(pull.warnings);
+                    cursor = next_cursor;
+                    if let Err(e) = self.save_peer_cursors(peer_id, Some(cursor), None, None) {
+                        outcome.errors.push(format!("Failed to save cursor: {}", e));
+                        break;
+                    }
+                    if complete {
+                        // Anything queued for retry (a row that arrived before
+                        // the row it references) gets one more chance now,
+                        // instead of waiting for the next sync.
+                        if self.db.lock().map(|db| db.count_pending_sync_failures().unwrap_or(0)).unwrap_or(0) > 0 {
+                            if let Ok((applied, conflicts, _)) = self.apply_changes_from(&[], peer_id, Some(peer_name)) {
+                                outcome.applied += applied;
+                                outcome.conflicts += conflicts;
+                            }
+                        }
+                        break;
+                    }
+                    if page + 1 == MAX_PAGES {
+                        outcome.warnings.push("Pull stopped after the page limit; run sync again to continue".to_string());
+                    }
+                }
+                Err(e) => {
+                    outcome.errors.push(format!("Pull failed: {}", e));
+                    break;
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Push our changes with `sent < seq <= upto`, page by page, saving the
+    /// high-water mark after every page the peer accepted.
+    async fn push_all(&self, peer_url: &str, peer_id: &str, mut sent: i64, upto: i64) -> (i64, i64, Vec<String>, Vec<String>) {
+        let mut pushed = 0;
+        let mut conflicts = 0;
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let mut server_queued = false;
+        for _ in 0..MAX_PAGES {
+            let (changes, next, complete) = {
+                let db = self.db.lock().unwrap();
+                match db.get_changes_after_seq_as_sync_changes(sent, Some(upto), PULL_LIMIT) {
+                    Ok(page) => page,
+                    Err(e) => {
+                        errors.push(format!("Failed to get local changes: {}", e));
+                        return (pushed, conflicts, errors, warnings);
+                    }
+                }
+            };
+            if changes.is_empty() {
+                break;
+            }
+            let changes = self.stamp_origin(changes);
+            let _ = &mut server_queued;
+            tracing::debug!("Pushing {} changes to {}", changes.len(), &peer_id[..UUID_SHORT_LEN.min(peer_id.len())]);
+            match self.push_changes_with_data(peer_url, &changes).await {
+                Ok((applied, page_conflicts, server_errors)) => {
+                    pushed += applied;
+                    conflicts += page_conflicts;
+                    server_queued |= !server_errors.is_empty();
+                    warnings.extend(server_errors.into_iter().map(|e| format!("Server queued for retry: {}", e)));
+                    sent = next;
+                    if let Err(e) = self.save_peer_cursors(peer_id, None, Some(sent), None) {
+                        errors.push(format!("Failed to save cursor: {}", e));
+                        break;
+                    }
+                    if complete {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Push error: {}", e);
+                    errors.push(format!("Push failed: {}", e));
+                    break;
+                }
+            }
+        }
+        // A passive server retries queued changes only when a batch arrives;
+        // an empty batch now drains what this push left behind.
+        if server_queued && errors.is_empty() {
+            match self.push_changes_with_data_allow_empty(peer_url).await {
+                Ok((applied, page_conflicts, still_failing)) => {
+                    pushed += applied;
+                    conflicts += page_conflicts;
+                    if !still_failing.is_empty() {
+                        warnings.push(format!("{} change(s) still queued on the peer", still_failing.len()));
+                    }
+                }
+                Err(e) => warnings.push(format!("Could not ask the peer to retry queued changes: {}", e)),
+            }
+        }
+        (pushed, conflicts, errors, warnings)
+    }
+
+    /// Post an empty batch: the peer retries whatever it queued.
+    async fn push_changes_with_data_allow_empty(&self, peer_url: &str) -> VoiceResult<(i64, i64, Vec<String>)> {
+        let request = ApplyRequest {
+            device_id: self.device_id.clone(),
+            device_name: self.device_name.clone(),
+            changes: Vec::new(),
+        };
+        let response = self
+            .client
+            .post(format!("{}/sync/apply", peer_url))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| VoiceError::Network(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(VoiceError::Sync(format!("Retry request failed with status {}", response.status())));
+        }
+        let result: ApplyResponse = response
+            .json()
+            .await
+            .map_err(|e| VoiceError::Sync(format!("Failed to parse apply response: {}", e)))?;
+        Ok((result.applied, result.conflicts, result.errors))
+    }
+
+    /// Fill in this device's identity on outgoing changes.
+    fn stamp_origin(&self, changes: Vec<SyncChange>) -> Vec<SyncChange> {
+        changes
+            .into_iter()
+            .map(|mut c| {
+                if c.device_id.is_empty() {
+                    c.device_id = self.device_id.clone();
+                }
+                if c.device_name.is_none() {
+                    c.device_name = Some(self.device_name.clone());
+                }
+                c
+            })
+            .collect()
     }
 
     /// Check if a peer is reachable
@@ -600,7 +678,7 @@ impl SyncClient {
         let request = HandshakeRequest {
             device_id: self.device_id.clone(),
             device_name: self.device_name.clone(),
-            protocol_version: "1.0".to_string(),
+            protocol_version: "1.1".to_string(),
         };
 
         let response = self
@@ -624,19 +702,10 @@ impl SyncClient {
             .map_err(|e| VoiceError::Sync(format!("Failed to parse handshake response: {}", e)))
     }
 
-    async fn pull_changes(
-        &self,
-        peer_url: &str,
-        since: Option<i64>,
-    ) -> VoiceResult<(i64, i64, Vec<SyncChange>, Vec<String>)> {
-        let url = match since {
-            Some(ts) => format!(
-                "{}/sync/changes?since={}",
-                peer_url,
-                ts
-            ),
-            None => format!("{}/sync/changes", peer_url),
-        };
+    /// One page of the peer's feed after `cursor`. Returns what was applied,
+    /// the cursor to continue from, and whether the feed is exhausted.
+    async fn pull_page(&self, peer_url: &str, peer_id: &str, peer_name: &str, cursor: i64) -> VoiceResult<(PullOutcome, i64, bool)> {
+        let url = format!("{}/sync/changes?cursor={}&limit={}", peer_url, cursor, PULL_LIMIT);
 
         let response = self
             .client
@@ -657,583 +726,69 @@ impl SyncClient {
             .await
             .map_err(|e| VoiceError::Sync(format!("Failed to parse changes: {}", e)))?;
 
-        // Clone changes before applying so we can return them for audio sync
-        let changes = batch.changes.clone();
+        let next_cursor = match batch.next_cursor {
+            Some(n) => n,
+            None => {
+                return Err(VoiceError::Sync(
+                    "Peer does not support the cursor feed (protocol 1.1 or newer required)".to_string(),
+                ))
+            }
+        };
 
-        // Log received changes
-        tracing::debug!("Received {} changes to pull", changes.len());
+        // Changes carry the sender's identity so that failures are queued
+        // against the right peer
+        let mut changes = batch.changes;
+        for c in &mut changes {
+            if c.device_id.is_empty() {
+                c.device_id = batch.device_id.clone();
+            }
+            if c.device_name.is_none() {
+                c.device_name = batch.device_name.clone().or_else(|| Some(peer_name.to_string()));
+            }
+        }
+
+        tracing::debug!("Received {} changes from {} (cursor {} -> {})", changes.len(), &peer_id[..UUID_SHORT_LEN.min(peer_id.len())], cursor, next_cursor);
         for change in &changes {
             tracing::trace!("  Pull: {} {} from {}", change.entity_type, &change.entity_id[..UUID_SHORT_LEN.min(change.entity_id.len())], change.device_id);
         }
 
-        // Apply changes to local database
-        let (applied, conflicts, errors) = self.apply_changes(&batch.changes)?;
+        let (applied, conflicts, errors) = self.apply_changes_from(&changes, peer_id, Some(peer_name))?;
         tracing::debug!("Applied {} changes, {} conflicts", applied, conflicts);
 
-        Ok((applied, conflicts, changes, errors))
+        Ok((
+            PullOutcome { applied, conflicts, changes, errors, warnings: Vec::new() },
+            next_cursor,
+            batch.is_complete,
+        ))
     }
 
-    async fn push_changes(
-        &self,
-        peer_url: &str,
-        since: Option<i64>,
-    ) -> VoiceResult<(i64, i64, Vec<SyncChange>)> {
-        // Get local changes
-        let changes = self.get_changes_since(since)?;
-
-        if changes.is_empty() {
-            return Ok((0, 0, Vec::new()));
+    fn apply_changes_from(&self, changes: &[SyncChange], peer_id: &str, peer_name: Option<&str>) -> VoiceResult<(i64, i64, Vec<String>)> {
+        let db = self.db.lock().unwrap();
+        let sync_received_at = Utc::now().timestamp();
+        let outcome = crate::sync_apply::apply_changes(&db, changes, peer_id, peer_name, sync_received_at)?;
+        if outcome.retried_ok > 0 {
+            tracing::info!("Applied {} previously failed changes", outcome.retried_ok);
         }
-
-        // Clone changes before moving into request so we can return them
-        let pushed_changes = changes.clone();
-
-        let request = ApplyRequest {
-            device_id: self.device_id.clone(),
-            device_name: self.device_name.clone(),
-            changes,
-        };
-
-        let response = self
-            .client
-            .post(format!("{}/sync/apply", peer_url))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| VoiceError::Network(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(VoiceError::Sync(format!(
-                "Push failed with status {}",
-                response.status()
-            )));
-        }
-
-        let result: ApplyResponse = response
-            .json()
-            .await
-            .map_err(|e| VoiceError::Sync(format!("Failed to parse apply response: {}", e)))?;
-
-        Ok((result.applied, result.conflicts, pushed_changes))
+        Ok((outcome.applied, outcome.conflicts, outcome.errors))
     }
 
     fn apply_changes(&self, changes: &[SyncChange]) -> VoiceResult<(i64, i64, Vec<String>)> {
         let db = self.db.lock().unwrap();
-        let mut applied = 0i64;
-        let mut conflicts = 0i64;
-        let mut errors = Vec::new();
-
-        // Get last sync timestamp with this peer (use device_id as peer_id for self-tracking)
-        let last_sync_at: Option<i64> = None; // For pull, we don't use last_sync filtering here
-
-        for change in changes {
-            let result = match change.entity_type.as_str() {
-                "note" => self.apply_note_change(&db, change, last_sync_at),
-                "tag" => self.apply_tag_change(&db, change, last_sync_at),
-                "note_tag" => self.apply_note_tag_change(&db, change, last_sync_at),
-                "audio_file" => self.apply_audio_file_change(&db, change),
-                "note_attachment" => self.apply_note_attachment_change(&db, change),
-                "transcription" => self.apply_transcription_change(&db, change),
-                "file_storage_config" => self.apply_file_storage_config_change(&db, change),
-                _ => continue,
-            };
-
-            match result {
-                Ok(true) => applied += 1,
-                Ok(false) => {} // Skipped
-                Err(e) => {
-                    errors.push(format!(
-                        "Failed to apply {} {}: {}",
-                        change.entity_type, change.entity_id, e
-                    ));
-                    conflicts += 1;
-                }
-            }
+        let sync_received_at = Utc::now().timestamp();
+        // The peer is whoever sent the batch; the changes carry their origin device.
+        let peer_id = changes
+            .first()
+            .map(|c| c.device_id.clone())
+            .unwrap_or_else(|| self.device_id.clone());
+        let peer_name = changes.first().and_then(|c| c.device_name.clone());
+        let outcome = crate::sync_apply::apply_changes(&db, changes, &peer_id, peer_name.as_deref(), sync_received_at)?;
+        if outcome.retried_ok > 0 {
+            tracing::info!("Applied {} previously failed changes", outcome.retried_ok);
         }
-
-        Ok((applied, conflicts, errors))
+        Ok((outcome.applied, outcome.conflicts, outcome.errors))
     }
 
-    fn apply_note_change(
-        &self,
-        db: &Database,
-        change: &SyncChange,
-        last_sync_at: Option<i64>,
-    ) -> VoiceResult<bool> {
-        use crate::merge::merge_content;
-
-        let note_id = &change.entity_id;
-        let data = &change.data;
-
-        // Parse timestamps from incoming data as integers
-        let created_at = data["created_at"].as_i64().unwrap_or(0);
-        let content = data["content"].as_str().unwrap_or("");
-        let modified_at = data["modified_at"].as_i64();
-        let deleted_at = data["deleted_at"].as_i64();
-
-        // Check if local note exists and compare timestamps
-        if let Ok(Some(existing)) = db.get_note_raw(note_id) {
-            let local_modified = existing.get("modified_at")
-                .and_then(|v| v.as_i64());
-            let local_deleted = existing.get("deleted_at")
-                .and_then(|v| v.as_i64());
-            let local_content = existing.get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let _local_device_id = existing.get("device_id")
-                .and_then(|v| v.as_str());
-            let local_time = local_modified.or(local_deleted);
-
-            // Incoming timestamp: prefer modified_at, then deleted_at, then created_at
-            let incoming_time = modified_at.or(deleted_at).or(Some(created_at));
-
-            if let (Some(lt), Some(it)) = (local_time, incoming_time) {
-                // If incoming is strictly older than local, skip
-                if it < lt {
-                    return Ok(false);
-                }
-
-                // If same timestamp but same content, skip (idempotent)
-                if it == lt && content == local_content {
-                    return Ok(false);
-                }
-
-                // Check for delete vs edit conflict
-                // Case 1: Local is deleted, remote has edits
-                if local_deleted.is_some() && deleted_at.is_none() && modified_at.is_some() {
-                    // Remote edit is newer - resurrect with remote content
-                    // Create delete conflict record
-                    let _ = db.create_note_delete_conflict(
-                        note_id,
-                        content,                                 // surviving content (remote)
-                        modified_at.unwrap_or(0),
-                        Some(change.device_id.as_str()),         // surviving_device_id
-                        change.device_name.as_deref(),           // surviving_device_name
-                        Some(local_content),                     // deleted content
-                        local_deleted.unwrap_or(0),
-                        Some(&self.device_id),                   // deleting_device_id (local)
-                        Some(&self.device_name),                 // deleting_device_name (local)
-                    );
-                    db.apply_sync_note(note_id, created_at, content, modified_at, None, None)?;
-                    return Ok(true);
-                }
-
-                // Case 2: Local has edits, remote is deleted
-                if local_deleted.is_none() && local_modified.is_some() && deleted_at.is_some() {
-                    // Local edit should survive - create delete conflict
-                    let _ = db.create_note_delete_conflict(
-                        note_id,
-                        local_content,                           // surviving content (local)
-                        local_modified.unwrap_or(0),
-                        Some(&self.device_id),                   // surviving_device_id (local)
-                        Some(&self.device_name),                 // surviving_device_name (local)
-                        Some(content),                           // deleted content
-                        deleted_at.unwrap_or(0),
-                        Some(change.device_id.as_str()),         // deleting_device_id
-                        change.device_name.as_deref(),           // deleting_device_name
-                    );
-                    // Don't apply the delete - local edit survives
-                    return Ok(false);
-                }
-
-                // Detect concurrent modifications:
-                // 1. If we have last_sync_at and both local and incoming were modified after it
-                // 2. OR if both have the exact same modified_at timestamp
-                let is_concurrent = if let (Some(local_mod), Some(incoming_mod)) = (local_modified, modified_at) {
-                    if let Some(last) = last_sync_at {
-                        // Both modified since last sync = concurrent
-                        local_mod > last && incoming_mod > last
-                    } else {
-                        // No sync history - only conflict if timestamps are exactly equal
-                        local_mod == incoming_mod
-                    }
-                } else {
-                    false
-                };
-
-                // Content conflict: concurrent modification with different content
-                if is_concurrent && content != local_content && deleted_at.is_none() && local_deleted.is_none() {
-                    if let (Some(local_mod), Some(incoming_mod)) = (local_modified, modified_at) {
-                        // Create content conflict record before merging
-                        let _ = db.create_note_content_conflict(
-                            note_id,
-                            local_content,
-                            local_mod,
-                            Some(&self.device_id),
-                            Some(&self.device_name),
-                            content,
-                            incoming_mod,
-                            Some(change.device_id.as_str()),
-                            change.device_name.as_deref(),
-                        );
-
-                        let merge_result = merge_content(local_content, content, "LOCAL", "REMOTE");
-                        // Use the newer timestamp for the merged content
-                        let new_modified = if it > lt { Some(it) } else { Some(lt) };
-                        db.apply_sync_note(note_id, created_at, &merge_result.content, new_modified, deleted_at, None)?;
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-
-        // No conflict or local doesn't exist - just apply
-        db.apply_sync_note(note_id, created_at, content, modified_at, deleted_at, None)?;
-        Ok(true)
-    }
-
-    fn apply_tag_change(
-        &self,
-        db: &Database,
-        change: &SyncChange,
-        last_sync_at: Option<i64>,
-    ) -> VoiceResult<bool> {
-        let tag_id = &change.entity_id;
-        let data = &change.data;
-
-        let name = data["name"].as_str().unwrap_or("");
-        let parent_id = data["parent_id"].as_str();
-        // Parse timestamps from incoming data as integers
-        let created_at = data["created_at"].as_i64().unwrap_or(0);
-        let modified_at = data["modified_at"].as_i64();
-        let deleted_at = data["deleted_at"].as_i64();
-
-        // Check if local tag exists for conflict detection
-        if let Ok(Some(existing)) = db.get_tag_raw(tag_id) {
-            let local_name = existing.get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let local_parent_id = existing.get("parent_id")
-                .and_then(|v| v.as_str());
-            let local_modified = existing.get("modified_at")
-                .and_then(|v| v.as_i64());
-            let local_deleted = existing.get("deleted_at")
-                .and_then(|v| v.as_i64());
-            let _local_device_id = existing.get("device_id")
-                .and_then(|v| v.as_str());
-
-            let local_time = local_modified.or(local_deleted);
-            let incoming_time = modified_at.or(deleted_at).or(Some(created_at));
-
-            if let (Some(lt), Some(it)) = (local_time, incoming_time) {
-                // If incoming is strictly older, skip
-                if it < lt {
-                    return Ok(false);
-                }
-
-                // If same timestamp and same values, skip (idempotent)
-                if it == lt && name == local_name && parent_id == local_parent_id {
-                    return Ok(false);
-                }
-
-                // Check for delete vs rename conflict
-                if local_deleted.is_none() && deleted_at.is_some() && local_modified.is_some() {
-                    // Local was renamed, remote wants to delete
-                    // Keep local rename, record conflict
-                    let _ = db.create_tag_delete_conflict(
-                        tag_id,
-                        local_name, // surviving
-                        local_parent_id,
-                        local_modified.unwrap_or(0),
-                        Some(&self.device_id),
-                        Some(&self.device_name),
-                        deleted_at.unwrap_or(0),
-                        Some(change.device_id.as_str()),
-                        change.device_name.as_deref(),
-                    );
-                    return Ok(false);
-                }
-
-                if local_deleted.is_some() && deleted_at.is_none() && modified_at.is_some() {
-                    // Local was deleted, remote was renamed - resurrect with remote
-                    let _ = db.create_tag_delete_conflict(
-                        tag_id,
-                        name, // surviving (remote)
-                        parent_id,
-                        modified_at.unwrap_or(0),
-                        Some(change.device_id.as_str()),
-                        change.device_name.as_deref(),
-                        local_deleted.unwrap_or(0),
-                        Some(&self.device_id),
-                        Some(&self.device_name),
-                    );
-                    // Resurrect by clearing deleted_at
-                    db.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, None, None)?;
-                    return Ok(true);
-                }
-
-                // Detect concurrent modifications:
-                // 1. If we have last_sync_at and both local and incoming were modified after it
-                // 2. OR if both have the exact same modified_at timestamp
-                let is_concurrent = if let (Some(local_mod), Some(incoming_mod)) = (local_modified, modified_at) {
-                    if let Some(last) = last_sync_at {
-                        // Both modified since last sync = concurrent
-                        local_mod > last && incoming_mod > last
-                    } else {
-                        // No sync history - only conflict if timestamps are exactly equal
-                        local_mod == incoming_mod
-                    }
-                } else {
-                    false
-                };
-
-                if is_concurrent && local_deleted.is_none() && deleted_at.is_none() {
-                    if let (Some(local_mod), Some(incoming_mod)) = (local_modified, modified_at) {
-                        // Check for concurrent rename conflict
-                        if name != local_name {
-                            // Both renamed to different names concurrently - merge with separator
-                            let _ = db.create_tag_rename_conflict(
-                                tag_id,
-                                local_name,
-                                local_mod,
-                                Some(&self.device_id),
-                                Some(&self.device_name),
-                                name,
-                                incoming_mod,
-                                Some(change.device_id.as_str()),
-                                change.device_name.as_deref(),
-                            );
-
-                            // Merge names with separator (deleted_at is None in this branch)
-                            let merged_name = format!("{} | {}", local_name, name);
-                            db.apply_sync_tag_with_deleted(tag_id, &merged_name, parent_id, created_at, modified_at, None, None)?;
-                            return Ok(true);
-                        }
-
-                        // Check for parent conflict
-                        if parent_id != local_parent_id {
-                            let _ = db.create_tag_parent_conflict(
-                                tag_id,
-                                local_parent_id,
-                                local_mod,
-                                Some(&self.device_id),
-                                Some(&self.device_name),
-                                parent_id,
-                                incoming_mod,
-                                Some(change.device_id.as_str()),
-                                change.device_name.as_deref(),
-                            );
-                            // Use remote parent
-                        }
-                    }
-                }
-            }
-        }
-
-        db.apply_sync_tag_with_deleted(tag_id, name, parent_id, created_at, modified_at, deleted_at, None)?;
-        Ok(true)
-    }
-
-    fn apply_note_tag_change(
-        &self,
-        db: &Database,
-        change: &SyncChange,
-        _last_sync_at: Option<i64>,
-    ) -> VoiceResult<bool> {
-        // Parse entity_id (format: "note_id:tag_id")
-        let parts: Vec<&str> = change.entity_id.split(':').collect();
-        if parts.len() != 2 {
-            tracing::warn!("note_tag: invalid entity_id format: {}", change.entity_id);
-            return Ok(false);
-        }
-
-        let note_id = parts[0];
-        let tag_id = parts[1];
-        let data = &change.data;
-
-        // Parse timestamps from incoming data as integers
-        let created_at = data["created_at"].as_i64().unwrap_or(0);
-        let modified_at = data["modified_at"].as_i64();
-        let deleted_at = data["deleted_at"].as_i64();
-
-        tracing::trace!(
-            "note_tag: note={}... tag={}... created={} modified={:?} deleted={:?}",
-            &note_id[..UUID_SHORT_LEN.min(note_id.len())],
-            &tag_id[..UUID_SHORT_LEN.min(tag_id.len())],
-            created_at,
-            modified_at,
-            deleted_at
-        );
-
-        // Determine incoming timestamp
-        let incoming_time = deleted_at.or(modified_at).or(Some(created_at));
-
-        // Check if local note_tag exists and compare timestamps
-        if let Ok(Some(existing)) = db.get_note_tag_raw(note_id, tag_id) {
-            let local_modified = existing.get("modified_at").and_then(|v| v.as_i64());
-            let local_deleted = existing.get("deleted_at").and_then(|v| v.as_i64());
-            let local_created = existing.get("created_at").and_then(|v| v.as_i64());
-            let local_time = local_deleted.or(local_modified).or(local_created);
-
-            tracing::trace!(
-                "note_tag: existing local_time={:?} incoming_time={:?}",
-                local_time, incoming_time
-            );
-
-            if let (Some(lt), Some(it)) = (local_time, incoming_time) {
-                // If incoming is strictly older than local, skip
-                if it < lt {
-                    tracing::debug!("note_tag: skipped (incoming {} older than local {})", it, lt);
-                    return Ok(false);
-                }
-                // If same timestamp, skip (idempotent)
-                if it == lt {
-                    tracing::trace!("note_tag: skipped (same timestamp {})", it);
-                    return Ok(false);
-                }
-            }
-        } else {
-            tracing::trace!("note_tag: no existing local record, will insert");
-        }
-
-        db.apply_sync_note_tag(note_id, tag_id, created_at, modified_at, deleted_at, None)?;
-        tracing::debug!(
-            "note_tag: applied note={}... tag={}...",
-            &note_id[..UUID_SHORT_LEN.min(note_id.len())],
-            &tag_id[..UUID_SHORT_LEN.min(tag_id.len())]
-        );
-        Ok(true)
-    }
-
-    fn apply_audio_file_change(
-        &self,
-        db: &Database,
-        change: &SyncChange,
-    ) -> VoiceResult<bool> {
-        let audio_id = &change.entity_id;
-        let data = &change.data;
-
-        // Parse timestamps from incoming data as integers
-        let imported_at = data["imported_at"].as_i64().unwrap_or(0);
-        let filename = data["filename"].as_str().unwrap_or("");
-        let file_created_at = data["file_created_at"].as_i64();
-        let duration_seconds = data["duration_seconds"].as_i64();
-        let summary = data["summary"].as_str();
-        let modified_at = data["modified_at"].as_i64();
-        let deleted_at = data["deleted_at"].as_i64();
-        let storage_provider = data["storage_provider"].as_str();
-        let storage_key = data["storage_key"].as_str();
-        let storage_uploaded_at = data["storage_uploaded_at"].as_i64();
-
-        db.apply_sync_audio_file(
-            audio_id,
-            imported_at,
-            filename,
-            file_created_at,
-            duration_seconds,
-            summary,
-            modified_at,
-            deleted_at,
-            None,  // sync_received_at - None for client-side operations
-            storage_provider,
-            storage_key,
-            storage_uploaded_at,
-        )?;
-        Ok(true)
-    }
-
-    fn apply_note_attachment_change(
-        &self,
-        db: &Database,
-        change: &SyncChange,
-    ) -> VoiceResult<bool> {
-        let attachment_link_id = &change.entity_id;
-        let data = &change.data;
-
-        let note_id = data["note_id"].as_str().unwrap_or("");
-        let attachment_id = data["attachment_id"].as_str().unwrap_or("");
-        let attachment_type = data["attachment_type"].as_str().unwrap_or("");
-        // Parse timestamps from incoming data as integers
-        let created_at = data["created_at"].as_i64().unwrap_or(0);
-        let modified_at = data["modified_at"].as_i64();
-        let deleted_at = data["deleted_at"].as_i64();
-
-        db.apply_sync_note_attachment(
-            attachment_link_id,
-            note_id,
-            attachment_id,
-            attachment_type,
-            created_at,
-            modified_at,
-            deleted_at,
-            None,  // sync_received_at - None for client-side operations
-        )?;
-        Ok(true)
-    }
-
-    fn apply_transcription_change(
-        &self,
-        db: &Database,
-        change: &SyncChange,
-    ) -> VoiceResult<bool> {
-        let transcription_id = &change.entity_id;
-        let data = &change.data;
-
-        let audio_file_id = data["audio_file_id"].as_str().unwrap_or("");
-        let content = data["content"].as_str().unwrap_or("");
-        let content_segments = data["content_segments"].as_str();
-        let service = data["service"].as_str().unwrap_or("");
-        let service_arguments = data["service_arguments"].as_str();
-        let service_response = data["service_response"].as_str();
-        let state = data["state"].as_str().unwrap_or(crate::database::DEFAULT_TRANSCRIPTION_STATE);
-        let device_id = data["device_id"].as_str().unwrap_or("");
-        // Parse timestamps from incoming data as integers
-        let created_at = data["created_at"].as_i64().unwrap_or(0);
-        let modified_at = data["modified_at"].as_i64();
-        let deleted_at = data["deleted_at"].as_i64();
-
-        db.apply_sync_transcription(
-            transcription_id,
-            audio_file_id,
-            content,
-            content_segments,
-            service,
-            service_arguments,
-            service_response,
-            state,
-            device_id,
-            created_at,
-            modified_at,
-            deleted_at,
-            None,  // sync_received_at - None for client-side operations
-        )?;
-        Ok(true)
-    }
-
-    fn apply_file_storage_config_change(
-        &self,
-        db: &Database,
-        change: &SyncChange,
-    ) -> VoiceResult<bool> {
-        let data = &change.data;
-
-        let provider = data["provider"].as_str().unwrap_or("none");
-        let config = data.get("config").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                Some(v.clone())
-            }
-        });
-        let modified_at = data["modified_at"].as_i64();
-        let device_id = data["device_id"].as_str();
-
-        db.apply_sync_file_storage_config(
-            provider,
-            config.as_ref(),
-            modified_at,
-            device_id,
-            None,  // sync_received_at - None for client-side operations
-        )?;
-
-        tracing::info!(
-            provider = provider,
-            "Applied file_storage_config from sync"
-        );
-
-        Ok(true)
-    }
-
+    #[allow(dead_code)]
     fn get_changes_since(&self, since: Option<i64>) -> VoiceResult<Vec<SyncChange>> {
         let db = self.db.lock().unwrap();
         let (changes, _) = db.get_changes_since(since, 10000)?;
@@ -1266,6 +821,7 @@ impl SyncClient {
     /// Return the older of two timestamps, treating None as infinitely old.
     /// If either is None, returns None (meaning "sync everything").
     /// If both are Some, returns the smaller (older) timestamp.
+    #[allow(dead_code)]
     fn older_timestamp(a: Option<i64>, b: Option<i64>) -> Option<i64> {
         match (a, b) {
             (None, _) | (_, None) => None,
@@ -1275,6 +831,7 @@ impl SyncClient {
         }
     }
 
+    #[allow(dead_code)]
     fn calculate_clock_skew(&self, server_timestamp: Option<i64>) -> f64 {
         if let Some(server_ts) = server_timestamp {
             let local_time = Utc::now().timestamp();
@@ -1283,6 +840,7 @@ impl SyncClient {
         0.0
     }
 
+    #[allow(dead_code)]
     fn adjust_timestamp_for_skew(&self, timestamp: Option<i64>, clock_skew: f64) -> Option<i64> {
         let ts = timestamp?;
 
@@ -1327,6 +885,7 @@ impl SyncClient {
     }
 
     /// Get the local record of when we last synced with a peer
+    #[allow(dead_code)]
     fn get_local_last_sync(&self, peer_id: &str) -> Option<i64> {
         let peer_uuid = Uuid::parse_str(peer_id).ok()?;
         let peer_bytes = peer_uuid.as_bytes().to_vec();
@@ -1354,6 +913,7 @@ impl SyncClient {
     }
 
     /// Get full dataset from peer (for initial sync)
+    #[allow(dead_code)]
     async fn get_full_sync(&self, peer_url: &str) -> VoiceResult<FullSyncResponse> {
         let url = format!("{}/sync/full", peer_url);
 
@@ -1380,6 +940,7 @@ impl SyncClient {
     }
 
     /// Convert full sync response to SyncChange format for applying
+    #[allow(dead_code)]
     fn convert_full_sync_to_changes(&self, full_sync: &FullSyncResponse) -> Vec<SyncChange> {
         let mut changes = Vec::new();
 
@@ -1518,6 +1079,24 @@ impl SyncClient {
             }
         }
 
+        // Convert field_versions (immutable history)
+        if let Some(versions) = &full_sync.field_versions {
+            for v in versions {
+                if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                    let timestamp = v.get("created_at").and_then(|x| x.as_i64()).unwrap_or(0);
+                    changes.push(SyncChange {
+                        entity_type: "field_version".to_string(),
+                        entity_id: id.to_string(),
+                        operation: "create".to_string(),
+                        data: v.clone(),
+                        timestamp,
+                        device_id: full_sync.device_id.clone(),
+                        device_name: full_sync.device_name.clone(),
+                    });
+                }
+            }
+        }
+
         // Convert file_storage_config (single entity)
         if let Some(config) = &full_sync.file_storage_config {
             let timestamp = config
@@ -1544,9 +1123,9 @@ impl SyncClient {
         &self,
         peer_url: &str,
         changes: &[SyncChange],
-    ) -> VoiceResult<(i64, i64)> {
+    ) -> VoiceResult<(i64, i64, Vec<String>)> {
         if changes.is_empty() {
-            return Ok((0, 0));
+            return Ok((0, 0, Vec::new()));
         }
 
         let request = ApplyRequest {
@@ -1575,7 +1154,11 @@ impl SyncClient {
             .await
             .map_err(|e| VoiceError::Sync(format!("Failed to parse apply response: {}", e)))?;
 
-        Ok((result.applied, result.conflicts))
+        for err in &result.errors {
+            tracing::warn!("Server could not apply a change (queued there for retry): {}", err);
+        }
+
+        Ok((result.applied, result.conflicts, result.errors))
     }
 
     /// Download an audio file from a peer.
@@ -1773,12 +1356,8 @@ impl SyncClient {
                 .get("filename")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown.bin");
-            let ext = filename
-                .rsplit('.')
-                .next()
-                .unwrap_or("bin");
 
-            let dest_path = audiofile_directory.join(format!("{}.{}", audio_id, ext));
+            let dest_path = audio_local_path(audiofile_directory, audio_id, filename);
 
             // Skip if file already exists
             if dest_path.exists() {
@@ -1837,14 +1416,7 @@ impl SyncClient {
 
             let audio_id = &audio_file.id;
 
-            // Get extension from filename
-            let ext = audio_file
-                .filename
-                .rsplit('.')
-                .next()
-                .unwrap_or("bin");
-
-            let dest_path = audiofile_directory.join(format!("{}.{}", audio_id, ext));
+            let dest_path = audio_local_path(audiofile_directory, audio_id, &audio_file.filename);
 
             // Skip if file already exists
             if dest_path.exists() {
@@ -1905,9 +1477,8 @@ impl SyncClient {
                 .get("filename")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown.bin");
-            let ext = filename.rsplit('.').next().unwrap_or("bin");
 
-            let source_path = audiofile_directory.join(format!("{}.{}", audio_id, ext));
+            let source_path = audio_local_path(audiofile_directory, audio_id, filename);
 
             // Skip if local file doesn't exist
             if !source_path.exists() {
@@ -1978,257 +1549,137 @@ impl SyncClient {
         errors
     }
 
-    /// Upload pending audio files to cloud storage (S3).
-    ///
-    /// This is called during sync to upload any local files that haven't been
-    /// uploaded to cloud storage yet. Files are identified by having
-    /// storage_provider = NULL in the database.
-    ///
-    /// # Arguments
-    /// * `audiofile_directory` - Directory where audio files are stored locally
-    ///
-    /// # Returns
-    /// Tuple of (uploaded_count, error_messages)
-    #[cfg(feature = "file-storage")]
-    pub async fn upload_audio_files_to_cloud(
-        &self,
-        audiofile_directory: &std::path::Path,
-    ) -> (usize, Vec<String>) {
-        use crate::file_storage::{upload_pending_audio_files, FileStorageError};
+    /// Audio file directory from config, if configured.
+    fn audiofile_directory(&self) -> Option<std::path::PathBuf> {
+        let config = self.config.lock().ok()?;
+        config.audiofile_directory().map(std::path::PathBuf::from)
+    }
 
-        // Check if cloud storage is configured
-        let is_enabled = {
-            let db = match self.db.lock() {
-                Ok(db) => db,
-                Err(_) => return (0, vec!["Failed to lock database".to_string()]),
-            };
-            match db.get_file_storage_config_struct() {
-                Ok(config) => config.is_enabled(),
-                Err(_) => false,
-            }
+    /// Upload pending audio files to cloud storage.
+    ///
+    /// Runs automatically before every push. Returns warnings only: a missing
+    /// audio directory or storage configuration is not a problem, and any
+    /// upload failure is retried on the next sync because the record stays
+    /// pending (`storage_provider IS NULL`).
+    #[cfg(feature = "file-storage")]
+    pub async fn upload_audio_files_to_cloud(&self) -> Vec<String> {
+        use crate::file_storage::{create_storage_service, upload_pending_audio_files};
+
+        let dir = match self.audiofile_directory() {
+            Some(d) => d,
+            None => return Vec::new(),
         };
 
-        if !is_enabled {
-            tracing::debug!("Cloud storage not configured, skipping upload");
-            return (0, Vec::new());
-        }
-
-        // Use the file_storage module's upload function
         let db = match self.db.lock() {
             Ok(db) => db,
-            Err(_) => return (0, vec!["Failed to lock database".to_string()]),
+            Err(_) => return vec!["Failed to lock database".to_string()],
         };
 
-        match upload_pending_audio_files(&db, audiofile_directory).await {
+        match create_storage_service(&db) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::debug!("Cloud storage not configured, skipping upload");
+                return Vec::new();
+            }
+            Err(e) => return vec![format!("Cloud storage configuration problem: {}", e)],
+        }
+
+        match upload_pending_audio_files(&db, &dir).await {
             Ok(result) => {
                 if result.uploaded > 0 {
                     tracing::info!("Uploaded {} audio files to cloud storage", result.uploaded);
                 }
+                if result.skipped > 0 {
+                    tracing::debug!(
+                        "{} pending audio files are not on this device and were left for their owner",
+                        result.skipped
+                    );
+                }
                 if result.failed > 0 {
                     tracing::warn!("Failed to upload {} audio files to cloud storage", result.failed);
                 }
-                (result.uploaded, result.errors)
+                result.errors
             }
             Err(e) => {
                 let msg = format!("Cloud storage upload failed: {}", e);
                 tracing::error!("{}", msg);
-                (0, vec![msg])
+                vec![msg]
             }
         }
     }
 
-    /// Download audio files from cloud storage (S3) that are missing locally.
-    ///
-    /// This is called during sync to download files that exist in the database
-    /// (with storage_provider set) but don't exist locally.
-    ///
-    /// # Arguments
-    /// * `audiofile_directory` - Directory to save audio files
-    ///
-    /// # Returns
-    /// Tuple of (downloaded_count, error_messages)
+    /// Download every cloud audio file that is missing locally, if this
+    /// installation is configured to mirror the cloud bucket
+    /// (`sync.mirror_audio_files`). Otherwise does nothing. Returns warnings.
     #[cfg(feature = "file-storage")]
-    pub async fn download_audio_files_from_cloud(
+    pub async fn mirror_audio_files_from_cloud(&self) -> Vec<String> {
+        let mirror = self.config.lock().map(|c| c.mirror_audio_files()).unwrap_or(false);
+        if !mirror {
+            return Vec::new();
+        }
+        let dir = match self.audiofile_directory() {
+            Some(d) => d,
+            None => return vec!["mirror_audio_files is enabled but audiofile_directory is not configured".to_string()],
+        };
+        match self.download_missing_audio_files_from_cloud(&dir).await {
+            Ok(result) => result.errors,
+            Err(e) => vec![format!("Cloud storage mirror failed: {}", e)],
+        }
+    }
+
+    /// Download every non-deleted audio file that is in cloud storage but not
+    /// in `audiofile_directory`. No-op when storage is not configured.
+    #[cfg(feature = "file-storage")]
+    pub async fn download_missing_audio_files_from_cloud(
         &self,
         audiofile_directory: &std::path::Path,
-    ) -> (usize, Vec<String>) {
-        #[cfg(not(target_os = "android"))]
-        use crate::file_storage_s3::{S3Config, S3StorageService};
-        #[cfg(target_os = "android")]
-        use crate::file_storage_aws::{S3Config, S3StorageService};
-        use crate::file_storage::FileStorageService;
-
-        let mut downloaded = 0;
-        let mut errors = Vec::new();
-
-        // Get storage config
-        let storage_config = {
-            let db = match self.db.lock() {
-                Ok(db) => db,
-                Err(_) => return (0, vec!["Failed to lock database".to_string()]),
-            };
-            match db.get_file_storage_config_struct() {
-                Ok(config) => config,
-                Err(e) => return (0, vec![format!("Failed to get storage config: {}", e)]),
-            }
-        };
-
-        if !storage_config.is_enabled() {
-            tracing::info!("Cloud storage not configured - cannot download files from cloud");
-            return (0, vec!["Cloud storage not configured. Configure S3 credentials on this device.".to_string()]);
+    ) -> Result<crate::file_storage::DownloadMissingResult, crate::file_storage::FileStorageError> {
+        let db = self.db.lock().map_err(|_| {
+            crate::file_storage::FileStorageError::Config("Failed to lock database".to_string())
+        })?;
+        let result = crate::file_storage::download_missing_audio_files(&db, audiofile_directory).await?;
+        if result.downloaded > 0 {
+            tracing::info!("Downloaded {} audio files from cloud storage", result.downloaded);
         }
+        Ok(result)
+    }
 
-        tracing::info!(
-            provider = %storage_config.provider,
-            "Cloud storage is configured, proceeding with download"
-        );
+    /// Download a single audio file on demand.
+    #[cfg(feature = "file-storage")]
+    pub async fn download_audio_file_from_cloud(
+        &self,
+        audiofile_directory: &std::path::Path,
+        audio_file_id: &str,
+    ) -> Result<crate::file_storage::DownloadOutcome, crate::file_storage::FileStorageError> {
+        let db = self.db.lock().map_err(|_| {
+            crate::file_storage::FileStorageError::Config("Failed to lock database".to_string())
+        })?;
+        crate::file_storage::download_audio_file(&db, audiofile_directory, audio_file_id).await
+    }
 
-        if storage_config.provider != "s3" {
-            return (0, vec![format!("Unsupported storage provider: {}", storage_config.provider)]);
-        }
-
-        // Create S3 service
-        let bucket = match storage_config.s3_bucket() {
-            Some(b) => b.to_string(),
-            None => return (0, vec!["S3 bucket not configured".to_string()]),
-        };
-        let region = match storage_config.s3_region() {
-            Some(r) => r.to_string(),
-            None => return (0, vec!["S3 region not configured".to_string()]),
-        };
-        let access_key_id = match storage_config.s3_access_key_id() {
-            Some(k) => k.to_string(),
-            None => return (0, vec!["S3 access_key_id not configured".to_string()]),
-        };
-        let secret_access_key = match storage_config.s3_secret_access_key() {
-            Some(k) => k.to_string(),
-            None => return (0, vec!["S3 secret_access_key not configured".to_string()]),
-        };
-        let prefix = storage_config.s3_prefix().map(String::from);
-        let endpoint = storage_config.s3_endpoint().map(String::from);
-
-        let s3_config = S3Config {
-            bucket,
-            region,
-            access_key_id,
-            secret_access_key,
-            prefix: prefix.clone(),
-            endpoint,
-        };
-
-        let storage = match S3StorageService::new(s3_config) {
-            Ok(s) => s,
-            Err(e) => return (0, vec![format!("Failed to create S3 service: {}", e)]),
-        };
-
-        // Get audio files that have cloud storage info but are missing locally
-        let audio_files = {
-            let db = match self.db.lock() {
-                Ok(db) => db,
-                Err(_) => return (0, vec!["Failed to lock database".to_string()]),
-            };
-            match db.get_all_audio_files() {
-                Ok(files) => files,
-                Err(e) => return (0, vec![format!("Failed to get audio files: {}", e)]),
-            }
-        };
-
-        let total_count = audio_files.len();
-        let cloud_count = audio_files.iter().filter(|f| f.storage_key.is_some()).count();
-        tracing::info!(
-            total = total_count,
-            in_cloud = cloud_count,
-            "Checking audio files for download"
-        );
-
-        for audio_file in audio_files {
-            // Skip files without cloud storage info
-            let storage_key = match &audio_file.storage_key {
-                Some(key) => key.clone(),
-                None => continue,
-            };
-
-            // Skip files that already exist locally
-            let ext = audio_file.filename.rsplit('.').next().unwrap_or("bin");
-            let local_path = audiofile_directory.join(format!("{}.{}", audio_file.id, ext));
-            if local_path.exists() {
-                continue;
-            }
-
-            tracing::info!(
-                audio_id = %audio_file.id,
-                storage_key = %storage_key,
-                "Downloading audio file from cloud storage"
-            );
-
-            // Get pre-signed download URL
-            let download_url = match storage.get_download_url(&storage_key).await {
-                Ok(url) => url,
-                Err(e) => {
-                    errors.push(format!("Failed to get download URL for {}: {}", audio_file.id, e));
-                    continue;
-                }
-            };
-
-            // Download the file using the existing client (properly configured for Android TLS)
-            let response = match self.client.get(&download_url.url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    errors.push(format!("Failed to download {}: {}", audio_file.id, e));
-                    continue;
-                }
-            };
-
-            if !response.status().is_success() {
-                errors.push(format!(
-                    "Download failed for {}: HTTP {}",
-                    audio_file.id,
-                    response.status()
-                ));
-                continue;
-            }
-
-            let bytes = match response.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    errors.push(format!("Failed to read download response for {}: {}", audio_file.id, e));
-                    continue;
-                }
-            };
-
-            // Save to local file
-            if let Err(e) = tokio::fs::write(&local_path, &bytes).await {
-                errors.push(format!("Failed to save {} to {}: {}", audio_file.id, local_path.display(), e));
-                continue;
-            }
-
-            tracing::info!(
-                audio_id = %audio_file.id,
-                size_bytes = bytes.len(),
-                "Downloaded audio file from cloud storage"
-            );
-            downloaded += 1;
-        }
-
-        (downloaded, errors)
+    /// Download all missing audio files attached to a note on demand.
+    #[cfg(feature = "file-storage")]
+    pub async fn download_audio_files_for_note_from_cloud(
+        &self,
+        audiofile_directory: &std::path::Path,
+        note_id: &str,
+    ) -> Result<crate::file_storage::DownloadMissingResult, crate::file_storage::FileStorageError> {
+        let db = self.db.lock().map_err(|_| {
+            crate::file_storage::FileStorageError::Config("Failed to lock database".to_string())
+        })?;
+        crate::file_storage::download_audio_files_for_note(&db, audiofile_directory, note_id).await
     }
 
     /// Stub for when file-storage feature is not enabled
     #[cfg(not(feature = "file-storage"))]
-    pub async fn upload_audio_files_to_cloud(
-        &self,
-        _audiofile_directory: &std::path::Path,
-    ) -> (usize, Vec<String>) {
-        (0, Vec::new())
+    pub async fn upload_audio_files_to_cloud(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Stub for when file-storage feature is not enabled
     #[cfg(not(feature = "file-storage"))]
-    pub async fn download_audio_files_from_cloud(
-        &self,
-        _audiofile_directory: &std::path::Path,
-    ) -> (usize, Vec<String>) {
-        (0, Vec::new())
+    pub async fn mirror_audio_files_from_cloud(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -2477,10 +1928,14 @@ mod tests {
             let (db, config, _temp_dir) = create_test_db_and_config();
             let client = SyncClient::new(db, config).unwrap();
 
-            // Empty db still has system tags (_system, _marked, _nonsynced, _too-big)
+            // Empty db still has system tags (_system, _marked, _nonsynced, _too-big),
+            // each with its name and parent version
             let changes = client.get_changes_since(None).unwrap();
-            assert_eq!(changes.len(), 4);
-            assert!(changes.iter().all(|c| c.entity_type == "tag"));
+            let tags = changes.iter().filter(|c| c.entity_type == "tag").count();
+            let versions = changes.iter().filter(|c| c.entity_type == "field_version").count();
+            assert_eq!(tags, 4);
+            assert_eq!(versions, 8);
+            assert_eq!(changes.len(), 12);
         }
 
         #[test]
@@ -2510,9 +1965,12 @@ mod tests {
                 note_attachments: None,
                 transcriptions: None,
                 file_storage_config: None,
+                field_versions: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
-                timestamp: 1735689600, // 2025-01-01 00:00:00 UTC
+                timestamp: 1735689600,
+                cursor: None,
+                database_id: None, // 2025-01-01 00:00:00 UTC
             };
 
             let changes = client.convert_full_sync_to_changes(&full_sync);
@@ -2538,9 +1996,12 @@ mod tests {
                 note_attachments: None,
                 transcriptions: None,
                 file_storage_config: None,
+                field_versions: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
                 timestamp: 1735689600,
+                cursor: None,
+                database_id: None,
             };
 
             let changes = client.convert_full_sync_to_changes(&full_sync);
@@ -2568,9 +2029,12 @@ mod tests {
                 note_attachments: None,
                 transcriptions: None,
                 file_storage_config: None,
+                field_versions: None,
                 device_id: "test".to_string(),
                 device_name: Some("Test".to_string()),
                 timestamp: 1735689600,
+                cursor: None,
+                database_id: None,
             };
 
             let changes = client.convert_full_sync_to_changes(&full_sync);

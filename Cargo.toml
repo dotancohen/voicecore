@@ -19,14 +19,12 @@ server = ["dep:axum", "dep:tower", "dep:tower-http"]
 desktop = ["dep:hostname", "dep:dirs"]
 # UniFFI bindings for mobile (Android/iOS)
 uniffi = ["dep:uniffi"]
-# Cloud file storage (S3, Backblaze B2, etc.)
-# Using rust-s3 instead of aws-sdk-s3 for much faster compilation and smaller binary
-# Note: rust-s3 used on desktop, aws-sdk-s3 on Android (target-specific)
-file-storage = []
+# Cloud file storage (S3 and S3-compatible services)
+# rust-s3 0.37+ uses reqwest with bundled webpki roots, so the same
+# implementation works on desktop and Android.
+file-storage = ["dep:rust-s3"]
 
 [dependencies]
-android_logger = "0.14" # Logging experiment
-
 # Async runtime - use lighter features for mobile
 tokio = { version = "1.42", features = ["rt", "sync", "time", "macros", "fs"] }
 
@@ -41,7 +39,13 @@ serde_json = "1.0"
 uuid = { version = "1.11", features = ["v7", "serde"] }
 
 # HTTP client - base config (TLS features added per-platform below)
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+
+# Cloud storage (optional - file-storage feature)
+# rust-s3 is much lighter than aws-sdk-s3 and needs no native C build.
+# Must be >= 0.37: earlier versions load TLS roots from the OS certificate
+# directory, which does not exist on Android, so every S3 request failed there.
+rust-s3 = { version = "0.37.2", default-features = false, features = ["tokio-rustls-tls"], optional = true }
 
 # HTTP server (optional - server feature)
 axum = { version = "0.7", features = ["json"], optional = true }
@@ -101,13 +105,11 @@ uniffi = { version = "0.28", features = ["build"] }
 
 # Desktop (Linux, macOS, Windows): use aws-lc (default, better performance)
 [target.'cfg(not(target_os = "android"))'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 
-# Android: use ring + AWS SDK (better TLS handling than rust-s3)
+# Android: use ring (better cross-compilation support). "rustls-tls" bundles the
+# Mozilla root certificates, which Android does not expose to rustls otherwise.
 [target.'cfg(target_os = "android")'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-aws-sdk-s3 = "1.65"
-aws-config = "1.5"

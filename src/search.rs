@@ -92,10 +92,20 @@ pub fn parse_search_input(search_input: &str) -> ParsedSearch {
 pub fn get_tag_full_path(db: &Database, tag_id: &str) -> VoiceResult<String> {
     let mut path_parts = Vec::new();
     let mut current_id = Some(tag_id.to_string());
+    // A parent chain is a chain only as long as every device agrees. Two
+    // devices that are both offline can each move a tag under the other's,
+    // and both moves survive the merge: the two are then each other's parent,
+    // and walking up never reaches the root. Every tag already seen ends the
+    // walk, so a search of a looping hierarchy returns an odd path instead of
+    // locking up the application that asked.
+    let mut seen = std::collections::HashSet::new();
 
     while let Some(ref id) = current_id {
         match db.get_tag(id)? {
             Some(tag) => {
+                if !seen.insert(tag.id.clone()) {
+                    break;
+                }
                 path_parts.insert(0, tag.name.clone());
                 current_id = tag.parent_id;
             }
@@ -329,5 +339,56 @@ mod tests {
         let result = parse_search_input("tag:Work is:marked tag:Important");
         assert_eq!(result.tag_terms, vec!["Work", "_system/_marked", "Important"]);
         assert!(result.free_text.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod loop_safety_tests {
+    use super::*;
+    use crate::database::Database;
+
+    /// Two tags that are each other's parent: a shape two offline devices can
+    /// produce, each moving one tag under the other, both moves surviving the
+    /// merge. Before this was bounded, a tag search walked the chain for ever
+    /// with the database lock held, and the application that asked simply
+    /// stopped answering.
+    #[test]
+    fn a_looping_tag_hierarchy_does_not_hang_the_search() {
+        let db = Database::new(":memory:").unwrap();
+        let work = db.create_tag("עבודה", None).unwrap();
+        let trips = db.create_tag("נסיעות", Some(&work)).unwrap();
+        // Close the loop the way a merge would: straight into the row.
+        db.connection()
+            .execute(
+                "UPDATE tags SET parent_id = (SELECT id FROM tags WHERE id = ?) WHERE id = ?",
+                rusqlite::params![
+                    uuid::Uuid::parse_str(&trips).unwrap().as_bytes().to_vec(),
+                    uuid::Uuid::parse_str(&work).unwrap().as_bytes().to_vec()
+                ],
+            )
+            .unwrap();
+
+        let path = get_tag_full_path(&db, &trips).unwrap();
+        assert!(!path.is_empty(), "a looping hierarchy still has a path");
+        assert!(path.contains("נסיעות"));
+
+        let other = get_tag_full_path(&db, &work).unwrap();
+        assert!(other.contains("עבודה"));
+    }
+
+    /// A tag that is its own parent: the smallest loop there is.
+    #[test]
+    fn a_tag_that_is_its_own_parent_does_not_hang_the_search() {
+        let db = Database::new(":memory:").unwrap();
+        let tag = db.create_tag("עצמי", None).unwrap();
+        let bytes = uuid::Uuid::parse_str(&tag).unwrap().as_bytes().to_vec();
+        db.connection()
+            .execute(
+                "UPDATE tags SET parent_id = ? WHERE id = ?",
+                rusqlite::params![bytes.clone(), bytes],
+            )
+            .unwrap();
+
+        assert_eq!(get_tag_full_path(&db, &tag).unwrap(), "עצמי");
     }
 }

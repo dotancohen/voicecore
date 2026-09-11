@@ -16,12 +16,30 @@ use uuid::Uuid;
 
 use crate::error::{VoiceError, VoiceResult};
 use crate::models::SyncChange;
+use crate::versions::{
+    note_tag_entity_id, ENTITY_AUDIO_FILE, ENTITY_NOTE, ENTITY_NOTE_ATTACHMENT, ENTITY_NOTE_TAG,
+    ENTITY_TAG, ENTITY_TRANSCRIPTION, FIELD_ACTIVE, FIELD_CONTENT, FIELD_DELETED, FIELD_NAME,
+    FIELD_PARENT, FIELD_PRIMARY_ATTACHMENT, FIELD_PRIMARY_TRANSCRIPTION, FIELD_STATE, FIELD_SUMMARY,
+};
 use crate::validation::{
     validate_note_id, validate_search_query, validate_tag_id, validate_tag_path,
 };
 
 // Global device ID for local operations
 static LOCAL_DEVICE_ID: OnceLock<Uuid> = OnceLock::new();
+static LOCAL_DEVICE_NAME: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set the human-readable name of this device, recorded on every version it creates.
+pub fn set_local_device_name(name: &str) {
+    if let Ok(mut n) = LOCAL_DEVICE_NAME.lock() {
+        *n = Some(name.to_string());
+    }
+}
+
+/// Name of this device, if configured.
+pub fn get_local_device_name() -> Option<String> {
+    LOCAL_DEVICE_NAME.lock().ok().and_then(|n| n.clone())
+}
 
 /// System tag name - parent of all hidden system tags (e.g., _marked)
 pub const SYSTEM_TAG_NAME: &str = "_system";
@@ -101,6 +119,43 @@ pub fn get_local_device_id() -> Uuid {
 }
 
 
+/// Every timestamp that carries the timezone of the action beside it, as
+/// `<stamp>_offset` (seconds east of UTC) and `<stamp>_zone` (IANA name).
+pub const STAMPED_COLUMNS: &[(&str, &[&str])] = &[
+    ("notes", &["created_at", "modified_at", "deleted_at"]),
+    ("tags", &["created_at", "modified_at", "deleted_at"]),
+    ("note_tags", &["created_at", "modified_at", "deleted_at"]),
+    ("note_attachments", &["created_at", "modified_at", "deleted_at"]),
+    ("audio_files", &["imported_at", "file_created_at", "modified_at", "deleted_at"]),
+    ("transcriptions", &["created_at", "modified_at", "deleted_at"]),
+    ("field_versions", &["created_at"]),
+];
+
+/// Largest page of the cursor feed, in bytes of JSON (roughly). Kept well
+/// under the server body limit and small enough for a slow link to finish
+/// within the client timeout.
+pub const FEED_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+
+/// How the change feed is filtered.
+#[derive(Debug, Clone)]
+pub enum FeedFilter {
+    /// Historical timestamp filter (per-type limits)
+    Since(Option<i64>),
+    /// Write-order feed: `seq > cursor` and, when given, `seq <= upto`
+    AfterSeq { cursor: i64, upto: Option<i64> },
+}
+
+/// A page of the change feed.
+#[derive(Debug, Clone)]
+pub struct ChangeFeed {
+    pub changes: Vec<HashMap<String, serde_json::Value>>,
+    pub latest_timestamp: Option<i64>,
+    /// Pass back to continue after this page (cursor feed only)
+    pub next_cursor: i64,
+    /// False when the page was cut and more changes remain
+    pub is_complete: bool,
+}
+
 /// Note data returned from database queries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteRow {
@@ -110,6 +165,14 @@ pub struct NoteRow {
     pub modified_at: Option<i64>,
     pub deleted_at: Option<i64>,
     pub tag_names: Option<String>,
+    /// The timezone each timestamp was written in: seconds east of UTC and
+    /// the IANA name, when the device that wrote it knew one.
+    pub created_at_offset: Option<i32>,
+    pub created_at_zone: Option<String>,
+    pub modified_at_offset: Option<i32>,
+    pub modified_at_zone: Option<String>,
+    pub deleted_at_offset: Option<i32>,
+    pub deleted_at_zone: Option<String>,
     pub display_cache: Option<String>,
     /// Cache for notes list pane display (JSON with date, marked, content_preview)
     pub list_display_cache: Option<String>,
@@ -156,6 +219,15 @@ pub struct AudioFileRow {
     pub storage_key: Option<String>,
     /// Unix timestamp when file was uploaded to cloud storage
     pub storage_uploaded_at: Option<i64>,
+    /// The timezone each timestamp was written in.
+    pub imported_at_offset: Option<i32>,
+    pub imported_at_zone: Option<String>,
+    pub file_created_at_offset: Option<i32>,
+    pub file_created_at_zone: Option<String>,
+    pub modified_at_offset: Option<i32>,
+    pub modified_at_zone: Option<String>,
+    pub deleted_at_offset: Option<i32>,
+    pub deleted_at_zone: Option<String>,
 }
 
 /// Transcription data returned from database queries
@@ -173,6 +245,9 @@ pub struct TranscriptionRow {
     pub created_at: i64,
     pub modified_at: Option<i64>,
     pub deleted_at: Option<i64>,
+    /// The timezone the transcription was made in.
+    pub created_at_offset: Option<i32>,
+    pub created_at_zone: Option<String>,
 }
 
 /// Result of a tag change operation (add/remove tag from note)
@@ -216,6 +291,10 @@ impl Database {
 
         // Enable WAL mode for better concurrent access
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // A sync batch holds a write transaction for a moment; the GUI (or
+        // the server, when the GUI writes) waits instead of failing with
+        // "database is locked".
+        conn.execute_batch("PRAGMA busy_timeout=10000;")?;
 
         // Checkpoint any pending WAL frames to ensure we see the latest data
         // from other connections that may have written and closed
@@ -227,6 +306,11 @@ impl Database {
         db.migrate_timestamps_to_unix()?;
         db.migrate_add_storage_columns()?;
         db.migrate_add_file_storage_config_table()?;
+        db.migrate_drop_legacy_conflict_tables()?;
+        db.create_version_tables()?;
+        db.migrate_create_root_versions()?;
+        db.migrate_add_sync_sequence()?;
+        db.migrate_add_timezone_columns()?;
         Ok(db)
     }
 
@@ -239,6 +323,11 @@ impl Database {
         db.migrate_timestamps_to_unix()?;
         db.migrate_add_storage_columns()?;
         db.migrate_add_file_storage_config_table()?;
+        db.migrate_drop_legacy_conflict_tables()?;
+        db.create_version_tables()?;
+        db.migrate_create_root_versions()?;
+        db.migrate_add_sync_sequence()?;
+        db.migrate_add_timezone_columns()?;
         Ok(db)
     }
 
@@ -256,7 +345,14 @@ impl Database {
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
                 di_cache_note_pane_display TEXT,
-                di_cache_note_list_pane_display TEXT
+                di_cache_note_list_pane_display TEXT,
+                -- Timezone of each action; see migrate_add_timezone_columns
+                created_at_offset INTEGER,
+                created_at_zone TEXT,
+                modified_at_offset INTEGER,
+                modified_at_zone TEXT,
+                deleted_at_offset INTEGER,
+                deleted_at_zone TEXT
             );
 
             -- Create tags table with UUID7 BLOB primary key
@@ -268,6 +364,13 @@ impl Database {
                 modified_at INTEGER,
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
+                -- Timezone of each action; see migrate_add_timezone_columns
+                created_at_offset INTEGER,
+                created_at_zone TEXT,
+                modified_at_offset INTEGER,
+                modified_at_zone TEXT,
+                deleted_at_offset INTEGER,
+                deleted_at_zone TEXT,
                 FOREIGN KEY (parent_id) REFERENCES tags (id) ON DELETE CASCADE
             );
 
@@ -279,6 +382,13 @@ impl Database {
                 modified_at INTEGER,
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
+                -- Timezone of each action; see migrate_add_timezone_columns
+                created_at_offset INTEGER,
+                created_at_zone TEXT,
+                modified_at_offset INTEGER,
+                modified_at_zone TEXT,
+                deleted_at_offset INTEGER,
+                deleted_at_zone TEXT,
                 FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE,
                 FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE,
                 PRIMARY KEY (note_id, tag_id)
@@ -427,6 +537,13 @@ impl Database {
                 modified_at INTEGER,
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
+                -- Timezone of each action; see migrate_add_timezone_columns
+                created_at_offset INTEGER,
+                created_at_zone TEXT,
+                modified_at_offset INTEGER,
+                modified_at_zone TEXT,
+                deleted_at_offset INTEGER,
+                deleted_at_zone TEXT,
                 FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE
             );
 
@@ -445,7 +562,16 @@ impl Database {
                 -- Cloud storage fields
                 storage_provider TEXT,     -- "s3", "backblaze", etc. NULL = local only
                 storage_key TEXT,          -- Object key/path in cloud storage
-                storage_uploaded_at INTEGER -- When file was uploaded to cloud
+                storage_uploaded_at INTEGER, -- When file was uploaded to cloud storage
+                -- Timezone of each action; see migrate_add_timezone_columns
+                imported_at_offset INTEGER,
+                imported_at_zone TEXT,
+                file_created_at_offset INTEGER,
+                file_created_at_zone TEXT,
+                modified_at_offset INTEGER,
+                modified_at_zone TEXT,
+                deleted_at_offset INTEGER,
+                deleted_at_zone TEXT
             );
 
             -- Create transcriptions table
@@ -463,6 +589,13 @@ impl Database {
                 modified_at INTEGER,
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
+                -- Timezone of each action; see migrate_add_timezone_columns
+                created_at_offset INTEGER,
+                created_at_zone TEXT,
+                modified_at_offset INTEGER,
+                modified_at_zone TEXT,
+                deleted_at_offset INTEGER,
+                deleted_at_zone TEXT,
                 FOREIGN KEY (audio_file_id) REFERENCES audio_files (id) ON DELETE CASCADE
             );
 
@@ -1391,7 +1524,13 @@ impl Database {
                 n.deleted_at,
                 GROUP_CONCAT(t.name, ', ') as tag_names,
                 NULL as di_cache_note_pane_display,
-                n.di_cache_note_list_pane_display
+                n.di_cache_note_list_pane_display,
+                n.created_at_offset,
+                n.created_at_zone,
+                n.modified_at_offset,
+                n.modified_at_zone,
+                n.deleted_at_offset,
+                n.deleted_at_zone
             FROM notes n
             LEFT JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
@@ -1428,7 +1567,13 @@ impl Database {
                 n.deleted_at,
                 GROUP_CONCAT(t.name, ', ') as tag_names,
                 n.di_cache_note_pane_display,
-                n.di_cache_note_list_pane_display
+                n.di_cache_note_list_pane_display,
+                n.created_at_offset,
+                n.created_at_zone,
+                n.modified_at_offset,
+                n.modified_at_zone,
+                n.deleted_at_offset,
+                n.deleted_at_zone
             FROM notes n
             LEFT JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
@@ -1456,6 +1601,11 @@ impl Database {
         )?;
 
         let note_id_hex = note_id.simple().to_string();
+        // The clock this device was reading when the note was made
+        let _ = self.stamp_local_zone("notes", &note_id_hex, "created_at");
+
+        // The root of this note's content history
+        self.init_field(ENTITY_NOTE, &note_id_hex, FIELD_CONTENT, content)?;
 
         // Rebuild list cache for the new note
         let _ = self.rebuild_note_list_cache(&note_id_hex);
@@ -1491,6 +1641,7 @@ impl Database {
         }
 
         let note_id_hex = note_id.simple().to_string();
+        let _ = self.stamp_local_zone("notes", &note_id_hex, "created_at");
 
         // Rebuild list cache for the new note
         let _ = self.rebuild_note_list_cache(&note_id_hex);
@@ -1524,6 +1675,488 @@ impl Database {
         Ok((note_id, audio_file_id))
     }
 
+    // =====================================================================
+    // Which attachment or transcription stands for its parent
+    // =====================================================================
+
+    /// Make one of a note's attachments the one that stands for it: the
+    /// recording played when the note is opened, and the one whose
+    /// transcription the notes list shows.
+    ///
+    /// Pass `None` to go back to "the first one", which is what a note that
+    /// has never been asked uses.
+    pub fn set_primary_attachment(&self, note_id: &str, attachment_id: Option<&str>) -> VoiceResult<bool> {
+        let resolved = self.resolve_note_id(note_id)?;
+        let id_hex = Uuid::parse_str(&resolved)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?
+            .simple()
+            .to_string();
+        let value = match attachment_id {
+            Some(a) => {
+                let attachment = Uuid::parse_str(a)
+                    .map_err(|e| VoiceError::validation("attachment_id", e.to_string()))?;
+                let belongs: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM note_attachments WHERE id = ? AND note_id = ? AND deleted_at IS NULL",
+                        params![attachment.as_bytes().to_vec(), Uuid::parse_str(&resolved).unwrap().as_bytes().to_vec()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if belongs.is_none() {
+                    return Err(VoiceError::validation(
+                        "attachment_id",
+                        "That attachment does not belong to this note",
+                    ));
+                }
+                attachment.simple().to_string()
+            }
+            None => String::new(),
+        };
+        self.set_field(ENTITY_NOTE, &id_hex, FIELD_PRIMARY_ATTACHMENT, &value, None)?;
+        Ok(true)
+    }
+
+    /// Make one of a recording's transcriptions the one that stands for it.
+    /// `None` goes back to the first one.
+    pub fn set_primary_transcription(&self, audio_file_id: &str, transcription_id: Option<&str>) -> VoiceResult<bool> {
+        let audio = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let value = match transcription_id {
+            Some(t) => {
+                let transcription = Uuid::parse_str(t)
+                    .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
+                let belongs: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM transcriptions WHERE id = ? AND audio_file_id = ? AND deleted_at IS NULL",
+                        params![transcription.as_bytes().to_vec(), audio.as_bytes().to_vec()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if belongs.is_none() {
+                    return Err(VoiceError::validation(
+                        "transcription_id",
+                        "That transcription does not belong to this recording",
+                    ));
+                }
+                transcription.simple().to_string()
+            }
+            None => String::new(),
+        };
+        self.set_field(ENTITY_AUDIO_FILE, &audio.simple().to_string(), FIELD_PRIMARY_TRANSCRIPTION, &value, None)?;
+        Ok(true)
+    }
+
+    /// The attachment that stands for this note, if one was chosen.
+    pub fn get_primary_attachment(&self, note_id: &str) -> VoiceResult<Option<String>> {
+        let resolved = self.resolve_note_id(note_id)?;
+        let uuid = Uuid::parse_str(&resolved)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
+        let chosen: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row(
+                "SELECT primary_attachment_id FROM notes WHERE id = ?",
+                params![uuid.as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(chosen.flatten().and_then(|b| uuid_bytes_to_hex(&b)))
+    }
+
+    /// The transcription that stands for this recording, if one was chosen.
+    pub fn get_primary_transcription(&self, audio_file_id: &str) -> VoiceResult<Option<String>> {
+        let uuid = Uuid::parse_str(audio_file_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let chosen: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row(
+                "SELECT primary_transcription_id FROM audio_files WHERE id = ?",
+                params![uuid.as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(chosen.flatten().and_then(|b| uuid_bytes_to_hex(&b)))
+    }
+
+    // =====================================================================
+    // The trash bin
+    // =====================================================================
+
+    /// The notes in the trash: deleted, but still here, newest deletion
+    /// first.
+    ///
+    /// A delete in this application has always been a soft delete, so every
+    /// note that was ever deleted is still in the database with its history
+    /// and its recordings. This is how the user sees them and gets them
+    /// back.
+    pub fn get_deleted_notes(&self) -> VoiceResult<Vec<NoteRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                n.id,
+                n.created_at,
+                n.content,
+                n.modified_at,
+                n.deleted_at,
+                GROUP_CONCAT(t.name, ', ') as tag_names,
+                NULL as di_cache_note_pane_display,
+                n.di_cache_note_list_pane_display,
+                n.created_at_offset,
+                n.created_at_zone,
+                n.modified_at_offset,
+                n.modified_at_zone,
+                n.deleted_at_offset,
+                n.deleted_at_zone
+            FROM notes n
+            LEFT JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
+            LEFT JOIN tags t ON nt.tag_id = t.id
+            WHERE n.deleted_at IS NOT NULL
+            GROUP BY n.id
+            -- The id breaks a tie: two notes deleted in the same second
+            -- would otherwise come back in whatever order the table
+            -- happened to hold them. Ids are time-ordered, so the newer
+            -- note stays on top.
+            ORDER BY n.deleted_at DESC, n.created_at DESC, n.id DESC
+            "#,
+        )?;
+        let notes = stmt
+            .query_map([], |row| self.row_to_note(row))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(notes)
+    }
+
+    /// Take a note out of the trash.
+    ///
+    /// Returns false when the note is not in the trash (already alive, or
+    /// purged, or never existed). The recovery is a version like any other,
+    /// so it reaches the other devices by the ordinary route.
+    pub fn undelete_note(&self, note_id: &str) -> VoiceResult<bool> {
+        let resolved = match self.try_resolve_note_id(note_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
+        let id_hex = uuid.simple().to_string();
+        let deleted: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT deleted_at FROM notes WHERE id = ?",
+                params![uuid.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if deleted.flatten().is_none() {
+            return Ok(false);
+        }
+        let restored = self.set_undeleted(ENTITY_NOTE, &id_hex)?;
+        if restored {
+            let _ = self.rebuild_note_cache(&resolved);
+            let _ = self.rebuild_note_list_cache(&resolved);
+        }
+        Ok(restored)
+    }
+
+    /// Remove a note from the trash for good, with everything that belonged
+    /// only to it.
+    ///
+    /// This is the one operation in the application that really destroys
+    /// something. The note, its history, its tag links, its attachments and
+    /// the recordings that hung on this note alone are removed from the
+    /// database, and a `purges` row is written for each of them. Those rows
+    /// travel to the other devices, which remove the same entities, and they
+    /// stay for ever so that a peer which has not synced yet cannot bring
+    /// any of it back.
+    ///
+    /// Returns the ids of the audio files that were removed, so the caller
+    /// can delete the files themselves: the database does not know where
+    /// each platform keeps them.
+    ///
+    /// A recording that is also attached to a note which is staying is left
+    /// alone, along with its transcriptions.
+    pub fn purge_note(&self, note_id: &str) -> VoiceResult<Vec<String>> {
+        let resolved = self.resolve_note_id(note_id)?;
+        let uuid = Uuid::parse_str(&resolved)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
+        let note_bytes = uuid.as_bytes().to_vec();
+        let deleted: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT deleted_at FROM notes WHERE id = ?",
+                params![&note_bytes],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if deleted.is_none() {
+            return Err(VoiceError::validation(
+                "note_id",
+                "Only a note in the trash can be deleted for good; delete it first",
+            ));
+        }
+
+        // What goes: the note, its links, its attachments, and the audio
+        // files (with their transcriptions) that no surviving note holds.
+        let mut victims: Vec<(String, Vec<u8>)> = vec![(ENTITY_NOTE.to_string(), note_bytes.clone())];
+
+        let tag_ids: Vec<Vec<u8>> = {
+            let mut stmt = self.conn.prepare("SELECT tag_id FROM note_tags WHERE note_id = ?")?;
+            let rows = stmt.query_map(params![&note_bytes], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let attachments: Vec<(Vec<u8>, Vec<u8>, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, attachment_id, attachment_type FROM note_attachments WHERE note_id = ?",
+            )?;
+            let rows = stmt.query_map(params![&note_bytes], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut audio_ids: Vec<Vec<u8>> = Vec::new();
+        for (attachment_row_id, attachment_id, attachment_type) in &attachments {
+            victims.push((ENTITY_NOTE_ATTACHMENT.to_string(), attachment_row_id.clone()));
+            if attachment_type != "audio_file" {
+                continue;
+            }
+            // Is this recording held by any note that is staying?
+            let held_elsewhere: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM note_attachments \
+                 WHERE attachment_id = ? AND note_id != ? AND deleted_at IS NULL",
+                params![attachment_id, &note_bytes],
+                |r| r.get(0),
+            )?;
+            if held_elsewhere == 0 {
+                audio_ids.push(attachment_id.clone());
+            }
+        }
+
+        for audio_id in &audio_ids {
+            victims.push((ENTITY_AUDIO_FILE.to_string(), audio_id.clone()));
+            let transcriptions: Vec<Vec<u8>> = {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id FROM transcriptions WHERE audio_file_id = ?")?;
+                let rows = stmt.query_map(params![audio_id], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for t in transcriptions {
+                victims.push((ENTITY_TRANSCRIPTION.to_string(), t));
+            }
+        }
+
+        let purged_at = Utc::now().timestamp();
+        for (entity_type, entity_id) in &victims {
+            self.purge_entity(entity_type, entity_id, purged_at)?;
+        }
+        let _ = tag_ids;
+
+        Ok(audio_ids
+            .iter()
+            .filter_map(|b| uuid_bytes_to_hex(b))
+            .collect())
+    }
+
+    /// Write down that an entity was removed for good.
+    fn record_purge(&self, entity_type: &str, entity_id: &[u8], purged_at: i64) -> VoiceResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO purges \
+             (entity_type, entity_id, purged_at, purged_at_offset, purged_at_zone, device_id) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                entity_type,
+                entity_id.to_vec(),
+                purged_at,
+                crate::timezone::stamp_offset(),
+                crate::timezone::stamp_zone(),
+                get_local_device_id().as_bytes().to_vec(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this entity was removed for good, here or on another device.
+    pub fn is_purged(&self, entity_type: &str, entity_id: &str) -> VoiceResult<bool> {
+        let uuid = match Uuid::parse_str(entity_id) {
+            Ok(u) => u,
+            Err(_) => return Ok(false),
+        };
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM purges WHERE entity_type = ? AND entity_id = ?",
+                params![entity_type, uuid.as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Remove one entity for good: write the purge down, take the entity
+    /// away, and do the same for everything that hangs on it.
+    ///
+    /// The cascade is written down rather than merely done, because those
+    /// purge records travel: a device that had an attachment on the note
+    /// which the device emptying the trash never saw records a purge for it
+    /// too, and every device ends up removing the same set. Without that,
+    /// two devices could each hold rows the other had removed and never
+    /// agree again.
+    fn purge_entity(&self, entity_type: &str, entity_id: &[u8], purged_at: i64) -> VoiceResult<()> {
+        let already = self.purge_recorded(entity_type, entity_id)?;
+        self.record_purge(entity_type, entity_id, purged_at)?;
+        if already {
+            // Its dependants were dealt with when it was first purged.
+            self.remove_purged_entity(entity_type, entity_id)?;
+            return Ok(());
+        }
+        let dependants: Vec<(String, Vec<u8>)> = match entity_type {
+            ENTITY_NOTE => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id FROM note_attachments WHERE note_id = ?")?;
+                let rows = stmt.query_map(params![entity_id.to_vec()], |r| r.get::<_, Vec<u8>>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|id| (ENTITY_NOTE_ATTACHMENT.to_string(), id))
+                    .collect()
+            }
+            ENTITY_AUDIO_FILE => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id FROM transcriptions WHERE audio_file_id = ?")?;
+                let rows = stmt.query_map(params![entity_id.to_vec()], |r| r.get::<_, Vec<u8>>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|id| (ENTITY_TRANSCRIPTION.to_string(), id))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        for (dependant_type, dependant_id) in dependants {
+            self.purge_entity(&dependant_type, &dependant_id, purged_at)?;
+        }
+        self.remove_purged_entity(entity_type, entity_id)?;
+        Ok(())
+    }
+
+    /// Whether this exact entity already has a purge record here.
+    fn purge_recorded(&self, entity_type: &str, entity_id: &[u8]) -> VoiceResult<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM purges WHERE entity_type = ? AND entity_id = ?",
+                params![entity_type, entity_id.to_vec()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Remove one entity and its history from this database.
+    ///
+    /// A purge cascades only along relationships that never move: a tag link
+    /// belongs to its note for ever, and a transcription to its recording.
+    /// An attachment can be moved from one note to another (that is what
+    /// merging does), so removing "the attachments of this note" would
+    /// remove different rows on different devices depending on which changes
+    /// had arrived, and the two databases could never agree again.
+    /// Attachments are therefore removed only when they are named, and the
+    /// device that empties the trash names every one it can see.
+    fn remove_purged_entity(&self, entity_type: &str, entity_id: &[u8]) -> VoiceResult<()> {
+        let id_hex = uuid_bytes_to_hex(entity_id).unwrap_or_default();
+        match entity_type {
+            ENTITY_NOTE => {
+                self.conn.execute("DELETE FROM note_tags WHERE note_id = ?", params![entity_id.to_vec()])?;
+                self.conn.execute("DELETE FROM notes WHERE id = ?", params![entity_id.to_vec()])?;
+                // A tag link is named by the pair of ids, so it cannot have a
+                // purge record of its own; its history goes with the note's,
+                // and every device does this the same way when the note's
+                // purge arrives. Leaving it behind left one device with a
+                // head the other did not have.
+                let link_prefix = format!("{}:%", id_hex);
+                for table in ["field_versions", "field_heads", "field_conflicts"] {
+                    self.conn.execute(
+                        &format!(
+                            "DELETE FROM {table} WHERE entity_type = 'note_tag' AND entity_id LIKE ?"
+                        ),
+                        params![&link_prefix],
+                    )?;
+                }
+            }
+            ENTITY_AUDIO_FILE => {
+                self.conn.execute("DELETE FROM audio_files WHERE id = ?", params![entity_id.to_vec()])?;
+            }
+            ENTITY_TRANSCRIPTION => {
+                self.conn.execute("DELETE FROM transcriptions WHERE id = ?", params![entity_id.to_vec()])?;
+            }
+            ENTITY_NOTE_ATTACHMENT => {
+                self.conn.execute("DELETE FROM note_attachments WHERE id = ?", params![entity_id.to_vec()])?;
+            }
+            _ => {}
+        }
+        // The history of a thing that is gone goes with it.
+        self.conn.execute(
+            "DELETE FROM field_versions WHERE entity_type = ? AND entity_id = ?",
+            params![entity_type, &id_hex],
+        )?;
+        self.conn.execute(
+            "DELETE FROM field_heads WHERE entity_type = ? AND entity_id = ?",
+            params![entity_type, &id_hex],
+        )?;
+        self.conn.execute(
+            "DELETE FROM field_conflicts WHERE entity_type = ? AND entity_id = ?",
+            params![entity_type, &id_hex],
+        )?;
+        Ok(())
+    }
+
+    /// Apply a purge that arrived from another device.
+    ///
+    /// The entity is removed here too, and the purge is remembered so that
+    /// nothing brings it back.
+    ///
+    /// A purge is obeyed exactly as it was sent, with no local judgement
+    /// about whether this device would have removed the same things. The
+    /// device that emptied the trash decided what went (a recording held by
+    /// another note is never included), and every device must end up with
+    /// the same database: a receiver that kept something back "to be safe"
+    /// would leave two devices that could never agree again. A recording
+    /// attached to another note in the same moment on another device is the
+    /// one thing this can lose, and it is the price of a delete that really
+    /// deletes.
+    pub fn apply_purge(&self, entity_type: &str, entity_id: &str, purged_at: i64) -> VoiceResult<bool> {
+        let uuid = Uuid::parse_str(entity_id)
+            .map_err(|e| VoiceError::validation("entity_id", e.to_string()))?;
+        let bytes = uuid.as_bytes().to_vec();
+        self.purge_entity(entity_type, &bytes, purged_at)?;
+        Ok(true)
+    }
+
+    /// Import a recording into a note that already exists.
+    ///
+    /// This is what the phone does now: the note is created first and the
+    /// recording is made inside it, so the recorder has somewhere to put the
+    /// file the moment the user presses Save. Returns the audio file id.
+    ///
+    /// `import_audio_file` above is the other way round, for the importer,
+    /// which meets the file before there is any note.
+    pub fn import_audio_file_into_note(
+        &self,
+        note_id: &str,
+        filename: &str,
+        file_created_at: Option<i64>,
+        duration_seconds: Option<i64>,
+    ) -> VoiceResult<String> {
+        // Resolve first: attaching a recording to a note that is not there
+        // would leave the file with no way back to the user.
+        let resolved_id = self.resolve_note_id(note_id)?;
+        let audio_file_id =
+            self.create_audio_file_with_duration(filename, file_created_at, duration_seconds)?;
+        self.attach_to_note(&resolved_id, &audio_file_id, "audio_file")?;
+        Ok(audio_file_id)
+    }
+
     /// Update a note's content (accepts ID or ID prefix)
     pub fn update_note(&self, note_id: &str, content: &str) -> VoiceResult<bool> {
         // Use try_resolve to return false if not found (instead of error)
@@ -1533,28 +2166,27 @@ impl Database {
         };
         let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
-        let uuid_bytes = uuid.as_bytes().to_vec();
 
         if content.trim().is_empty() {
             return Err(VoiceError::validation("content", "Note content cannot be empty"));
         }
 
-        let updated = self.conn.execute(
-            r#"
-            UPDATE notes
-            SET content = ?, modified_at = strftime('%s', 'now')
-            WHERE id = ? AND deleted_at IS NULL
-            "#,
-            params![content, uuid_bytes],
-        )?;
-
-        // Rebuild display caches if update succeeded
-        if updated > 0 {
-            let _ = self.rebuild_note_cache(&resolved_id);
-            let _ = self.rebuild_note_list_cache(&resolved_id);
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM notes WHERE id = ? AND deleted_at IS NULL",
+                params![uuid.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Ok(false);
         }
 
-        Ok(updated > 0)
+        // A new version whose parent is the current head; the head recompute
+        // writes the content column and rebuilds the display caches.
+        self.set_field(ENTITY_NOTE, &resolved_id, FIELD_CONTENT, content, None)?;
+        Ok(true)
     }
 
     /// Soft-delete a note (accepts ID or ID prefix)
@@ -1566,18 +2198,20 @@ impl Database {
         };
         let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
-        let uuid_bytes = uuid.as_bytes().to_vec();
-
-        let deleted = self.conn.execute(
-            r#"
-            UPDATE notes
-            SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now')
-            WHERE id = ? AND deleted_at IS NULL
-            "#,
-            params![uuid_bytes],
-        )?;
-
-        Ok(deleted > 0)
+        let alive: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM notes WHERE id = ? AND deleted_at IS NULL",
+                params![uuid.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if alive.is_none() {
+            return Ok(false);
+        }
+        // Tombstone version carrying what this device saw; a concurrent edit
+        // elsewhere resurrects the note and flags a conflict instead of losing it.
+        self.set_deleted(ENTITY_NOTE, &resolved_id)
     }
 
     /// Merge two notes into one.
@@ -1611,24 +2245,20 @@ impl Database {
         let bytes_1 = uuid_1.as_bytes().to_vec();
         let bytes_2 = uuid_2.as_bytes().to_vec();
 
-        // 2. Get both notes (must exist and not be deleted)
-        let note_1: (String, String, Option<String>) = self
-            .conn
-            .query_row(
+        // 2. Get both notes (must exist and not be deleted). The timestamps are
+        // Unix seconds; reading them as text made every merge fail with "Note
+        // not found", because the type error was reported as a missing row.
+        let read_note = |bytes: &Vec<u8>| -> rusqlite::Result<(i64, String, Option<i64>)> {
+            self.conn.query_row(
                 "SELECT created_at, content, deleted_at FROM notes WHERE id = ?",
-                params![&bytes_1],
+                params![bytes],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .map_err(|_| VoiceError::validation("note_id_1", "Note not found"))?;
-
-        let note_2: (String, String, Option<String>) = self
-            .conn
-            .query_row(
-                "SELECT created_at, content, deleted_at FROM notes WHERE id = ?",
-                params![&bytes_2],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|_| VoiceError::validation("note_id_2", "Note not found"))?;
+        };
+        let note_1 = read_note(&bytes_1)
+            .map_err(|e| VoiceError::validation("note_id_1", format!("Note not found: {e}")))?;
+        let note_2 = read_note(&bytes_2)
+            .map_err(|e| VoiceError::validation("note_id_2", format!("Note not found: {e}")))?;
 
         // Check if either note is deleted
         if note_1.2.is_some() {
@@ -1657,11 +2287,9 @@ impl Database {
             format!("{}\n----------------\n{}", survivor_content, victim_content)
         };
 
-        // 5. Update survivor's content
-        self.conn.execute(
-            "UPDATE notes SET content = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
-            params![&merged_content, &survivor_bytes],
-        )?;
+        // 5. Update survivor's content (a normal versioned edit)
+        self.set_field(ENTITY_NOTE, &survivor_id, FIELD_CONTENT, &merged_content, None)?;
+        let victim_id = uuid_bytes_to_hex(&victim_bytes).unwrap_or_default();
 
         // 6. Move tags from victim to survivor (with deduplication)
         // First, get all active tags on the victim
@@ -1674,65 +2302,26 @@ impl Database {
             .collect();
 
         for tag_bytes in victim_tags {
-            // Check if survivor already has this tag (active)
-            let survivor_has_tag: bool = self
-                .conn
-                .query_row(
-                    "SELECT 1 FROM note_tags WHERE note_id = ? AND tag_id = ? AND deleted_at IS NULL",
-                    params![&survivor_bytes, &tag_bytes],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
-
-            if survivor_has_tag {
-                // Soft-delete the victim's association (duplicate)
-                self.conn.execute(
-                    "UPDATE note_tags SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
-                    params![&victim_bytes, &tag_bytes],
-                )?;
-            } else {
-                // Check if survivor has a soft-deleted association we can reactivate
-                let survivor_had_tag: bool = self
-                    .conn
-                    .query_row(
-                        "SELECT 1 FROM note_tags WHERE note_id = ? AND tag_id = ? AND deleted_at IS NOT NULL",
-                        params![&survivor_bytes, &tag_bytes],
-                        |_| Ok(true),
-                    )
-                    .unwrap_or(false);
-
-                if survivor_had_tag {
-                    // Reactivate survivor's association
-                    self.conn.execute(
-                        "UPDATE note_tags SET deleted_at = NULL, modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
-                        params![&survivor_bytes, &tag_bytes],
-                    )?;
-                    // Soft-delete victim's association
-                    self.conn.execute(
-                        "UPDATE note_tags SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
-                        params![&victim_bytes, &tag_bytes],
-                    )?;
-                } else {
-                    // Move the association to survivor
-                    self.conn.execute(
-                        "UPDATE note_tags SET note_id = ?, modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
-                        params![&survivor_bytes, &victim_bytes, &tag_bytes],
-                    )?;
-                }
-            }
+            let tag_hex = uuid_bytes_to_hex(&tag_bytes).unwrap_or_default();
+            // Attach to the survivor (no-op if already attached) and detach from the victim.
+            self.set_field(ENTITY_NOTE_TAG, &note_tag_entity_id(&survivor_id, &tag_hex), FIELD_ACTIVE, "1", None)?;
+            self.set_field(ENTITY_NOTE_TAG, &note_tag_entity_id(&victim_id, &tag_hex), FIELD_ACTIVE, "0", None)?;
         }
 
         // 7. Move attachments from victim to survivor
+        let zone = crate::timezone::local_zone();
         self.conn.execute(
-            "UPDATE note_attachments SET note_id = ?, modified_at = strftime('%s', 'now') WHERE note_id = ? AND deleted_at IS NULL",
-            params![&survivor_bytes, &victim_bytes],
+            r#"
+            UPDATE note_attachments
+            SET note_id = ?, modified_at = strftime('%s', 'now'),
+                modified_at_offset = ?, modified_at_zone = ?
+            WHERE note_id = ? AND deleted_at IS NULL
+            "#,
+            params![&survivor_bytes, zone.offset_seconds, zone.name, &victim_bytes],
         )?;
 
-        // 8. Soft-delete the victim note
-        self.conn.execute(
-            "UPDATE notes SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now') WHERE id = ?",
-            params![&victim_bytes],
-        )?;
+        // 8. Soft-delete the victim note (tombstone version)
+        self.set_deleted(ENTITY_NOTE, &victim_id)?;
 
         Ok(survivor_id)
     }
@@ -1746,19 +2335,18 @@ impl Database {
         };
         let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
-        let uuid_bytes = uuid.as_bytes().to_vec();
-
-        // Soft delete: set deleted_at and modified_at timestamps
-        let deleted = self.conn.execute(
-            r#"
-            UPDATE tags
-            SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now')
-            WHERE id = ? AND deleted_at IS NULL
-            "#,
-            params![uuid_bytes],
-        )?;
-
-        Ok(deleted > 0)
+        let alive: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM tags WHERE id = ? AND deleted_at IS NULL",
+                params![uuid.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if alive.is_none() {
+            return Ok(false);
+        }
+        self.set_deleted(ENTITY_TAG, &resolved_id)
     }
 
     /// Get all tags with their hierarchy information (excludes deleted tags)
@@ -1954,7 +2542,7 @@ impl Database {
             r#"
             WITH RECURSIVE tag_tree AS (
                 SELECT id FROM tags WHERE id = ?
-                UNION ALL
+                UNION
                 SELECT t.id FROM tags t
                 JOIN tag_tree tt ON t.parent_id = tt.id
             )
@@ -1993,7 +2581,13 @@ impl Database {
                 n.deleted_at,
                 GROUP_CONCAT(t.name, ', ') as tag_names,
                 NULL as di_cache_note_pane_display,
-                n.di_cache_note_list_pane_display
+                n.di_cache_note_list_pane_display,
+                n.created_at_offset,
+                n.created_at_zone,
+                n.modified_at_offset,
+                n.modified_at_zone,
+                n.deleted_at_offset,
+                n.deleted_at_zone
             FROM notes n
             INNER JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
@@ -2038,7 +2632,13 @@ impl Database {
                 n.deleted_at,
                 GROUP_CONCAT(t.name, ', ') as tag_names,
                 NULL as di_cache_note_pane_display,
-                n.di_cache_note_list_pane_display
+                n.di_cache_note_list_pane_display,
+                n.created_at_offset,
+                n.created_at_zone,
+                n.modified_at_offset,
+                n.modified_at_zone,
+                n.deleted_at_offset,
+                n.deleted_at_zone
             FROM notes n
             LEFT JOIN note_tags nt ON n.id = nt.note_id AND nt.deleted_at IS NULL
             LEFT JOIN tags t ON nt.tag_id = t.id
@@ -2095,13 +2695,13 @@ impl Database {
         let tag_id = Uuid::now_v7();
         let uuid_bytes = tag_id.as_bytes().to_vec();
 
-        let parent_bytes = match parent_id {
+        let (parent_bytes, parent_hex) = match parent_id {
             Some(pid) => {
                 let resolved_id = self.resolve_tag_id(pid)?;
                 let uuid = Uuid::parse_str(&resolved_id).map_err(|e| VoiceError::validation("parent_id", e.to_string()))?;
-                Some(uuid.as_bytes().to_vec())
+                (Some(uuid.as_bytes().to_vec()), resolved_id)
             }
-            None => None,
+            None => (None, String::new()),
         };
 
         self.conn.execute(
@@ -2109,7 +2709,12 @@ impl Database {
             params![uuid_bytes, name, parent_bytes],
         )?;
 
-        Ok(tag_id.simple().to_string())
+        let tag_hex = tag_id.simple().to_string();
+        self.init_field(ENTITY_TAG, &tag_hex, FIELD_NAME, name)?;
+        self.init_field(ENTITY_TAG, &tag_hex, FIELD_PARENT, &parent_hex)?;
+
+        let _ = self.stamp_local_zone("tags", &tag_hex, "created_at");
+        Ok(tag_hex)
     }
 
     /// Rename a tag (accepts ID or ID prefix)
@@ -2121,14 +2726,15 @@ impl Database {
         };
         let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
-        let uuid_bytes = uuid.as_bytes().to_vec();
-
-        let updated = self.conn.execute(
-            "UPDATE tags SET name = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
-            params![new_name, uuid_bytes],
-        )?;
-
-        Ok(updated > 0)
+        let exists: Option<i64> = self
+            .conn
+            .query_row("SELECT 1 FROM tags WHERE id = ?", params![uuid.as_bytes().to_vec()], |row| row.get(0))
+            .optional()?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        self.set_field(ENTITY_TAG, &resolved_id, FIELD_NAME, new_name, None)?;
+        Ok(true)
     }
 
     /// Move a tag to a different parent (or make it a root tag)
@@ -2174,12 +2780,16 @@ impl Database {
             None => None,
         };
 
-        let updated = self.conn.execute(
-            "UPDATE tags SET parent_id = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
-            params![parent_bytes, tag_bytes],
-        )?;
-
-        Ok(updated > 0)
+        let exists: Option<i64> = self
+            .conn
+            .query_row("SELECT 1 FROM tags WHERE id = ?", params![&tag_bytes], |row| row.get(0))
+            .optional()?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        let parent_hex = parent_bytes.as_ref().and_then(|b| uuid_bytes_to_hex(b)).unwrap_or_default();
+        self.set_field(ENTITY_TAG, &resolved_id, FIELD_PARENT, &parent_hex, None)?;
+        Ok(true)
     }
 
     /// Check if a tag is a descendant of another tag
@@ -2191,9 +2801,16 @@ impl Database {
         let descendant_bytes = descendant_uuid.as_bytes().to_vec();
         let ancestor_bytes = ancestor_uuid.as_bytes().to_vec();
 
-        // Walk up the parent chain from descendant to see if we hit ancestor
+        // Walk up the parent chain from descendant to see if we hit ancestor.
+        // Bounded: a chain that loops (two offline devices each moving one tag
+        // under the other, merged) would otherwise spin here for ever, with
+        // the database lock held.
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut current_id = descendant_bytes;
         loop {
+            if !seen.insert(current_id.clone()) {
+                break;
+            }
             let parent: Option<Option<Vec<u8>>> = self
                 .conn
                 .query_row(
@@ -2242,62 +2859,32 @@ impl Database {
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let tag_uuid = Uuid::parse_str(&resolved_tag_id)
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
-        let note_bytes = note_uuid.as_bytes().to_vec();
-        let tag_bytes = tag_uuid.as_bytes().to_vec();
 
-        // Check if association exists (including soft-deleted)
-        let existing: Option<Option<i64>> = self
+        // Already attached?
+        let active: Option<Option<i64>> = self
             .conn
             .query_row(
                 "SELECT deleted_at FROM note_tags WHERE note_id = ? AND tag_id = ?",
-                params![&note_bytes, &tag_bytes],
+                params![note_uuid.as_bytes().to_vec(), tag_uuid.as_bytes().to_vec()],
                 |row| row.get::<_, Option<i64>>(0),
             )
             .optional()?;
-
-        let changed = match existing {
-            Some(deleted_at) => {
-                if deleted_at.is_some() {
-                    // Reactivate soft-deleted association
-                    self.conn.execute(
-                        "UPDATE note_tags SET deleted_at = NULL, modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ?",
-                        params![&note_bytes, &tag_bytes],
-                    )?;
-                    true
-                } else {
-                    // Already active
-                    false
-                }
-            }
-            None => {
-                // Create new association
-                self.conn.execute(
-                    "INSERT INTO note_tags (note_id, tag_id, created_at) VALUES (?, ?, strftime('%s', 'now'))",
-                    params![&note_bytes, &tag_bytes],
-                )?;
-                true
-            }
-        };
-
-        // Update caches and return result
-        let mut list_cache_rebuilt = false;
-        if changed {
-            // Update the parent Note's modified_at to trigger sync
-            self.conn.execute(
-                "UPDATE notes SET modified_at = strftime('%s', 'now') WHERE id = ?",
-                params![note_bytes],
-            )?;
-            // Rebuild note pane cache (tags list changed)
-            let _ = self.rebuild_note_cache(&resolved_note_id);
-            // Always rebuild list cache since tags are displayed in the list pane
-            let _ = self.rebuild_note_list_cache(&resolved_note_id);
-            list_cache_rebuilt = true;
+        if let Some(None) = active {
+            return Ok(TagChangeResult {
+                changed: false,
+                note_id: resolved_note_id,
+                list_cache_rebuilt: false,
+            });
         }
 
+        // The membership version writes the row, bumps the note and rebuilds caches.
+        let entity_id = note_tag_entity_id(&resolved_note_id, &resolved_tag_id);
+        self.init_field(ENTITY_NOTE_TAG, &entity_id, FIELD_ACTIVE, "1")?;
+
         Ok(TagChangeResult {
-            changed,
+            changed: true,
             note_id: resolved_note_id,
-            list_cache_rebuilt,
+            list_cache_rebuilt: true,
         })
     }
 
@@ -2324,35 +2911,30 @@ impl Database {
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let tag_uuid = Uuid::parse_str(&resolved_tag_id)
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
-        let note_bytes = note_uuid.as_bytes().to_vec();
-        let tag_bytes = tag_uuid.as_bytes().to_vec();
 
-        let updated = self.conn.execute(
-            "UPDATE note_tags SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now') WHERE note_id = ? AND tag_id = ? AND deleted_at IS NULL",
-            params![&note_bytes, &tag_bytes],
-        )?;
-
-        let changed = updated > 0;
-        let mut list_cache_rebuilt = false;
-
-        // Update the parent Note's modified_at to trigger sync
-        if changed {
-            self.conn.execute(
-                "UPDATE notes SET modified_at = strftime('%s', 'now') WHERE id = ?",
-                params![note_bytes],
-            )?;
-            // Rebuild note pane cache (tags list changed)
-            let _ = self.rebuild_note_cache(&resolved_note_id);
-
-            // Always rebuild list cache (tags are now shown in list view)
-            let _ = self.rebuild_note_list_cache(&resolved_note_id);
-            list_cache_rebuilt = true;
+        let active: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT deleted_at FROM note_tags WHERE note_id = ? AND tag_id = ?",
+                params![note_uuid.as_bytes().to_vec(), tag_uuid.as_bytes().to_vec()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        if !matches!(active, Some(None)) {
+            return Ok(TagChangeResult {
+                changed: false,
+                note_id: resolved_note_id,
+                list_cache_rebuilt: false,
+            });
         }
 
+        let entity_id = note_tag_entity_id(&resolved_note_id, &resolved_tag_id);
+        self.set_field(ENTITY_NOTE_TAG, &entity_id, FIELD_ACTIVE, "0", None)?;
+
         Ok(TagChangeResult {
-            changed,
+            changed: true,
             note_id: resolved_note_id,
-            list_cache_rebuilt,
+            list_cache_rebuilt: true,
         })
     }
 
@@ -2524,6 +3106,24 @@ impl Database {
         Ok(result.changed)
     }
 
+    /// Start a write transaction for a sync batch (one fsync for thousands
+    /// of statements instead of one per statement). Statement failures
+    /// inside it roll back only that statement, so partial batches keep
+    /// their independent-change semantics.
+    pub fn begin_batch(&self) -> VoiceResult<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+
+    pub fn commit_batch(&self) -> VoiceResult<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    pub fn rollback_batch(&self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
+    }
+
     /// Close the database connection
     pub fn close(self) -> VoiceResult<()> {
         // Connection is closed when dropped
@@ -2582,613 +3182,501 @@ impl Database {
     /// Reset sync timestamps to NULL to force re-fetching all data
     /// Unlike clear_sync_peers, this preserves peer configuration
     pub fn reset_sync_timestamps(&self) -> VoiceResult<()> {
-        self.conn.execute("UPDATE sync_peers SET last_sync_at = NULL", [])?;
+        self.conn.execute(
+            "UPDATE sync_peers SET last_sync_at = NULL, last_received_cursor = NULL, last_sent_seq = NULL",
+            [],
+        )?;
         Ok(())
     }
 
     /// Get all changes since a timestamp (for sync)
     /// The `since` parameter is a Unix timestamp (seconds since epoch).
     /// Returns changes where: sync_received_at >= since OR modified_at >= since OR created_at >= since
+    /// Each entity type gets its own `limit` (one busy type must not starve the others).
     pub fn get_changes_since(&self, since: Option<i64>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<i64>)> {
-        let mut changes = Vec::new();
-        let mut latest_timestamp: Option<i64> = None;
+        let feed = self.collect_changes(&FeedFilter::Since(since), limit)?;
+        Ok((feed.changes, feed.latest_timestamp))
+    }
 
-        let since_ts: Option<i64> = since;
+    /// Changes in write order: every row and version whose `seq` is greater
+    /// than `cursor` (and at most `upto`, when given), oldest first, at most
+    /// `limit` in total. This is the primary feed: exact, resumable, and
+    /// independent of clocks. `next_cursor` is the last `seq` returned (or
+    /// `cursor` when nothing was); pass it back to continue.
+    pub fn get_changes_after_seq(&self, cursor: i64, upto: Option<i64>, limit: i64) -> VoiceResult<ChangeFeed> {
+        self.collect_changes(&FeedFilter::AfterSeq { cursor, upto }, limit)
+    }
 
-        // Get note changes
-        // Fixed query: include entities where ANY timestamp is >= since (not just sync_received_at)
-        let note_rows: Vec<(Vec<u8>, i64, String, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
-            let mut stmt = self.conn.prepare(
-                r#"
-                SELECT id, created_at, content, modified_at, deleted_at
-                FROM notes
-                WHERE sync_received_at >= ? OR modified_at >= ? OR created_at >= ?
-                ORDER BY COALESCE(sync_received_at, modified_at, created_at)
-                LIMIT ?
-                "#,
-            )?;
-            let rows = stmt.query_map(params![ts, ts, ts, limit], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            let mut stmt = self.conn.prepare(
-                r#"
-                SELECT id, created_at, content, modified_at, deleted_at
-                FROM notes
-                ORDER BY COALESCE(modified_at, created_at)
-                LIMIT ?
-                "#,
-            )?;
-            let rows = stmt.query_map(params![limit], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
+    /// The largest `seq` written so far (0 for an empty database).
+    pub fn current_seq(&self) -> VoiceResult<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM sync_sequence WHERE id = 1", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Random id of this database, minted when the sequence was created.
+    /// A peer that sees a different id knows the database was reset and its
+    /// cursors are void.
+    pub fn database_id(&self) -> VoiceResult<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM sync_meta WHERE key = 'database_id'", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Per-peer cursor state: (cursor into the peer's feed, our own seq last
+    /// pushed to the peer, the peer's database id we last saw).
+    pub fn get_peer_cursors(&self, peer_device_id: &str) -> VoiceResult<(i64, i64, Option<String>)> {
+        let peer_uuid = Uuid::parse_str(peer_device_id)
+            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+        let row: Option<(Option<i64>, Option<i64>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT last_received_cursor, last_sent_seq, peer_database_id FROM sync_peers WHERE peer_id = ?",
+                params![peer_uuid.as_bytes().to_vec()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let (c, s, d) = row.unwrap_or((None, None, None));
+        Ok((c.unwrap_or(0), s.unwrap_or(0), d))
+    }
+
+    /// Store cursor state for a peer (any `None` leaves that value alone).
+    pub fn set_peer_cursors(
+        &self,
+        peer_device_id: &str,
+        peer_name: Option<&str>,
+        received_cursor: Option<i64>,
+        sent_seq: Option<i64>,
+        peer_database_id: Option<&str>,
+    ) -> VoiceResult<()> {
+        let peer_uuid = Uuid::parse_str(peer_device_id)
+            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+        let peer_bytes = peer_uuid.as_bytes().to_vec();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, '')",
+            params![peer_bytes, peer_name],
+        )?;
+        self.conn.execute(
+            r#"UPDATE sync_peers SET
+                 last_received_cursor = COALESCE(?, last_received_cursor),
+                 last_sent_seq = COALESCE(?, last_sent_seq),
+                 peer_database_id = COALESCE(?, peer_database_id),
+                 peer_name = COALESCE(?, peer_name)
+               WHERE peer_id = ?"#,
+            params![received_cursor, sent_seq, peer_database_id, peer_name, peer_bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Build the feed. `Since` keeps the historical per-type timestamp
+    /// filter (used by the `since` query parameter and by tools); `AfterSeq`
+    /// is the cursor feed used by the sync client. The cursor feed reads the
+    /// sequence in small ranges so memory stays bounded by one page even when
+    /// every change is a long transcription.
+    fn collect_changes(&self, filter: &FeedFilter, limit: i64) -> VoiceResult<ChangeFeed> {
+        let mut out = ChangeFeed { changes: Vec::new(), latest_timestamp: None, next_cursor: 0, is_complete: true };
+        match filter {
+            FeedFilter::Since(_) => {
+                let (items, saturated) = self.collect_items(filter, limit)?;
+                // Historical behaviour: per-type order, per-type limits.
+                for (_, timestamp, c) in items {
+                    if out.latest_timestamp.map_or(true, |t| timestamp > t) {
+                        out.latest_timestamp = Some(timestamp);
+                    }
+                    out.changes.push(c);
+                }
+                out.is_complete = !saturated;
+            }
+            FeedFilter::AfterSeq { cursor, upto } => {
+                out.next_cursor = *cursor;
+                let end = upto.unwrap_or(i64::MAX).min(self.current_seq()?);
+                const CHUNK: i64 = 512;
+                let mut items: Vec<(i64, i64, HashMap<String, serde_json::Value>)> = Vec::new();
+                let mut bytes = 0usize;
+                let mut lo = *cursor;
+                let mut truncated = false;
+                'chunks: while lo < end && (items.len() as i64) < limit {
+                    let hi = lo.saturating_add(CHUNK).min(end);
+                    let (mut chunk, _) = self.collect_items(&FeedFilter::AfterSeq { cursor: lo, upto: Some(hi) }, CHUNK)?;
+                    chunk.sort_by_key(|(seq, _, _)| *seq);
+                    for item in chunk {
+                        // A page is bounded in bytes as well as in count, so that
+                        // thousands of long transcriptions never produce a body
+                        // that exceeds the peer's limit or its timeout. At least
+                        // one change always goes out, and the cursor stays exact.
+                        let size = serde_json::to_string(&item.2).map(|s| s.len()).unwrap_or(0);
+                        if !items.is_empty() && (bytes + size > FEED_BYTE_BUDGET || items.len() as i64 >= limit) {
+                            truncated = true;
+                            break 'chunks;
+                        }
+                        bytes += size;
+                        items.push(item);
+                    }
+                    lo = hi;
+                }
+                out.is_complete = !truncated && lo >= end;
+                out.next_cursor = items.last().map(|(seq, _, _)| *seq).unwrap_or(*cursor);
+                if !truncated && lo >= end && items.is_empty() {
+                    // Nothing after the cursor: report the end so the caller
+                    // does not re-read empty ranges forever
+                    out.next_cursor = (*cursor).max(end.min(*cursor));
+                }
+                for (_, timestamp, c) in items {
+                    if out.latest_timestamp.map_or(true, |t| timestamp > t) {
+                        out.latest_timestamp = Some(timestamp);
+                    }
+                    out.changes.push(c);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Run the per-type feed queries for one filter; returns (seq, timestamp,
+    /// change) items and whether any type hit `limit`.
+    fn collect_items(&self, filter: &FeedFilter, limit: i64) -> VoiceResult<(Vec<(i64, i64, HashMap<String, serde_json::Value>)>, bool)> {
+        // (seq, timestamp, change)
+        let mut items: Vec<(i64, i64, HashMap<String, serde_json::Value>)> = Vec::new();
+        let mut saturated = false;
+
+        let ts_val = |v: Option<i64>| v.map_or(serde_json::Value::Null, |t| serde_json::Value::Number(t.into()));
+        let str_val = |v: Option<String>| v.map_or(serde_json::Value::Null, serde_json::Value::String);
+        let op = |modified_at: Option<i64>, deleted_at: Option<i64>| {
+            if deleted_at.is_some() { "delete" } else if modified_at.is_some() { "update" } else { "create" }
         };
-
-        for (id_bytes, created_at, content, modified_at, deleted_at) in note_rows {
-            let timestamp = modified_at.unwrap_or(created_at);
-            let operation = if deleted_at.is_some() {
-                "delete"
-            } else if modified_at.is_some() {
-                "update"
-            } else {
-                "create"
-            };
-
-            let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-            let mut change = HashMap::new();
-            change.insert("entity_type".to_string(), serde_json::Value::String("note".to_string()));
-            change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
-            change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-            change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
-
-            let mut data = serde_json::Map::new();
-            data.insert("id".to_string(), serde_json::Value::String(id_hex));
-            data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
-            data.insert("content".to_string(), serde_json::Value::String(content));
-            data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-            data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-            change.insert("data".to_string(), serde_json::Value::Object(data));
-
-            latest_timestamp = Some(timestamp);
-            changes.push(change);
+        /// Read `count` (offset, zone) pairs starting at column `at`: the
+        /// timezone each of the row's timestamps was written in.
+        fn read_zone_pairs(row: &rusqlite::Row, at: usize, count: usize) -> rusqlite::Result<Vec<(Option<i32>, Option<String>)>> {
+            let mut pairs = Vec::with_capacity(count);
+            for i in 0..count {
+                pairs.push((
+                    row.get::<_, Option<i64>>(at + i * 2)?.map(|v| v as i32),
+                    row.get(at + i * 2 + 1)?,
+                ));
+            }
+            Ok(pairs)
         }
 
-        // Get tag changes
-        // Fixed query: include entities where ANY timestamp is >= since
-        let remaining = limit - changes.len() as i64;
-        if remaining > 0 {
-            let tag_rows: Vec<(Vec<u8>, String, Option<Vec<u8>>, i64, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT id, name, parent_id, created_at, modified_at, deleted_at
-                    FROM tags
-                    WHERE sync_received_at >= ? OR modified_at >= ? OR created_at >= ?
-                    ORDER BY COALESCE(sync_received_at, modified_at, created_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![ts, ts, ts, remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT id, name, parent_id, created_at, modified_at, deleted_at
-                    FROM tags
-                    ORDER BY COALESCE(modified_at, created_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
+        /// Put those pairs into the payload beside the timestamps they belong to.
+        fn insert_zone_pairs(data: &mut serde_json::Map<String, serde_json::Value>, stamps: &[&str], pairs: &[(Option<i32>, Option<String>)]) {
+            for (stamp, (offset, zone)) in stamps.iter().zip(pairs.iter()) {
+                data.insert(
+                    format!("{}_offset", stamp),
+                    offset.map_or(serde_json::Value::Null, |o| serde_json::Value::Number(o.into())),
+                );
+                data.insert(
+                    format!("{}_zone", stamp),
+                    zone.clone().map_or(serde_json::Value::Null, serde_json::Value::String),
+                );
+            }
+        }
 
-            for (id_bytes, name, parent_id_bytes, created_at, modified_at, deleted_at) in tag_rows {
+        fn change(entity_type: &str, entity_id: String, operation: &str, timestamp: i64, seq: i64, data: serde_json::Map<String, serde_json::Value>) -> HashMap<String, serde_json::Value> {
+            let mut c = HashMap::new();
+            c.insert("entity_type".to_string(), serde_json::Value::String(entity_type.to_string()));
+            c.insert("entity_id".to_string(), serde_json::Value::String(entity_id));
+            c.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
+            c.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
+            c.insert("seq".to_string(), serde_json::Value::Number(seq.into()));
+            c.insert("data".to_string(), serde_json::Value::Object(data));
+            c
+        }
+
+        // Notes
+        {
+            let rows: Vec<(Vec<u8>, i64, String, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>)> = self.feed_query(
+                "id, created_at, content, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_attachment_id", "notes",
+                "sync_received_at >= ?1 OR modified_at >= ?1 OR created_at >= ?1",
+                "COALESCE(sync_received_at, modified_at, created_at)", "COALESCE(modified_at, created_at)",
+                filter, limit,
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, Option<i64>>(12)?.unwrap_or(0), read_zone_pairs(row, 5, 3)?, row.get(11)?)),
+            )?;
+            saturated |= rows.len() as i64 >= limit;
+            for (id_bytes, created_at, content, modified_at, deleted_at, seq, zones, primary_attachment) in rows {
                 let timestamp = modified_at.unwrap_or(created_at);
-                let operation = if deleted_at.is_some() {
-                    "delete"
-                } else if modified_at.is_some() {
-                    "update"
-                } else {
-                    "create"
-                };
-
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-                let parent_id_hex = parent_id_bytes.and_then(|b| uuid_bytes_to_hex(&b));
-
-                let mut change = HashMap::new();
-                change.insert("entity_type".to_string(), serde_json::Value::String("tag".to_string()));
-                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
-                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
-
                 let mut data = serde_json::Map::new();
-                data.insert("id".to_string(), serde_json::Value::String(id_hex));
+                data.insert("id".to_string(), serde_json::Value::String(id_hex.clone()));
+                data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
+                data.insert("content".to_string(), serde_json::Value::String(content));
+                data.insert("modified_at".to_string(), ts_val(modified_at));
+                data.insert("deleted_at".to_string(), ts_val(deleted_at));
+                data.insert(
+                    "primary_attachment_id".to_string(),
+                    str_val(primary_attachment.and_then(|b| uuid_bytes_to_hex(&b))),
+                );
+                insert_zone_pairs(&mut data, &["created_at", "modified_at", "deleted_at"], &zones);
+                items.push((seq, timestamp, change("note", id_hex, op(modified_at, deleted_at), timestamp, seq, data)));
+            }
+        }
+
+        // Tags
+        {
+            let rows: Vec<(Vec<u8>, String, Option<Vec<u8>>, i64, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>)> = self.feed_query(
+                "id, name, parent_id, created_at, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone", "tags",
+                "sync_received_at >= ?1 OR modified_at >= ?1 OR created_at >= ?1",
+                "COALESCE(sync_received_at, modified_at, created_at)", "COALESCE(modified_at, created_at)",
+                filter, limit,
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(12)?.unwrap_or(0), read_zone_pairs(row, 6, 3)?)),
+            )?;
+            saturated |= rows.len() as i64 >= limit;
+            for (id_bytes, name, parent_bytes, created_at, modified_at, deleted_at, seq, zones) in rows {
+                let timestamp = modified_at.unwrap_or(created_at);
+                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
+                let mut data = serde_json::Map::new();
+                data.insert("id".to_string(), serde_json::Value::String(id_hex.clone()));
                 data.insert("name".to_string(), serde_json::Value::String(name));
-                data.insert("parent_id".to_string(), parent_id_hex.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("parent_id".to_string(), str_val(parent_bytes.and_then(|b| uuid_bytes_to_hex(&b))));
                 data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                change.insert("data".to_string(), serde_json::Value::Object(data));
-
-                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
-                    latest_timestamp = Some(timestamp);
-                }
-                changes.push(change);
+                data.insert("modified_at".to_string(), ts_val(modified_at));
+                data.insert("deleted_at".to_string(), ts_val(deleted_at));
+                insert_zone_pairs(&mut data, &["created_at", "modified_at", "deleted_at"], &zones);
+                items.push((seq, timestamp, change("tag", id_hex, op(modified_at, deleted_at), timestamp, seq, data)));
             }
         }
 
-        // Get note_tag changes
-        // Fixed query: include entities where ANY timestamp is >= since
-        let remaining = limit - changes.len() as i64;
-        if remaining > 0 {
-            let nt_rows: Vec<(Vec<u8>, Vec<u8>, i64, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT note_id, tag_id, created_at, modified_at, deleted_at
-                    FROM note_tags
-                    WHERE sync_received_at >= ? OR modified_at >= ? OR deleted_at >= ? OR created_at >= ?
-                    ORDER BY COALESCE(sync_received_at, modified_at, deleted_at, created_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![ts, ts, ts, ts, remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT note_id, tag_id, created_at, modified_at, deleted_at
-                    FROM note_tags
-                    ORDER BY COALESCE(modified_at, deleted_at, created_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-
-            for (note_id_bytes, tag_id_bytes, created_at, modified_at, deleted_at) in nt_rows {
-                let timestamp = modified_at
-                    .or(deleted_at)
-                    .unwrap_or(created_at);
-
-                let operation = if deleted_at.is_some() {
-                    "delete"
-                } else if modified_at.is_some() {
-                    "update"
-                } else {
-                    "create"
-                };
-
-                let note_id_hex = uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default();
-                let tag_id_hex = uuid_bytes_to_hex(&tag_id_bytes).unwrap_or_default();
-                let entity_id = format!("{}:{}", note_id_hex, tag_id_hex);
-
-                let mut change = HashMap::new();
-                change.insert("entity_type".to_string(), serde_json::Value::String("note_tag".to_string()));
-                change.insert("entity_id".to_string(), serde_json::Value::String(entity_id));
-                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
-
+        // Note-tag links
+        {
+            let rows: Vec<(Vec<u8>, Vec<u8>, i64, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>)> = self.feed_query(
+                "note_id, tag_id, created_at, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone", "note_tags",
+                "sync_received_at >= ?1 OR modified_at >= ?1 OR deleted_at >= ?1 OR created_at >= ?1",
+                "COALESCE(sync_received_at, modified_at, deleted_at, created_at)", "COALESCE(modified_at, deleted_at, created_at)",
+                filter, limit,
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, Option<i64>>(11)?.unwrap_or(0), read_zone_pairs(row, 5, 3)?)),
+            )?;
+            saturated |= rows.len() as i64 >= limit;
+            for (note_bytes, tag_bytes, created_at, modified_at, deleted_at, seq, zones) in rows {
+                let timestamp = modified_at.or(deleted_at).unwrap_or(created_at);
+                let note_hex = uuid_bytes_to_hex(&note_bytes).unwrap_or_default();
+                let tag_hex = uuid_bytes_to_hex(&tag_bytes).unwrap_or_default();
                 let mut data = serde_json::Map::new();
-                data.insert("note_id".to_string(), serde_json::Value::String(note_id_hex));
-                data.insert("tag_id".to_string(), serde_json::Value::String(tag_id_hex));
+                data.insert("note_id".to_string(), serde_json::Value::String(note_hex.clone()));
+                data.insert("tag_id".to_string(), serde_json::Value::String(tag_hex.clone()));
                 data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                change.insert("data".to_string(), serde_json::Value::Object(data));
-
-                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
-                    latest_timestamp = Some(timestamp);
-                }
-                changes.push(change);
+                data.insert("modified_at".to_string(), ts_val(modified_at));
+                data.insert("deleted_at".to_string(), ts_val(deleted_at));
+                insert_zone_pairs(&mut data, &["created_at", "modified_at", "deleted_at"], &zones);
+                items.push((seq, timestamp, change("note_tag", format!("{}:{}", note_hex, tag_hex), op(modified_at, deleted_at), timestamp, seq, data)));
             }
         }
 
-        // Get audio_file changes
-        // Fixed query: include entities where ANY timestamp is >= since
-        let remaining = limit - changes.len() as i64;
-        if remaining > 0 {
-            let audio_rows: Vec<(Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>)> = if let Some(ts) = since_ts {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at,
-                           storage_provider, storage_key, storage_uploaded_at
-                    FROM audio_files
-                    WHERE sync_received_at >= ? OR modified_at >= ? OR imported_at >= ?
-                    ORDER BY COALESCE(sync_received_at, modified_at, imported_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![ts, ts, ts, remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                        row.get::<_, Option<i64>>(9)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT id, imported_at, filename, file_created_at, summary, modified_at, deleted_at,
-                           storage_provider, storage_key, storage_uploaded_at
-                    FROM audio_files
-                    ORDER BY COALESCE(modified_at, imported_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                        row.get::<_, Option<i64>>(9)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-
-            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at) in audio_rows {
+        // Audio files
+        {
+            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>);
+            let rows: Vec<AudioRow> = self.feed_query(
+                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id", "audio_files",
+                "sync_received_at >= ?1 OR modified_at >= ?1 OR imported_at >= ?1",
+                "COALESCE(sync_received_at, modified_at, imported_at)", "COALESCE(modified_at, imported_at)",
+                filter, limit,
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(19)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?)),
+            )?;
+            saturated |= rows.len() as i64 >= limit;
+            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription) in rows {
                 let timestamp = modified_at.unwrap_or(imported_at);
-                let operation = if deleted_at.is_some() {
-                    "delete"
-                } else if modified_at.is_some() {
-                    "update"
-                } else {
-                    "create"
-                };
-
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-                let mut change = HashMap::new();
-                change.insert("entity_type".to_string(), serde_json::Value::String("audio_file".to_string()));
-                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
-                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
-
                 let mut data = serde_json::Map::new();
-                data.insert("id".to_string(), serde_json::Value::String(id_hex));
+                data.insert("id".to_string(), serde_json::Value::String(id_hex.clone()));
                 data.insert("imported_at".to_string(), serde_json::Value::Number(imported_at.into()));
                 data.insert("filename".to_string(), serde_json::Value::String(filename));
-                data.insert("file_created_at".to_string(), file_created_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                data.insert("summary".to_string(), summary.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                data.insert("storage_provider".to_string(), storage_provider.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("storage_key".to_string(), storage_key.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("storage_uploaded_at".to_string(), storage_uploaded_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                change.insert("data".to_string(), serde_json::Value::Object(data));
-
-                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
-                    latest_timestamp = Some(timestamp);
-                }
-                changes.push(change);
+                data.insert("file_created_at".to_string(), ts_val(file_created_at));
+                data.insert("summary".to_string(), str_val(summary));
+                data.insert("modified_at".to_string(), ts_val(modified_at));
+                data.insert("deleted_at".to_string(), ts_val(deleted_at));
+                data.insert("storage_provider".to_string(), str_val(storage_provider));
+                data.insert("storage_key".to_string(), str_val(storage_key));
+                data.insert("storage_uploaded_at".to_string(), ts_val(storage_uploaded_at));
+                data.insert(
+                    "primary_transcription_id".to_string(),
+                    str_val(primary_transcription.and_then(|b| uuid_bytes_to_hex(&b))),
+                );
+                insert_zone_pairs(&mut data, &["imported_at", "file_created_at", "modified_at", "deleted_at"], &zones);
+                items.push((seq, timestamp, change("audio_file", id_hex, op(modified_at, deleted_at), timestamp, seq, data)));
             }
         }
 
-        // Get note_attachment changes
-        // Fixed query: include entities where ANY timestamp is >= since
-        let remaining = limit - changes.len() as i64;
-        if remaining > 0 {
-            let na_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, String, i64, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
-                    FROM note_attachments
-                    WHERE sync_received_at >= ? OR modified_at >= ? OR deleted_at >= ? OR created_at >= ?
-                    ORDER BY COALESCE(sync_received_at, modified_at, deleted_at, created_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![ts, ts, ts, ts, remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at
-                    FROM note_attachments
-                    ORDER BY COALESCE(modified_at, deleted_at, created_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-
-            for (id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at) in na_rows {
-                let timestamp = modified_at
-                    .or(deleted_at)
-                    .unwrap_or(created_at);
-
-                let operation = if deleted_at.is_some() {
-                    "delete"
-                } else if modified_at.is_some() {
-                    "update"
-                } else {
-                    "create"
-                };
-
+        // Attachments
+        {
+            let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, String, i64, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>)> = self.feed_query(
+                "id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone", "note_attachments",
+                "sync_received_at >= ?1 OR modified_at >= ?1 OR deleted_at >= ?1 OR created_at >= ?1",
+                "COALESCE(sync_received_at, modified_at, deleted_at, created_at)", "COALESCE(modified_at, deleted_at, created_at)",
+                filter, limit,
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get::<_, Option<i64>>(13)?.unwrap_or(0), read_zone_pairs(row, 7, 3)?)),
+            )?;
+            saturated |= rows.len() as i64 >= limit;
+            for (id_bytes, note_bytes, att_bytes, attachment_type, created_at, modified_at, deleted_at, seq, zones) in rows {
+                let timestamp = modified_at.or(deleted_at).unwrap_or(created_at);
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-                let note_id_hex = uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default();
-                let attachment_id_hex = uuid_bytes_to_hex(&attachment_id_bytes).unwrap_or_default();
-
-                let mut change = HashMap::new();
-                change.insert("entity_type".to_string(), serde_json::Value::String("note_attachment".to_string()));
-                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
-                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
-
                 let mut data = serde_json::Map::new();
-                data.insert("id".to_string(), serde_json::Value::String(id_hex));
-                data.insert("note_id".to_string(), serde_json::Value::String(note_id_hex));
-                data.insert("attachment_id".to_string(), serde_json::Value::String(attachment_id_hex));
+                data.insert("id".to_string(), serde_json::Value::String(id_hex.clone()));
+                data.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_bytes).unwrap_or_default()));
+                data.insert("attachment_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&att_bytes).unwrap_or_default()));
                 data.insert("attachment_type".to_string(), serde_json::Value::String(attachment_type));
                 data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                change.insert("data".to_string(), serde_json::Value::Object(data));
-
-                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
-                    latest_timestamp = Some(timestamp);
-                }
-                changes.push(change);
+                data.insert("modified_at".to_string(), ts_val(modified_at));
+                data.insert("deleted_at".to_string(), ts_val(deleted_at));
+                insert_zone_pairs(&mut data, &["created_at", "modified_at", "deleted_at"], &zones);
+                items.push((seq, timestamp, change("note_attachment", id_hex, op(modified_at, deleted_at), timestamp, seq, data)));
             }
         }
 
-        // Get transcription changes
-        // Fixed query: include entities where ANY timestamp is >= since
-        let remaining = limit - changes.len() as i64;
-        if remaining > 0 {
-            let transcription_rows: Vec<(Vec<u8>, Vec<u8>, String, Option<String>, String, Option<String>, Option<String>, String, Vec<u8>, i64, Option<i64>, Option<i64>)> = if let Some(ts) = since_ts {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
-                    FROM transcriptions
-                    WHERE sync_received_at >= ? OR modified_at >= ? OR created_at >= ?
-                    ORDER BY COALESCE(sync_received_at, modified_at, created_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![ts, ts, ts, remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, Vec<u8>>(8)?,
-                        row.get::<_, i64>(9)?,
-                        row.get::<_, Option<i64>>(10)?,
-                        row.get::<_, Option<i64>>(11)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                let mut stmt = self.conn.prepare(
-                    r#"
-                    SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
-                    FROM transcriptions
-                    ORDER BY COALESCE(modified_at, created_at)
-                    LIMIT ?
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![remaining], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, Vec<u8>>(8)?,
-                        row.get::<_, i64>(9)?,
-                        row.get::<_, Option<i64>>(10)?,
-                        row.get::<_, Option<i64>>(11)?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-
-            for (id_bytes, audio_file_id_bytes, content, content_segments, service, service_arguments, service_response, state, device_id_bytes, created_at, modified_at, deleted_at) in transcription_rows {
+        // Transcriptions
+        {
+            type TrRow = (Vec<u8>, Vec<u8>, String, Option<String>, String, Option<String>, Option<String>, String, Vec<u8>, i64, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>);
+            let rows: Vec<TrRow> = self.feed_query(
+                "id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone", "transcriptions",
+                "sync_received_at >= ?1 OR modified_at >= ?1 OR created_at >= ?1",
+                "COALESCE(sync_received_at, modified_at, created_at)", "COALESCE(modified_at, created_at)",
+                filter, limit,
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<i64>>(18)?.unwrap_or(0), read_zone_pairs(row, 12, 3)?)),
+            )?;
+            saturated |= rows.len() as i64 >= limit;
+            for (id_bytes, audio_bytes, content, content_segments, service, service_arguments, service_response, state, device_bytes, created_at, modified_at, deleted_at, seq, zones) in rows {
                 let timestamp = modified_at.unwrap_or(created_at);
-                let operation = if deleted_at.is_some() {
-                    "delete"
-                } else if modified_at.is_some() {
-                    "update"
-                } else {
-                    "create"
-                };
-
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-                let audio_file_id_hex = uuid_bytes_to_hex(&audio_file_id_bytes).unwrap_or_default();
-                let device_id_hex = uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default();
-
-                let mut change = HashMap::new();
-                change.insert("entity_type".to_string(), serde_json::Value::String("transcription".to_string()));
-                change.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
-                change.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
-
                 let mut data = serde_json::Map::new();
-                data.insert("id".to_string(), serde_json::Value::String(id_hex));
-                data.insert("audio_file_id".to_string(), serde_json::Value::String(audio_file_id_hex));
+                data.insert("id".to_string(), serde_json::Value::String(id_hex.clone()));
+                data.insert("audio_file_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&audio_bytes).unwrap_or_default()));
                 data.insert("content".to_string(), serde_json::Value::String(content));
-                data.insert("content_segments".to_string(), content_segments.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("content_segments".to_string(), str_val(content_segments));
                 data.insert("service".to_string(), serde_json::Value::String(service));
-                data.insert("service_arguments".to_string(), service_arguments.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-                data.insert("service_response".to_string(), service_response.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
+                data.insert("service_arguments".to_string(), str_val(service_arguments));
+                data.insert("service_response".to_string(), str_val(service_response));
                 data.insert("state".to_string(), serde_json::Value::String(state));
-                data.insert("device_id".to_string(), serde_json::Value::String(device_id_hex));
+                data.insert("device_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&device_bytes).unwrap_or_default()));
                 data.insert("created_at".to_string(), serde_json::Value::Number(created_at.into()));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                data.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                change.insert("data".to_string(), serde_json::Value::Object(data));
-
-                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
-                    latest_timestamp = Some(timestamp);
-                }
-                changes.push(change);
+                data.insert("modified_at".to_string(), ts_val(modified_at));
+                data.insert("deleted_at".to_string(), ts_val(deleted_at));
+                insert_zone_pairs(&mut data, &["created_at", "modified_at", "deleted_at"], &zones);
+                items.push((seq, timestamp, change("transcription", id_hex, op(modified_at, deleted_at), timestamp, seq, data)));
             }
         }
 
-        // Get file_storage_config changes
-        // This is a single-row config table that syncs S3 credentials between devices
-        let remaining = limit - changes.len() as i64;
-        if remaining > 0 {
-            let config_row: Option<(String, Option<String>, Option<i64>, Option<Vec<u8>>)> = if let Some(ts) = since_ts {
-                self.conn.query_row(
-                    r#"
-                    SELECT provider, config, modified_at, device_id
-                    FROM file_storage_config
-                    WHERE id = 'default' AND (sync_received_at >= ? OR modified_at >= ?)
-                    "#,
-                    params![ts, ts],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, Option<i64>>(2)?,
-                            row.get::<_, Option<Vec<u8>>>(3)?,
-                        ))
-                    },
-                ).ok()
-            } else {
-                self.conn.query_row(
-                    r#"
-                    SELECT provider, config, modified_at, device_id
-                    FROM file_storage_config
-                    WHERE id = 'default'
-                    "#,
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, Option<i64>>(2)?,
-                            row.get::<_, Option<Vec<u8>>>(3)?,
-                        ))
-                    },
-                ).ok()
-            };
-
-            if let Some((provider, config, modified_at, device_id_bytes)) = config_row {
+        // Cloud storage configuration (single row)
+        {
+            let rows: Vec<(String, Option<String>, Option<i64>, Option<Vec<u8>>, i64)> = self.feed_query(
+                "provider, config, modified_at, device_id", "file_storage_config",
+                "id = 'default' AND (sync_received_at >= ?1 OR modified_at >= ?1)",
+                "modified_at", "modified_at",
+                filter, limit,
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, Option<i64>>(4)?.unwrap_or(0))),
+            )?;
+            for (provider, config, modified_at, device_bytes, seq) in rows {
                 let timestamp = modified_at.unwrap_or(0);
-                let device_id_hex = device_id_bytes.and_then(|b| uuid_bytes_to_hex(&b));
-
-                let mut change = HashMap::new();
-                change.insert("entity_type".to_string(), serde_json::Value::String("file_storage_config".to_string()));
-                change.insert("entity_id".to_string(), serde_json::Value::String("default".to_string()));
-                change.insert("operation".to_string(), serde_json::Value::String("update".to_string()));
-                change.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
-                if let Some(did) = &device_id_hex {
-                    change.insert("device_id".to_string(), serde_json::Value::String(did.clone()));
-                }
-
+                let device_hex = device_bytes.and_then(|b| uuid_bytes_to_hex(&b));
                 let mut data = serde_json::Map::new();
                 data.insert("id".to_string(), serde_json::Value::String("default".to_string()));
                 data.insert("provider".to_string(), serde_json::Value::String(provider));
-                data.insert("config".to_string(), config.map_or(serde_json::Value::Null, |s| {
-                    serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
-                }));
-                data.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |ts| serde_json::Value::Number(ts.into())));
-                if let Some(did) = device_id_hex {
-                    data.insert("device_id".to_string(), serde_json::Value::String(did));
+                data.insert("config".to_string(), config.map_or(serde_json::Value::Null, |s| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)));
+                data.insert("modified_at".to_string(), ts_val(modified_at));
+                if let Some(d) = &device_hex {
+                    data.insert("device_id".to_string(), serde_json::Value::String(d.clone()));
                 }
-                change.insert("data".to_string(), serde_json::Value::Object(data));
-
-                if latest_timestamp.is_none() || timestamp > latest_timestamp.unwrap() {
-                    latest_timestamp = Some(timestamp);
+                let mut c = change("file_storage_config", "default".to_string(), "update", timestamp, seq, data);
+                if let Some(d) = device_hex {
+                    c.insert("device_id".to_string(), serde_json::Value::String(d));
                 }
-                changes.push(change);
+                items.push((seq, timestamp, c));
             }
         }
 
-        Ok((changes, latest_timestamp))
+        // Field versions: immutable history entries, one per edit. Applied
+        // before entity rows on the receiving side (see apply order).
+        {
+            let versions = match filter {
+                FeedFilter::Since(since) => self.get_versions_since(*since, limit)?.into_iter().map(|v| (0i64, v)).collect::<Vec<_>>(),
+                FeedFilter::AfterSeq { cursor, upto } => self.get_versions_after_seq(*cursor, *upto, limit)?,
+            };
+            saturated |= versions.len() as i64 >= limit;
+            for (seq, v) in versions {
+                let timestamp = v.created_at;
+                let mut c = HashMap::new();
+                c.insert("entity_type".to_string(), serde_json::Value::String("field_version".to_string()));
+                c.insert("entity_id".to_string(), serde_json::Value::String(v.id_hex()));
+                c.insert("operation".to_string(), serde_json::Value::String("create".to_string()));
+                c.insert("timestamp".to_string(), serde_json::Value::Number(timestamp.into()));
+                c.insert("seq".to_string(), serde_json::Value::Number(seq.into()));
+                c.insert("data".to_string(), v.to_json());
+                items.push((seq, timestamp, c));
+            }
+        }
+
+        // Purges: entities removed for good. They carry no data of their
+        // own beyond what was removed and when, and a receiver that has
+        // never heard of them ignores them (PROTO-2).
+        {
+            let rows: Vec<(String, Vec<u8>, i64, Option<i32>, Option<String>, i64)> = self.feed_query(
+                "entity_type, entity_id, purged_at, purged_at_offset, purged_at_zone", "purges",
+                "purged_at >= ?1", "purged_at", "purged_at",
+                filter, limit,
+                |row| Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, Option<i64>>(3)?.map(|v| v as i32),
+                    row.get(4)?,
+                    row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                )),
+            )?;
+            saturated |= rows.len() as i64 >= limit;
+            for (entity_type, id_bytes, purged_at, offset, zone, seq) in rows {
+                let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
+                let mut data = serde_json::Map::new();
+                data.insert("entity_type".to_string(), serde_json::Value::String(entity_type));
+                data.insert("entity_id".to_string(), serde_json::Value::String(id_hex.clone()));
+                data.insert("purged_at".to_string(), serde_json::Value::Number(purged_at.into()));
+                data.insert(
+                    "purged_at_offset".to_string(),
+                    offset.map_or(serde_json::Value::Null, |o| serde_json::Value::Number(o.into())),
+                );
+                data.insert(
+                    "purged_at_zone".to_string(),
+                    zone.map_or(serde_json::Value::Null, serde_json::Value::String),
+                );
+                items.push((seq, purged_at, change("purge", id_hex, "delete", purged_at, seq, data)));
+            }
+        }
+
+        Ok((items, saturated))
+    }
+
+    /// One feed query: `cols` (plus `seq` appended) from `table`, filtered
+    /// and ordered according to `filter`.
+    fn feed_query<T, F>(
+        &self,
+        cols: &str,
+        table: &str,
+        since_where: &str,
+        since_order: &str,
+        all_order: &str,
+        filter: &FeedFilter,
+        limit: i64,
+        map: F,
+    ) -> VoiceResult<Vec<T>>
+    where
+        F: Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        let (sql, values): (String, Vec<rusqlite::types::Value>) = match filter {
+            FeedFilter::Since(Some(ts)) => (
+                format!("SELECT {}, seq FROM {} WHERE {} ORDER BY {} LIMIT ?2", cols, table, since_where, since_order),
+                vec![(*ts).into(), limit.into()],
+            ),
+            FeedFilter::Since(None) => (
+                format!("SELECT {}, seq FROM {} ORDER BY {} LIMIT ?1", cols, table, all_order),
+                vec![limit.into()],
+            ),
+            FeedFilter::AfterSeq { cursor, upto } => (
+                format!("SELECT {}, seq FROM {} WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3", cols, table),
+                vec![(*cursor).into(), upto.unwrap_or(i64::MAX).into(), limit.into()],
+            ),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| map(row))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Get changes since a timestamp using exclusive comparison (>)
@@ -3215,9 +3703,24 @@ impl Database {
         } else {
             self.get_changes_since(None, limit)?
         };
+        Ok((Self::feed_to_sync_changes(changes), latest_timestamp))
+    }
 
-        // Convert HashMap changes to SyncChange structs
-        let sync_changes: Vec<SyncChange> = changes
+    /// Cursor feed as `SyncChange`s: (changes, next_cursor, is_complete).
+    pub fn get_changes_after_seq_as_sync_changes(
+        &self,
+        cursor: i64,
+        upto: Option<i64>,
+        limit: i64,
+    ) -> VoiceResult<(Vec<SyncChange>, i64, bool)> {
+        let feed = self.get_changes_after_seq(cursor, upto, limit)?;
+        Ok((Self::feed_to_sync_changes(feed.changes), feed.next_cursor, feed.is_complete))
+    }
+
+    /// Convert feed maps to `SyncChange` structs (device fields are filled by
+    /// the transport layer).
+    pub fn feed_to_sync_changes(changes: Vec<HashMap<String, serde_json::Value>>) -> Vec<SyncChange> {
+        changes
             .into_iter()
             .filter_map(|c| {
                 let entity_type = c.get("entity_type")?.as_str()?.to_string();
@@ -3225,7 +3728,6 @@ impl Database {
                 let operation = c.get("operation")?.as_str().unwrap_or("create").to_string();
                 let timestamp = c.get("timestamp")?.as_i64()?;
                 let data = c.get("data").cloned().unwrap_or(serde_json::Value::Null);
-
                 Some(SyncChange {
                     entity_type,
                     entity_id,
@@ -3236,9 +3738,7 @@ impl Database {
                     device_name: None,
                 })
             })
-            .collect();
-
-        Ok((sync_changes, latest_timestamp))
+            .collect()
     }
 
     /// Get full dataset for initial sync
@@ -3403,6 +3903,15 @@ impl Database {
         }
         result.insert("note_attachments".to_string(), note_attachments);
 
+        // Every version: the complete history travels with the full dataset
+        let mut field_versions = Vec::new();
+        for v in self.get_versions_since(None, i64::MAX)? {
+            if let serde_json::Value::Object(map) = v.to_json() {
+                field_versions.push(map.into_iter().collect::<HashMap<String, serde_json::Value>>());
+            }
+        }
+        result.insert("field_versions".to_string(), field_versions);
+
         Ok(result)
     }
 
@@ -3419,35 +3928,54 @@ impl Database {
         modified_at: Option<i64>,
         deleted_at: Option<i64>,
         sync_received_at: Option<i64>,
+        // Which attachment stands for the note, when the sender named one.
+        // A hint like every other row value (VER-4): the version is the
+        // truth, and this only gives a root to a database that has none.
+        primary_attachment_id: Option<&str>,
     ) -> VoiceResult<bool> {
         let uuid = Uuid::parse_str(note_id)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
+        let id_hex = uuid.simple().to_string();
 
-        // Check if note exists
+        // Row: create if missing; never overwrite versioned columns from a row.
         let existing: Option<i64> = self.conn
             .query_row("SELECT 1 FROM notes WHERE id = ?", params![&uuid_bytes], |row| row.get(0))
             .optional()?;
-
         if existing.is_some() {
-            // Update existing note
             self.conn.execute(
-                "UPDATE notes SET content = ?, modified_at = ?, deleted_at = ?, sync_received_at = ? WHERE id = ?",
-                params![content, modified_at, deleted_at, sync_received_at, uuid_bytes],
+                "UPDATE notes SET modified_at = NULLIF(MAX(COALESCE(modified_at, 0), COALESCE(?, 0)), 0), sync_received_at = COALESCE(?, sync_received_at) WHERE id = ?",
+                params![modified_at, sync_received_at, uuid_bytes],
             )?;
         } else {
-            // Insert new note
             self.conn.execute(
                 "INSERT INTO notes (id, created_at, content, modified_at, deleted_at, sync_received_at) VALUES (?, ?, ?, ?, ?, ?)",
                 params![uuid_bytes, created_at, content, modified_at, deleted_at, sync_received_at],
             )?;
         }
 
+        // Peers that predate versioning send rows without history: give those
+        // rows deterministic roots so every device converges on the same graph.
+        self.ensure_root_version(ENTITY_NOTE, &id_hex, FIELD_CONTENT, content, modified_at.unwrap_or(created_at))?;
+        if let Some(primary) = primary_attachment_id.filter(|p| !p.is_empty()) {
+            self.ensure_root_version(
+                ENTITY_NOTE,
+                &id_hex,
+                FIELD_PRIMARY_ATTACHMENT,
+                primary,
+                modified_at.unwrap_or(created_at),
+            )?;
+        }
+        if let Some(d) = deleted_at {
+            self.ensure_root_version(ENTITY_NOTE, &id_hex, FIELD_DELETED, "1", d)?;
+        }
+
+        // Heads are the authority for content and deletion.
+        self.reapply_entity_heads(ENTITY_NOTE, &id_hex)?;
+
         // Rebuild caches after sync (only if not deleted)
         if deleted_at.is_none() {
-            // List cache: content_preview may have changed
             let _ = self.rebuild_note_list_cache(note_id);
-            // Note pane cache: conflicts may have been created during sync
             let _ = self.rebuild_note_cache(note_id);
         }
 
@@ -3481,6 +4009,7 @@ impl Database {
         let uuid = Uuid::parse_str(tag_id)
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
+        let id_hex = uuid.simple().to_string();
 
         let parent_bytes = match parent_id {
             Some(pid) => {
@@ -3491,24 +4020,28 @@ impl Database {
             None => None,
         };
 
-        // Check if tag exists
         let existing: Option<i64> = self.conn
             .query_row("SELECT 1 FROM tags WHERE id = ?", params![&uuid_bytes], |row| row.get(0))
             .optional()?;
-
         if existing.is_some() {
-            // Update existing tag
             self.conn.execute(
-                "UPDATE tags SET name = ?, parent_id = ?, modified_at = ?, deleted_at = ?, sync_received_at = ? WHERE id = ?",
-                params![name, parent_bytes, modified_at, deleted_at, sync_received_at, uuid_bytes],
+                "UPDATE tags SET modified_at = NULLIF(MAX(COALESCE(modified_at, 0), COALESCE(?, 0)), 0), sync_received_at = COALESCE(?, sync_received_at) WHERE id = ?",
+                params![modified_at, sync_received_at, uuid_bytes],
             )?;
         } else {
-            // Insert new tag
             self.conn.execute(
                 "INSERT INTO tags (id, name, parent_id, created_at, modified_at, deleted_at, sync_received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 params![uuid_bytes, name, parent_bytes, created_at, modified_at, deleted_at, sync_received_at],
             )?;
         }
+
+        let ts = modified_at.unwrap_or(created_at);
+        self.ensure_root_version(ENTITY_TAG, &id_hex, FIELD_NAME, name, ts)?;
+        self.ensure_root_version(ENTITY_TAG, &id_hex, FIELD_PARENT, parent_id.unwrap_or(""), ts)?;
+        if let Some(d) = deleted_at {
+            self.ensure_root_version(ENTITY_TAG, &id_hex, FIELD_DELETED, "1", d)?;
+        }
+        self.reapply_entity_heads(ENTITY_TAG, &id_hex)?;
         Ok(true)
     }
 
@@ -3528,8 +4061,9 @@ impl Database {
             .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
         let note_bytes = note_uuid.as_bytes().to_vec();
         let tag_bytes = tag_uuid.as_bytes().to_vec();
+        let note_hex = note_uuid.simple().to_string();
+        let tag_hex = tag_uuid.simple().to_string();
 
-        // Check if association exists
         let existing: Option<i64> = self.conn
             .query_row(
                 "SELECT 1 FROM note_tags WHERE note_id = ? AND tag_id = ?",
@@ -3537,29 +4071,26 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
-
         if existing.is_some() {
-            // Update existing association
             self.conn.execute(
-                "UPDATE note_tags SET modified_at = ?, deleted_at = ?, sync_received_at = ? WHERE note_id = ? AND tag_id = ?",
-                params![modified_at, deleted_at, sync_received_at, note_bytes, tag_bytes],
+                "UPDATE note_tags SET modified_at = NULLIF(MAX(COALESCE(modified_at, 0), COALESCE(?, 0)), 0), sync_received_at = COALESCE(?, sync_received_at) WHERE note_id = ? AND tag_id = ?",
+                params![modified_at, sync_received_at, note_bytes, tag_bytes],
             )?;
         } else {
-            // Insert new association
             self.conn.execute(
                 "INSERT INTO note_tags (note_id, tag_id, created_at, modified_at, deleted_at, sync_received_at) VALUES (?, ?, ?, ?, ?, ?)",
                 params![note_bytes, tag_bytes, created_at, modified_at, deleted_at, sync_received_at],
             )?;
         }
 
-        // Always rebuild note pane cache (tags list changed)
-        let _ = self.rebuild_note_cache(note_id);
+        let entity_id = note_tag_entity_id(&note_hex, &tag_hex);
+        let active = if deleted_at.is_some() { "0" } else { "1" };
+        self.ensure_root_version(ENTITY_NOTE_TAG, &entity_id, FIELD_ACTIVE, active, deleted_at.or(modified_at).unwrap_or(created_at))?;
+        self.reapply_entity_heads(ENTITY_NOTE_TAG, &entity_id)?;
 
-        // Also rebuild list cache if this is the _marked tag (marked status changed)
-        let marked_tag_id = self.get_marked_tag_id()?;
-        if tag_bytes == marked_tag_id {
-            let _ = self.rebuild_note_list_cache(note_id);
-        }
+        // Always rebuild note pane cache (tags list may have changed)
+        let _ = self.rebuild_note_cache(&note_hex);
+        let _ = self.rebuild_note_list_cache(&note_hex);
 
         Ok(true)
     }
@@ -3667,814 +4198,7 @@ impl Database {
         }
     }
 
-    /// Create a conflict record for note content conflict
-    pub fn create_note_content_conflict(
-        &self,
-        note_id: &str,
-        local_content: &str,
-        local_modified_at: i64,
-        local_device_id: Option<&str>,
-        local_device_name: Option<&str>,
-        remote_content: &str,
-        remote_modified_at: i64,
-        remote_device_id: Option<&str>,
-        remote_device_name: Option<&str>,
-    ) -> VoiceResult<String> {
-        let conflict_id = Uuid::now_v7();
-        let conflict_bytes = conflict_id.as_bytes().to_vec();
-
-        let note_uuid = Uuid::parse_str(note_id)
-            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
-        let note_bytes = note_uuid.as_bytes().to_vec();
-
-        let local_device_bytes = local_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-        let remote_device_bytes = remote_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-
-        self.conn.execute(
-            r#"
-            INSERT INTO conflicts_note_content
-            (id, note_id, local_content, local_modified_at, local_device_id, local_device_name,
-             remote_content, remote_modified_at, remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
-            "#,
-            params![
-                conflict_bytes,
-                note_bytes,
-                local_content,
-                local_modified_at,
-                local_device_bytes,
-                local_device_name,
-                remote_content,
-                remote_modified_at,
-                remote_device_bytes,
-                remote_device_name,
-            ],
-        )?;
-
-        Ok(conflict_id.simple().to_string())
-    }
-
-    /// Create a conflict record for note delete conflict
-    pub fn create_note_delete_conflict(
-        &self,
-        note_id: &str,
-        surviving_content: &str,
-        surviving_modified_at: i64,
-        surviving_device_id: Option<&str>,
-        surviving_device_name: Option<&str>,
-        deleted_content: Option<&str>,
-        deleted_at: i64,
-        deleting_device_id: Option<&str>,
-        deleting_device_name: Option<&str>,
-    ) -> VoiceResult<String> {
-        let conflict_id = Uuid::now_v7();
-        let conflict_bytes = conflict_id.as_bytes().to_vec();
-
-        let note_uuid = Uuid::parse_str(note_id)
-            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
-        let note_bytes = note_uuid.as_bytes().to_vec();
-
-        let surviving_device_bytes = surviving_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-        let deleting_device_bytes = deleting_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-
-        self.conn.execute(
-            r#"
-            INSERT INTO conflicts_note_delete
-            (id, note_id, surviving_content, surviving_modified_at, surviving_device_id,
-             surviving_device_name, deleted_content, deleted_at, deleting_device_id,
-             deleting_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
-            "#,
-            params![
-                conflict_bytes,
-                note_bytes,
-                surviving_content,
-                surviving_modified_at,
-                surviving_device_bytes,
-                surviving_device_name,
-                deleted_content,
-                deleted_at,
-                deleting_device_bytes,
-                deleting_device_name,
-            ],
-        )?;
-
-        Ok(conflict_id.simple().to_string())
-    }
-
-    /// Create a conflict record for tag rename conflict
-    pub fn create_tag_rename_conflict(
-        &self,
-        tag_id: &str,
-        local_name: &str,
-        local_modified_at: i64,
-        local_device_id: Option<&str>,
-        local_device_name: Option<&str>,
-        remote_name: &str,
-        remote_modified_at: i64,
-        remote_device_id: Option<&str>,
-        remote_device_name: Option<&str>,
-    ) -> VoiceResult<String> {
-        let conflict_id = Uuid::now_v7();
-        let conflict_bytes = conflict_id.as_bytes().to_vec();
-
-        let tag_uuid = Uuid::parse_str(tag_id)
-            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
-        let tag_bytes = tag_uuid.as_bytes().to_vec();
-
-        let local_device_bytes = local_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-        let remote_device_bytes = remote_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-
-        self.conn.execute(
-            r#"
-            INSERT INTO conflicts_tag_rename
-            (id, tag_id, local_name, local_modified_at, local_device_id, local_device_name,
-             remote_name, remote_modified_at, remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
-            "#,
-            params![
-                conflict_bytes,
-                tag_bytes,
-                local_name,
-                local_modified_at,
-                local_device_bytes,
-                local_device_name,
-                remote_name,
-                remote_modified_at,
-                remote_device_bytes,
-                remote_device_name,
-            ],
-        )?;
-
-        Ok(conflict_id.simple().to_string())
-    }
-
-    /// Create a conflict record for note_tag conflict
-    pub fn create_note_tag_conflict(
-        &self,
-        note_id: &str,
-        tag_id: &str,
-        local_created_at: Option<i64>,
-        local_modified_at: Option<i64>,
-        local_deleted_at: Option<i64>,
-        local_device_id: Option<&str>,
-        local_device_name: Option<&str>,
-        remote_created_at: Option<i64>,
-        remote_modified_at: Option<i64>,
-        remote_deleted_at: Option<i64>,
-        remote_device_id: Option<&str>,
-        remote_device_name: Option<&str>,
-    ) -> VoiceResult<String> {
-        let conflict_id = Uuid::now_v7();
-        let conflict_bytes = conflict_id.as_bytes().to_vec();
-
-        let note_uuid = Uuid::parse_str(note_id)
-            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
-        let tag_uuid = Uuid::parse_str(tag_id)
-            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
-        let note_bytes = note_uuid.as_bytes().to_vec();
-        let tag_bytes = tag_uuid.as_bytes().to_vec();
-
-        let local_device_bytes = local_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-        let remote_device_bytes = remote_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-
-        self.conn.execute(
-            r#"
-            INSERT INTO conflicts_note_tag
-            (id, note_id, tag_id,
-             local_created_at, local_modified_at, local_deleted_at, local_device_id, local_device_name,
-             remote_created_at, remote_modified_at, remote_deleted_at, remote_device_id, remote_device_name,
-             created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
-            "#,
-            params![
-                conflict_bytes,
-                note_bytes,
-                tag_bytes,
-                local_created_at,
-                local_modified_at,
-                local_deleted_at,
-                local_device_bytes,
-                local_device_name,
-                remote_created_at,
-                remote_modified_at,
-                remote_deleted_at,
-                remote_device_bytes,
-                remote_device_name,
-            ],
-        )?;
-
-        Ok(conflict_id.simple().to_string())
-    }
-
-    /// Create a conflict record for tag parent_id conflict
-    pub fn create_tag_parent_conflict(
-        &self,
-        tag_id: &str,
-        local_parent_id: Option<&str>,
-        local_modified_at: i64,
-        local_device_id: Option<&str>,
-        local_device_name: Option<&str>,
-        remote_parent_id: Option<&str>,
-        remote_modified_at: i64,
-        remote_device_id: Option<&str>,
-        remote_device_name: Option<&str>,
-    ) -> VoiceResult<String> {
-        let conflict_id = Uuid::now_v7();
-        let conflict_bytes = conflict_id.as_bytes().to_vec();
-
-        let tag_uuid = Uuid::parse_str(tag_id)
-            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
-        let tag_bytes = tag_uuid.as_bytes().to_vec();
-
-        let local_parent_bytes = local_parent_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-        let local_device_bytes = local_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-
-        let remote_parent_bytes = remote_parent_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-        let remote_device_bytes = remote_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-
-        self.conn.execute(
-            r#"
-            INSERT INTO conflicts_tag_parent
-            (id, tag_id, local_parent_id, local_modified_at, local_device_id, local_device_name,
-             remote_parent_id, remote_modified_at, remote_device_id, remote_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
-            "#,
-            params![
-                conflict_bytes,
-                tag_bytes,
-                local_parent_bytes,
-                local_modified_at,
-                local_device_bytes,
-                local_device_name,
-                remote_parent_bytes,
-                remote_modified_at,
-                remote_device_bytes,
-                remote_device_name,
-            ],
-        )?;
-
-        Ok(conflict_id.simple().to_string())
-    }
-
-    /// Create a conflict record for tag delete conflict (rename vs delete)
-    pub fn create_tag_delete_conflict(
-        &self,
-        tag_id: &str,
-        surviving_name: &str,
-        surviving_parent_id: Option<&str>,
-        surviving_modified_at: i64,
-        surviving_device_id: Option<&str>,
-        surviving_device_name: Option<&str>,
-        deleted_at: i64,
-        deleting_device_id: Option<&str>,
-        deleting_device_name: Option<&str>,
-    ) -> VoiceResult<String> {
-        let conflict_id = Uuid::now_v7();
-        let conflict_bytes = conflict_id.as_bytes().to_vec();
-
-        let tag_uuid = Uuid::parse_str(tag_id)
-            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
-        let tag_bytes = tag_uuid.as_bytes().to_vec();
-
-        let surviving_parent_bytes = surviving_parent_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-
-        let surviving_device_bytes = surviving_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-
-        let deleting_device_bytes = deleting_device_id.and_then(|id| {
-            Uuid::parse_str(id).ok().map(|u| u.as_bytes().to_vec())
-        });
-
-        self.conn.execute(
-            r#"
-            INSERT INTO conflicts_tag_delete
-            (id, tag_id, surviving_name, surviving_parent_id, surviving_modified_at,
-             surviving_device_id, surviving_device_name,
-             deleted_at, deleting_device_id, deleting_device_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
-            "#,
-            params![
-                conflict_bytes,
-                tag_bytes,
-                surviving_name,
-                surviving_parent_bytes,
-                surviving_modified_at,
-                surviving_device_bytes,
-                surviving_device_name,
-                deleted_at,
-                deleting_device_bytes,
-                deleting_device_name,
-            ],
-        )?;
-
-        Ok(conflict_id.simple().to_string())
-    }
-
-    // ============================================================================
-    // Conflict query and resolution methods
-    // ============================================================================
-
-    /// Get counts of unresolved conflicts by type
-    pub fn get_unresolved_conflict_counts(&self) -> VoiceResult<HashMap<String, i64>> {
-        let mut counts = HashMap::new();
-
-        let note_content: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conflicts_note_content WHERE resolved_at IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        let note_delete: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conflicts_note_delete WHERE resolved_at IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        let tag_rename: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conflicts_tag_rename WHERE resolved_at IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-
-        counts.insert("note_content".to_string(), note_content);
-        counts.insert("note_delete".to_string(), note_delete);
-        counts.insert("tag_rename".to_string(), tag_rename);
-        counts.insert("total".to_string(), note_content + note_delete + tag_rename);
-
-        Ok(counts)
-    }
-
-    /// Get the types of unresolved conflicts for a specific note.
-    ///
-    /// Returns a list of conflict type strings (e.g., ["content", "delete"]).
-    /// Returns an empty list if the note has no unresolved conflicts.
-    pub fn get_note_conflict_types(&self, note_id: &str) -> VoiceResult<Vec<String>> {
-        let resolved_id = self.resolve_note_id(note_id)?;
-        let note_uuid = Uuid::parse_str(&resolved_id)
-            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
-        let note_bytes = note_uuid.as_bytes().to_vec();
-
-        let mut types = Vec::new();
-
-        // Check for note content conflicts
-        let content_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conflicts_note_content WHERE note_id = ? AND resolved_at IS NULL",
-            params![note_bytes],
-            |row| row.get(0),
-        )?;
-        if content_count > 0 {
-            types.push("content".to_string());
-        }
-
-        // Check for note delete conflicts
-        let delete_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conflicts_note_delete WHERE note_id = ? AND resolved_at IS NULL",
-            params![note_bytes],
-            |row| row.get(0),
-        )?;
-        if delete_count > 0 {
-            types.push("delete".to_string());
-        }
-
-        Ok(types)
-    }
-
-    /// Get note content conflicts
-    pub fn get_note_content_conflicts(&self, include_resolved: bool) -> VoiceResult<Vec<HashMap<String, serde_json::Value>>> {
-        let query = if include_resolved {
-            r#"SELECT id, note_id, local_content, local_modified_at, local_device_id,
-                      local_device_name, remote_content, remote_modified_at,
-                      remote_device_id, remote_device_name, created_at, resolved_at
-               FROM conflicts_note_content ORDER BY created_at DESC"#
-        } else {
-            r#"SELECT id, note_id, local_content, local_modified_at, local_device_id,
-                      local_device_name, remote_content, remote_modified_at,
-                      remote_device_id, remote_device_name, created_at, resolved_at
-               FROM conflicts_note_content WHERE resolved_at IS NULL ORDER BY created_at DESC"#
-        };
-
-        let mut stmt = self.conn.prepare(query)?;
-        let rows = stmt.query_map([], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let note_id: Vec<u8> = row.get(1)?;
-            let local_content: String = row.get(2)?;
-            let local_modified_at: i64 = row.get(3)?;
-            let local_device_id: Option<Vec<u8>> = row.get(4)?;
-            let local_device_name: Option<String> = row.get(5)?;
-            let remote_content: String = row.get(6)?;
-            let remote_modified_at: i64 = row.get(7)?;
-            let remote_device_id: Option<Vec<u8>> = row.get(8)?;
-            let remote_device_name: Option<String> = row.get(9)?;
-            let created_at: i64 = row.get(10)?;
-            let resolved_at: Option<i64> = row.get(11)?;
-
-            Ok((id, note_id, local_content, local_modified_at, local_device_id,
-                local_device_name, remote_content, remote_modified_at,
-                remote_device_id, remote_device_name, created_at, resolved_at))
-        })?;
-
-        let mut conflicts = Vec::new();
-        for row in rows {
-            let (id, note_id, local_content, local_modified_at, local_device_id,
-                 local_device_name, remote_content, remote_modified_at,
-                 remote_device_id, remote_device_name, created_at, resolved_at) = row?;
-
-            let mut conflict = HashMap::new();
-            conflict.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id).unwrap_or_default()));
-            conflict.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id).unwrap_or_default()));
-            conflict.insert("local_content".to_string(), serde_json::Value::String(local_content));
-            conflict.insert("local_modified_at".to_string(), serde_json::json!(local_modified_at));
-            conflict.insert("local_device_id".to_string(), local_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("local_device_name".to_string(), local_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("remote_content".to_string(), serde_json::Value::String(remote_content));
-            conflict.insert("remote_modified_at".to_string(), serde_json::json!(remote_modified_at));
-            conflict.insert("remote_device_id".to_string(), remote_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("remote_device_name".to_string(), remote_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            conflicts.push(conflict);
-        }
-
-        Ok(conflicts)
-    }
-
-    /// Get note delete conflicts
-    pub fn get_note_delete_conflicts(&self, include_resolved: bool) -> VoiceResult<Vec<HashMap<String, serde_json::Value>>> {
-        let query = if include_resolved {
-            r#"SELECT id, note_id, surviving_content, surviving_modified_at,
-                      surviving_device_id, surviving_device_name, deleted_content, deleted_at,
-                      deleting_device_id, deleting_device_name, created_at, resolved_at
-               FROM conflicts_note_delete ORDER BY created_at DESC"#
-        } else {
-            r#"SELECT id, note_id, surviving_content, surviving_modified_at,
-                      surviving_device_id, surviving_device_name, deleted_content, deleted_at,
-                      deleting_device_id, deleting_device_name, created_at, resolved_at
-               FROM conflicts_note_delete WHERE resolved_at IS NULL ORDER BY created_at DESC"#
-        };
-
-        let mut stmt = self.conn.prepare(query)?;
-        let rows = stmt.query_map([], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let note_id: Vec<u8> = row.get(1)?;
-            let surviving_content: String = row.get(2)?;
-            let surviving_modified_at: i64 = row.get(3)?;
-            let surviving_device_id: Option<Vec<u8>> = row.get(4)?;
-            let surviving_device_name: Option<String> = row.get(5)?;
-            let deleted_content: Option<String> = row.get(6)?;
-            let deleted_at: i64 = row.get(7)?;
-            let deleting_device_id: Option<Vec<u8>> = row.get(8)?;
-            let deleting_device_name: Option<String> = row.get(9)?;
-            let created_at: i64 = row.get(10)?;
-            let resolved_at: Option<i64> = row.get(11)?;
-
-            Ok((id, note_id, surviving_content, surviving_modified_at,
-                surviving_device_id, surviving_device_name, deleted_content, deleted_at,
-                deleting_device_id, deleting_device_name, created_at, resolved_at))
-        })?;
-
-        let mut conflicts = Vec::new();
-        for row in rows {
-            let (id, note_id, surviving_content, surviving_modified_at,
-                 surviving_device_id, surviving_device_name, deleted_content, deleted_at,
-                 deleting_device_id, deleting_device_name, created_at, resolved_at) = row?;
-
-            let mut conflict = HashMap::new();
-            conflict.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id).unwrap_or_default()));
-            conflict.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id).unwrap_or_default()));
-            conflict.insert("surviving_content".to_string(), serde_json::Value::String(surviving_content));
-            conflict.insert("surviving_modified_at".to_string(), serde_json::json!(surviving_modified_at));
-            conflict.insert("surviving_device_id".to_string(), surviving_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("surviving_device_name".to_string(), surviving_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("deleted_content".to_string(), deleted_content.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("deleted_at".to_string(), serde_json::json!(deleted_at));
-            conflict.insert("deleting_device_id".to_string(), deleting_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("deleting_device_name".to_string(), deleting_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            conflicts.push(conflict);
-        }
-
-        Ok(conflicts)
-    }
-
-    /// Get tag rename conflicts
-    pub fn get_tag_rename_conflicts(&self, include_resolved: bool) -> VoiceResult<Vec<HashMap<String, serde_json::Value>>> {
-        let query = if include_resolved {
-            r#"SELECT id, tag_id, local_name, local_modified_at, local_device_id,
-                      local_device_name, remote_name, remote_modified_at,
-                      remote_device_id, remote_device_name, created_at, resolved_at
-               FROM conflicts_tag_rename ORDER BY created_at DESC"#
-        } else {
-            r#"SELECT id, tag_id, local_name, local_modified_at, local_device_id,
-                      local_device_name, remote_name, remote_modified_at,
-                      remote_device_id, remote_device_name, created_at, resolved_at
-               FROM conflicts_tag_rename WHERE resolved_at IS NULL ORDER BY created_at DESC"#
-        };
-
-        let mut stmt = self.conn.prepare(query)?;
-        let rows = stmt.query_map([], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let tag_id: Vec<u8> = row.get(1)?;
-            let local_name: String = row.get(2)?;
-            let local_modified_at: i64 = row.get(3)?;
-            let local_device_id: Option<Vec<u8>> = row.get(4)?;
-            let local_device_name: Option<String> = row.get(5)?;
-            let remote_name: String = row.get(6)?;
-            let remote_modified_at: i64 = row.get(7)?;
-            let remote_device_id: Option<Vec<u8>> = row.get(8)?;
-            let remote_device_name: Option<String> = row.get(9)?;
-            let created_at: i64 = row.get(10)?;
-            let resolved_at: Option<i64> = row.get(11)?;
-
-            Ok((id, tag_id, local_name, local_modified_at, local_device_id,
-                local_device_name, remote_name, remote_modified_at,
-                remote_device_id, remote_device_name, created_at, resolved_at))
-        })?;
-
-        let mut conflicts = Vec::new();
-        for row in rows {
-            let (id, tag_id, local_name, local_modified_at, local_device_id,
-                 local_device_name, remote_name, remote_modified_at,
-                 remote_device_id, remote_device_name, created_at, resolved_at) = row?;
-
-            let mut conflict = HashMap::new();
-            conflict.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id).unwrap_or_default()));
-            conflict.insert("tag_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&tag_id).unwrap_or_default()));
-            conflict.insert("local_name".to_string(), serde_json::Value::String(local_name));
-            conflict.insert("local_modified_at".to_string(), serde_json::json!(local_modified_at));
-            conflict.insert("local_device_id".to_string(), local_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("local_device_name".to_string(), local_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("remote_name".to_string(), serde_json::Value::String(remote_name));
-            conflict.insert("remote_modified_at".to_string(), serde_json::json!(remote_modified_at));
-            conflict.insert("remote_device_id".to_string(), remote_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("remote_device_name".to_string(), remote_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            conflicts.push(conflict);
-        }
-
-        Ok(conflicts)
-    }
-
-    /// Get tag parent conflicts
-    pub fn get_tag_parent_conflicts(&self, include_resolved: bool) -> VoiceResult<Vec<HashMap<String, serde_json::Value>>> {
-        let query = if include_resolved {
-            r#"SELECT id, tag_id, local_parent_id, local_modified_at, local_device_id,
-                      local_device_name, remote_parent_id, remote_modified_at,
-                      remote_device_id, remote_device_name, created_at, resolved_at
-               FROM conflicts_tag_parent ORDER BY created_at DESC"#
-        } else {
-            r#"SELECT id, tag_id, local_parent_id, local_modified_at, local_device_id,
-                      local_device_name, remote_parent_id, remote_modified_at,
-                      remote_device_id, remote_device_name, created_at, resolved_at
-               FROM conflicts_tag_parent WHERE resolved_at IS NULL ORDER BY created_at DESC"#
-        };
-
-        let mut stmt = self.conn.prepare(query)?;
-        let rows = stmt.query_map([], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let tag_id: Vec<u8> = row.get(1)?;
-            let local_parent_id: Option<Vec<u8>> = row.get(2)?;
-            let local_modified_at: i64 = row.get(3)?;
-            let local_device_id: Option<Vec<u8>> = row.get(4)?;
-            let local_device_name: Option<String> = row.get(5)?;
-            let remote_parent_id: Option<Vec<u8>> = row.get(6)?;
-            let remote_modified_at: i64 = row.get(7)?;
-            let remote_device_id: Option<Vec<u8>> = row.get(8)?;
-            let remote_device_name: Option<String> = row.get(9)?;
-            let created_at: i64 = row.get(10)?;
-            let resolved_at: Option<i64> = row.get(11)?;
-
-            Ok((id, tag_id, local_parent_id, local_modified_at, local_device_id,
-                local_device_name, remote_parent_id, remote_modified_at,
-                remote_device_id, remote_device_name, created_at, resolved_at))
-        })?;
-
-        let mut conflicts = Vec::new();
-        for row in rows {
-            let (id, tag_id, local_parent_id, local_modified_at, local_device_id,
-                 local_device_name, remote_parent_id, remote_modified_at,
-                 remote_device_id, remote_device_name, created_at, resolved_at) = row?;
-
-            let mut conflict = HashMap::new();
-            conflict.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id).unwrap_or_default()));
-            conflict.insert("tag_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&tag_id).unwrap_or_default()));
-            conflict.insert("local_parent_id".to_string(), local_parent_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("local_modified_at".to_string(), serde_json::json!(local_modified_at));
-            conflict.insert("local_device_id".to_string(), local_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("local_device_name".to_string(), local_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("remote_parent_id".to_string(), remote_parent_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("remote_modified_at".to_string(), serde_json::json!(remote_modified_at));
-            conflict.insert("remote_device_id".to_string(), remote_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("remote_device_name".to_string(), remote_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            conflicts.push(conflict);
-        }
-
-        Ok(conflicts)
-    }
-
-    /// Get tag delete conflicts (rename vs delete)
-    pub fn get_tag_delete_conflicts(&self, include_resolved: bool) -> VoiceResult<Vec<HashMap<String, serde_json::Value>>> {
-        let query = if include_resolved {
-            r#"SELECT id, tag_id, surviving_name, surviving_parent_id, surviving_modified_at,
-                      surviving_device_id, surviving_device_name,
-                      deleted_at, deleting_device_id, deleting_device_name,
-                      created_at, resolved_at
-               FROM conflicts_tag_delete ORDER BY created_at DESC"#
-        } else {
-            r#"SELECT id, tag_id, surviving_name, surviving_parent_id, surviving_modified_at,
-                      surviving_device_id, surviving_device_name,
-                      deleted_at, deleting_device_id, deleting_device_name,
-                      created_at, resolved_at
-               FROM conflicts_tag_delete WHERE resolved_at IS NULL ORDER BY created_at DESC"#
-        };
-
-        let mut stmt = self.conn.prepare(query)?;
-        let rows = stmt.query_map([], |row| {
-            let id: Vec<u8> = row.get(0)?;
-            let tag_id: Vec<u8> = row.get(1)?;
-            let surviving_name: String = row.get(2)?;
-            let surviving_parent_id: Option<Vec<u8>> = row.get(3)?;
-            let surviving_modified_at: i64 = row.get(4)?;
-            let surviving_device_id: Option<Vec<u8>> = row.get(5)?;
-            let surviving_device_name: Option<String> = row.get(6)?;
-            let deleted_at: i64 = row.get(7)?;
-            let deleting_device_id: Option<Vec<u8>> = row.get(8)?;
-            let deleting_device_name: Option<String> = row.get(9)?;
-            let created_at: i64 = row.get(10)?;
-            let resolved_at: Option<i64> = row.get(11)?;
-
-            Ok((id, tag_id, surviving_name, surviving_parent_id, surviving_modified_at,
-                surviving_device_id, surviving_device_name,
-                deleted_at, deleting_device_id, deleting_device_name, created_at, resolved_at))
-        })?;
-
-        let mut conflicts = Vec::new();
-        for row in rows {
-            let (id, tag_id, surviving_name, surviving_parent_id, surviving_modified_at,
-                 surviving_device_id, surviving_device_name,
-                 deleted_at, deleting_device_id, deleting_device_name, created_at, resolved_at) = row?;
-
-            let mut conflict = HashMap::new();
-            conflict.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id).unwrap_or_default()));
-            conflict.insert("tag_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&tag_id).unwrap_or_default()));
-            conflict.insert("surviving_name".to_string(), serde_json::Value::String(surviving_name));
-            conflict.insert("surviving_parent_id".to_string(), surviving_parent_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("surviving_modified_at".to_string(), serde_json::json!(surviving_modified_at));
-            conflict.insert("surviving_device_id".to_string(), surviving_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("surviving_device_name".to_string(), surviving_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("deleted_at".to_string(), serde_json::json!(deleted_at));
-            conflict.insert("deleting_device_id".to_string(), deleting_device_id.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("deleting_device_name".to_string(), deleting_device_name.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            conflict.insert("created_at".to_string(), serde_json::json!(created_at));
-            conflict.insert("resolved_at".to_string(), resolved_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            conflicts.push(conflict);
-        }
-
-        Ok(conflicts)
-    }
-
-    /// Resolve a note content conflict
-    pub fn resolve_note_content_conflict(&self, conflict_id: &str, new_content: &str) -> VoiceResult<bool> {
-        let conflict_uuid = Uuid::parse_str(conflict_id)
-            .map_err(|e| VoiceError::validation("conflict_id", e.to_string()))?;
-        let conflict_bytes = conflict_uuid.as_bytes().to_vec();
-
-        // Get the note_id for this conflict
-        let note_id: Option<Vec<u8>> = self.conn.query_row(
-            "SELECT note_id FROM conflicts_note_content WHERE id = ?",
-            params![conflict_bytes],
-            |row| row.get(0),
-        ).optional()?;
-
-        let note_id = match note_id {
-            Some(id) => id,
-            None => return Ok(false),
-        };
-
-        // Update the note content
-        self.conn.execute(
-            "UPDATE notes SET content = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
-            params![new_content, &note_id],
-        )?;
-
-        // Mark conflict as resolved
-        self.conn.execute(
-            "UPDATE conflicts_note_content SET resolved_at = strftime('%s', 'now') WHERE id = ?",
-            params![conflict_bytes],
-        )?;
-
-        // Rebuild display cache
-        if let Some(note_id_hex) = uuid_bytes_to_hex(&note_id) {
-            let _ = self.rebuild_note_cache(&note_id_hex);
-        }
-
-        Ok(true)
-    }
-
-    /// Resolve a note delete conflict
-    pub fn resolve_note_delete_conflict(&self, conflict_id: &str, restore_note: bool) -> VoiceResult<bool> {
-        let conflict_uuid = Uuid::parse_str(conflict_id)
-            .map_err(|e| VoiceError::validation("conflict_id", e.to_string()))?;
-        let conflict_bytes = conflict_uuid.as_bytes().to_vec();
-
-        // Get the note_id and surviving content for this conflict
-        let row: Option<(Vec<u8>, String)> = self.conn.query_row(
-            "SELECT note_id, surviving_content FROM conflicts_note_delete WHERE id = ?",
-            params![conflict_bytes],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
-
-        let (note_id, surviving_content) = match row {
-            Some(r) => r,
-            None => return Ok(false),
-        };
-
-        if restore_note {
-            // Restore the note with surviving content
-            self.conn.execute(
-                "UPDATE notes SET content = ?, deleted_at = NULL, modified_at = strftime('%s', 'now') WHERE id = ?",
-                params![surviving_content, &note_id],
-            )?;
-        }
-        // If not restoring, the note stays deleted (no action needed)
-
-        // Mark conflict as resolved
-        self.conn.execute(
-            "UPDATE conflicts_note_delete SET resolved_at = strftime('%s', 'now') WHERE id = ?",
-            params![conflict_bytes],
-        )?;
-
-        // Rebuild display cache if note was restored
-        if restore_note {
-            if let Some(note_id_hex) = uuid_bytes_to_hex(&note_id) {
-                let _ = self.rebuild_note_cache(&note_id_hex);
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Resolve a tag rename conflict
-    pub fn resolve_tag_rename_conflict(&self, conflict_id: &str, new_name: &str) -> VoiceResult<bool> {
-        let conflict_uuid = Uuid::parse_str(conflict_id)
-            .map_err(|e| VoiceError::validation("conflict_id", e.to_string()))?;
-        let conflict_bytes = conflict_uuid.as_bytes().to_vec();
-
-        // Get the tag_id for this conflict
-        let tag_id: Option<Vec<u8>> = self.conn.query_row(
-            "SELECT tag_id FROM conflicts_tag_rename WHERE id = ?",
-            params![conflict_bytes],
-            |row| row.get(0),
-        ).optional()?;
-
-        let tag_id = match tag_id {
-            Some(id) => id,
-            None => return Ok(false),
-        };
-
-        // Update the tag name
-        self.conn.execute(
-            "UPDATE tags SET name = ?, modified_at = strftime('%s', 'now') WHERE id = ?",
-            params![new_name, tag_id],
-        )?;
-
-        // Mark conflict as resolved
-        self.conn.execute(
-            "UPDATE conflicts_tag_rename SET resolved_at = strftime('%s', 'now') WHERE id = ?",
-            params![conflict_bytes],
-        )?;
-
-        Ok(true)
-    }
+    // Conflict detection, records and resolution live in versions.rs.
 
     // Helper methods for row conversion
 
@@ -4495,6 +4219,12 @@ impl Database {
             modified_at,
             deleted_at,
             tag_names,
+            created_at_offset: row.get::<_, Option<i64>>(8)?.and_then(|o| i32::try_from(o).ok()),
+            created_at_zone: row.get(9)?,
+            modified_at_offset: row.get::<_, Option<i64>>(10)?.and_then(|o| i32::try_from(o).ok()),
+            modified_at_zone: row.get(11)?,
+            deleted_at_offset: row.get::<_, Option<i64>>(12)?.and_then(|o| i32::try_from(o).ok()),
+            deleted_at_zone: row.get(13)?,
             display_cache,
             list_display_cache,
         })
@@ -4555,10 +4285,15 @@ impl Database {
             params![note_bytes],
         )?;
 
+        // Membership version: the start of this link's history
+        let association_hex = association_id.simple().to_string();
+        self.init_field(ENTITY_NOTE_ATTACHMENT, &association_hex, FIELD_ACTIVE, "1")?;
+
         // Rebuild display cache for the note
         let _ = self.rebuild_note_cache(note_id);
+        let _ = self.stamp_local_zone("note_attachments", &association_hex, "created_at");
 
-        Ok(association_id.simple().to_string())
+        Ok(association_hex)
     }
 
     /// Detach an attachment from a note (soft delete)
@@ -4566,7 +4301,6 @@ impl Database {
         let uuid = Uuid::parse_str(association_id)
             .map_err(|e| VoiceError::validation("association_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
-        let device_id = get_local_device_id();
 
         // Get the note_id before updating so we can update the note's modified_at
         let note_bytes: Option<Vec<u8>> = self
@@ -4577,31 +4311,23 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
+        let note_bytes = match note_bytes {
+            Some(n) => n,
+            None => return Ok(false),
+        };
 
-        let updated = self.conn.execute(
-            r#"
-            UPDATE note_attachments
-            SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now'), device_id = ?
-            WHERE id = ? AND deleted_at IS NULL
-            "#,
-            params![device_id.as_bytes().to_vec(), uuid_bytes],
-        )?;
+        self.set_field(ENTITY_NOTE_ATTACHMENT, &uuid.simple().to_string(), FIELD_ACTIVE, "0", None)?;
 
         // Update the parent Note's modified_at to trigger sync and rebuild cache
-        if updated > 0 {
-            if let Some(note_id) = note_bytes {
-                self.conn.execute(
-                    "UPDATE notes SET modified_at = strftime('%s', 'now') WHERE id = ?",
-                    params![&note_id],
-                )?;
-                // Rebuild display cache for the note
-                if let Some(note_id_hex) = uuid_bytes_to_hex(&note_id) {
-                    let _ = self.rebuild_note_cache(&note_id_hex);
-                }
-            }
+        self.conn.execute(
+            "UPDATE notes SET modified_at = strftime('%s', 'now') WHERE id = ?",
+            params![&note_bytes],
+        )?;
+        if let Some(note_id_hex) = uuid_bytes_to_hex(&note_bytes) {
+            let _ = self.rebuild_note_cache(&note_id_hex);
         }
 
-        Ok(updated > 0)
+        Ok(true)
     }
 
     /// Get all attachments for a note (accepts ID or ID prefix)
@@ -4714,7 +4440,15 @@ impl Database {
             ],
         )?;
 
-        Ok(audio_file_id.simple().to_string())
+        let id_hex = audio_file_id.simple().to_string();
+        let _ = self.stamp_local_zone("audio_files", &id_hex, "imported_at");
+        if file_created_at.is_some() {
+            // The best this device can say about a file's own date: a file it
+            // recorded itself was recorded here, and one copied from elsewhere
+            // carries no zone of its own.
+            let _ = self.stamp_local_zone("audio_files", &id_hex, "file_created_at");
+        }
+        Ok(id_hex)
     }
 
     /// Get an audio file by ID (accepts ID or ID prefix)
@@ -4731,7 +4465,9 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
-                   storage_provider, storage_key, storage_uploaded_at
+                   storage_provider, storage_key, storage_uploaded_at,
+                   imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone
             FROM audio_files
             WHERE id = ?
             "#,
@@ -4760,14 +4496,20 @@ impl Database {
             r#"
             SELECT af.id, af.imported_at, af.filename, af.file_created_at, af.duration_seconds,
                    af.summary, af.device_id, af.modified_at, af.deleted_at,
-                   af.storage_provider, af.storage_key, af.storage_uploaded_at
+                   af.storage_provider, af.storage_key, af.storage_uploaded_at,
+                   af.imported_at_offset, af.imported_at_zone, af.file_created_at_offset, af.file_created_at_zone,
+                   af.modified_at_offset, af.modified_at_zone, af.deleted_at_offset, af.deleted_at_zone
             FROM audio_files af
             INNER JOIN note_attachments na ON af.id = na.attachment_id
             WHERE na.note_id = ?
               AND na.attachment_type = 'audio_file'
               AND na.deleted_at IS NULL
               AND af.deleted_at IS NULL
-            ORDER BY af.imported_at DESC
+            -- Oldest first: a note's recordings read as the conversation
+            -- happened, and "the first recording" means the first one made.
+            -- The id breaks a tie, so two recordings imported in the same
+            -- second come back in the same order on every device.
+            ORDER BY COALESCE(af.file_created_at, af.imported_at) ASC, af.id ASC
             "#,
         )?;
 
@@ -4816,7 +4558,9 @@ impl Database {
             r#"
             SELECT id, imported_at, filename, file_created_at, duration_seconds,
                    summary, device_id, modified_at, deleted_at,
-                   storage_provider, storage_key, storage_uploaded_at
+                   storage_provider, storage_key, storage_uploaded_at,
+                   imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone
             FROM audio_files
             ORDER BY imported_at DESC
             "#,
@@ -4838,24 +4582,19 @@ impl Database {
     ) -> VoiceResult<bool> {
         let uuid = Uuid::parse_str(audio_file_id)
             .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
-        let uuid_bytes = uuid.as_bytes().to_vec();
-        let device_id = get_local_device_id();
-
-        let updated = self.conn.execute(
-            r#"
-            UPDATE audio_files
-            SET summary = ?, modified_at = strftime('%s', 'now'), device_id = ?
-            WHERE id = ? AND deleted_at IS NULL
-            "#,
-            params![summary, device_id.as_bytes().to_vec(), uuid_bytes],
-        )?;
-
-        // Rebuild display cache for associated note(s)
-        if updated > 0 {
-            self.rebuild_caches_for_audio_file(audio_file_id);
+        let alive: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM audio_files WHERE id = ? AND deleted_at IS NULL",
+                params![uuid.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if alive.is_none() {
+            return Ok(false);
         }
-
-        Ok(updated > 0)
+        self.set_field(ENTITY_AUDIO_FILE, &uuid.simple().to_string(), FIELD_SUMMARY, summary, None)?;
+        Ok(true)
     }
 
     /// Soft-delete an audio file (accepts ID or ID prefix)
@@ -4865,21 +4604,7 @@ impl Database {
             Some(id) => id,
             None => return Ok(false),
         };
-        let uuid = Uuid::parse_str(&resolved_id)
-            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
-        let uuid_bytes = uuid.as_bytes().to_vec();
-        let device_id = get_local_device_id();
-
-        let updated = self.conn.execute(
-            r#"
-            UPDATE audio_files
-            SET deleted_at = strftime('%s', 'now'), modified_at = strftime('%s', 'now'), device_id = ?
-            WHERE id = ? AND deleted_at IS NULL
-            "#,
-            params![device_id.as_bytes().to_vec(), uuid_bytes],
-        )?;
-
-        Ok(updated > 0)
+        self.set_deleted(ENTITY_AUDIO_FILE, &resolved_id)
     }
 
     /// Update an audio file's duration
@@ -4914,13 +4639,52 @@ impl Database {
         Ok(updated > 0)
     }
 
+    /// Set when a recording was made, for a row that never had it.
+    ///
+    /// Unversioned metadata, like the duration: read off the file or its name
+    /// by whichever device has the file, merged per column by `modified_at`.
+    /// Calculating it is a repair, not an edit by the user, so it is written
+    /// directly rather than as a new version.
+    pub fn update_audio_file_created_at(
+        &self,
+        audio_file_id: &str,
+        file_created_at: i64,
+    ) -> VoiceResult<bool> {
+        let resolved_id = match self.try_resolve_audio_file_id(audio_file_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let uuid = Uuid::parse_str(&resolved_id)
+            .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
+        let uuid_bytes = uuid.as_bytes().to_vec();
+        let device_id = get_local_device_id();
+
+        let updated = self.conn.execute(
+            r#"
+            UPDATE audio_files
+            SET file_created_at = ?, modified_at = strftime('%s', 'now'), device_id = ?
+            WHERE id = ? AND deleted_at IS NULL
+            "#,
+            params![file_created_at, device_id.as_bytes().to_vec(), uuid_bytes],
+        )?;
+
+        if updated > 0 {
+            // The date is shown on the note, so the caches that hold it change
+            self.rebuild_caches_for_audio_file(&resolved_id);
+        }
+
+        Ok(updated > 0)
+    }
+
     /// Get all audio files that are missing duration information
     pub fn get_audio_files_missing_duration(&self) -> VoiceResult<Vec<AudioFileRow>> {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, imported_at, filename, file_created_at, duration_seconds,
                    summary, device_id, modified_at, deleted_at,
-                   storage_provider, storage_key, storage_uploaded_at
+                   storage_provider, storage_key, storage_uploaded_at,
+                   imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone
             FROM audio_files
             WHERE duration_seconds IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -4962,6 +4726,14 @@ impl Database {
             storage_provider,
             storage_key,
             storage_uploaded_at,
+            imported_at_offset: row.get::<_, Option<i64>>(12)?.and_then(|o| i32::try_from(o).ok()),
+            imported_at_zone: row.get(13)?,
+            file_created_at_offset: row.get::<_, Option<i64>>(14)?.and_then(|o| i32::try_from(o).ok()),
+            file_created_at_zone: row.get(15)?,
+            modified_at_offset: row.get::<_, Option<i64>>(16)?.and_then(|o| i32::try_from(o).ok()),
+            modified_at_zone: row.get(17)?,
+            deleted_at_offset: row.get::<_, Option<i64>>(18)?.and_then(|o| i32::try_from(o).ok()),
+            deleted_at_zone: row.get(19)?,
         })
     }
 
@@ -4978,7 +4750,9 @@ impl Database {
             r#"
             SELECT id, imported_at, filename, file_created_at, duration_seconds,
                    summary, device_id, modified_at, deleted_at,
-                   storage_provider, storage_key, storage_uploaded_at
+                   storage_provider, storage_key, storage_uploaded_at,
+                   imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone
             FROM audio_files
             WHERE storage_provider IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -5263,19 +5037,36 @@ impl Database {
         let attachment_uuid = Uuid::parse_str(attachment_id)
             .map_err(|e| VoiceError::validation("attachment_id", e.to_string()))?;
         let device_id = get_local_device_id();
+        let id_hex = id_uuid.simple().to_string();
 
+        // The link's target columns are not versioned (they only change when
+        // notes are merged); deleted_at is owned by the membership version.
         self.conn.execute(
             r#"
             INSERT INTO note_attachments (id, note_id, attachment_id, attachment_type, created_at, device_id, modified_at, deleted_at, sync_received_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                note_id = excluded.note_id,
-                attachment_id = excluded.attachment_id,
-                attachment_type = excluded.attachment_type,
-                modified_at = excluded.modified_at,
-                deleted_at = excluded.deleted_at,
-                device_id = excluded.device_id,
-                sync_received_at = excluded.sync_received_at
+                -- The target changes only when notes are merged; an older row
+                -- (an echo from a peer that has not seen the merge) must not
+                -- move the attachment back. Two devices that merge the same
+                -- attachment onto different notes within one second would
+                -- otherwise each keep whichever row arrived last, so the tie
+                -- is broken on the target itself: a rule every device computes
+                -- the same way, whatever order the rows reach it in.
+                note_id = CASE WHEN COALESCE(excluded.modified_at, 0) > COALESCE(note_attachments.modified_at, 0)
+                                 OR (COALESCE(excluded.modified_at, 0) = COALESCE(note_attachments.modified_at, 0)
+                                     AND excluded.note_id < note_attachments.note_id)
+                               THEN excluded.note_id ELSE note_attachments.note_id END,
+                attachment_id = CASE WHEN COALESCE(excluded.modified_at, 0) > COALESCE(note_attachments.modified_at, 0)
+                                       OR (COALESCE(excluded.modified_at, 0) = COALESCE(note_attachments.modified_at, 0)
+                                           AND excluded.note_id < note_attachments.note_id)
+                                     THEN excluded.attachment_id ELSE note_attachments.attachment_id END,
+                attachment_type = CASE WHEN COALESCE(excluded.modified_at, 0) > COALESCE(note_attachments.modified_at, 0)
+                                         OR (COALESCE(excluded.modified_at, 0) = COALESCE(note_attachments.modified_at, 0)
+                                             AND excluded.note_id < note_attachments.note_id)
+                                       THEN excluded.attachment_type ELSE note_attachments.attachment_type END,
+                modified_at = NULLIF(MAX(COALESCE(note_attachments.modified_at, 0), COALESCE(excluded.modified_at, 0)), 0),
+                sync_received_at = COALESCE(excluded.sync_received_at, note_attachments.sync_received_at)
             "#,
             params![
                 id_uuid.as_bytes().to_vec(),
@@ -5289,6 +5080,26 @@ impl Database {
                 sync_received_at,
             ],
         )?;
+
+        // When the sender's target lost, it is holding a value this device has
+        // already rejected, and nothing in its own row changed to tell it so.
+        // Publishing this row again carries the winning target back, which
+        // ends the disagreement: the loser adopts it and stops sending its own.
+        let stored: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT note_id FROM note_attachments WHERE id = ?",
+                params![id_uuid.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored.as_deref() != Some(note_uuid.as_bytes().as_slice()) {
+            self.republish("note_attachments", id_uuid.as_bytes())?;
+        }
+
+        let active = if deleted_at.is_some() { "0" } else { "1" };
+        self.ensure_root_version(ENTITY_NOTE_ATTACHMENT, &id_hex, FIELD_ACTIVE, active, deleted_at.or(modified_at).unwrap_or(created_at))?;
+        self.reapply_entity_heads(ENTITY_NOTE_ATTACHMENT, &id_hex)?;
 
         Ok(())
     }
@@ -5362,6 +5173,9 @@ impl Database {
         storage_provider: Option<&str>,
         storage_key: Option<&str>,
         storage_uploaded_at: Option<i64>,
+        // Which transcription stands for this recording, when the sender
+        // named one. A hint like every other row value (VER-4).
+        primary_transcription_id: Option<&str>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
@@ -5372,17 +5186,35 @@ impl Database {
             INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                filename = excluded.filename,
-                file_created_at = excluded.file_created_at,
-                duration_seconds = excluded.duration_seconds,
-                summary = excluded.summary,
-                modified_at = excluded.modified_at,
-                deleted_at = excluded.deleted_at,
+                -- Metadata written by the importing device: the newer row
+                -- wins column by column, an older row fills in only what is
+                -- missing here. summary and deleted_at are versioned: heads
+                -- are reapplied below, so a row never writes them (writing
+                -- them twice would publish the row again on every echo).
+                filename = CASE WHEN COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0)
+                                THEN excluded.filename ELSE audio_files.filename END,
+                file_created_at = CASE WHEN audio_files.file_created_at IS NULL
+                                         OR (excluded.file_created_at IS NOT NULL AND COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
+                                       THEN excluded.file_created_at ELSE audio_files.file_created_at END,
+                duration_seconds = CASE WHEN audio_files.duration_seconds IS NULL
+                                          OR (excluded.duration_seconds IS NOT NULL AND COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
+                                        THEN excluded.duration_seconds ELSE audio_files.duration_seconds END,
+                -- The cloud location is set once by the uploading device. It is
+                -- never erased by a row without one (an echo, or a peer that
+                -- edited the summary before receiving the upload), and only
+                -- replaced by a newer row that has one (a re-upload).
+                storage_provider = CASE WHEN excluded.storage_key IS NOT NULL
+                                          AND (audio_files.storage_key IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
+                                        THEN excluded.storage_provider ELSE audio_files.storage_provider END,
+                storage_key = CASE WHEN excluded.storage_key IS NOT NULL
+                                     AND (audio_files.storage_key IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
+                                   THEN excluded.storage_key ELSE audio_files.storage_key END,
+                storage_uploaded_at = CASE WHEN excluded.storage_key IS NOT NULL
+                                             AND (audio_files.storage_key IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
+                                           THEN excluded.storage_uploaded_at ELSE audio_files.storage_uploaded_at END,
+                modified_at = NULLIF(MAX(COALESCE(audio_files.modified_at, 0), COALESCE(excluded.modified_at, 0)), 0),
                 device_id = excluded.device_id,
-                sync_received_at = excluded.sync_received_at,
-                storage_provider = excluded.storage_provider,
-                storage_key = excluded.storage_key,
-                storage_uploaded_at = excluded.storage_uploaded_at
+                sync_received_at = COALESCE(excluded.sync_received_at, audio_files.sync_received_at)
             "#,
             params![
                 id_uuid.as_bytes().to_vec(),
@@ -5400,6 +5232,18 @@ impl Database {
                 storage_uploaded_at,
             ],
         )?;
+
+        let ts = modified_at.unwrap_or(imported_at);
+        if let Some(s) = summary {
+            self.ensure_root_version(ENTITY_AUDIO_FILE, id, FIELD_SUMMARY, s, ts)?;
+        }
+        if let Some(primary) = primary_transcription_id.filter(|p| !p.is_empty()) {
+            self.ensure_root_version(ENTITY_AUDIO_FILE, id, FIELD_PRIMARY_TRANSCRIPTION, primary, ts)?;
+        }
+        if let Some(d) = deleted_at {
+            self.ensure_root_version(ENTITY_AUDIO_FILE, id, FIELD_DELETED, "1", d)?;
+        }
+        self.reapply_entity_heads(ENTITY_AUDIO_FILE, id)?;
 
         Ok(())
     }
@@ -5427,23 +5271,31 @@ impl Database {
             .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
         let device_uuid = Uuid::parse_str(device_id)
             .map_err(|e| VoiceError::validation("device_id", e.to_string()))?;
+        let id_hex = id_uuid.simple().to_string();
 
+        // Service metadata is not versioned; content, state and deletion are.
         self.conn.execute(
             r#"
             INSERT INTO transcriptions (id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at, sync_received_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                -- Service metadata is not versioned: a newer row replaces it,
+                -- an older row (an echo, or a peer that has not received a
+                -- re-run yet) only fills in what is missing here.
                 audio_file_id = excluded.audio_file_id,
-                content = excluded.content,
-                content_segments = excluded.content_segments,
-                service = excluded.service,
-                service_arguments = excluded.service_arguments,
-                service_response = excluded.service_response,
-                state = excluded.state,
-                device_id = excluded.device_id,
-                modified_at = excluded.modified_at,
-                deleted_at = excluded.deleted_at,
-                sync_received_at = excluded.sync_received_at
+                content_segments = CASE WHEN transcriptions.content_segments IS NULL
+                                          OR (excluded.content_segments IS NOT NULL AND COALESCE(excluded.modified_at, 0) >= COALESCE(transcriptions.modified_at, 0))
+                                        THEN excluded.content_segments ELSE transcriptions.content_segments END,
+                service = CASE WHEN COALESCE(excluded.modified_at, 0) >= COALESCE(transcriptions.modified_at, 0)
+                               THEN excluded.service ELSE transcriptions.service END,
+                service_arguments = CASE WHEN transcriptions.service_arguments IS NULL
+                                           OR (excluded.service_arguments IS NOT NULL AND COALESCE(excluded.modified_at, 0) >= COALESCE(transcriptions.modified_at, 0))
+                                         THEN excluded.service_arguments ELSE transcriptions.service_arguments END,
+                service_response = CASE WHEN transcriptions.service_response IS NULL
+                                          OR (excluded.service_response IS NOT NULL AND COALESCE(excluded.modified_at, 0) >= COALESCE(transcriptions.modified_at, 0))
+                                        THEN excluded.service_response ELSE transcriptions.service_response END,
+                modified_at = NULLIF(MAX(COALESCE(transcriptions.modified_at, 0), COALESCE(excluded.modified_at, 0)), 0),
+                sync_received_at = COALESCE(excluded.sync_received_at, transcriptions.sync_received_at)
             "#,
             params![
                 id_uuid.as_bytes().to_vec(),
@@ -5462,6 +5314,14 @@ impl Database {
             ],
         )?;
 
+        let ts = modified_at.unwrap_or(created_at);
+        self.ensure_root_version(ENTITY_TRANSCRIPTION, &id_hex, FIELD_CONTENT, content, ts)?;
+        self.ensure_root_version(ENTITY_TRANSCRIPTION, &id_hex, FIELD_STATE, state, ts)?;
+        if let Some(d) = deleted_at {
+            self.ensure_root_version(ENTITY_TRANSCRIPTION, &id_hex, FIELD_DELETED, "1", d)?;
+        }
+        self.reapply_entity_heads(ENTITY_TRANSCRIPTION, &id_hex)?;
+
         Ok(())
     }
 
@@ -5473,7 +5333,8 @@ impl Database {
 
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
+            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at,
+                   created_at_offset, created_at_zone
             FROM transcriptions
             WHERE id = ?
             "#,
@@ -5558,10 +5419,15 @@ impl Database {
             ],
         )?;
 
+        let id_hex = id.simple().to_string();
+        let _ = self.stamp_local_zone("transcriptions", &id_hex, "created_at");
+        self.init_field(ENTITY_TRANSCRIPTION, &id_hex, FIELD_CONTENT, content)?;
+        self.init_field(ENTITY_TRANSCRIPTION, &id_hex, FIELD_STATE, state)?;
+
         // Rebuild display cache for associated note(s)
         self.rebuild_caches_for_audio_file(audio_file_id);
 
-        Ok(id.simple().to_string())
+        Ok(id_hex)
     }
 
     /// Get a transcription by ID
@@ -5571,7 +5437,8 @@ impl Database {
 
         let result = self.conn.query_row(
             r#"
-            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
+            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at,
+                   created_at_offset, created_at_zone
             FROM transcriptions
             WHERE id = ? AND deleted_at IS NULL
             "#,
@@ -5593,6 +5460,8 @@ impl Database {
                     created_at: row.get(9)?,
                     modified_at: row.get(10)?,
                     deleted_at: row.get(11)?,
+                    created_at_offset: row.get::<_, Option<i64>>(12)?.and_then(|o| i32::try_from(o).ok()),
+                    created_at_zone: row.get(13)?,
                 })
             },
         );
@@ -5611,7 +5480,8 @@ impl Database {
 
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at
+            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at,
+                   created_at_offset, created_at_zone
             FROM transcriptions
             WHERE audio_file_id = ? AND deleted_at IS NULL
             ORDER BY created_at DESC
@@ -5635,6 +5505,8 @@ impl Database {
                 created_at: row.get(9)?,
                 modified_at: row.get(10)?,
                 deleted_at: row.get(11)?,
+                created_at_offset: row.get::<_, Option<i64>>(12)?.and_then(|o| i32::try_from(o).ok()),
+                created_at_zone: row.get(13)?,
             })
         })?;
 
@@ -5650,35 +5522,18 @@ impl Database {
     pub fn delete_transcription(&self, transcription_id: &str) -> VoiceResult<bool> {
         let id_uuid = Uuid::parse_str(transcription_id)
             .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
-        let now = Utc::now().timestamp();
-
-        // Get the audio_file_id before deleting (for cache rebuild)
-        let audio_file_id: Option<String> = self.conn.query_row(
-            "SELECT audio_file_id FROM transcriptions WHERE id = ? AND deleted_at IS NULL",
-            params![id_uuid.as_bytes().to_vec()],
-            |row| {
-                let bytes: Vec<u8> = row.get(0)?;
-                Ok(uuid_bytes_to_hex(&bytes).unwrap_or_default())
-            },
-        ).optional()?;
-
-        let count = self.conn.execute(
-            r#"
-            UPDATE transcriptions
-            SET deleted_at = ?, modified_at = ?
-            WHERE id = ? AND deleted_at IS NULL
-            "#,
-            params![now, now, id_uuid.as_bytes().to_vec()],
-        )?;
-
-        // Rebuild display cache for associated note(s)
-        if count > 0 {
-            if let Some(audio_id) = audio_file_id {
-                self.rebuild_caches_for_audio_file(&audio_id);
-            }
+        let alive: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM transcriptions WHERE id = ? AND deleted_at IS NULL",
+                params![id_uuid.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if alive.is_none() {
+            return Ok(false);
         }
-
-        Ok(count > 0)
+        self.set_deleted(ENTITY_TRANSCRIPTION, &id_uuid.simple().to_string())
     }
 
     /// Update a transcription's content, state, and service response
@@ -5695,50 +5550,40 @@ impl Database {
     ) -> VoiceResult<bool> {
         let id_uuid = Uuid::parse_str(transcription_id)
             .map_err(|e| VoiceError::validation("transcription_id", e.to_string()))?;
-        let now = Utc::now().timestamp();
+        let id_hex = id_uuid.simple().to_string();
 
-        // If state is provided, update it; otherwise keep existing
-        let count = if let Some(state) = state {
-            self.conn.execute(
-                r#"
-                UPDATE transcriptions
-                SET content = ?, content_segments = ?, service_response = ?, state = ?, modified_at = ?
-                WHERE id = ? AND deleted_at IS NULL
-                "#,
-                params![
-                    content,
-                    content_segments,
-                    service_response,
-                    state,
-                    now,
-                    id_uuid.as_bytes().to_vec()
-                ],
-            )?
-        } else {
-            self.conn.execute(
-                r#"
-                UPDATE transcriptions
-                SET content = ?, content_segments = ?, service_response = ?, modified_at = ?
-                WHERE id = ? AND deleted_at IS NULL
-                "#,
-                params![
-                    content,
-                    content_segments,
-                    service_response,
-                    now,
-                    id_uuid.as_bytes().to_vec()
-                ],
-            )?
-        };
-
-        // Rebuild display cache for associated note(s)
-        if count > 0 {
-            if let Ok(Some(transcription)) = self.get_transcription(transcription_id) {
-                self.rebuild_caches_for_audio_file(&transcription.audio_file_id);
-            }
+        // Non-versioned service metadata: None leaves a value alone (a state
+        // toggle from the UI must not erase the segments or the service
+        // response), and a real change stamps modified_at so that peers take
+        // the newer value over an older echo.
+        let count = self.conn.execute(
+            r#"
+            UPDATE transcriptions
+            SET modified_at = CASE
+                    WHEN (?1 IS NOT NULL AND ?1 IS NOT content_segments) OR (?2 IS NOT NULL AND ?2 IS NOT service_response)
+                    THEN strftime('%s', 'now') ELSE modified_at END,
+                content_segments = COALESCE(?1, content_segments),
+                service_response = COALESCE(?2, service_response)
+            WHERE id = ?3 AND deleted_at IS NULL
+            "#,
+            params![content_segments, service_response, id_uuid.as_bytes().to_vec()],
+        )?;
+        if count == 0 {
+            return Ok(false);
         }
 
-        Ok(count > 0)
+        // Versioned text and flags
+        self.set_field(ENTITY_TRANSCRIPTION, &id_hex, FIELD_CONTENT, content, None)?;
+        if let Some(state) = state {
+            self.set_field(ENTITY_TRANSCRIPTION, &id_hex, FIELD_STATE, state, None)?;
+        }
+
+        // Rebuild display cache for associated note(s)
+        if let Ok(Some(transcription)) = self.get_transcription(&id_hex) {
+            self.rebuild_caches_for_audio_file(&transcription.audio_file_id);
+        }
+
+        Ok(true)
     }
 
     // =========================================================================
@@ -5793,7 +5638,7 @@ impl Database {
     /// The cache contains pre-computed data for the notes list pane:
     /// - date: created_at timestamp
     /// - marked: whether the note has the _system/_marked tag
-    /// - content_preview: first 100 characters of content
+    /// - content_preview: first 200 characters of content
     ///
     /// This should be called after any mutation that affects the note's list display.
     pub fn rebuild_note_list_cache(&self, note_id: &str) -> VoiceResult<()> {
@@ -5867,10 +5712,18 @@ impl Database {
         }
 
         // 6. Build JSON cache
-        // Format Unix timestamp as local time for display
-        let date_display = chrono::DateTime::from_timestamp(created_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
+        // The date reads as the clock read where the note was made, so a note
+        // written at 15:20 in Jerusalem still says 15:20 after the user flies
+        // to New York. Notes with no zone recorded fall back to this device's.
+        let created_offset: Option<i64> = self.conn
+            .query_row(
+                "SELECT created_at_offset FROM notes WHERE id = ?",
+                params![&note_bytes],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let date_display = crate::timezone::format_at_offset(created_at, created_offset.and_then(|o| i32::try_from(o).ok()));
         let cache = serde_json::json!({
             "date": date_display,
             "marked": is_marked,
@@ -6008,7 +5861,57 @@ impl Database {
     /// Rebuild display caches for all notes associated with an audio file.
     ///
     /// This is called when transcriptions or audio file metadata are created/updated/deleted.
-    fn rebuild_caches_for_audio_file(&self, audio_file_id: &str) {
+    /// Rebuild the caches of every note that carries this tag, or any tag
+    /// beneath it.
+    ///
+    /// A note's cache holds the name of each tag on it, so renaming a tag
+    /// leaves every one of those notes showing the old name until something
+    /// else happens to them. Reparenting reaches further still: the path of
+    /// every tag *below* the moved one changes too, so their notes are
+    /// rebuilt as well.
+    ///
+    /// The walk down is bounded: a parent chain that loops (two devices each
+    /// moving one tag under the other, merged) would otherwise never end.
+    pub(crate) fn rebuild_caches_for_tag(&self, tag_id: &str) {
+        let tag_uuid = match Uuid::parse_str(tag_id) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+
+        let note_ids: Vec<String> = match self.conn.prepare(
+            r#"
+            WITH RECURSIVE subtree(id, depth) AS (
+                SELECT ?, 0
+                UNION
+                SELECT t.id, subtree.depth + 1
+                FROM tags t
+                JOIN subtree ON t.parent_id = subtree.id
+                WHERE subtree.depth < 64
+            )
+            SELECT DISTINCT nt.note_id
+            FROM note_tags nt
+            JOIN subtree ON nt.tag_id = subtree.id
+            WHERE nt.deleted_at IS NULL
+            "#,
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map(params![tag_uuid.as_bytes().to_vec()], |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    Ok(uuid_bytes_to_hex(&id_bytes).unwrap_or_default())
+                })
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => return,
+        };
+
+        for note_id in note_ids {
+            let _ = self.rebuild_note_cache(&note_id);
+            let _ = self.rebuild_note_list_cache(&note_id);
+        }
+    }
+
+    pub(crate) fn rebuild_caches_for_audio_file(&self, audio_file_id: &str) {
         // Find all notes that have this audio file attached
         let audio_uuid = match Uuid::parse_str(audio_file_id) {
             Ok(u) => u,
@@ -6146,14 +6049,14 @@ impl Database {
                 let path_count: i64 = self.conn.query_row(
                     r#"
                     WITH RECURSIVE tag_paths AS (
-                        SELECT id, name, parent_id, name as path
+                        SELECT id, name, parent_id, name as path, 0 AS depth
                         FROM tags WHERE deleted_at IS NULL
                         UNION ALL
-                        SELECT t.id, t.name, t.parent_id, p.name || '/' || tp.path
+                        SELECT t.id, t.name, t.parent_id, p.name || '/' || tp.path, tp.depth + 1
                         FROM tags t
                         JOIN tag_paths tp ON t.id = tp.parent_id
                         JOIN tags p ON t.id = p.id
-                        WHERE t.deleted_at IS NULL
+                        WHERE t.deleted_at IS NULL AND tp.depth < 64
                     )
                     SELECT COUNT(*) FROM tag_paths WHERE path = ? COLLATE NOCASE
                     "#,
@@ -6187,7 +6090,11 @@ impl Database {
             r#"
             SELECT na.id, na.attachment_id, na.attachment_type
             FROM note_attachments na
+            LEFT JOIN audio_files af ON af.id = na.attachment_id
             WHERE na.note_id = ? AND na.deleted_at IS NULL
+            -- Oldest first, like everywhere else a note's recordings are
+            -- listed, with the id breaking a tie so every device agrees.
+            ORDER BY COALESCE(af.file_created_at, af.imported_at, na.created_at) ASC, na.id ASC
             "#
         )?;
 
@@ -6262,7 +6169,7 @@ impl Database {
 
     /// Get transcription metadata for cache (with content preview).
     ///
-    /// Includes first 100 characters of content as `content_preview`.
+    /// Includes the first 200 characters of content as `content_preview`.
     /// Full content should be lazy-loaded via `get_transcription_content()`.
     fn get_transcriptions_for_cache(&self, audio_id: &str) -> VoiceResult<Vec<serde_json::Value>> {
         let audio_uuid = Uuid::parse_str(audio_id)
@@ -6579,6 +6486,45 @@ mod tests {
         assert!(audio_file.duration_seconds.is_none());
     }
 
+    /// Merging keeps the older note, gains the newer note's text, takes over
+    /// its recordings, and leaves nothing behind.
+    #[test]
+    fn merging_two_notes_keeps_both_texts_and_moves_the_recording() {
+        let db = Database::new_in_memory().unwrap();
+        // The older note is the one with a recording on it
+        let (older, audio) = db
+            .import_audio_file("הקלטה.ogg", Some(1_700_000_000), Some(5))
+            .unwrap();
+        db.update_note(&older, "הפגישה הראשונה").unwrap();
+        let newer = db.create_note("הערה שנייה").unwrap();
+
+        let survivor = db.merge_notes(&older, &newer).unwrap();
+
+        assert_eq!(survivor, older, "the older note survives");
+        let note = db.get_note(&survivor).unwrap().unwrap();
+        assert!(note.content.contains("הפגישה הראשונה"), "{}", note.content);
+        assert!(note.content.contains("הערה שנייה"), "{}", note.content);
+
+        let files = db.get_audio_files_for_note(&survivor).unwrap();
+        assert_eq!(files.len(), 1, "the recording came across");
+        assert_eq!(files[0].id, audio);
+
+        assert!(db.get_note(&newer).unwrap().is_none(), "the emptied note is gone");
+    }
+
+    /// The order the two are given in does not matter.
+    #[test]
+    fn merging_the_other_way_round_keeps_the_same_note() {
+        let db = Database::new_in_memory().unwrap();
+        let (older, _) = db
+            .import_audio_file("הקלטה.ogg", Some(1_700_000_000), Some(5))
+            .unwrap();
+        let newer = db.create_note("הערה שנייה").unwrap();
+
+        let survivor = db.merge_notes(&newer, &older).unwrap();
+        assert_eq!(survivor, older, "still the older one");
+    }
+
     #[test]
     fn test_create_note_with_timestamp() {
         let db = Database::new_in_memory().unwrap();
@@ -6693,7 +6639,8 @@ mod tests {
             None,        // sync_received_at
             Some("s3"),  // storage_provider
             Some("audio/synced.mp3"), // storage_key
-            Some(1700000002), // storage_uploaded_at
+            Some(1700000002), // storage_uploaded_at,
+            None,
         ).unwrap();
 
         // Verify storage info was applied
@@ -6836,3 +6783,395 @@ mod tests {
     }
 
 }
+
+
+// ============================================================================
+// Versioning support: migrations, cache helpers, and the sync failure queue
+// ============================================================================
+
+impl Database {
+    /// The pre-versioning conflict tables are replaced by `field_conflicts`,
+    /// which is derived from the version graph on every device.
+    /// Write-order sequence for the change feed (see `get_changes_after_seq`).
+    ///
+    /// Every syncable table gets a `seq` column; triggers stamp the next
+    /// value on insert and on any change of a synced column. Cache columns
+    /// and `sync_received_at` do not bump it, so applying an echo of our own
+    /// data from a peer does not re-publish it. Idempotent.
+    fn migrate_add_sync_sequence(&mut self) -> VoiceResult<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS sync_sequence (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                value INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO sync_sequence (id, value) VALUES (1, 0);
+            CREATE TABLE IF NOT EXISTS sync_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            "#,
+        )?;
+        let has_id: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sync_meta WHERE key = 'database_id'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_id == 0 {
+            self.conn.execute(
+                "INSERT INTO sync_meta (key, value) VALUES ('database_id', ?)",
+                params![Uuid::now_v7().simple().to_string()],
+            )?;
+        }
+        for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT"] {
+            let name = col.split(' ').next().unwrap_or_default();
+            if !self.column_exists("sync_peers", name)? {
+                self.conn.execute(&format!("ALTER TABLE sync_peers ADD COLUMN {}", col), [])?;
+            }
+        }
+
+        if !self.column_exists("field_versions", "published")? {
+            self.conn.execute("ALTER TABLE field_versions ADD COLUMN published INTEGER NOT NULL DEFAULT 0", [])?;
+        }
+        // Which attachment stands for a note, and which transcription for a
+        // recording. Empty until the user chooses one, and then it is the
+        // one played and the one shown in the list.
+        for (table, column) in [
+            ("notes", "primary_attachment_id"),
+            ("audio_files", "primary_transcription_id"),
+        ] {
+            if !self.column_exists(table, column)? {
+                self.conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} BLOB"), [])?;
+            }
+        }
+
+        // The trash bin's floor: what has been removed for good, and must
+        // not come back from a peer that has not heard yet. The rows are
+        // kept for ever, which costs 40 bytes per purged entity.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS purges (
+                entity_type TEXT NOT NULL,
+                entity_id BLOB NOT NULL,
+                purged_at INTEGER NOT NULL,
+                purged_at_offset INTEGER,
+                purged_at_zone TEXT,
+                device_id BLOB,
+                seq INTEGER,
+                PRIMARY KEY (entity_type, entity_id)
+            );
+            "#,
+        )?;
+
+        // (table, columns whose change means "publish again")
+        let tables: [(&str, &[&str]); 9] = [
+            ("field_versions", &["published"]),
+            ("notes", &["content", "modified_at", "deleted_at", "primary_attachment_id"]),
+            ("tags", &["name", "parent_id", "modified_at", "deleted_at"]),
+            ("note_tags", &["modified_at", "deleted_at"]),
+            ("note_attachments", &["modified_at", "deleted_at"]),
+            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id"]),
+            ("transcriptions", &["content", "content_segments", "service_response", "state", "modified_at", "deleted_at"]),
+            ("file_storage_config", &["provider", "config", "modified_at"]),
+            // A purge is written once and never changed, so it only needs
+            // the insert trigger.
+            ("purges", &[]),
+        ];
+        for (table, cols) in tables {
+            let fresh = !self.column_exists(table, "seq")?;
+            if fresh {
+                self.conn.execute(&format!("ALTER TABLE {} ADD COLUMN seq INTEGER", table), [])?;
+            }
+            self.conn.execute(
+                &format!("CREATE INDEX IF NOT EXISTS idx_{}_seq ON {}(seq)", table, table),
+                [],
+            )?;
+            if fresh {
+                // Existing rows: versions first so that they precede their rows
+                self.conn.execute(
+                    &format!(
+                        "UPDATE {t} SET seq = (SELECT value FROM sync_sequence WHERE id = 1) + rowid WHERE seq IS NULL",
+                        t = table
+                    ),
+                    [],
+                )?;
+                self.conn.execute(
+                    &format!(
+                        "UPDATE sync_sequence SET value = COALESCE((SELECT MAX(seq) FROM {t}), value) WHERE id = 1",
+                        t = table
+                    ),
+                    [],
+                )?;
+            }
+            let bump = format!(
+                "UPDATE sync_sequence SET value = value + 1 WHERE id = 1; \
+                 UPDATE {t} SET seq = (SELECT value FROM sync_sequence WHERE id = 1) WHERE rowid = NEW.rowid;",
+                t = table
+            );
+            self.conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS trg_{t}_seq_insert AFTER INSERT ON {t} BEGIN {bump} END;",
+                t = table, bump = bump
+            ))?;
+            if !cols.is_empty() {
+                let of = cols.join(", ");
+                let when = cols
+                    .iter()
+                    .map(|c| format!("NEW.{c} IS NOT OLD.{c}", c = c))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                self.conn.execute_batch(&format!(
+                    "CREATE TRIGGER IF NOT EXISTS trg_{t}_seq_update AFTER UPDATE OF {of} ON {t} WHEN {when} BEGIN {bump} END;",
+                    t = table, of = of, when = when, bump = bump
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> VoiceResult<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        for n in names {
+            if n? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Attach the timezone that came with a row from a peer to each timestamp
+    /// that actually took the peer's value.
+    ///
+    /// The `WHERE <stamp> = ?` clause is what makes this safe: when the upsert
+    /// kept a value of its own, the peer's zone is not recorded against it.
+    /// A peer that predates the timezone fields sends none, and the row keeps
+    /// whatever it had.
+    pub fn apply_zones_by_id(&self, table: &str, id_hex: &str, stamps: &[&str], data: &serde_json::Value) -> VoiceResult<()> {
+        let id = Uuid::parse_str(id_hex)
+            .map_err(|e| VoiceError::validation("id", e.to_string()))?
+            .as_bytes()
+            .to_vec();
+        for stamp in stamps {
+            let Some(ts) = data[*stamp].as_i64() else { continue };
+            let offset = data[&format!("{}_offset", stamp)].as_i64();
+            let zone = data[&format!("{}_zone", stamp)].as_str();
+            if offset.is_none() && zone.is_none() {
+                continue;
+            }
+            let sql = format!(
+                "UPDATE {table} SET {stamp}_offset = ?, {stamp}_zone = ? WHERE id = ? AND {stamp} = ?"
+            );
+            self.conn.execute(&sql, params![offset, zone, id, ts])?;
+        }
+        Ok(())
+    }
+
+    /// The same for the note-tag link, which is keyed by its two ends.
+    pub fn apply_zones_for_note_tag(&self, note_hex: &str, tag_hex: &str, stamps: &[&str], data: &serde_json::Value) -> VoiceResult<()> {
+        let note = Uuid::parse_str(note_hex)
+            .map_err(|e| VoiceError::validation("note_id", e.to_string()))?
+            .as_bytes()
+            .to_vec();
+        let tag = Uuid::parse_str(tag_hex)
+            .map_err(|e| VoiceError::validation("tag_id", e.to_string()))?
+            .as_bytes()
+            .to_vec();
+        for stamp in stamps {
+            let Some(ts) = data[*stamp].as_i64() else { continue };
+            let offset = data[&format!("{}_offset", stamp)].as_i64();
+            let zone = data[&format!("{}_zone", stamp)].as_str();
+            if offset.is_none() && zone.is_none() {
+                continue;
+            }
+            let sql = format!(
+                "UPDATE note_tags SET {stamp}_offset = ?, {stamp}_zone = ? WHERE note_id = ? AND tag_id = ? AND {stamp} = ?"
+            );
+            self.conn.execute(&sql, params![offset, zone, note, tag, ts])?;
+        }
+        Ok(())
+    }
+
+    /// Stamp the timezone of this device on a timestamp it has just written.
+    pub fn stamp_local_zone(&self, table: &str, id_hex: &str, stamp: &str) -> VoiceResult<()> {
+        let id = Uuid::parse_str(id_hex)
+            .map_err(|e| VoiceError::validation("id", e.to_string()))?
+            .as_bytes()
+            .to_vec();
+        let zone = crate::timezone::local_zone();
+        let sql = format!(
+            "UPDATE {table} SET {stamp}_offset = ?, {stamp}_zone = ? WHERE id = ? AND {stamp}_offset IS NULL"
+        );
+        self.conn.execute(&sql, params![zone.offset_seconds, zone.name, id])?;
+        Ok(())
+    }
+
+    /// Send a row again although none of its values changed.
+    ///
+    /// The sequence triggers only fire when something is written, so a device
+    /// that rejects a peer's value has nothing to send and the peer would keep
+    /// its losing value for ever. Giving the row a new sequence number puts it
+    /// back in the feed; the peer adopts the winning value, and because its own
+    /// value then matches, the exchange stops there.
+    fn republish(&self, table: &str, id: &[u8]) -> VoiceResult<()> {
+        self.conn.execute("UPDATE sync_sequence SET value = value + 1 WHERE id = 1", [])?;
+        let sql = format!(
+            "UPDATE {table} SET seq = (SELECT value FROM sync_sequence WHERE id = 1) WHERE id = ?"
+        );
+        self.conn.execute(&sql, params![id.to_vec()])?;
+        Ok(())
+    }
+
+    /// Whether a table already has a column.
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let sql = format!("PRAGMA table_info({})", table);
+        let Ok(mut stmt) = conn.prepare(&sql) else { return false };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else { return false };
+        let found = rows.filter_map(|r| r.ok()).any(|name| name == column);
+        found
+    }
+
+    /// Put the timezone of the action next to every user-visible timestamp.
+    ///
+    /// A Unix timestamp is an instant and cannot say what the clock read where
+    /// the action happened, so each one is followed by `<stamp>_offset`
+    /// (seconds east of UTC at that moment) and `<stamp>_zone` (the IANA name
+    /// when the device knew it). A note recorded at 15:20 in Jerusalem is then
+    /// still shown as 15:20 from New York.
+    ///
+    /// Sync bookkeeping (`sync_received_at`, `last_sync_at`, `seq`) and the
+    /// cloud upload time deliberately get none: no screen shows them, and they
+    /// are machine events rather than something a person did.
+    ///
+    /// Rows written before this migration keep NULL, and a reader shows those
+    /// in its own timezone, exactly as it did before.
+    fn migrate_add_timezone_columns(&mut self) -> VoiceResult<()> {
+        for (table, stamps) in STAMPED_COLUMNS {
+            for stamp in stamps.iter() {
+                for (suffix, kind) in [("offset", "INTEGER"), ("zone", "TEXT")] {
+                    let column = format!("{}_{}", stamp, suffix);
+                    if !Self::has_column(&self.conn, table, &column) {
+                        self.conn.execute_batch(&format!(
+                            "ALTER TABLE {} ADD COLUMN {} {}",
+                            table, column, kind
+                        ))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn migrate_drop_legacy_conflict_tables(&mut self) -> VoiceResult<()> {
+        self.conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS conflicts_note_content;
+            DROP TABLE IF EXISTS conflicts_note_delete;
+            DROP TABLE IF EXISTS conflicts_tag_rename;
+            DROP TABLE IF EXISTS conflicts_tag_parent;
+            DROP TABLE IF EXISTS conflicts_tag_delete;
+            DROP TABLE IF EXISTS conflicts_note_tag;
+            "#,
+        )?;
+        Ok(())
+    }
+
+    /// Rebuild the display caches of every note that shows a transcription.
+    pub(crate) fn rebuild_caches_for_transcription(&self, transcription_id: &str) {
+        // Looked up directly so that a transcription that was just deleted
+        // still refreshes the caches of its audio file and note.
+        let audio: Option<Vec<u8>> = Uuid::parse_str(transcription_id).ok().and_then(|u| {
+            self.conn
+                .query_row(
+                    "SELECT audio_file_id FROM transcriptions WHERE id = ?",
+                    params![u.as_bytes().to_vec()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        });
+        if let Some(hex) = audio.and_then(|a| Uuid::from_slice(&a).ok()).map(|u| u.simple().to_string()) {
+            self.rebuild_caches_for_audio_file(&hex);
+        }
+    }
+
+    /// Remember a change from a peer that could not be applied, so it is
+    /// retried on the next sync instead of being silently dropped.
+    pub fn record_sync_failure(
+        &self,
+        peer_device_id: &str,
+        peer_device_name: Option<&str>,
+        change: &SyncChange,
+        error: &str,
+    ) -> VoiceResult<()> {
+        let peer_bytes = Uuid::parse_str(peer_device_id)
+            .map(|u| u.as_bytes().to_vec())
+            .unwrap_or_else(|_| vec![0u8; 16]);
+        let payload = serde_json::to_string(change)?;
+        // The peer row may not exist yet on the first exchange (it is upserted
+        // after the batch); the failure must still be queued.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, '')",
+            params![peer_bytes, peer_device_name],
+        )?;
+        // One pending row per (peer, entity, operation): replace an older failure of the same change.
+        self.conn.execute(
+            "DELETE FROM sync_failures WHERE peer_id = ? AND entity_type = ? AND operation = ? AND resolved_at IS NULL AND payload = ?",
+            params![peer_bytes, change.entity_type, change.operation, payload],
+        )?;
+        self.conn.execute(
+            r#"
+            INSERT INTO sync_failures (id, peer_id, peer_name, entity_type, entity_id, operation, payload, error_message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+            "#,
+            params![
+                Uuid::now_v7().as_bytes().to_vec(),
+                peer_bytes,
+                peer_device_name,
+                change.entity_type,
+                Uuid::parse_str(&change.entity_id).ok().map(|u| u.as_bytes().to_vec()),
+                change.operation,
+                payload,
+                error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Pending (unresolved) failures, oldest first: (failure id hex, change).
+    pub fn get_pending_sync_failures(&self) -> VoiceResult<Vec<(String, SyncChange)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, payload FROM sync_failures WHERE resolved_at IS NULL ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, payload) = row?;
+            match serde_json::from_str::<SyncChange>(&payload) {
+                Ok(change) => out.push((uuid_bytes_to_hex(&id).unwrap_or_default(), change)),
+                Err(e) => tracing::warn!("Unreadable sync failure payload: {}", e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Mark a failure as dealt with.
+    pub fn resolve_sync_failure(&self, failure_id: &str) -> VoiceResult<()> {
+        let id = Uuid::parse_str(failure_id).map_err(|e| VoiceError::validation("failure_id", e.to_string()))?;
+        self.conn.execute(
+            "UPDATE sync_failures SET resolved_at = strftime('%s', 'now') WHERE id = ?",
+            params![id.as_bytes().to_vec()],
+        )?;
+        Ok(())
+    }
+
+    /// Number of pending sync failures.
+    pub fn count_pending_sync_failures(&self) -> VoiceResult<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM sync_failures WHERE resolved_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+}
+

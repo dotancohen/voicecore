@@ -15,15 +15,29 @@ use crate::sync_client::SyncClient;
 use crate::UUID_SHORT_LEN;
 
 /// Format a Unix timestamp (i64) to "YYYY-MM-DD HH:MM:SS" string for display.
-fn format_timestamp(ts: i64) -> String {
-    DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "Unknown".to_string())
+/// An instant, with the clock that was being read where it happened.
+///
+/// The core does not render dates: only the application knows the phone's
+/// locale and whether it shows a 12 or 24-hour clock. It hands over the
+/// instant and the offset that was in force when the action happened, and the
+/// application draws them.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Stamp {
+    /// Seconds since the Unix epoch.
+    pub at: i64,
+    /// Seconds east of UTC where the action happened, when it was recorded.
+    /// Without one, a reader falls back to its own timezone.
+    pub offset: Option<i32>,
+    /// IANA name of that timezone, e.g. "Asia/Jerusalem", when it was known.
+    pub zone: Option<String>,
 }
 
-/// Format an optional Unix timestamp to an optional string.
-fn format_timestamp_opt(ts: Option<i64>) -> Option<String> {
-    ts.map(format_timestamp)
+fn stamp(at: i64, offset: Option<i32>, zone: Option<String>) -> Stamp {
+    Stamp { at, offset, zone }
+}
+
+fn stamp_opt(at: Option<i64>, offset: Option<i32>, zone: Option<String>) -> Option<Stamp> {
+    at.map(|at| Stamp { at, offset, zone })
 }
 
 /// Error type exposed to Kotlin via UniFFI
@@ -80,9 +94,9 @@ impl From<crate::error::VoiceError> for VoiceCoreError {
 pub struct NoteData {
     pub id: String,
     pub content: String,
-    pub created_at: String,
-    pub modified_at: Option<String>,
-    pub deleted_at: Option<String>,
+    pub created_at: Stamp,
+    pub modified_at: Option<Stamp>,
+    pub deleted_at: Option<Stamp>,
     /// Cache for notes list pane display (JSON with date, marked, content_preview)
     pub list_display_cache: Option<String>,
 }
@@ -91,19 +105,25 @@ pub struct NoteData {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AudioFileData {
     pub id: String,
-    pub imported_at: String,
+    pub imported_at: Stamp,
     pub filename: String,
-    pub file_created_at: Option<String>,
+    pub file_created_at: Option<Stamp>,
+    /// How long the recording is, where it is known. The phone needs it to
+    /// decide what work is worth doing on a recording: a waveform is offered
+    /// rather than drawn past an hour, and transcription on the phone is
+    /// capped (see VoiceFamily/TECHNICAL-DECISIONS.md).
+    pub duration_seconds: Option<i64>,
     pub summary: Option<String>,
     pub device_id: String,
-    pub modified_at: Option<String>,
-    pub deleted_at: Option<String>,
+    pub modified_at: Option<Stamp>,
+    pub deleted_at: Option<Stamp>,
     /// Cloud storage provider ("s3", "backblaze", etc.) or None for local-only
     pub storage_provider: Option<String>,
     /// Object key/path in cloud storage
     pub storage_key: Option<String>,
-    /// Unix timestamp when file was uploaded to cloud storage (as formatted string)
-    pub storage_uploaded_at: Option<String>,
+    /// When the file was uploaded to cloud storage; a machine event, so it
+    /// carries no timezone of its own and a reader shows it in its own.
+    pub storage_uploaded_at: Option<Stamp>,
 }
 
 /// A note-attachment association from the database
@@ -113,10 +133,10 @@ pub struct NoteAttachmentData {
     pub note_id: String,
     pub attachment_id: String,
     pub attachment_type: String,
-    pub created_at: String,
+    pub created_at: Stamp,
     pub device_id: String,
-    pub modified_at: Option<String>,
-    pub deleted_at: Option<String>,
+    pub modified_at: Option<Stamp>,
+    pub deleted_at: Option<Stamp>,
 }
 
 /// A transcription from the database
@@ -131,9 +151,9 @@ pub struct TranscriptionData {
     pub service_response: Option<String>,
     pub state: String,
     pub device_id: String,
-    pub created_at: String,
-    pub modified_at: Option<String>,
-    pub deleted_at: Option<String>,
+    pub created_at: Stamp,
+    pub modified_at: Option<Stamp>,
+    pub deleted_at: Option<Stamp>,
 }
 
 /// A tag from the database
@@ -142,8 +162,8 @@ pub struct TagData {
     pub id: String,
     pub name: String,
     pub parent_id: Option<String>,
-    pub created_at: Option<String>,
-    pub modified_at: Option<String>,
+    pub created_at: Option<Stamp>,
+    pub modified_at: Option<Stamp>,
 }
 
 /// Result of a search operation
@@ -172,6 +192,8 @@ pub struct SyncResultData {
     pub notes_received: i32,
     pub notes_sent: i32,
     pub error_message: Option<String>,
+    /// Non-fatal problems, e.g. a cloud upload that will be retried next sync
+    pub warnings: Vec<String>,
 }
 
 /// Configuration for sync server connection
@@ -232,6 +254,14 @@ impl VoiceClient {
         }))
     }
 
+    /// Tell the core which timezone this phone is in, so every timestamp it
+    /// writes records the clock the user is reading. Android keeps the zone in
+    /// its framework, where a native library cannot see it, so the application
+    /// calls this at start and whenever the phone's timezone changes.
+    pub fn set_local_timezone(&self, offset_seconds: i32, zone_name: Option<String>) {
+        crate::timezone::set_local_timezone(offset_seconds, zone_name);
+    }
+
     /// Get all notes from the local database
     pub fn get_all_notes(&self) -> Result<Vec<NoteData>, VoiceCoreError> {
         let db = self.db.lock().unwrap();
@@ -242,9 +272,9 @@ impl VoiceClient {
             .map(|n| NoteData {
                 id: n.id,
                 content: n.content,
-                created_at: format_timestamp(n.created_at),
-                modified_at: format_timestamp_opt(n.modified_at),
-                deleted_at: format_timestamp_opt(n.deleted_at),
+                created_at: stamp(n.created_at, n.created_at_offset, n.created_at_zone.clone()),
+                modified_at: stamp_opt(n.modified_at, n.modified_at_offset, n.modified_at_zone.clone()),
+                deleted_at: stamp_opt(n.deleted_at, n.deleted_at_offset, n.deleted_at_zone.clone()),
                 list_display_cache: n.list_display_cache,
             })
             .collect())
@@ -351,6 +381,7 @@ impl VoiceClient {
             } else {
                 Some(result.errors.join("; "))
             },
+            warnings: result.warnings,
         })
     }
 
@@ -422,6 +453,7 @@ impl VoiceClient {
             } else {
                 Some(result.errors.join("; "))
             },
+            warnings: result.warnings,
         })
     }
 
@@ -483,10 +515,11 @@ impl VoiceClient {
                 note_id: a.note_id,
                 attachment_id: a.attachment_id,
                 attachment_type: a.attachment_type,
-                created_at: format_timestamp(a.created_at),
+                // The link's zones are stored but not surfaced yet
+                created_at: stamp(a.created_at, None, None),
                 device_id: a.device_id,
-                modified_at: format_timestamp_opt(a.modified_at),
-                deleted_at: format_timestamp_opt(a.deleted_at),
+                modified_at: stamp_opt(a.modified_at, None, None),
+                deleted_at: stamp_opt(a.deleted_at, None, None),
             })
             .collect())
     }
@@ -500,16 +533,17 @@ impl VoiceClient {
             .into_iter()
             .map(|a| AudioFileData {
                 id: a.id,
-                imported_at: format_timestamp(a.imported_at),
+                imported_at: stamp(a.imported_at, a.imported_at_offset, a.imported_at_zone.clone()),
                 filename: a.filename,
-                file_created_at: format_timestamp_opt(a.file_created_at),
+                file_created_at: stamp_opt(a.file_created_at, a.file_created_at_offset, a.file_created_at_zone.clone()),
+                duration_seconds: a.duration_seconds,
                 summary: a.summary,
                 device_id: a.device_id,
-                modified_at: format_timestamp_opt(a.modified_at),
-                deleted_at: format_timestamp_opt(a.deleted_at),
+                modified_at: stamp_opt(a.modified_at, a.modified_at_offset, a.modified_at_zone.clone()),
+                deleted_at: stamp_opt(a.deleted_at, a.deleted_at_offset, a.deleted_at_zone.clone()),
                 storage_provider: a.storage_provider,
                 storage_key: a.storage_key,
-                storage_uploaded_at: format_timestamp_opt(a.storage_uploaded_at),
+                storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
             })
             .collect())
     }
@@ -521,16 +555,17 @@ impl VoiceClient {
 
         Ok(audio_file.map(|a| AudioFileData {
             id: a.id,
-            imported_at: format_timestamp(a.imported_at),
+            imported_at: stamp(a.imported_at, a.imported_at_offset, a.imported_at_zone.clone()),
             filename: a.filename,
-            file_created_at: format_timestamp_opt(a.file_created_at),
+            file_created_at: stamp_opt(a.file_created_at, a.file_created_at_offset, a.file_created_at_zone.clone()),
+            duration_seconds: a.duration_seconds,
             summary: a.summary,
             device_id: a.device_id,
-            modified_at: format_timestamp_opt(a.modified_at),
-            deleted_at: format_timestamp_opt(a.deleted_at),
+            modified_at: stamp_opt(a.modified_at, a.modified_at_offset, a.modified_at_zone.clone()),
+            deleted_at: stamp_opt(a.deleted_at, a.deleted_at_offset, a.deleted_at_zone.clone()),
             storage_provider: a.storage_provider,
             storage_key: a.storage_key,
-            storage_uploaded_at: format_timestamp_opt(a.storage_uploaded_at),
+            storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
         }))
     }
 
@@ -544,16 +579,17 @@ impl VoiceClient {
             .filter(|a| a.deleted_at.is_none())
             .map(|a| AudioFileData {
                 id: a.id,
-                imported_at: format_timestamp(a.imported_at),
+                imported_at: stamp(a.imported_at, a.imported_at_offset, a.imported_at_zone.clone()),
                 filename: a.filename,
-                file_created_at: format_timestamp_opt(a.file_created_at),
+                file_created_at: stamp_opt(a.file_created_at, a.file_created_at_offset, a.file_created_at_zone.clone()),
+                duration_seconds: a.duration_seconds,
                 summary: a.summary,
                 device_id: a.device_id,
-                modified_at: format_timestamp_opt(a.modified_at),
-                deleted_at: format_timestamp_opt(a.deleted_at),
+                modified_at: stamp_opt(a.modified_at, a.modified_at_offset, a.modified_at_zone.clone()),
+                deleted_at: stamp_opt(a.deleted_at, a.deleted_at_offset, a.deleted_at_zone.clone()),
                 storage_provider: a.storage_provider,
                 storage_key: a.storage_key,
-                storage_uploaded_at: format_timestamp_opt(a.storage_uploaded_at),
+                storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
             })
             .collect())
     }
@@ -582,17 +618,14 @@ impl VoiceClient {
             None => return Ok(None),
         };
 
-        // Determine extension from filename
-        let ext = audio_file
-            .filename
-            .rsplit('.')
-            .next()
-            .unwrap_or("bin");
-
-        let path = std::path::Path::new(&audiofile_dir).join(format!("{}.{}", audio_file_id, ext));
+        let path = crate::models::audio_local_path(
+            std::path::Path::new(&audiofile_dir),
+            &audio_file.id,
+            &audio_file.filename,
+        );
 
         // Only return path if file exists
-        if path.exists() {
+        if path.is_file() {
             Ok(Some(path.to_string_lossy().to_string()))
         } else {
             Ok(None)
@@ -614,16 +647,17 @@ impl VoiceClient {
             .into_iter()
             .map(|a| AudioFileData {
                 id: a.id,
-                imported_at: format_timestamp(a.imported_at),
+                imported_at: stamp(a.imported_at, a.imported_at_offset, a.imported_at_zone.clone()),
                 filename: a.filename,
-                file_created_at: format_timestamp_opt(a.file_created_at),
+                file_created_at: stamp_opt(a.file_created_at, a.file_created_at_offset, a.file_created_at_zone.clone()),
+                duration_seconds: a.duration_seconds,
                 summary: a.summary,
                 device_id: a.device_id,
-                modified_at: format_timestamp_opt(a.modified_at),
-                deleted_at: format_timestamp_opt(a.deleted_at),
+                modified_at: stamp_opt(a.modified_at, a.modified_at_offset, a.modified_at_zone.clone()),
+                deleted_at: stamp_opt(a.deleted_at, a.deleted_at_offset, a.deleted_at_zone.clone()),
                 storage_provider: a.storage_provider,
                 storage_key: a.storage_key,
-                storage_uploaded_at: format_timestamp_opt(a.storage_uploaded_at),
+                storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
             })
             .collect())
     }
@@ -645,6 +679,46 @@ impl VoiceClient {
     ) -> Result<bool, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.update_audio_file_storage(&audio_file_id, &storage_provider, &storage_key)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Set how long a recording is, for a row that never had it.
+    ///
+    /// Calculating data that was never calculated is a repair, not an edit by
+    /// the user: see Settings -> "Calculate missing data". The length is read
+    /// off the file on the device that has the file.
+    ///
+    /// # Returns
+    /// True if the row was updated, false if there is no such recording.
+    pub fn update_audio_file_duration(
+        &self,
+        audio_file_id: String,
+        duration_seconds: i64,
+    ) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.update_audio_file_duration(&audio_file_id, duration_seconds)
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Set when a recording was made, for a row that never had it.
+    ///
+    /// Unix seconds. The timezone it was made in is *not* written: it cannot be
+    /// read off a file, and guessing it would state something false about where
+    /// the recording was made.
+    ///
+    /// # Returns
+    /// True if the row was updated, false if there is no such recording.
+    pub fn update_audio_file_created_at(
+        &self,
+        audio_file_id: String,
+        file_created_at: i64,
+    ) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.update_audio_file_created_at(&audio_file_id, file_created_at)
             .map_err(|e| VoiceCoreError::Database {
                 msg: e.to_string(),
             })
@@ -847,7 +921,7 @@ impl VoiceClient {
             info.push_str(&format!("Peer ID: {}...\n", &peer.peer_id[..UUID_SHORT_LEN.min(peer.peer_id.len())]));
 
             if let Ok(Some(last_sync)) = db.get_peer_last_sync(&peer.peer_id) {
-                info.push_str(&format!("Last sync: {} ({})\n", last_sync, format_timestamp(last_sync)));
+                info.push_str(&format!("Last sync: {} ({})\n", last_sync, crate::timezone::format_at_offset(last_sync, None)));
 
                 // Check changes with >= (current behavior)
                 if let Ok((changes, _)) = db.get_changes_since(Some(last_sync), 10) {
@@ -896,9 +970,9 @@ impl VoiceClient {
                 service_response: t.service_response,
                 state: t.state,
                 device_id: t.device_id,
-                created_at: format_timestamp(t.created_at),
-                modified_at: format_timestamp_opt(t.modified_at),
-                deleted_at: format_timestamp_opt(t.deleted_at),
+                created_at: stamp(t.created_at, t.created_at_offset, t.created_at_zone.clone()),
+                modified_at: stamp_opt(t.modified_at, None, None),
+                deleted_at: stamp_opt(t.deleted_at, None, None),
             })
             .collect())
     }
@@ -918,9 +992,9 @@ impl VoiceClient {
             service_response: t.service_response,
             state: t.state,
             device_id: t.device_id,
-            created_at: format_timestamp(t.created_at),
-            modified_at: format_timestamp_opt(t.modified_at),
-            deleted_at: format_timestamp_opt(t.deleted_at),
+            created_at: stamp(t.created_at, t.created_at_offset, t.created_at_zone.clone()),
+            modified_at: stamp_opt(t.modified_at, None, None),
+            deleted_at: stamp_opt(t.deleted_at, None, None),
         }))
     }
 
@@ -970,6 +1044,62 @@ impl VoiceClient {
         ).map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
     }
 
+    /// Create a transcription record for an audio file (used by on-device
+    /// transcription: a "Pending..." row first, then the result via
+    /// `update_transcription_result`). Returns the new transcription id.
+    pub fn create_transcription(
+        &self,
+        audio_file_id: String,
+        content: String,
+        content_segments: Option<String>,
+        service: String,
+        service_arguments: Option<String>,
+        service_response: Option<String>,
+    ) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.create_transcription(
+            &audio_file_id,
+            &content,
+            content_segments.as_deref(),
+            &service,
+            service_arguments.as_deref(),
+            service_response.as_deref(),
+            None,
+        ).map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Store a finished (or failed) transcription: the text, the segments
+    /// JSON and the service response, exactly as the desktop does.
+    pub fn update_transcription_result(
+        &self,
+        transcription_id: String,
+        content: String,
+        content_segments: Option<String>,
+        service_response: Option<String>,
+    ) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.update_transcription(
+            &transcription_id,
+            &content,
+            content_segments.as_deref(),
+            service_response.as_deref(),
+            None,
+        ).map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Delete a transcription (a soft delete, like every other deletion
+    /// here, so the removal travels to the other devices).
+    ///
+    /// The phone uses this to clear the "the app was closed before the
+    /// transcription finished" placeholder once the recording really has
+    /// been transcribed: the failed attempt is of no interest to anybody
+    /// after that, and leaving it makes the note look transcribed twice.
+    pub fn delete_transcription(&self, transcription_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.delete_transcription(&transcription_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
     // =========================================================================
     // Tag and Search Methods
     // =========================================================================
@@ -985,8 +1115,8 @@ impl VoiceClient {
                 id: t.id,
                 name: t.name,
                 parent_id: t.parent_id,
-                created_at: format_timestamp_opt(t.created_at),
-                modified_at: format_timestamp_opt(t.modified_at),
+                created_at: stamp_opt(t.created_at, None, None),
+                modified_at: stamp_opt(t.modified_at, None, None),
             })
             .collect())
     }
@@ -1002,8 +1132,8 @@ impl VoiceClient {
                 id: t.id,
                 name: t.name,
                 parent_id: t.parent_id,
-                created_at: format_timestamp_opt(t.created_at),
-                modified_at: format_timestamp_opt(t.modified_at),
+                created_at: stamp_opt(t.created_at, None, None),
+                modified_at: stamp_opt(t.modified_at, None, None),
             })
             .collect())
     }
@@ -1147,7 +1277,7 @@ impl VoiceClient {
     /// Rebuild the list pane display cache for a single note
     ///
     /// The cache stores pre-computed data for the Notes List display:
-    /// date, marked status, and content preview (first 100 chars).
+    /// date, marked status, and content preview (first 200 chars).
     pub fn rebuild_note_list_cache(&self, note_id: String) -> Result<(), VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.rebuild_note_list_cache(&note_id)
@@ -1162,6 +1292,18 @@ impl VoiceClient {
     pub fn rebuild_all_note_list_caches(&self) -> Result<u32, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.rebuild_all_note_list_caches()
+            .map_err(|e| VoiceCoreError::Database {
+                msg: e.to_string(),
+            })
+    }
+
+    /// Rebuild every display cache of one note: the note pane's and the list's.
+    ///
+    /// Used when calculating missing data, for a note written before the caches
+    /// existed.
+    pub fn rebuild_all_caches_for_note(&self, note_id: String) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.rebuild_all_caches_for_note(&note_id)
             .map_err(|e| VoiceCoreError::Database {
                 msg: e.to_string(),
             })
@@ -1193,9 +1335,9 @@ impl VoiceClient {
                 .map(|n| NoteData {
                     id: n.id,
                     content: n.content,
-                    created_at: format_timestamp(n.created_at),
-                    modified_at: format_timestamp_opt(n.modified_at),
-                    deleted_at: format_timestamp_opt(n.deleted_at),
+                    created_at: stamp(n.created_at, n.created_at_offset, n.created_at_zone.clone()),
+                    modified_at: stamp_opt(n.modified_at, n.modified_at_offset, n.modified_at_zone.clone()),
+                    deleted_at: stamp_opt(n.deleted_at, n.deleted_at_offset, n.deleted_at_zone.clone()),
                     list_display_cache: n.list_display_cache,
                 })
                 .collect(),
@@ -1214,6 +1356,99 @@ impl VoiceClient {
             .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
     }
 
+    /// Every unresolved conflict that concerns a note: its content, its
+    /// deletion, its tag links, its attachments and their transcriptions.
+    pub fn get_note_conflicts(&self, note_id: String) -> Result<Vec<ConflictData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let rows = db.get_note_conflicts(&note_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
+        Ok(rows.into_iter().map(conflict_to_data).collect())
+    }
+
+    /// All conflicts (unresolved only unless include_resolved), newest first.
+    pub fn get_conflicts(&self, include_resolved: bool) -> Result<Vec<ConflictData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let rows = db.get_conflicts(include_resolved)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
+        Ok(rows.into_iter().map(conflict_to_data).collect())
+    }
+
+    /// Number of unresolved conflicts in the whole database.
+    pub fn get_unresolved_conflict_count(&self) -> Result<i64, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let counts = db.get_unresolved_conflict_counts()
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
+        Ok(*counts.get("total").unwrap_or(&0))
+    }
+
+    /// Accept the merged value of a conflict as it stands. The acceptance is
+    /// a new version and reaches every peer on the next sync.
+    pub fn accept_conflict(&self, conflict_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.accept_conflict(&conflict_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Accept every unresolved conflict of a note. Returns how many were accepted.
+    pub fn accept_note_conflicts(&self, note_id: String) -> Result<i32, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let rows = db.get_note_conflicts(&note_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
+        let mut n = 0;
+        for c in rows {
+            if db.accept_conflict(&c.id).map_err(|e| VoiceCoreError::Database { msg: e.to_string() })? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Resolve a conflict by writing a new value for its field.
+    pub fn resolve_conflict_with_content(&self, conflict_id: String, content: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.resolve_conflict_with_content(&conflict_id, &content)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Every version of one field, oldest first (e.g. "note", note_id, "content").
+    pub fn get_field_history(&self, entity_type: String, entity_id: String, field: String) -> Result<Vec<VersionData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let rows = db.get_field_history(&entity_type, &entity_id, &field)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
+        Ok(rows.into_iter().map(version_to_data).collect())
+    }
+
+    /// One version by hex id, or None.
+    pub fn get_version(&self, version_id: String) -> Result<Option<VersionData>, VoiceCoreError> {
+        let bytes = crate::versions::hex_to_bytes(&version_id)
+            .map_err(|e| VoiceCoreError::Validation { msg: e.to_string() })?;
+        let db = self.db.lock().unwrap();
+        let row = db.get_version(&bytes)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
+        Ok(row.map(version_to_data))
+    }
+
+    /// A synced setting (shared by every device), or None.
+    pub fn get_setting(&self, key: String) -> Result<Option<String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.get_setting(&key)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Set a synced setting. Concurrent changes on two devices are merged and flagged.
+    pub fn set_setting(&self, key: String, value: String) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.set_setting(&key, &value)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// All synced settings.
+    pub fn get_all_settings(&self) -> Result<std::collections::HashMap<String, String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.get_all_settings()
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
     /// Filter notes by tag IDs.
     ///
     /// Returns notes that have ALL the specified tags.
@@ -1227,9 +1462,9 @@ impl VoiceClient {
             .map(|n| NoteData {
                 id: n.id,
                 content: n.content,
-                created_at: format_timestamp(n.created_at),
-                modified_at: format_timestamp_opt(n.modified_at),
-                deleted_at: format_timestamp_opt(n.deleted_at),
+                created_at: stamp(n.created_at, n.created_at_offset, n.created_at_zone.clone()),
+                modified_at: stamp_opt(n.modified_at, n.modified_at_offset, n.modified_at_zone.clone()),
+                deleted_at: stamp_opt(n.deleted_at, n.deleted_at_offset, n.deleted_at_zone.clone()),
                 list_display_cache: n.list_display_cache,
             })
             .collect())
@@ -1274,6 +1509,97 @@ impl VoiceClient {
         })
     }
 
+    // =========================================================================
+    // Which attachment or transcription stands for its parent
+    // =========================================================================
+
+    /// Make one of a note's attachments the one that stands for it: the
+    /// recording played when the note is opened, and the one whose
+    /// transcription the notes list shows. Null goes back to the first one.
+    pub fn set_primary_attachment(&self, note_id: String, attachment_id: Option<String>) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.set_primary_attachment(&note_id, attachment_id.as_deref())
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// The attachment that stands for this note, if one was chosen.
+    pub fn get_primary_attachment(&self, note_id: String) -> Result<Option<String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.get_primary_attachment(&note_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Make one of a recording's transcriptions the one that stands for it.
+    pub fn set_primary_transcription(&self, audio_file_id: String, transcription_id: Option<String>) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.set_primary_transcription(&audio_file_id, transcription_id.as_deref())
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// The transcription that stands for this recording, if one was chosen.
+    pub fn get_primary_transcription(&self, audio_file_id: String) -> Result<Option<String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.get_primary_transcription(&audio_file_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    // =========================================================================
+    // The trash bin
+    // =========================================================================
+
+    /// The notes in the trash: deleted, still here, newest deletion first.
+    pub fn get_deleted_notes(&self) -> Result<Vec<NoteData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let notes = db.get_deleted_notes()?;
+        Ok(notes
+            .into_iter()
+            .map(|n| NoteData {
+                id: n.id,
+                content: n.content,
+                created_at: stamp(n.created_at, n.created_at_offset, n.created_at_zone.clone()),
+                modified_at: stamp_opt(n.modified_at, n.modified_at_offset, n.modified_at_zone.clone()),
+                deleted_at: stamp_opt(n.deleted_at, n.deleted_at_offset, n.deleted_at_zone.clone()),
+                list_display_cache: n.list_display_cache,
+            })
+            .collect())
+    }
+
+    /// Take a note out of the trash. False when it was not in there.
+    pub fn undelete_note(&self, note_id: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.undelete_note(&note_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Empty one note out of the trash for good.
+    ///
+    /// Returns the ids of the recordings that went with it, so the app can
+    /// delete the files from the phone. The removal travels to the other
+    /// devices and cannot be undone.
+    pub fn purge_note(&self, note_id: String) -> Result<Vec<String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.purge_note(&note_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Import a recording into a note that already exists.
+    ///
+    /// The phone records inside the note now, so the note is there before
+    /// the recording is: pressing Save attaches the file to that note rather
+    /// than making a second one. Returns the new audio file id, which is
+    /// also the name the file is stored under.
+    pub fn import_audio_file_into_note(
+        &self,
+        note_id: String,
+        filename: String,
+        file_created_at: Option<i64>,
+        duration_seconds: Option<i64>,
+    ) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.import_audio_file_into_note(&note_id, &filename, file_created_at, duration_seconds)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
     /// Create a new note with empty content
     ///
     /// Returns the ID of the created note as a hex string.
@@ -1289,58 +1615,73 @@ impl VoiceClient {
     // Cloud Storage Download Methods
     // =========================================================================
 
-    /// Download missing audio files from cloud storage.
+    /// Download one audio file from cloud storage, on demand.
     ///
-    /// This downloads all audio files that:
-    /// - Have storage_provider and storage_key set (uploaded to cloud)
-    /// - Don't exist locally in the audiofile directory
-    ///
-    /// # Returns
-    /// DownloadResultData with count of downloaded files and any errors
+    /// Returns a result with `downloaded = 1` when the file was fetched,
+    /// `already_local = 1` when nothing was needed, or `not_in_cloud = 1`
+    /// when the owning device has not uploaded the file yet. Errors (offline,
+    /// storage not configured yet, object missing) are returned as an
+    /// exception so the UI can show them.
+    pub fn download_audio_file(&self, audio_file_id: String) -> Result<DownloadResultData, VoiceCoreError> {
+        #[cfg(feature = "file-storage")]
+        {
+            use crate::file_storage::DownloadOutcome;
+            let (client, dir, rt) = self.cloud_context()?;
+            let outcome = rt.block_on(client.download_audio_file_from_cloud(&dir, &audio_file_id));
+            match outcome {
+                Ok(DownloadOutcome::Downloaded(_)) => Ok(DownloadResultData { downloaded: 1, ..Default::default() }),
+                Ok(DownloadOutcome::AlreadyLocal) => Ok(DownloadResultData { already_local: 1, ..Default::default() }),
+                Ok(DownloadOutcome::NotInCloud) => Ok(DownloadResultData { not_in_cloud: 1, ..Default::default() }),
+                Err(e) => Err(VoiceCoreError::Sync { msg: e.to_string() }),
+            }
+        }
+
+        #[cfg(not(feature = "file-storage"))]
+        {
+            let _ = audio_file_id;
+            Err(VoiceCoreError::Config { msg: "File storage feature not enabled".to_string() })
+        }
+    }
+
+    /// Download every audio file attached to a note that is in cloud storage
+    /// but not on this device. This is the "media missing, download" action.
+    pub fn download_audio_files_for_note(&self, note_id: String) -> Result<DownloadResultData, VoiceCoreError> {
+        #[cfg(feature = "file-storage")]
+        {
+            let (client, dir, rt) = self.cloud_context()?;
+            let result = rt.block_on(client.download_audio_files_for_note_from_cloud(&dir, &note_id));
+            match result {
+                Ok(r) => Ok(DownloadResultData::from(r)),
+                Err(e) => Err(VoiceCoreError::Sync { msg: e.to_string() }),
+            }
+        }
+
+        #[cfg(not(feature = "file-storage"))]
+        {
+            let _ = note_id;
+            Err(VoiceCoreError::Config { msg: "File storage feature not enabled".to_string() })
+        }
+    }
+
+    /// Download every non-deleted audio file that is in cloud storage but not
+    /// on this device. Intended for explicit "fetch everything" actions; sync
+    /// itself never does this on Android.
     pub fn download_missing_audio_files(&self) -> Result<DownloadResultData, VoiceCoreError> {
         #[cfg(feature = "file-storage")]
         {
-            // Get audiofile directory
-            let audiofile_dir = {
-                let cfg = self.config.lock().unwrap();
-                cfg.audiofile_directory().map(|s| s.to_string())
-            };
-
-            let audiofile_dir = match audiofile_dir {
-                Some(d) => std::path::PathBuf::from(d),
-                None => {
-                    return Err(VoiceCoreError::Config {
-                        msg: "Audio file directory not configured".to_string(),
-                    });
-                }
-            };
-
-            // Create sync client
-            let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
-
-            // Run download in tokio runtime
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| VoiceCoreError::Io {
-                    msg: format!("Failed to create runtime: {}", e),
-                })?;
-
-            let (downloaded, errors) = rt.block_on(async {
-                sync_client.download_audio_files_from_cloud(&audiofile_dir).await
-            });
-
-            Ok(DownloadResultData {
-                downloaded: downloaded as i32,
-                errors,
-            })
+            let (client, dir, rt) = self.cloud_context()?;
+            let result = rt.block_on(client.download_missing_audio_files_from_cloud(&dir));
+            match result {
+                Ok(r) => Ok(DownloadResultData::from(r)),
+                Err(e) => Err(VoiceCoreError::Sync { msg: e.to_string() }),
+            }
         }
 
         #[cfg(not(feature = "file-storage"))]
         {
             Ok(DownloadResultData {
-                downloaded: 0,
                 errors: vec!["File storage feature not enabled".to_string()],
+                ..Default::default()
             })
         }
     }
@@ -1371,15 +1712,12 @@ impl VoiceClient {
             None => return Ok(false),
         };
 
-        // Determine extension from filename
-        let ext = audio_file
-            .filename
-            .rsplit('.')
-            .next()
-            .unwrap_or("bin");
-
-        let path = std::path::Path::new(&audiofile_dir).join(format!("{}.{}", audio_file_id, ext));
-        Ok(path.exists())
+        let path = crate::models::audio_local_path(
+            std::path::Path::new(&audiofile_dir),
+            &audio_file.id,
+            &audio_file.filename,
+        );
+        Ok(path.is_file())
     }
 
     /// Check if an audio file is available in cloud storage.
@@ -1395,11 +1733,334 @@ impl VoiceClient {
     }
 }
 
-/// Result of downloading audio files from cloud storage
+/// Private helpers (not exported through UniFFI).
+impl VoiceClient {
+    /// Resolve the audio file directory or return a Config error.
+    fn require_audiofile_directory(&self) -> Result<std::path::PathBuf, VoiceCoreError> {
+        let cfg = self.config.lock().unwrap();
+        cfg.audiofile_directory()
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| VoiceCoreError::Config {
+                msg: "Audio file directory not configured".to_string(),
+            })
+    }
+
+    /// Everything a cloud storage operation needs: a sync client, the audio
+    /// directory, and a single-threaded runtime to block on.
+    #[cfg(feature = "file-storage")]
+    fn cloud_context(
+        &self,
+    ) -> Result<(SyncClient, std::path::PathBuf, tokio::runtime::Runtime), VoiceCoreError> {
+        let audiofile_dir = self.require_audiofile_directory()?;
+        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| VoiceCoreError::Io {
+                msg: format!("Failed to create runtime: {}", e),
+            })?;
+        Ok((sync_client, audiofile_dir, rt))
+    }
+}
+
+/// One immutable version of a field (see versions.rs).
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct VersionData {
+    pub id: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub field: String,
+    pub parent_id: Option<String>,
+    pub merge_parent_id: Option<String>,
+    pub content: String,
+    /// "text", "scalar", ... when this merge needed a human
+    pub conflict_kind: Option<String>,
+    pub device_id: Option<String>,
+    pub device_name: Option<String>,
+    /// Label for lists: device name, short id, or "merge"
+    pub device_label: String,
+    pub created_at: Stamp,
+}
+
+fn version_to_data(v: crate::versions::VersionRow) -> VersionData {
+    let device_label = match (&v.device_name, &v.device_id) {
+        (Some(n), _) if !n.is_empty() => n.clone(),
+        (_, Some(i)) if !i.is_empty() => i.chars().take(8).collect(),
+        _ if v.merge_parent_id.is_some() => "merge".to_string(),
+        _ => "original".to_string(),
+    };
+    VersionData {
+        id: v.id_hex(),
+        entity_type: v.entity_type,
+        entity_id: v.entity_id,
+        field: v.field,
+        parent_id: v.parent_id.as_deref().map(crate::versions::hex),
+        merge_parent_id: v.merge_parent_id.as_deref().map(crate::versions::hex),
+        content: v.content,
+        conflict_kind: v.conflict_kind,
+        device_id: v.device_id,
+        device_name: v.device_name,
+        device_label,
+        created_at: stamp(v.created_at, v.created_at_offset, v.created_at_zone.clone()),
+    }
+}
+
+/// A recorded disagreement between two versions of one field.
+///
+/// `kind` is one of "text", "scalar", "flags", "membership", "delete";
+/// `display_kind` is what the user sees ("content", "delete", "tag",
+/// "attachment", or the field name). Device labels fall back to a short id.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ConflictData {
+    pub id: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub field: String,
+    pub kind: String,
+    pub display_kind: String,
+    /// One line: what disagreed and which devices did it
+    pub description: String,
+    pub device_a: String,
+    pub device_b: String,
+    pub base_version_id: Option<String>,
+    pub version_a_id: String,
+    pub version_b_id: String,
+    pub merge_version_id: String,
+    /// A conflict is noticed by the machine, so it carries no timezone of its
+    /// own and a reader shows it in its own.
+    pub created_at: Stamp,
+    pub resolved_at: Option<Stamp>,
+}
+
+fn device_label(name: &Option<String>, id: &Option<String>) -> String {
+    match (name, id) {
+        (Some(n), _) if !n.is_empty() => n.clone(),
+        (_, Some(i)) if !i.is_empty() => i.chars().take(8).collect(),
+        _ => "unknown device".to_string(),
+    }
+}
+
+fn conflict_to_data(c: crate::versions::ConflictRow) -> ConflictData {
+    let entity = match c.entity_type.as_str() {
+        "note" => "Note",
+        "tag" => "Tag",
+        "note_tag" => "Note tag",
+        "note_attachment" => "Attachment",
+        "transcription" => "Transcription",
+        "audio_file" => "Audio file",
+        "setting" => "Setting",
+        other => other,
+    };
+    let display_kind = match (c.kind.as_str(), c.entity_type.as_str()) {
+        ("delete", _) => "delete".to_string(),
+        (_, "note_tag") => "tag".to_string(),
+        (_, "note_attachment") => "attachment".to_string(),
+        ("text", _) => "content".to_string(),
+        _ => c.field.clone(),
+    };
+    let what = match c.kind.as_str() {
+        "text" => format!("{} {} edited on both", entity, c.field),
+        "delete" => format!("{} deleted on one, changed on the other", entity),
+        "membership" => format!("{} removed on one, kept on the other", entity),
+        _ => format!("{} {} changed on both", entity, c.field),
+    };
+    let device_a = device_label(&c.device_a_name, &c.device_a_id);
+    let device_b = device_label(&c.device_b_name, &c.device_b_id);
+    ConflictData {
+        description: format!("{}: {} vs {}", what, device_a, device_b),
+        id: c.id,
+        entity_type: c.entity_type,
+        entity_id: c.entity_id,
+        field: c.field,
+        kind: c.kind,
+        display_kind,
+        device_a,
+        device_b,
+        base_version_id: c.base_version_id,
+        version_a_id: c.version_a_id,
+        version_b_id: c.version_b_id,
+        merge_version_id: c.merge_version_id,
+        created_at: stamp(c.created_at, None, None),
+        resolved_at: stamp_opt(c.resolved_at, None, None),
+    }
+}
+
+/// Result of downloading audio files from cloud storage
+#[derive(Debug, Clone, Default, uniffi::Record)]
 pub struct DownloadResultData {
-    /// Number of files successfully downloaded
+    /// Number of files successfully downloaded and verified
     pub downloaded: i32,
+    /// Number of files that were already on this device
+    pub already_local: i32,
+    /// Number of files whose owning device has not uploaded them yet
+    pub not_in_cloud: i32,
+    /// Number of downloads that failed
+    pub failed: i32,
     /// Error messages for any failed downloads
     pub errors: Vec<String>,
+}
+
+#[cfg(feature = "file-storage")]
+impl From<crate::file_storage::DownloadMissingResult> for DownloadResultData {
+    fn from(r: crate::file_storage::DownloadMissingResult) -> Self {
+        Self {
+            downloaded: r.downloaded as i32,
+            already_local: r.already_local as i32,
+            not_in_cloud: r.not_in_cloud as i32,
+            failed: r.failed as i32,
+            errors: r.errors,
+        }
+    }
+}
+
+#[cfg(test)]
+mod transcription_binding_tests {
+    use super::*;
+
+    /// A phone's on-device transcription writes a pending row and then the
+    /// Hebrew result with segments and the service response.
+    #[test]
+    fn create_then_update_transcription_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = VoiceClient::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let imported = client
+            .import_audio_file("Recording 2026-09-08 02-00-00.ogg".into(), Some(1_757_000_000), Some(4))
+            .unwrap();
+
+        let id = client
+            .create_transcription(
+                imported.audio_file_id.clone(),
+                "Pending... (2026-09-08 02:00:00)".into(),
+                None,
+                "local_whisper".into(),
+                Some(r#"{"provider_id":"local_whisper","model":"large-v3-q5_0","language":"he","beam_size":5,"device":"android"}"#.into()),
+                None,
+            )
+            .unwrap();
+        let pending = client.get_transcription(id.clone()).unwrap().unwrap();
+        assert_eq!(pending.service, "local_whisper");
+        assert!(pending.content.starts_with("Pending..."));
+        assert!(pending.content_segments.is_none());
+
+        let segments = r#"[{"text":"זוהי הקלטה מהטלפון","start_seconds":0.0,"end_seconds":2.5,"speaker":null,"confidence":null}]"#;
+        let response = r#"{"elapsed_time":12.5,"segment_count":1,"model":"large-v3-q5_0","device":"android"}"#;
+        assert!(client
+            .update_transcription_result(id.clone(), "זוהי הקלטה מהטלפון".into(), Some(segments.into()), Some(response.into()))
+            .unwrap());
+
+        let done = client.get_transcription(id.clone()).unwrap().unwrap();
+        assert_eq!(done.content, "זוהי הקלטה מהטלפון");
+        assert_eq!(done.content_segments.as_deref(), Some(segments));
+        assert_eq!(done.service_response.as_deref(), Some(response));
+        assert_eq!(done.service_arguments.as_deref().map(|s| s.contains("\"language\":\"he\"")), Some(true));
+
+        // A failed run keeps the segments empty and records the error
+        assert!(client
+            .update_transcription_result(id.clone(), "Error: המודל לא נטען".into(), None, Some(r#"{"error":"המודל לא נטען"}"#.into()))
+            .unwrap());
+        let failed = client.get_transcription(id).unwrap().unwrap();
+        assert!(failed.content.starts_with("Error: "));
+        // None leaves the earlier segments in place (same rule as the desktop)
+        assert_eq!(failed.content_segments.as_deref(), Some(segments));
+
+        let all = client.get_transcriptions_for_audio_file(imported.audio_file_id).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    /// A recording made inside a note joins that note, and no other note is
+    /// created. This is the phone's recorder: the note exists before the
+    /// recording does, so the file has somewhere to go the moment the user
+    /// presses Save.
+    #[test]
+    fn a_recording_made_in_a_note_joins_that_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = VoiceClient::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let note_id = client.create_note("הערה עם הקלטה".into()).unwrap();
+        let notes_before = client.get_all_notes().unwrap().len();
+
+        let audio_id = client
+            .import_audio_file_into_note(
+                note_id.clone(),
+                "Recording 2026-09-09 04-30-00.ogg".into(),
+                Some(1_757_000_000),
+                Some(12),
+            )
+            .unwrap();
+
+        // No second note: the recording joined the one the user was in.
+        assert_eq!(client.get_all_notes().unwrap().len(), notes_before);
+        let files = client.get_audio_files_for_note(note_id.clone()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, audio_id);
+        assert_eq!(files[0].filename, "Recording 2026-09-09 04-30-00.ogg");
+        assert_eq!(files[0].file_created_at.as_ref().map(|s| s.at), Some(1_757_000_000));
+
+        // A second recording in the same note is added, not swapped in.
+        client
+            .import_audio_file_into_note(note_id.clone(), "Recording 2026-09-09 04-31-00.ogg".into(), None, Some(3))
+            .unwrap();
+        assert_eq!(client.get_audio_files_for_note(note_id).unwrap().len(), 2);
+    }
+
+    /// A note that is not there is said to be not there, rather than the
+    /// recording being filed somewhere the user will never find it.
+    #[test]
+    fn a_recording_for_a_missing_note_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = VoiceClient::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let missing = "00000000000040008000000000000099".to_string();
+
+        let result = client.import_audio_file_into_note(missing, "Recording.ogg".into(), None, Some(1));
+
+        assert!(result.is_err(), "a recording must not be attached to a note that does not exist");
+        // And nothing was left behind for it.
+        assert!(client.get_all_notes().unwrap().is_empty());
+    }
+
+    /// The phone writes a placeholder when a transcription is interrupted and
+    /// removes it once the recording has really been transcribed. Deleting is
+    /// a soft delete, so the recording keeps only the good transcription and
+    /// the removal travels to the other devices.
+    #[test]
+    fn a_deleted_transcription_leaves_only_the_good_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = VoiceClient::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let imported = client
+            .import_audio_file("Recording 2026-09-08 03-00-00.ogg".into(), Some(1_757_003_600), Some(9))
+            .unwrap();
+
+        let interrupted = client
+            .create_transcription(
+                imported.audio_file_id.clone(),
+                "Error: the app was closed before the transcription finished".into(),
+                None,
+                "local_whisper".into(),
+                None,
+                None,
+            )
+            .unwrap();
+        let good = client
+            .create_transcription(
+                imported.audio_file_id.clone(),
+                "שלום, זו ההקלטה השנייה".into(),
+                None,
+                "local_whisper".into(),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            client.get_transcriptions_for_audio_file(imported.audio_file_id.clone()).unwrap().len(),
+            2
+        );
+
+        assert!(client.delete_transcription(interrupted.clone()).unwrap());
+        let left = client.get_transcriptions_for_audio_file(imported.audio_file_id).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, good);
+        assert_eq!(left[0].content, "שלום, זו ההקלטה השנייה");
+
+        // Deleting again says so rather than pretending to have done it.
+        assert!(!client.delete_transcription(interrupted).unwrap());
+    }
 }
