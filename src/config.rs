@@ -123,6 +123,34 @@ impl Default for SyncConfig {
     }
 }
 
+/// The periodic backup of every open account's database (SNAP-5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupConfig {
+    /// Hours between copies; 0 turns the backup off
+    #[serde(default = "default_backup_interval_hours")]
+    pub interval_hours: u32,
+    /// Where the copies go; empty means `<root>/backups/<account id>/`
+    #[serde(default)]
+    pub directory: String,
+    /// How many copies are kept per account
+    #[serde(default = "default_backup_keep")]
+    pub keep: u32,
+}
+
+fn default_backup_interval_hours() -> u32 {
+    24
+}
+
+fn default_backup_keep() -> u32 {
+    30
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self { interval_hours: default_backup_interval_hours(), directory: String::new(), keep: default_backup_keep() }
+    }
+}
+
 /// Cloud file storage configuration
 ///
 /// NOTE: This is kept in config.rs for backwards compatibility during migration.
@@ -245,6 +273,13 @@ pub struct ConfigData {
     /// Transcription configuration (stored as generic JSON - voicecore doesn't interpret this)
     #[serde(default = "default_transcription_config")]
     pub transcription: serde_json::Value,
+    /// The periodic backup (SNAP-5): machine-level, desktop and server only
+    #[serde(default)]
+    pub backup: BackupConfig,
+    /// Where this machine is reachable from the internet, for a server behind
+    /// a real certificate; empty on a LAN device
+    #[serde(default)]
+    pub public_url: String,
     /// Cloud file storage configuration
     #[serde(default)]
     pub file_storage: FileStorageConfig,
@@ -282,15 +317,28 @@ impl Default for ConfigData {
             server_certificate_fingerprint: None,
             audiofile_directory: None,
             transcription: default_transcription_config(),
+            backup: BackupConfig::default(),
+            public_url: String::new(),
             file_storage: FileStorageConfig::default(),
         }
     }
 }
 
 /// Configuration manager
+///
+/// One directory holds an account: its `config.json`, `notes.db`, `audio/`.
+/// On a desktop with several accounts the **machine** settings (the device
+/// identity, the listen port, the certificates, the backup) live in the
+/// root's `config.json` and override what an account's file says (Stage 2);
+/// on the phone, and in a single-directory installation, the root is the
+/// account and one file holds both.
 pub struct Config {
     config_dir: PathBuf,
     config_file: PathBuf,
+    /// The machine's `config.json`, when it is a different file
+    machine_file: Option<PathBuf>,
+    /// Where `certs/` lives: the root
+    certs_root: PathBuf,
     data: ConfigData,
 }
 
@@ -345,8 +393,10 @@ impl Config {
         }
 
         let config = Self {
+            certs_root: config_dir.clone(),
             config_dir,
             config_file,
+            machine_file: None,
             data,
         };
 
@@ -365,10 +415,71 @@ impl Config {
         Ok(config)
     }
 
-    /// Save configuration to file
+    /// Open an account directory under a root that holds the machine's
+    /// settings (Stage 2). The account's file is loaded as usual; the device
+    /// id and name, the listen port, the backup and the public URL come from
+    /// the root's `config.json` (made with defaults if missing), and the
+    /// certificates live under the root.
+    pub fn open_account(root: &Path, account_dir: &Path) -> VoiceResult<Self> {
+        let machine = Self::new(Some(root.to_path_buf()))?;
+        let mut config = Self::new(Some(account_dir.to_path_buf()))?;
+        config.machine_file = Some(machine.config_file.clone());
+        config.certs_root = root.to_path_buf();
+        config.data.device_id = machine.data.device_id.clone();
+        config.data.device_name = machine.data.device_name.clone();
+        config.data.sync.server_port = machine.data.sync.server_port;
+        config.data.backup = machine.data.backup.clone();
+        config.data.public_url = machine.data.public_url.clone();
+        if let Ok(uuid) = config.device_id() {
+            crate::database::set_local_device_id(uuid);
+        }
+        crate::database::set_local_device_name(config.device_name());
+        Ok(config)
+    }
+
+    /// The root that holds the machine's settings and certificates: the
+    /// account directory itself on a single-directory installation.
+    pub fn root(&self) -> &Path {
+        &self.certs_root
+    }
+
+    /// The periodic backup settings (machine-level).
+    pub fn backup(&self) -> &BackupConfig {
+        &self.data.backup
+    }
+
+    pub fn set_backup(&mut self, backup: BackupConfig) -> VoiceResult<()> {
+        self.data.backup = backup;
+        self.save()
+    }
+
+    /// Where this machine is reachable from the internet, or empty.
+    pub fn public_url(&self) -> &str {
+        &self.data.public_url
+    }
+
+    pub fn set_public_url(&mut self, url: &str) -> VoiceResult<()> {
+        self.data.public_url = url.to_string();
+        self.save()
+    }
+
+    /// Save configuration to file. The machine-level fields go to the
+    /// machine's file as well when that is a different file.
     pub fn save(&self) -> VoiceResult<()> {
         let content = serde_json::to_string_pretty(&self.data)?;
         fs::write(&self.config_file, content)?;
+        if let Some(machine_file) = &self.machine_file {
+            let mut machine: ConfigData = fs::read_to_string(machine_file)
+                .ok()
+                .and_then(|c| serde_json::from_str(&c).ok())
+                .unwrap_or_default();
+            machine.device_id = self.data.device_id.clone();
+            machine.device_name = self.data.device_name.clone();
+            machine.sync.server_port = self.data.sync.server_port;
+            machine.backup = self.data.backup.clone();
+            machine.public_url = self.data.public_url.clone();
+            fs::write(machine_file, serde_json::to_string_pretty(&machine)?)?;
+        }
         Ok(())
     }
 
@@ -541,7 +652,7 @@ impl Config {
 
     /// Get the certificates directory
     pub fn certs_dir(&self) -> VoiceResult<PathBuf> {
-        let certs_dir = self.config_dir.join("certs");
+        let certs_dir = self.certs_root.join("certs");
         fs::create_dir_all(&certs_dir)?;
         Ok(certs_dir)
     }

@@ -31,6 +31,7 @@ pub mod timezone;
 pub mod sync_apply;
 pub mod sync_client;
 #[cfg(feature = "server")]
+pub mod accounts;
 pub mod auth;
 pub mod pairing;
 pub mod sync_protocol;
