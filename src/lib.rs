@@ -36,6 +36,7 @@ pub mod pairing;
 pub mod sync_protocol;
 pub mod sync_server;
 pub mod tls;
+pub mod transfer;
 pub mod validation;
 pub mod versions;
 

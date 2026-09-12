@@ -190,6 +190,12 @@ pub struct SyncResultData {
     pub success: bool,
     pub notes_received: i32,
     pub notes_sent: i32,
+    /// Recordings sent to the peer (deliver, exchange, send)
+    pub files_sent: i32,
+    /// Recordings fetched from the peer (exchange, fetch)
+    pub files_fetched: i32,
+    /// Bytes of recordings moved either way
+    pub bytes_moved: u64,
     pub error_message: Option<String>,
     /// Non-fatal problems, e.g. a cloud upload that will be retried next sync
     pub warnings: Vec<String>,
@@ -376,6 +382,9 @@ impl VoiceClient {
             success: result.success,
             notes_received: result.pulled as i32,
             notes_sent: result.pushed as i32,
+            files_sent: result.sent as i32,
+            files_fetched: result.fetched as i32,
+            bytes_moved: result.bytes_moved,
             error_message: if result.errors.is_empty() {
                 None
             } else {
@@ -483,6 +492,43 @@ impl VoiceClient {
         Ok(())
     }
 
+    /// One operation with the configured peer: "sync", "deliver" (sync then
+    /// send), "exchange" (sync, send and fetch), "send" or "fetch".
+    pub fn operate(&self, operation: String) -> Result<SyncResultData, VoiceCoreError> {
+        let peer_id = {
+            let cfg = self.config.lock().unwrap();
+            if !cfg.is_sync_enabled() || cfg.peers().is_empty() {
+                return Err(VoiceCoreError::Sync { msg: "No sync peers configured".to_string() });
+            }
+            cfg.peers()[0].peer_id.clone()
+        };
+        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
+        let result = rt.block_on(async {
+            match operation.as_str() {
+                "sync" => sync_client.sync_with_peer(&peer_id).await,
+                "deliver" => sync_client.deliver(&peer_id).await,
+                "exchange" => sync_client.exchange(&peer_id).await,
+                "send" => sync_client.send_to_peer(&peer_id).await,
+                "fetch" => sync_client.fetch_from_peer(&peer_id).await,
+                other => crate::sync_client::SyncResult::failure(format!("{} is not an operation", other)),
+            }
+        });
+        Ok(SyncResultData {
+            success: result.success,
+            notes_received: result.pulled as i32,
+            notes_sent: result.pushed as i32,
+            files_sent: result.sent as i32,
+            files_fetched: result.fetched as i32,
+            bytes_moved: result.bytes_moved,
+            error_message: if result.errors.is_empty() { None } else { Some(result.errors.join("; ")) },
+            warnings: result.warnings,
+        })
+    }
+
     /// Clear sync state to force a full re-sync from scratch
     ///
     /// This deletes the sync peer record, causing the next sync to start
@@ -546,6 +592,9 @@ impl VoiceClient {
             success: result.success,
             notes_received: result.pulled as i32,
             notes_sent: result.pushed as i32,
+            files_sent: result.sent as i32,
+            files_fetched: result.fetched as i32,
+            bytes_moved: result.bytes_moved,
             error_message: if result.errors.is_empty() {
                 None
             } else {

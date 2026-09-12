@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::{
-    body::Bytes,
+    body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
@@ -30,10 +30,11 @@ use crate::auth;
 use crate::config::Config;
 use crate::database::Database;
 use crate::error::VoiceResult;
-use crate::models::SyncChange;
+use crate::models::{audio_local_path, SyncChange};
 use crate::sync_protocol::{
     codes, ApplyRequest, ApplyResponse, ChangesQuery, ChangesResponse, ErrorResponse, HandshakeRequest,
-    HandshakeResponse, PairClaimRequest, PairClaimResponse, StatusResponse, PROTOCOL_VERSION,
+    HandshakeResponse, MissingFilesRequest, MissingFilesResponse, PairClaimRequest, PairClaimResponse, StatusResponse,
+    HEADER_FILE_SHA256, PROTOCOL_VERSION,
 };
 use crate::UUID_SHORT_LEN;
 
@@ -514,105 +515,154 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-/// Download an audio file
+/// Where a recording's file is, from its row, or None if the row does not
+/// exist or no audio directory is configured.
+fn audio_path_for(state: &AppState, audio_id: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    Uuid::parse_str(audio_id).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
+    let audiofile_dir = {
+        let config = state.config.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Config lock error".to_string()))?;
+        config.audiofile_directory().map(|s| s.to_string())
+    }
+    .ok_or_else(|| (StatusCode::BAD_REQUEST, "audiofile_directory not configured".to_string()))?;
+    let filename = {
+        let db = state.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
+        db.get_audio_file(audio_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Audio file record not found: {}", audio_id)))?
+            .filename
+    };
+    Ok(audio_local_path(std::path::Path::new(&audiofile_dir), audio_id, &filename))
+}
+
+/// `GET /sync/audio/:id/file`: stream one recording to a fetching peer
+/// (FILE-12), from the byte a `Range: bytes=N-` header asks for, with the
+/// whole file's size and SHA-256 in headers so the peer can verify.
 async fn serve_audio_file(
     State(state): State<AppState>,
     Path(audio_id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    tracing::debug!("GET /sync/audio/{}/file", &audio_id[..UUID_SHORT_LEN.min(audio_id.len())]);
-
-    // Validate audio_id is a valid UUID
-    let _uuid = Uuid::parse_str(&audio_id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
-
-    // Get audiofile_directory from config
-    let audiofile_dir = {
-        let config = state.config.lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Config lock error".to_string()))?;
-        config.audiofile_directory().map(|s| s.to_string())
-    };
-
-    let audiofile_dir = audiofile_dir
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "audiofile_directory not configured".to_string()))?;
-
-    // Look for file with any extension
-    let dir_path = std::path::Path::new(&audiofile_dir);
-
-    // Find the file
-    let mut found_file: Option<std::path::PathBuf> = None;
-    if let Ok(entries) = std::fs::read_dir(dir_path) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy();
-            if name.starts_with(&audio_id) && name.contains('.') {
-                found_file = Some(entry.path());
-                break;
-            }
-        }
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, String)> {
+    tracing::debug!("GET /sync/audio/{}/file", short(&audio_id));
+    let file_path = audio_path_for(&state, &audio_id)?;
+    if !file_path.is_file() {
+        return Err((StatusCode::NOT_FOUND, format!("Audio file not found: {}", audio_id)));
     }
-
-    let file_path = found_file
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Audio file not found: {}", audio_id)))?;
-
-    // Read file contents
-    let contents = std::fs::read(&file_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read file: {}", e)))?;
-
-    Ok((StatusCode::OK, contents))
+    let total = std::fs::metadata(&file_path).map(|m| m.len()).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let start = header(&headers, "range").and_then(crate::transfer::parse_range_start).unwrap_or(0);
+    if start > total {
+        return Err((StatusCode::RANGE_NOT_SATISFIABLE, format!("The file is {} bytes", total)));
+    }
+    let hash = crate::transfer::file_sha256(&file_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut file = tokio::fs::File::open(&file_path).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if start > 0 {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    let stream = tokio_util::io::ReaderStream::with_capacity(file, crate::transfer::CHUNK);
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = if start > 0 { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
+    let h = response.headers_mut();
+    h.insert("content-type", "application/octet-stream".parse().unwrap());
+    h.insert("content-length", (total - start).to_string().parse().unwrap());
+    h.insert("accept-ranges", "bytes".parse().unwrap());
+    h.insert(HEADER_FILE_SHA256, hash.parse().unwrap());
+    if start > 0 {
+        h.insert("content-range", format!("bytes {}-{}/{}", start, total - 1, total).parse().unwrap());
+    }
+    Ok(response)
 }
 
-/// Receive one recording sent by a peer (`send_audio_file` on the client).
+/// `POST /sync/audio/:id/file`: receive one recording sent by a peer
+/// (FILE-12), streamed into `<file>.part`, continuing from the part's
+/// length when a `Content-Range: bytes N-M/total` says so, verified by the
+/// `X-File-SHA256` header before the rename (FILE-13).
 async fn receive_audio_file(
     State(state): State<AppState>,
     Path(audio_id): Path<String>,
-    body: Bytes,
+    headers: HeaderMap,
+    request: Request,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    tracing::debug!(
-        "POST /sync/audio/{}/file ({} bytes)",
-        &audio_id[..UUID_SHORT_LEN.min(audio_id.len())],
-        body.len()
-    );
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
 
-    // Validate audio_id is a valid UUID
-    let _uuid = Uuid::parse_str(&audio_id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
-
-    // Get audiofile_directory from config
-    let audiofile_dir = {
-        let config = state.config.lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Config lock error".to_string()))?;
-        config.audiofile_directory().map(|s| s.to_string())
+    let file_path = audio_path_for(&state, &audio_id)?;
+    let content_length: Option<u64> = header(&headers, "content-length").and_then(|v| v.parse().ok());
+    let (start, total) = match header(&headers, "content-range").and_then(crate::transfer::parse_content_range) {
+        Some((start, total)) => (start, total),
+        None => (0, content_length.unwrap_or(0)),
     };
+    let expected_hash = header(&headers, HEADER_FILE_SHA256).map(str::to_string);
+    tracing::debug!("POST /sync/audio/{}/file from byte {} of {}", short(&audio_id), start, total);
 
-    let audiofile_dir = audiofile_dir
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "audiofile_directory not configured".to_string()))?;
-
-    // Get the extension from the database
-    let extension = {
-        let db = state.db.lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
-
-        let audio_file = db.get_audio_file(&audio_id)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Audio file record not found: {}", audio_id)))?;
-
-        crate::models::audio_file_extension(&audio_file.filename)
-    };
-
-    // Create audiofile_directory if it doesn't exist
-    let dir_path = std::path::Path::new(&audiofile_dir);
-    std::fs::create_dir_all(dir_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create directory: {}", e)))?;
-
-    // Write file
-    let file_path = dir_path.join(format!("{}.{}", audio_id, extension));
-    std::fs::write(&file_path, body.as_ref())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)))?;
-
+    let dir = file_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create directory: {}", e)))?;
+    if start == 0 {
+        crate::transfer::check_free_space(dir, total).map_err(|e| (StatusCode::INSUFFICIENT_STORAGE, e.to_string()))?;
+    }
+    let part = crate::transfer::part_path(&file_path);
+    let have = crate::transfer::part_len(&file_path);
+    if start != have {
+        return Err((StatusCode::CONFLICT, format!("This device holds {} bytes of the file, not {}", have, start)));
+    }
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to open the part file: {}", e)))?;
+    let mut stream = request.into_body().into_data_stream();
+    let mut written = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| (StatusCode::BAD_REQUEST, format!("The transfer stopped: {}", e)))?;
+        out.write_all(&chunk).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)))?;
+        written += chunk.len() as u64;
+    }
+    out.flush().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    drop(out);
+    let now_have = start + written;
+    if total == 0 || now_have < total {
+        // Either the sender did not say the size, or this was a part of it.
+        if total == 0 {
+            crate::transfer::complete(&file_path, now_have, expected_hash.as_deref())
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            return Ok((StatusCode::OK, "OK"));
+        }
+        return Ok((StatusCode::ACCEPTED, "PART"));
+    }
+    crate::transfer::complete(&file_path, total, expected_hash.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    tracing::info!("Received audio file {} ({} bytes)", short(&audio_id), total);
     Ok((StatusCode::OK, "OK"))
 }
 
-// Helper functions
+/// `POST /sync/audio/missing` (FILE-12): of the ids a sender holds, which
+/// this device lacks, and how many bytes of each it already has in a part.
+async fn missing_audio_files(
+    State(state): State<AppState>,
+    Json(request): Json<MissingFilesRequest>,
+) -> Result<Json<MissingFilesResponse>, (StatusCode, String)> {
+    let mut missing = Vec::new();
+    let mut partial = std::collections::HashMap::new();
+    for audio_id in request.audio_ids {
+        let path = match audio_path_for(&state, &audio_id) {
+            Ok(p) => p,
+            Err((StatusCode::NOT_FOUND, _)) => {
+                // No row yet: the sender's sync has not reached us; ask for it next time
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if path.is_file() {
+            continue;
+        }
+        let have = crate::transfer::part_len(&path);
+        if have > 0 {
+            partial.insert(audio_id.clone(), have);
+        }
+        missing.push(audio_id);
+    }
+    Ok(Json(MissingFilesResponse { missing, partial }))
+}
 
 fn get_peer_last_sync(db: &Arc<Mutex<Database>>, peer_id: &str) -> Option<i64> {
     let peer_uuid = Uuid::parse_str(peer_id).ok()?;
@@ -940,6 +990,7 @@ pub fn create_router(
         .route("/sync/changes", get(get_changes))
         .route("/sync/apply", post(apply_changes))
         .route("/sync/full", get(get_full_sync))
+        .route("/sync/audio/missing", post(missing_audio_files))
         .route("/sync/audio/:audio_id/file", get(serve_audio_file))
         .route("/sync/audio/:audio_id/file", post(receive_audio_file))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
@@ -948,7 +999,8 @@ pub fn create_router(
         .route("/sync/status", get(status))
         .route("/pair/claim", post(pair_claim))
         .merge(authenticated)
-        // Body limit is configurable via sync.max_sync_file_size_mb in config
+        // The limit applies to the JSON routes; a recording streams past it
+        // (FILE-12) because the file route reads its body as a stream
         .layer(DefaultBodyLimit::max(max_body_size))
         .with_state(state)
 }
@@ -1523,6 +1575,175 @@ mod tests {
             let err = client.join(&setup.to_text()).await.unwrap_err().to_string();
             assert!(err.contains(codes::DEVICE_HOLDS_NOTES), "{}", err);
             assert!(desk.db.lock().unwrap().has_pairing_offer(chrono::Utc::now().timestamp()).unwrap(), "the code was not spent");
+        }
+    }
+
+    mod files_between_instances {
+        use super::*;
+        use crate::auth;
+        use crate::config::Config;
+        use crate::sync_client::SyncClient;
+
+        struct Device {
+            db: Arc<Mutex<Database>>,
+            config: Arc<Mutex<Config>>,
+            id: String,
+            audio: std::path::PathBuf,
+            _dir: TempDir,
+        }
+
+        fn device(name: &str) -> Device {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new(dir.path().join("notes.db")).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            config.set_device_name(name).unwrap();
+            let audio = dir.path().join("audio");
+            std::fs::create_dir_all(&audio).unwrap();
+            config.set_audiofile_directory(audio.to_str().unwrap()).unwrap();
+            auth::ensure_own_device_card(&db, &mut config).unwrap();
+            let id = config.device_id_hex().to_string();
+            Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, audio, _dir: dir }
+        }
+
+        /// Two devices of one account, each admitted on the other, the
+        /// second serving plain http on this machine.
+        fn pair() -> (Device, Device, String, tokio::task::JoinHandle<()>) {
+            let a = device("A");
+            let b = device("B");
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            b.db.lock().unwrap().move_to_account(&account).unwrap();
+            let card_a = a.db.lock().unwrap().get_device_card(&a.id).unwrap().unwrap();
+            let card_b = b.db.lock().unwrap().get_device_card(&b.id).unwrap().unwrap();
+            a.db.lock().unwrap().write_device_card(&card_b).unwrap();
+            b.db.lock().unwrap().write_device_card(&card_a).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let router = create_router(b.db.clone(), b.config.clone()).into_make_service_with_connect_info::<SocketAddr>();
+            let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
+            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            (a, b, url, task)
+        }
+
+        /// A note with one recording of `size` bytes on `d`.
+        fn recording(d: &Device, size: usize) -> (String, std::path::PathBuf) {
+            let db = d.db.lock().unwrap();
+            let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let source = d._dir.path().join("source.ogg");
+            std::fs::write(&source, &content).unwrap();
+            let (_note_id, audio_id) = db.import_audio_file("source.ogg", None, None).unwrap();
+            let path = audio_local_path(&d.audio, &audio_id, "source.ogg");
+            std::fs::rename(&source, &path).unwrap();
+            (audio_id, path)
+        }
+
+        #[tokio::test]
+        async fn exchange_moves_a_recording_each_way_and_a_second_run_moves_nothing() {
+            let (a, b, _url, task) = pair();
+            let (id_a, path_a) = recording(&a, 300_000);
+            let (id_b, path_b) = recording(&b, 200_000);
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+
+            let result = client.exchange(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!((result.sent, result.fetched), (1, 1));
+            assert_eq!(result.bytes_moved, 500_000);
+            let on_b = audio_local_path(&b.audio, &id_a, "source.ogg");
+            assert_eq!(std::fs::read(&on_b).unwrap(), std::fs::read(&path_a).unwrap(), "A's recording arrived on B whole");
+            let on_a = audio_local_path(&a.audio, &id_b, "source.ogg");
+            assert_eq!(std::fs::read(&on_a).unwrap(), std::fs::read(&path_b).unwrap(), "B's recording arrived on A whole");
+            assert!(!crate::transfer::part_path(&on_a).exists());
+
+            let again = client.exchange(&b.id).await;
+            assert!(again.success);
+            assert_eq!((again.sent, again.fetched, again.bytes_moved), (0, 0, 0), "nothing left to move");
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn deliver_sends_but_does_not_fetch_and_send_alone_needs_no_sync() {
+            let (a, b, _url, task) = pair();
+            let (id_a, _) = recording(&a, 1000);
+            let (id_b, _) = recording(&b, 1000);
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+
+            let result = client.deliver(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!((result.sent, result.fetched), (1, 0));
+            assert!(audio_local_path(&b.audio, &id_a, "source.ogg").is_file());
+            assert!(!audio_local_path(&a.audio, &id_b, "source.ogg").is_file(), "deliver fetches nothing");
+
+            let fetched = client.fetch_from_peer(&b.id).await;
+            assert!(fetched.success, "{:?}", fetched.errors);
+            assert_eq!(fetched.fetched, 1);
+            assert!(audio_local_path(&a.audio, &id_b, "source.ogg").is_file());
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_stopped_transfer_continues_from_the_part_in_both_directions() {
+            let (a, b, _url, task) = pair();
+            let (id_a, path_a) = recording(&a, 100_000);
+            let (id_b, path_b) = recording(&b, 100_000);
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            // The rows must be on both sides before files can move
+            assert!(client.sync_with_peer(&b.id).await.success);
+
+            // B already holds the first 40,000 bytes of A's recording: a send continues from there
+            let on_b = audio_local_path(&b.audio, &id_a, "source.ogg");
+            std::fs::write(crate::transfer::part_path(&on_b), &std::fs::read(&path_a).unwrap()[..40_000]).unwrap();
+            // A already holds the first 25,000 bytes of B's recording: a fetch continues from there
+            let on_a = audio_local_path(&a.audio, &id_b, "source.ogg");
+            std::fs::write(crate::transfer::part_path(&on_a), &std::fs::read(&path_b).unwrap()[..25_000]).unwrap();
+
+            let result = client.exchange(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(result.bytes_moved, 60_000 + 75_000, "only the missing bytes crossed the wire");
+            assert_eq!(std::fs::read(&on_b).unwrap(), std::fs::read(&path_a).unwrap());
+            assert_eq!(std::fs::read(&on_a).unwrap(), std::fs::read(&path_b).unwrap());
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_corrupt_part_is_discarded_and_the_file_fetched_whole() {
+            let (a, b, _url, task) = pair();
+            let (id_b, path_b) = recording(&b, 50_000);
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            assert!(client.sync_with_peer(&b.id).await.success);
+            let on_a = audio_local_path(&a.audio, &id_b, "source.ogg");
+            std::fs::write(crate::transfer::part_path(&on_a), vec![0u8; 10_000]).unwrap();
+
+            // The first attempt assembles a wrong file, finds the hash does not agree and discards the part;
+            // the retry fetches it whole.
+            let result = client.fetch_from_peer(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(std::fs::read(&on_a).unwrap(), std::fs::read(&path_b).unwrap());
+            assert_eq!(result.bytes_moved, 50_000, "only the attempt that succeeded counts");
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn the_missing_list_answers_in_one_round_trip() {
+            let (a, b, url, task) = pair();
+            let (id_a, _) = recording(&a, 100);
+            let (id_b, _) = recording(&b, 100);
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            assert!(client.sync_with_peer(&b.id).await.success);
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            let key = a.config.lock().unwrap().device_key().to_string();
+            let resp = reqwest::Client::new()
+                .post(format!("{}/sync/audio/missing", url))
+                .header(auth::HEADER_ACCOUNT, &account)
+                .header(auth::HEADER_DEVICE, &a.id)
+                .bearer_auth(&key)
+                .json(&crate::sync_protocol::MissingFilesRequest { audio_ids: vec![id_a.clone(), id_b.clone(), "00000000000070008000000000000000".to_string()] })
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: crate::sync_protocol::MissingFilesResponse = resp.json().await.unwrap();
+            assert_eq!(body.missing, vec![id_a], "B lacks A's file, holds its own, and ignores an id it has no row for");
+            task.abort();
         }
     }
 

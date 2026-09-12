@@ -153,6 +153,26 @@ pub struct PairClaimResponse {
     pub addresses: String,
 }
 
+/// `POST /sync/audio/missing` request body (FILE-12): the recordings the
+/// sender holds, so the receiver can say which it lacks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingFilesRequest {
+    pub audio_ids: Vec<String>,
+}
+
+/// `POST /sync/audio/missing` response body: the ids the receiver lacks,
+/// and for those it holds a part of, how many bytes it has (FILE-13).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingFilesResponse {
+    pub missing: Vec<String>,
+    #[serde(default)]
+    pub partial: std::collections::HashMap<String, u64>,
+}
+
+/// The header a sender puts the whole file's hex SHA-256 in, so the
+/// receiver can verify what it assembled (FILE-13).
+pub const HEADER_FILE_SHA256: &str = "x-file-sha256";
+
 /// `GET /sync/status` response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {

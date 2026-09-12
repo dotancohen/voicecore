@@ -33,6 +33,12 @@ pub struct SyncResult {
     pub pulled: i64,
     pub pushed: i64,
     pub conflicts: i64,
+    /// Recordings sent to the peer in this operation (deliver, exchange)
+    pub sent: i64,
+    /// Recordings fetched from the peer in this operation (exchange, fetch)
+    pub fetched: i64,
+    /// Bytes of recordings moved in either direction
+    pub bytes_moved: u64,
     /// Problems that made the sync incomplete or wrong (metadata level).
     pub errors: Vec<String>,
     /// Problems that did not affect the metadata sync, e.g. a cloud storage
@@ -130,9 +136,23 @@ fn check_scheme(peer_url: &str) -> VoiceResult<()> {
 
 /// A client verified by `pin` when there is one, by the system roots when
 /// there is none. Verification is never off.
-fn build_client(pin: &str) -> VoiceResult<Client> {
+/// Three seconds to connect on this machine or the LAN, ten on the internet
+/// (FILE-14); a private address is one of RFC 1918's or a loopback.
+fn connect_timeout_for(peer_url: &str) -> Duration {
+    let host = reqwest::Url::parse(peer_url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+    let near = host == "localhost"
+        || host.parse::<std::net::IpAddr>().map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        }).unwrap_or(false);
+    Duration::from_secs(if near { 3 } else { 10 })
+}
+
+fn build_client(pin: &str, peer_url: &str) -> VoiceResult<Client> {
     // A page can be a few megabytes over a slow link
-    let builder = Client::builder().timeout(Duration::from_secs(180));
+    let builder = Client::builder()
+        .connect_timeout(connect_timeout_for(peer_url))
+        .timeout(Duration::from_secs(180));
     let builder = if pin.is_empty() {
         builder
     } else {
@@ -193,7 +213,7 @@ impl SyncClient {
         if let Some(client) = self.clients.lock().unwrap().get(&cache_key) {
             return Ok(client.clone());
         }
-        let client = build_client(&pin)?;
+        let client = build_client(&pin, peer_url)?;
         self.clients.lock().unwrap().insert(cache_key, client.clone());
         Ok(client)
     }
@@ -226,7 +246,7 @@ impl SyncClient {
             addresses: String::new(),
             application: crate::auth::APPLICATION_VOICE.to_string(),
         };
-        let client = build_client(&setup.certificate_fingerprint)?;
+        let client = build_client(&setup.certificate_fingerprint, &setup.urls[0])?;
         let mut last_error = String::new();
         let mut reply: Option<(String, crate::sync_protocol::PairClaimResponse)> = None;
         for url in &setup.urls {
@@ -982,159 +1002,339 @@ impl SyncClient {
         Ok((result.applied, result.conflicts, result.errors))
     }
 
-    /// Fetch one recording from a peer (the file, not the row).
-    ///
-    /// Args:
-    ///     peer_url: Base URL of the peer sync server
-    ///     audio_id: Audio file UUID hex string
-    ///     dest_path: Local path to save the file
-    ///
-    /// Returns:
-    ///     Number of bytes downloaded on success
+    /// The client used for a recording's bytes: no overall timeout, because
+    /// an eight-hour recording takes as long as it takes, but a read that
+    /// stalls for thirty seconds is over (FILE-14).
+    fn file_client_for(&self, peer_url: &str) -> VoiceResult<Client> {
+        check_scheme(peer_url)?;
+        let pin = self.pin_for(peer_url);
+        let cache_key = format!("file\n{}\n{}", peer_url, pin);
+        if let Some(client) = self.clients.lock().unwrap().get(&cache_key) {
+            return Ok(client.clone());
+        }
+        let builder = Client::builder()
+            .connect_timeout(connect_timeout_for(peer_url))
+            .read_timeout(Duration::from_secs(30));
+        let builder = if pin.is_empty() {
+            builder
+        } else {
+            builder.use_preconfigured_tls(crate::tls::pinned_client_config(&pin)?)
+        };
+        let client = builder.build().map_err(|e| VoiceError::Network(e.to_string()))?;
+        self.clients.lock().unwrap().insert(cache_key, client.clone());
+        Ok(client)
+    }
+
+    fn pin_for(&self, peer_url: &str) -> String {
+        let config = self.config.lock().unwrap();
+        config
+            .peers()
+            .iter()
+            .find(|p| p.peer_url.trim_end_matches('/') == peer_url.trim_end_matches('/'))
+            .and_then(|p| p.certificate_fingerprint.clone())
+            .unwrap_or_default()
+    }
+
+    /// Fetch one recording from a peer (FILE-12): streamed into
+    /// `<file>.part`, continuing from the bytes already there, verified by
+    /// the hash the peer announces, and renamed when whole. Returns the
+    /// bytes received in this call.
     pub async fn fetch_audio_file(
         &self,
         peer_url: &str,
         audio_id: &str,
         dest_path: &std::path::Path,
     ) -> VoiceResult<u64> {
-        use std::io::Write;
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
 
         let url = format!("{}/sync/audio/{}/file", peer_url, audio_id);
-
-        let response = self
-            .authed(self.client_for(peer_url)?.get(&url))
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let have = crate::transfer::part_len(dest_path);
+        let mut request = self.authed(self.file_client_for(peer_url)?.get(&url));
+        if have > 0 {
+            request = request.header("Range", format!("bytes={}-", have));
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| VoiceError::Network(format!("Failed to fetch audio {}: {}", audio_id, describe(&e))))?;
-
-        if !response.status().is_success() {
-            // Try to get error message from response body
-            let status = response.status();
+        let status = response.status();
+        if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            let error_msg = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&error_body) {
-                json.get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&error_body)
-                    .to_string()
-            } else {
-                error_body
-            };
-            return Err(VoiceError::Network(format!(
-                "Failed to download audio {}: HTTP {} - {}",
-                audio_id, status, error_msg
-            )));
+            let error_msg = serde_json::from_str::<ErrorResponse>(&error_body).map(|r| r.error).unwrap_or(error_body);
+            return Err(VoiceError::Network(format!("Failed to fetch audio {}: HTTP {} - {}", audio_id, status, error_msg)));
         }
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| VoiceError::Network(format!("Failed to read audio response: {}", e)))?;
-
-        let bytes_len = bytes.len() as u64;
-
-        // Create parent directory if needed
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                VoiceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to create audio directory: {}", e),
-                ))
-            })?;
+        // A server that ignored the Range starts over; so do we.
+        let resumed = status == reqwest::StatusCode::PARTIAL_CONTENT;
+        let start = if resumed { have } else { 0 };
+        let remaining: Option<u64> = response.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
+        let total = remaining.map(|r| start + r);
+        let expected_hash = response
+            .headers()
+            .get(crate::sync_protocol::HEADER_FILE_SHA256)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if let (Some(remaining), Some(parent)) = (remaining, dest_path.parent()) {
+            crate::transfer::check_free_space(parent, remaining)?;
         }
-
-        // Write to temp file first, then rename atomically
-        let temp_path = dest_path.with_extension("tmp");
-        let mut file = std::fs::File::create(&temp_path).map_err(|e| {
-            VoiceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to create temp file: {}", e),
-            ))
-        })?;
-        file.write_all(&bytes).map_err(|e| {
-            VoiceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to write audio file: {}", e),
-            ))
-        })?;
-        file.sync_all().map_err(|e| {
-            VoiceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to sync audio file: {}", e),
-            ))
-        })?;
-        drop(file);
-
-        // Rename atomically
-        std::fs::rename(&temp_path, dest_path).map_err(|e| {
-            // Clean up temp file on failure
-            let _ = std::fs::remove_file(&temp_path);
-            VoiceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to rename audio file: {}", e),
-            ))
-        })?;
-
-        Ok(bytes_len)
+        let part = crate::transfer::part_path(dest_path);
+        let mut out = if resumed {
+            tokio::fs::OpenOptions::new().append(true).open(&part).await?
+        } else {
+            tokio::fs::File::create(&part).await?
+        };
+        let mut stream = response.bytes_stream();
+        let mut received = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| VoiceError::Network(format!("The fetch of {} stopped: {}", audio_id, describe(&e))))?;
+            out.write_all(&chunk).await?;
+            received += chunk.len() as u64;
+        }
+        out.flush().await?;
+        drop(out);
+        let total = total.unwrap_or(start + received);
+        crate::transfer::complete(dest_path, total, expected_hash.as_deref())?;
+        Ok(received)
     }
 
-    /// Send one recording to a peer (the file, not the row).
-    ///
-    /// Args:
-    ///     peer_url: Base URL of the peer sync server
-    ///     audio_id: Audio file UUID hex string
-    ///     source_path: Local path to the file to upload
-    ///
-    /// Returns:
-    ///     Number of bytes uploaded on success
+    /// Send one recording to a peer (FILE-12): streamed from the file, from
+    /// `from_byte` when the peer already holds a part, with the size and
+    /// the hash in headers so the peer can verify. Returns the bytes sent.
     pub async fn send_audio_file(
         &self,
         peer_url: &str,
         audio_id: &str,
         source_path: &std::path::Path,
     ) -> VoiceResult<u64> {
+        self.send_audio_file_from(peer_url, audio_id, source_path, 0).await
+    }
+
+    pub async fn send_audio_file_from(
+        &self,
+        peer_url: &str,
+        audio_id: &str,
+        source_path: &std::path::Path,
+        from_byte: u64,
+    ) -> VoiceResult<u64> {
+        use tokio::io::AsyncSeekExt;
+
         let url = format!("{}/sync/audio/{}/file", peer_url, audio_id);
-
-        // Read file into memory
-        let bytes = std::fs::read(source_path).map_err(|e| {
-            VoiceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to read audio file {}: {}", source_path.display(), e),
-            ))
-        })?;
-
-        let bytes_len = bytes.len() as u64;
-
-        let response = self
-            .authed(self.client_for(peer_url)?.post(&url))
+        let total = std::fs::metadata(source_path)
+            .map_err(|e| VoiceError::Io(std::io::Error::new(e.kind(), format!("Failed to read audio file {}: {}", source_path.display(), e))))?
+            .len();
+        let from_byte = from_byte.min(total);
+        let hash = crate::transfer::file_sha256(source_path)?;
+        let mut file = tokio::fs::File::open(source_path).await?;
+        if from_byte > 0 {
+            file.seek(std::io::SeekFrom::Start(from_byte)).await?;
+        }
+        let stream = tokio_util::io::ReaderStream::with_capacity(file, crate::transfer::CHUNK);
+        let mut request = self
+            .authed(self.file_client_for(peer_url)?.post(&url))
             .header("Content-Type", "application/octet-stream")
-            .body(bytes)
+            .header("Content-Length", (total - from_byte).to_string())
+            .header(crate::sync_protocol::HEADER_FILE_SHA256, &hash);
+        if from_byte > 0 {
+            request = request.header("Content-Range", format!("bytes {}-{}/{}", from_byte, total.saturating_sub(1), total));
+        }
+        let response = request
+            .body(reqwest::Body::wrap_stream(stream))
             .send()
             .await
-            .map_err(|e| {
-                VoiceError::Network(format!("Failed to send audio {}: {}", audio_id, describe(&e)))
-            })?;
+            .map_err(|e| VoiceError::Network(format!("Failed to send audio {}: {}", audio_id, describe(&e))))?;
 
         if !response.status().is_success() {
-            // Try to get error message from response body
             let status = response.status();
             let error_body = response.text().await.unwrap_or_default();
-            let error_msg =
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&error_body) {
-                    json.get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&error_body)
-                        .to_string()
-                } else {
-                    error_body
-                };
-            return Err(VoiceError::Network(format!(
-                "Failed to upload audio {}: HTTP {} - {}",
-                audio_id, status, error_msg
-            )));
+            let error_msg = serde_json::from_str::<ErrorResponse>(&error_body).map(|r| r.error).unwrap_or(error_body);
+            return Err(VoiceError::Network(format!("Failed to send audio {}: HTTP {} - {}", audio_id, status, error_msg)));
         }
+        tracing::info!("Sent audio file {} ({} bytes from byte {})", audio_id, total - from_byte, from_byte);
+        Ok(total - from_byte)
+    }
 
-        tracing::info!("Uploaded audio file {} ({} bytes)", audio_id, bytes_len);
-        Ok(bytes_len)
+    /// Ask the peer which of these recordings it lacks, and how much of each
+    /// it already holds (FILE-12): one round trip for any number of files.
+    async fn missing_on_peer(&self, peer_url: &str, audio_ids: Vec<String>) -> VoiceResult<crate::sync_protocol::MissingFilesResponse> {
+        let response = self
+            .authed(self.client_for(peer_url)?.post(format!("{}/sync/audio/missing", peer_url)))
+            .json(&crate::sync_protocol::MissingFilesRequest { audio_ids })
+            .send()
+            .await
+            .map_err(|e| VoiceError::Network(describe(&e)))?;
+        if !response.status().is_success() {
+            return Err(VoiceError::Sync(format!("The peer would not say which files it lacks: HTTP {}", response.status())));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| VoiceError::Sync(format!("Could not read the peer's missing list: {}", e)))
+    }
+
+    /// A transfer is tried up to three times, waiting one, two and four
+    /// seconds between tries (FILE-14). A refusal (HTTP 4xx) is not retried.
+    async fn with_retries<F, Fut>(&self, what: &str, mut attempt: F) -> VoiceResult<u64>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = VoiceResult<u64>>,
+    {
+        let mut wait = Duration::from_secs(1);
+        let mut last = None;
+        for tries_left in (0..3).rev() {
+            match attempt().await {
+                Ok(n) => return Ok(n),
+                Err(e) => {
+                    let text = e.to_string();
+                    let refused = text.contains("HTTP 4");
+                    tracing::warn!("{} failed: {}{}", what, text, if tries_left > 0 && !refused { "; trying again" } else { "" });
+                    last = Some(e);
+                    if refused || tries_left == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(wait).await;
+                    wait *= 2;
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| VoiceError::Sync(format!("{} failed", what))))
+    }
+
+    /// **Send** (terms): every recording this device holds that the peer
+    /// lacks, in one question and as many transfers. Returns (files, bytes,
+    /// errors).
+    pub async fn send_missing_to_peer(&self, peer_url: &str, audiofile_directory: &std::path::Path) -> (i64, u64, Vec<String>) {
+        let mut errors = Vec::new();
+        let rows = match self.db.lock().unwrap().get_all_audio_files() {
+            Ok(rows) => rows,
+            Err(e) => return (0, 0, vec![format!("Failed to list recordings: {}", e)]),
+        };
+        let local: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.deleted_at.is_none())
+            .map(|r| (r.id.clone(), audio_local_path(audiofile_directory, &r.id, &r.filename)))
+            .filter(|(_, path)| path.is_file())
+            .collect();
+        if local.is_empty() {
+            return (0, 0, errors);
+        }
+        let missing = match self.missing_on_peer(peer_url, local.iter().map(|(id, _)| id.clone()).collect()).await {
+            Ok(m) => m,
+            Err(e) => return (0, 0, vec![e.to_string()]),
+        };
+        let mut sent = 0i64;
+        let mut bytes = 0u64;
+        for (audio_id, path) in local.into_iter().filter(|(id, _)| missing.missing.contains(id)) {
+            let from = missing.partial.get(&audio_id).copied().unwrap_or(0);
+            let what = format!("Send of {}", &audio_id[..UUID_SHORT_LEN.min(audio_id.len())]);
+            match self.with_retries(&what, || self.send_audio_file_from(peer_url, &audio_id, &path, from)).await {
+                Ok(n) => {
+                    sent += 1;
+                    bytes += n;
+                }
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        (sent, bytes, errors)
+    }
+
+    /// **Fetch** (terms): every recording the peer holds that this device
+    /// lacks. The rows say what exists; the peer answers 404 for a file it
+    /// does not hold, which is not an error. Returns (files, bytes, errors).
+    pub async fn fetch_missing_from_peer(&self, peer_url: &str, audiofile_directory: &std::path::Path) -> (i64, u64, Vec<String>) {
+        let mut errors = Vec::new();
+        let rows = match self.db.lock().unwrap().get_all_audio_files() {
+            Ok(rows) => rows,
+            Err(e) => return (0, 0, vec![format!("Failed to list recordings: {}", e)]),
+        };
+        let mut fetched = 0i64;
+        let mut bytes = 0u64;
+        for row in rows.into_iter().filter(|r| r.deleted_at.is_none()) {
+            let path = audio_local_path(audiofile_directory, &row.id, &row.filename);
+            if path.is_file() {
+                continue;
+            }
+            let what = format!("Fetch of {}", &row.id[..UUID_SHORT_LEN.min(row.id.len())]);
+            match self.with_retries(&what, || self.fetch_audio_file(peer_url, &row.id, &path)).await {
+                Ok(n) => {
+                    fetched += 1;
+                    bytes += n;
+                }
+                Err(e) if e.to_string().contains("HTTP 404") => {}
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        (fetched, bytes, errors)
+    }
+
+    /// The audio directory this device keeps recordings in.
+    fn audio_directory(&self) -> Option<std::path::PathBuf> {
+        self.config.lock().ok().and_then(|c| c.audiofile_directory().map(std::path::PathBuf::from))
+    }
+
+    fn peer_url_of(&self, peer_id: &str) -> Option<String> {
+        self.config.lock().ok().and_then(|c| c.get_peer(peer_id).map(|p| p.peer_url.clone()))
+    }
+
+    /// **Deliver**: sync, then send.
+    pub async fn deliver(&self, peer_id: &str) -> SyncResult {
+        let mut result = self.sync_with_peer(peer_id).await;
+        if !result.success {
+            return result;
+        }
+        self.move_files(peer_id, &mut result, true, false).await;
+        result
+    }
+
+    /// **Exchange**: sync, then send and fetch.
+    pub async fn exchange(&self, peer_id: &str) -> SyncResult {
+        let mut result = self.sync_with_peer(peer_id).await;
+        if !result.success {
+            return result;
+        }
+        self.move_files(peer_id, &mut result, true, true).await;
+        result
+    }
+
+    /// **Send** alone, or **fetch** alone, without a sync.
+    pub async fn send_to_peer(&self, peer_id: &str) -> SyncResult {
+        let mut result = SyncResult::success();
+        self.move_files(peer_id, &mut result, true, false).await;
+        result
+    }
+
+    pub async fn fetch_from_peer(&self, peer_id: &str) -> SyncResult {
+        let mut result = SyncResult::success();
+        self.move_files(peer_id, &mut result, false, true).await;
+        result
+    }
+
+    async fn move_files(&self, peer_id: &str, result: &mut SyncResult, send: bool, fetch: bool) {
+        let Some(peer_url) = self.peer_url_of(peer_id) else {
+            result.errors.push(format!("Unknown peer: {}", peer_id));
+            result.success = false;
+            return;
+        };
+        let Some(dir) = self.audio_directory() else {
+            result.errors.push("No audio directory is configured on this device".to_string());
+            result.success = false;
+            return;
+        };
+        if send {
+            let (n, bytes, errors) = self.send_missing_to_peer(&peer_url, &dir).await;
+            result.sent += n;
+            result.bytes_moved += bytes;
+            result.errors.extend(errors);
+        }
+        if fetch {
+            let (n, bytes, errors) = self.fetch_missing_from_peer(&peer_url, &dir).await;
+            result.fetched += n;
+            result.bytes_moved += bytes;
+            result.errors.extend(errors);
+        }
+        result.success = result.errors.is_empty();
     }
 
     /// Fetch the files of the recordings whose rows arrived in a sync.
