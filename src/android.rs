@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use chrono::DateTime;
 
 use crate::config::Config;
 use crate::database::Database;
@@ -225,7 +224,6 @@ pub fn generate_device_id() -> String {
 pub struct VoiceClient {
     config: Arc<Mutex<Config>>,
     db: Arc<Mutex<Database>>,
-    data_dir: PathBuf,
 }
 
 #[uniffi::export]
@@ -250,7 +248,6 @@ impl VoiceClient {
         Ok(Arc::new(Self {
             config: Arc::new(Mutex::new(config)),
             db: Arc::new(Mutex::new(db)),
-            data_dir: data_path,
         }))
     }
 
@@ -336,8 +333,8 @@ impl VoiceClient {
         })
     }
 
-    /// Perform sync with the configured server
-    pub fn sync_now(&self) -> Result<SyncResultData, VoiceCoreError> {
+    /// Sync with the configured server: database changes both ways, no files.
+    pub fn sync(&self) -> Result<SyncResultData, VoiceCoreError> {
         // Check if sync is configured
         {
             let cfg = self.config.lock().unwrap();
@@ -407,7 +404,7 @@ impl VoiceClient {
 
     /// Perform initial sync - fetches full dataset from server
     ///
-    /// Unlike sync_now(), this ignores timestamps and fetches all data.
+    /// Unlike sync(), this ignores timestamps and fetches all data.
     /// Use this for first-time sync or to re-fetch everything.
     pub fn initial_sync(&self) -> Result<SyncResultData, VoiceCoreError> {
         // Check if sync is configured
@@ -1708,6 +1705,45 @@ impl VoiceClient {
         }
     }
 
+    /// Upload every recording whose row says the bucket does not hold it yet.
+    /// Runs only when the user asks; a sync never uploads.
+    pub fn upload(&self) -> Result<UploadResultData, VoiceCoreError> {
+        #[cfg(feature = "file-storage")]
+        {
+            let dir = {
+                let cfg = self.config.lock().unwrap();
+                cfg.audiofile_directory().map(std::path::PathBuf::from)
+            };
+            let dir = dir.ok_or_else(|| VoiceCoreError::Sync {
+                msg: "No audio directory is configured".to_string(),
+            })?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
+            let db = self.db.lock().unwrap();
+            let result = rt.block_on(crate::file_storage::upload_pending_audio_files(&db, &dir));
+            match result {
+                Ok(r) => Ok(UploadResultData {
+                    uploaded: r.uploaded as i32,
+                    skipped: r.skipped as i32,
+                    failed: r.failed as i32,
+                    deferred: r.deferred as i32,
+                    errors: r.errors,
+                }),
+                Err(e) => Err(VoiceCoreError::Sync { msg: e.to_string() }),
+            }
+        }
+
+        #[cfg(not(feature = "file-storage"))]
+        {
+            Ok(UploadResultData {
+                errors: vec!["File storage feature not enabled".to_string()],
+                ..Default::default()
+            })
+        }
+    }
+
     /// Download every non-deleted audio file that is in cloud storage but not
     /// on this device. Intended for explicit "fetch everything" actions; sync
     /// itself never does this on Android.
@@ -1928,6 +1964,21 @@ fn conflict_to_data(c: crate::versions::ConflictRow) -> ConflictData {
         created_at: stamp(c.created_at, None, None),
         resolved_at: stamp_opt(c.resolved_at, None, None),
     }
+}
+
+/// Result of uploading recordings to the bucket
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct UploadResultData {
+    /// Files uploaded in this run
+    pub uploaded: i32,
+    /// Pending rows whose file is not on this device (another device owns them)
+    pub skipped: i32,
+    /// Files that failed to upload
+    pub failed: i32,
+    /// Files not attempted because an earlier failure stopped the batch
+    pub deferred: i32,
+    /// One message per failure
+    pub errors: Vec<String>,
 }
 
 /// Result of downloading audio files from cloud storage

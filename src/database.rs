@@ -7,9 +7,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -271,12 +271,6 @@ fn uuid_bytes_to_hex(bytes: &[u8]) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Parse SQLite datetime string, returning as-is
-fn parse_sqlite_datetime(s: &str) -> String {
-    // SQLite uses "YYYY-MM-DD HH:MM:SS" format - return unchanged
-    s.to_string()
 }
 
 /// Database wrapper for SQLite operations
@@ -3048,13 +3042,6 @@ impl Database {
     // Non-synced file tagging methods
     // ============================================================================
 
-    /// Get the _nonsynced tag ID (deterministic UUID, created at init)
-    fn get_nonsynced_tag_id(&self) -> VoiceResult<Vec<u8>> {
-        let uuid = Uuid::parse_str(NONSYNCED_TAG_UUID)
-            .map_err(|e| VoiceError::Other(format!("Invalid NONSYNCED_TAG_UUID: {}", e)))?;
-        Ok(uuid.as_bytes().to_vec())
-    }
-
     /// Get the _too-big tag ID (deterministic UUID, created at init)
     fn get_too_big_tag_id(&self) -> VoiceResult<Vec<u8>> {
         let uuid = Uuid::parse_str(TOO_BIG_TAG_UUID)
@@ -5774,9 +5761,8 @@ impl Database {
 
         let mut tag_display_names: Vec<String> = Vec::new();
         for row in tag_rows {
-            let (id_bytes, name, parent_id) = row?;
-            let tag_id = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-            let display_name = self.get_tag_display_name(&tag_id, &name, parent_id.as_deref())?;
+            let (_id_bytes, name, parent_id) = row?;
+            let display_name = self.get_tag_display_name(&name, parent_id.as_deref())?;
             tag_display_names.push(display_name);
         }
 
@@ -6039,7 +6025,7 @@ impl Database {
         let mut result = Vec::new();
         for (id_bytes, name, parent_id) in tags {
             let tag_id = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
-            let display_name = self.get_tag_display_name(&tag_id, &name, parent_id.as_deref())?;
+            let display_name = self.get_tag_display_name(&name, parent_id.as_deref())?;
             result.push(serde_json::json!({
                 "id": tag_id,
                 "name": name,
@@ -6050,36 +6036,11 @@ impl Database {
         Ok(result)
     }
 
-    /// Build the full hierarchical path for a tag.
-    fn build_tag_path(&self, _id_bytes: &[u8], name: &str, parent_id: Option<&[u8]>) -> VoiceResult<String> {
-        let mut path_parts = vec![name.to_string()];
-        let mut current_parent = parent_id.map(|p| p.to_vec());
-
-        // Walk up the parent chain
-        while let Some(parent_bytes) = current_parent {
-            let result: Option<(String, Option<Vec<u8>>)> = self.conn.query_row(
-                "SELECT name, parent_id FROM tags WHERE id = ? AND deleted_at IS NULL",
-                params![parent_bytes],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
-
-            if let Some((parent_name, grandparent_id)) = result {
-                path_parts.push(parent_name);
-                current_parent = grandparent_id;
-            } else {
-                break;
-            }
-        }
-
-        path_parts.reverse();
-        Ok(path_parts.join("/"))
-    }
-
     /// Get the minimal display name for a tag, adding parent prefixes only if ambiguous.
     ///
     /// If the tag name is unique, returns just the name (e.g., "Paris").
     /// If ambiguous, adds parent prefixes recursively until unique (e.g., "France/Paris").
-    fn get_tag_display_name(&self, tag_id: &str, tag_name: &str, parent_id: Option<&[u8]>) -> VoiceResult<String> {
+    fn get_tag_display_name(&self, tag_name: &str, parent_id: Option<&[u8]>) -> VoiceResult<String> {
         // Check if tag name is ambiguous
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tags WHERE name = ? COLLATE NOCASE AND deleted_at IS NULL",
@@ -6549,7 +6510,7 @@ mod tests {
     fn test_search_notes() {
         let db = Database::new_in_memory().unwrap();
         let note1_id = db.create_note("Hello world").unwrap();
-        let note2_id = db.create_note("Goodbye world").unwrap();
+        db.create_note("Goodbye world").unwrap();
         let tag_id = db.create_tag("Greeting", None).unwrap();
 
         db.add_tag_to_note(&note1_id, &tag_id).unwrap();

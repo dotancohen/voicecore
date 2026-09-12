@@ -133,7 +133,7 @@ pub fn generate_self_signed_cert(
     common_name: &str,
     device_id: Option<&str>,
 ) -> VoiceResult<(String, String)> {
-    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType, IsCa, BasicConstraints};
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType, IsCa};
 
     // Create certificate parameters
     let mut params = CertificateParams::default();

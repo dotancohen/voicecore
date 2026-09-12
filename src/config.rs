@@ -339,7 +339,7 @@ impl Config {
             data.database_file = config_dir.join("notes.db").to_string_lossy().to_string();
         }
 
-        let mut config = Self {
+        let config = Self {
             config_dir,
             config_file,
             data,

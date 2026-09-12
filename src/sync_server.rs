@@ -6,6 +6,7 @@
 //! - /sync/apply - Apply changes from peer
 //! - /sync/full - Get full dataset for initial sync
 //! - /sync/status - Health check
+//! - /sync/audio/:id/file - One recording's bytes: GET serves it to a fetching peer, POST receives it from a sending peer
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -19,7 +20,6 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -27,6 +27,10 @@ use crate::config::Config;
 use crate::database::Database;
 use crate::error::VoiceResult;
 use crate::models::SyncChange;
+use crate::sync_protocol::{
+    ApplyRequest, ApplyResponse, ChangesQuery, ChangesResponse, ErrorResponse, HandshakeRequest,
+    HandshakeResponse, StatusResponse, PROTOCOL_VERSION,
+};
 use crate::UUID_SHORT_LEN;
 
 /// Server shutdown handle
@@ -41,79 +45,6 @@ struct AppState {
     device_name: String,
 }
 
-// Request/Response types
-
-#[derive(Debug, Deserialize)]
-struct HandshakeRequest {
-    device_id: String,
-    device_name: String,
-    protocol_version: String,
-}
-
-#[derive(Debug, Serialize)]
-struct HandshakeResponse {
-    device_id: String,
-    device_name: String,
-    protocol_version: String,
-    last_sync_timestamp: Option<i64>,
-    server_timestamp: i64,
-    supports_audiofiles: bool,
-    /// Identity of this database; a change means the peer must forget its cursors
-    database_id: String,
-    /// Current end of this database's write-order feed
-    cursor: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChangesQuery {
-    /// Write-order cursor (primary). Takes precedence over `since`.
-    cursor: Option<i64>,
-    /// Timestamp filter (kept for tools and older clients)
-    since: Option<i64>,
-    limit: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChangesResponse {
-    changes: Vec<SyncChange>,
-    from_timestamp: Option<i64>,
-    to_timestamp: Option<i64>,
-    /// Pass back as `cursor` to continue (cursor mode only)
-    next_cursor: Option<i64>,
-    database_id: String,
-    device_id: String,
-    device_name: String,
-    is_complete: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApplyRequest {
-    device_id: String,
-    device_name: String,
-    changes: Vec<SyncChange>,
-}
-
-#[derive(Debug, Serialize)]
-struct ApplyResponse {
-    applied: i64,
-    conflicts: i64,
-    errors: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct StatusResponse {
-    device_id: String,
-    device_name: String,
-    protocol_version: String,
-    status: String,
-    supports_audiofiles: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
 // Route handlers
 
 async fn handshake(
@@ -121,9 +52,10 @@ async fn handshake(
     Json(request): Json<HandshakeRequest>,
 ) -> impl IntoResponse {
     tracing::debug!(
-        "Handshake from device_id={}... device_name={}",
+        "Handshake from device_id={}... device_name={} protocol_version={}",
         &request.device_id[..UUID_SHORT_LEN.min(request.device_id.len())],
-        request.device_name
+        request.device_name,
+        request.protocol_version
     );
 
     // Validate device_id
@@ -156,7 +88,7 @@ async fn handshake(
     let response = HandshakeResponse {
         device_id: state.device_id.clone(),
         device_name: state.device_name.clone(),
-        protocol_version: "1.1".to_string(),
+        protocol_version: PROTOCOL_VERSION.to_string(),
         last_sync_timestamp: last_sync,
         server_timestamp: Utc::now().timestamp(),
         supports_audiofiles,
@@ -363,14 +295,14 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
     Json(StatusResponse {
         device_id: state.device_id.clone(),
         device_name: state.device_name.clone(),
-        protocol_version: "1.1".to_string(),
+        protocol_version: PROTOCOL_VERSION.to_string(),
         status: "ok".to_string(),
         supports_audiofiles,
     })
 }
 
 /// Download an audio file
-async fn download_audio_file(
+async fn serve_audio_file(
     State(state): State<AppState>,
     Path(audio_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -392,7 +324,6 @@ async fn download_audio_file(
 
     // Look for file with any extension
     let dir_path = std::path::Path::new(&audiofile_dir);
-    let pattern = format!("{}.*", audio_id);
 
     // Find the file
     let mut found_file: Option<std::path::PathBuf> = None;
@@ -417,8 +348,8 @@ async fn download_audio_file(
     Ok((StatusCode::OK, contents))
 }
 
-/// Upload an audio file
-async fn upload_audio_file(
+/// Receive one recording sent by a peer (`send_audio_file` on the client).
+async fn receive_audio_file(
     State(state): State<AppState>,
     Path(audio_id): Path<String>,
     body: Bytes,
@@ -796,8 +727,8 @@ pub fn create_router(
         .route("/sync/apply", post(apply_changes))
         .route("/sync/full", get(get_full_sync))
         .route("/sync/status", get(status))
-        .route("/sync/audio/:audio_id/file", get(download_audio_file))
-        .route("/sync/audio/:audio_id/file", post(upload_audio_file))
+        .route("/sync/audio/:audio_id/file", get(serve_audio_file))
+        .route("/sync/audio/:audio_id/file", post(receive_audio_file))
         // Body limit is configurable via sync.max_sync_file_size_mb in config
         .layer(DefaultBodyLimit::max(max_body_size))
         .with_state(state)
@@ -853,7 +784,8 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
-    use uuid::Uuid;
+
+    use crate::sync_apply::ALL_SYNC_ENTITY_TYPES;
 
     /// Create a test database in a temporary directory
     fn create_test_db() -> (Database, TempDir) {
@@ -1030,7 +962,7 @@ mod tests {
             ),
         ];
 
-        let (applied, conflicts, errors) = apply_sync_changes(
+        let (applied, _, errors) = apply_sync_changes(
             &db,
             &changes,
             "00000000000070008000000000000099",
@@ -1563,20 +1495,6 @@ mod tests {
         assert_eq!(b_transcriptions[0].service, "whisper");
     }
 
-    /// All entity types that should be synced. This is the authoritative list.
-    /// If you add a new syncable entity type, add it here AND to get_changes_since.
-    const ALL_SYNC_ENTITY_TYPES: &[&str] = &[
-        "note",
-        "tag",
-        "note_tag",
-        "note_attachment",
-        "audio_file",
-        "transcription",
-        "file_storage_config",
-        "field_version",
-        "purge",
-    ];
-
     #[test]
     fn test_get_changes_since_returns_all_entity_types() {
         // CRITICAL TEST: Ensures get_changes_since returns ALL syncable entity types.
@@ -1683,8 +1601,6 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Modify the transcription (simulate changing state to "verified")
-        let now = chrono::Utc::now().timestamp();
-        let device_id = "00000000000000000000000000000000";  // Dummy device ID for test
         db.update_transcription(&transcription_id, "Hello world", None, None, Some("verified")).unwrap();
 
         // Get changes since last sync

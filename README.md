@@ -27,6 +27,7 @@ src/
 ├── config.rs           # Configuration management
 ├── sync_client.rs      # Peer-to-peer sync client
 ├── sync_server.rs      # Sync server (Axum-based)
+├── sync_protocol.rs    # The protocol's messages, shared by client and server
 ├── versions.rs         # Versioned fields: history, three-way merge, conflicts
 ├── sync_apply.rs       # Applying a batch of sync changes (shared by server and client)
 ├── conflicts.rs        # Thin conflict manager over versions.rs
@@ -78,6 +79,7 @@ not to the event, and each interface applies its own.
 | `config` | JSON-based configuration with device identity and peer management |
 | `sync_client` | Async HTTP client for pulling/pushing changes to peers |
 | `sync_server` | Axum-based REST server for receiving sync requests |
+| `sync_protocol` | The request and response types of the protocol, one definition for both sides |
 | `versions` | Field version graph, three-way merge, conflict records, synced settings |
 | `sync_apply` | Applying incoming changes in dependency order with retry of failures |
 | `conflicts` | Thin conflict manager over `versions` |

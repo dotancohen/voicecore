@@ -237,6 +237,104 @@ mod tests {
     }
 
     #[test]
+    fn matching_lines_stay_outside_the_markers() {
+        let local = "Same line 1\nDifferent local\nSame line 3\n";
+        let remote = "Same line 1\nDifferent remote\nSame line 3\n";
+        let result = merge_content(local, remote, "LOCAL", "REMOTE");
+
+        assert_eq!(result.conflict_count, 1);
+        let lines: Vec<&str> = result.content.lines().collect();
+        let start = lines.iter().position(|l| l.starts_with("<<<<<<<")).unwrap();
+        let end = lines.iter().position(|l| l.starts_with(">>>>>>>")).unwrap();
+        assert!(lines[..start].contains(&"Same line 1"));
+        assert!(lines[end + 1..].contains(&"Same line 3"));
+        assert!(lines[start..end].contains(&"Different local"));
+        assert!(lines[start..end].contains(&"Different remote"));
+    }
+
+    #[test]
+    fn only_the_differing_section_gets_markers() {
+        let local = "Line 1\nLine 2\nLocal line 3\nLine 4\nLine 5\n";
+        let remote = "Line 1\nLine 2\nRemote line 3\nLine 4\nLine 5\n";
+        let result = merge_content(local, remote, "LOCAL", "REMOTE");
+
+        assert_eq!(result.conflict_count, 1);
+        assert!(result.content.contains("Local line 3"));
+        assert!(result.content.contains("Remote line 3"));
+    }
+
+    #[test]
+    fn nothing_is_lost_from_either_side() {
+        let local = "Local line 1\nLocal line 2\nLocal line 3\n";
+        let remote = "Remote line 1\nRemote line 2\n";
+        let result = merge_content(local, remote, "LOCAL", "REMOTE");
+
+        for line in ["Local line 1", "Local line 2", "Local line 3", "Remote line 1", "Remote line 2"] {
+            assert!(result.content.contains(line), "{} is missing", line);
+        }
+    }
+
+    #[test]
+    fn hebrew_and_chinese_survive_a_conflict() {
+        let result = merge_content("Hello שלום\n", "Hello 你好\n", "LOCAL", "REMOTE");
+        assert!(result.content.contains("שלום"));
+        assert!(result.content.contains("你好"));
+    }
+
+    #[test]
+    fn long_content_and_very_long_lines_survive() {
+        let local = "A".repeat(1000) + "\n";
+        let remote = "B".repeat(1000) + "\n";
+        let result = merge_content(&local, &remote, "LOCAL", "REMOTE");
+        assert!(result.content.contains(&"A".repeat(1000)));
+        assert!(result.content.contains(&"B".repeat(1000)));
+
+        let long_line = "x".repeat(10000);
+        let result = merge_content(&format!("{} local\n", long_line), &format!("{} remote\n", long_line), "LOCAL", "REMOTE");
+        assert!(result.content.contains(&long_line));
+        assert!(result.content.contains("local"));
+        assert!(result.content.contains("remote"));
+    }
+
+    #[test]
+    fn labels_name_the_devices() {
+        let result = merge_content("local\n", "remote\n", "MY_DEVICE", "OTHER_DEVICE");
+        assert!(result.content.contains("<<<<<<< MY_DEVICE"));
+        assert!(result.content.contains(">>>>>>> OTHER_DEVICE"));
+    }
+
+    #[test]
+    fn a_conflict_has_start_middle_and_end_in_that_order() {
+        let result = merge_content("local\n", "remote\n", "LOCAL", "REMOTE");
+        let lines: Vec<&str> = result.content.lines().collect();
+        let start = lines.iter().position(|l| l.starts_with("<<<<<<<")).unwrap();
+        let mid = lines.iter().position(|l| l.starts_with("=======")).unwrap();
+        let end = lines.iter().position(|l| l.starts_with(">>>>>>>")).unwrap();
+        assert!(start < mid && mid < end);
+        assert!(lines[start..mid].contains(&"local"));
+        assert!(lines[mid..end].contains(&"remote"));
+    }
+
+    #[test]
+    fn two_empty_sides_merge_to_nothing() {
+        let result = merge_content("", "", "LOCAL", "REMOTE");
+        assert_eq!(result.content, "");
+        assert!(!result.has_conflicts);
+    }
+
+    #[test]
+    fn a_whitespace_only_difference_is_a_conflict() {
+        let result = merge_content("line \n", "line  \n", "LOCAL", "REMOTE");
+        assert!(result.has_conflicts);
+    }
+
+    #[test]
+    fn a_missing_final_newline_does_not_lose_the_line() {
+        let result = merge_content("content\n", "content", "LOCAL", "REMOTE");
+        assert!(result.content.contains("content"));
+    }
+
+    #[test]
     fn test_diff3_no_base() {
         let result = diff3_merge("", "local", "remote");
         assert!(result.has_conflicts);
