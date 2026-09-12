@@ -109,6 +109,75 @@ pub struct SyncClient {
     device_name: String,
 }
 
+impl SyncClient {
+    /// Give an empty device that cannot reach this one (a server) this
+    /// device's account (PAIR-5): post to its grant text with a key made for
+    /// it and this device's card, then add it as a peer.
+    pub async fn grant_host(&self, setup_text: &str, label: &str) -> VoiceResult<Joined> {
+        let setup = crate::pairing::SetupText::parse(setup_text)?;
+        if !setup.grant {
+            return Err(VoiceError::validation("setup text", format!("This is a code to join with, not a grant text; use 'account join' ({})", codes::SETUP_TEXT_INVALID)));
+        }
+        let (account_id, own_card) = {
+            let db = self.db.lock().unwrap();
+            let mut config = self.config.lock().unwrap();
+            let card = crate::auth::ensure_own_device_card(&db, &mut config)?;
+            (db.account_id()?, card)
+        };
+        let server_key = crate::auth::generate_device_key();
+        let request = crate::sync_protocol::PairGrantRequest {
+            token: setup.token.clone(),
+            account_id: account_id.clone(),
+            label: label.to_string(),
+            device_key: server_key.clone(),
+            holder_id: own_card.device_id.clone(),
+            holder_name: own_card.name.clone(),
+            holder_certificate_fingerprint: own_card.certificate_fingerprint.clone(),
+            holder_addresses: own_card.addresses.clone(),
+            holder_key_hash: own_card.key_hash.clone(),
+        };
+        let client = build_client(&setup.certificate_fingerprint, &setup.urls[0])?;
+        let mut last_error = String::new();
+        let mut reply: Option<(String, crate::sync_protocol::PairGrantResponse)> = None;
+        for url in &setup.urls {
+            check_scheme(url)?;
+            match client.post(format!("{}/pair/grant", url.trim_end_matches('/'))).json(&request).send().await {
+                Ok(response) if response.status().is_success() => {
+                    let body = response.json().await.map_err(|e| VoiceError::Sync(format!("Could not read the grant reply: {}", e)))?;
+                    reply = Some((url.clone(), body));
+                    break;
+                }
+                Ok(response) => {
+                    let body = response.text().await.unwrap_or_default();
+                    let sentence = serde_json::from_str::<ErrorResponse>(&body).map(|r| r.error).unwrap_or(body);
+                    return Err(VoiceError::Sync(if sentence.is_empty() { "The grant was refused".to_string() } else { sentence }));
+                }
+                Err(e) => last_error = describe(&e),
+            }
+        }
+        let (url, reply) = reply.ok_or_else(|| VoiceError::Network(format!("Could not reach device {}: {}", &setup.device_id[..UUID_SHORT_LEN.min(setup.device_id.len())], last_error)))?;
+        {
+            let db = self.db.lock().unwrap();
+            db.admit_device_card(&crate::versions::DeviceCard {
+                device_id: reply.device_id.clone(),
+                name: reply.device_name.clone(),
+                certificate_fingerprint: reply.certificate_fingerprint.clone(),
+                addresses: reply.addresses.clone(),
+                listens: "1".to_string(),
+                key_hash: crate::auth::key_hash(&server_key),
+                revoked: "0".to_string(),
+                application: crate::auth::APPLICATION_VOICE.to_string(),
+            })?;
+            let mut config = self.config.lock().unwrap();
+            let pin = if setup.certificate_fingerprint.is_empty() { None } else { Some(setup.certificate_fingerprint.as_str()) };
+            config.add_peer(&reply.device_id, &reply.device_name, &url, pin, true)?;
+            config.set_sync_enabled(true)?;
+        }
+        self.clients.lock().unwrap().clear();
+        Ok(Joined { account_id, peer_id: reply.device_id, peer_name: reply.device_name, peer_url: url })
+    }
+}
+
 /// What a successful join gives back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Joined {
@@ -238,8 +307,12 @@ impl SyncClient {
                 .and_then(|p| crate::tls::compute_fingerprint(&p).ok())
                 .unwrap_or_default()
         };
+        if setup.grant {
+            return Err(VoiceError::validation("setup text", format!("This is a grant text, shown by a device that holds no account; use 'account grant-host' with it ({})", codes::SETUP_TEXT_INVALID)));
+        }
         let request = crate::sync_protocol::PairClaimRequest {
             token: setup.token.clone(),
+            account_id: setup.account_id.clone(),
             device_id: self.device_id.clone(),
             device_name: self.device_name.clone(),
             certificate_fingerprint: own_fingerprint,

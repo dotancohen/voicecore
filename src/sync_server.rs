@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -33,8 +33,8 @@ use crate::error::VoiceResult;
 use crate::models::{audio_local_path, SyncChange};
 use crate::sync_protocol::{
     codes, ApplyRequest, ApplyResponse, ChangesQuery, ChangesResponse, ErrorResponse, HandshakeRequest,
-    HandshakeResponse, MissingFilesRequest, MissingFilesResponse, PairClaimRequest, PairClaimResponse, StatusResponse,
-    HEADER_FILE_SHA256, PROTOCOL_VERSION,
+    HandshakeResponse, MissingFilesRequest, MissingFilesResponse, PairClaimRequest, PairClaimResponse, PairGrantRequest,
+    PairGrantResponse, StatusResponse, HEADER_FILE_SHA256, PROTOCOL_VERSION,
 };
 use crate::UUID_SHORT_LEN;
 
@@ -42,11 +42,236 @@ use crate::UUID_SHORT_LEN;
 /// by a stop, so a listener can be started again after it stopped.
 static SHUTDOWN_TX: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
 
+/// One account as the server holds it open: its database and its config.
+#[derive(Clone)]
+pub struct AccountHandle {
+    pub db: Arc<Mutex<Database>>,
+    pub config: Arc<Mutex<Config>>,
+}
+
+/// Where the server finds the accounts it serves (AUTH-4, Stage 3).
+pub trait AccountSource: Send + Sync {
+    /// The account, opened, or None when this server does not hold it.
+    fn account(&self, account_id: &str) -> Option<AccountHandle>;
+    /// Take on a new account by grant (PAIR-5): register it, store the key
+    /// the holder made for this device, and return it open. A device that
+    /// does not host accounts answers with a sentence.
+    fn take_hosted_account(&self, account_id: &str, label: &str, device_key: &str) -> Result<AccountHandle, String>;
+    /// Spend a hosting token (PAIR-5), returning the label it was offered with.
+    fn spend_hosting_token(&self, token: &str) -> Option<String>;
+    /// Every account this server may serve, for the periodic work.
+    fn served(&self) -> Vec<String>;
+    /// The accounts open right now, for the record when the listener stops.
+    fn open_handles(&self) -> Vec<AccountHandle>;
+    /// The one account, when this server holds exactly one; a host that
+    /// serves several answers None.
+    fn single(&self) -> Option<AccountHandle>;
+    /// Where the request log of an account is written (Stage 3): beside its
+    /// database on a host; nowhere on a single-account listener, whose own
+    /// log already carries the lines.
+    fn audit_log_path(&self, account: &AccountHandle) -> Option<std::path::PathBuf>;
+}
+
+/// The one account of a single-directory installation.
+pub struct SingleAccount {
+    pub account_id: String,
+    pub handle: AccountHandle,
+}
+
+impl AccountSource for SingleAccount {
+    fn account(&self, account_id: &str) -> Option<AccountHandle> {
+        if account_id == self.account_id {
+            Some(self.handle.clone())
+        } else {
+            None
+        }
+    }
+
+    fn take_hosted_account(&self, _account_id: &str, _label: &str, _device_key: &str) -> Result<AccountHandle, String> {
+        Err(format!("This device holds one account and does not host others ({})", codes::ACCOUNT_UNKNOWN))
+    }
+
+    fn spend_hosting_token(&self, _token: &str) -> Option<String> {
+        None
+    }
+
+    fn served(&self) -> Vec<String> {
+        vec![self.account_id.clone()]
+    }
+
+    fn open_handles(&self) -> Vec<AccountHandle> {
+        vec![self.handle.clone()]
+    }
+
+    fn single(&self) -> Option<AccountHandle> {
+        Some(self.handle.clone())
+    }
+
+    fn audit_log_path(&self, _account: &AccountHandle) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// Every account of an indexed root, opened on demand and kept open, at
+/// most [`OPEN_ACCOUNTS_KEPT`] at a time (Stage 3). Nothing is opened at
+/// start; the first request for an account opens it.
+pub struct IndexedAccounts {
+    root: std::path::PathBuf,
+    listen_urls: Vec<String>,
+    open: Mutex<Vec<(String, AccountHandle, Instant)>>,
+}
+
+/// How many hosted accounts stay open at once; the least recently used is
+/// closed when another is needed.
+pub const OPEN_ACCOUNTS_KEPT: usize = 64;
+
+impl IndexedAccounts {
+    pub fn new(root: &std::path::Path, listen_urls: Vec<String>) -> Self {
+        Self { root: root.to_path_buf(), listen_urls, open: Mutex::new(Vec::new()) }
+    }
+
+    fn open_account(&self, account_id: &str) -> VoiceResult<AccountHandle> {
+        let index = crate::accounts::AccountIndex::open(&self.root)?;
+        let entry = index.find(account_id)?.ok_or_else(|| crate::error::VoiceError::NotFound(account_id.to_string()))?;
+        if entry.account_id != account_id {
+            return Err(crate::error::VoiceError::NotFound(account_id.to_string()));
+        }
+        let dir = index.directory(&entry.account_id);
+        let db = Database::new_for_account(dir.join("notes.db"), &entry.account_id)?;
+        let mut config = Config::open_account(&self.root, &dir)?;
+        record_listening(&db, &mut config, &self.listen_urls, true)?;
+        index.touch(&entry.account_id)?;
+        Ok(AccountHandle { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)) })
+    }
+}
+
+impl AccountSource for IndexedAccounts {
+    fn account(&self, account_id: &str) -> Option<AccountHandle> {
+        let mut open = self.open.lock().unwrap();
+        if let Some(entry) = open.iter_mut().find(|(id, _, _)| id == account_id) {
+            entry.2 = Instant::now();
+            return Some(entry.1.clone());
+        }
+        let handle = match self.open_account(account_id) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!("Account {} is not served here: {}", short(account_id), e);
+                return None;
+            }
+        };
+        if open.len() >= OPEN_ACCOUNTS_KEPT {
+            if let Some(oldest) = open.iter().enumerate().min_by_key(|(_, (_, _, used))| *used).map(|(i, _)| i) {
+                open.remove(oldest);
+            }
+        }
+        open.push((account_id.to_string(), handle.clone(), Instant::now()));
+        Some(handle)
+    }
+
+    fn take_hosted_account(&self, account_id: &str, label: &str, device_key: &str) -> Result<AccountHandle, String> {
+        let index = crate::accounts::AccountIndex::open(&self.root).map_err(|e| e.to_string())?;
+        if index.find(account_id).map_err(|e| e.to_string())?.is_some() {
+            return Err(format!("This server already holds account {}", short(account_id)));
+        }
+        let label = if label.trim().is_empty() { format!("hosted-{}", &account_id[..8]) } else { label.trim().to_string() };
+        index.register(account_id, &label, true).map_err(|e| e.to_string())?;
+        let dir = index.directory(account_id);
+        let mut config = Config::open_account(&self.root, &dir).map_err(|e| e.to_string())?;
+        config.set_device_key(device_key).map_err(|e| e.to_string())?;
+        drop(config);
+        self.account(account_id).ok_or_else(|| "The account was registered but could not be opened".to_string())
+    }
+
+    fn spend_hosting_token(&self, token: &str) -> Option<String> {
+        let index = crate::accounts::AccountIndex::open(&self.root).ok()?;
+        index.spend_hosting_token(&auth::key_hash(token), Utc::now().timestamp()).ok().flatten()
+    }
+
+    fn served(&self) -> Vec<String> {
+        crate::accounts::AccountIndex::open(&self.root)
+            .and_then(|i| i.list())
+            .map(|l| l.into_iter().map(|a| a.account_id).collect())
+            .unwrap_or_default()
+    }
+
+    fn open_handles(&self) -> Vec<AccountHandle> {
+        self.open.lock().unwrap().iter().map(|(_, h, _)| h.clone()).collect()
+    }
+
+    fn single(&self) -> Option<AccountHandle> {
+        None
+    }
+
+    fn audit_log_path(&self, account: &AccountHandle) -> Option<std::path::PathBuf> {
+        Some(account.config.lock().unwrap().config_dir().join("audit.log"))
+    }
+}
+
+/// The request log of a hosted account is bounded like every other log
+/// (TECHNICAL-DECISIONS 7.1): at this size it is renamed to `.1`, the
+/// previous `.1` to `.2`, and the `.2` before that is gone.
+pub const AUDIT_LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// One line per request to a hosted account: time, device, route, bytes in
+/// and out, outcome and refusal code. Never a key, never content.
+fn audit(path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() >= AUDIT_LOG_ROTATE_BYTES {
+            let older = path.with_extension("log.2");
+            let old = path.with_extension("log.1");
+            let _ = std::fs::remove_file(&older);
+            let _ = std::fs::rename(&old, &older);
+            let _ = std::fs::rename(path, &old);
+        }
+    }
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut file) => {
+            let _ = writeln!(file, "{}", line);
+        }
+        Err(e) => tracing::warn!("Could not write the audit log {}: {}", path.display(), e),
+    }
+}
+
+/// The audit line of one request, written after the handler answered.
+fn audit_request(
+    state: &AppState,
+    account: Option<&AccountHandle>,
+    device: Option<&str>,
+    method: &str,
+    path: &str,
+    bytes_in: u64,
+    response: &Response,
+    code: &str,
+) {
+    let Some(account) = account else { return };
+    let Some(log) = state.accounts.audit_log_path(account) else { return };
+    let bytes_out = response
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let outcome = response.status().as_u16();
+    let line = format!(
+        "{} {} {} {} in={} out={} {} {}",
+        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        device.unwrap_or("-"),
+        method,
+        path,
+        bytes_in,
+        bytes_out,
+        outcome,
+        if code.is_empty() { "-" } else { code }
+    );
+    audit(&log, &line);
+}
+
 /// Shared server state
 #[derive(Clone)]
 struct AppState {
-    db: Arc<Mutex<Database>>,
-    config: Arc<Mutex<Config>>,
+    accounts: Arc<dyn AccountSource>,
     device_id: String,
     device_name: String,
     /// Refusals per source address, for the delay that slows a guesser
@@ -80,6 +305,65 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
+/// `POST /pair/grant` (PAIR-5): a holder gives this device, which holds no
+/// account yet, its account: the token from this device's grant text, the
+/// account id, a key made for this device, and the holder's card.
+async fn pair_grant(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(request): Json<PairGrantRequest>,
+) -> Response {
+    let refuse = |status: StatusCode, sentence: String, code: &str| {
+        (status, Json(ErrorResponse::with_code(sentence, code))).into_response()
+    };
+    let Some(offered_label) = state.accounts.spend_hosting_token(&request.token) else {
+        let delay = note_failure(&state, addr.ip());
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        tracing::warn!("Refused a hosting grant from {}: {}", addr.ip(), codes::TOKEN_INVALID);
+        return refuse(StatusCode::FORBIDDEN, format!("The grant text is not valid: it was spent, it expired, or it was mistyped ({})", codes::TOKEN_INVALID), codes::TOKEN_INVALID);
+    };
+    if crate::database::validate_account_id(&request.account_id).is_err() || request.device_key.is_empty() || request.holder_id.len() != 32 {
+        return refuse(StatusCode::BAD_REQUEST, format!("The grant is incomplete ({})", codes::SETUP_TEXT_INVALID), codes::SETUP_TEXT_INVALID);
+    }
+    let label = if request.label.trim().is_empty() { offered_label } else { request.label.clone() };
+    let account = match state.accounts.take_hosted_account(&request.account_id, &label, &request.device_key) {
+        Ok(a) => a,
+        Err(sentence) => return refuse(StatusCode::CONFLICT, sentence, codes::ACCOUNT_UNKNOWN),
+    };
+    let own = {
+        let db = account.db.lock().unwrap();
+        let mut config = account.config.lock().unwrap();
+        if let Err(e) = db.admit_device_card(&crate::versions::DeviceCard {
+            device_id: request.holder_id.clone(),
+            name: request.holder_name.clone(),
+            certificate_fingerprint: request.holder_certificate_fingerprint.clone(),
+            addresses: request.holder_addresses.clone(),
+            listens: "0".to_string(),
+            key_hash: request.holder_key_hash.clone(),
+            revoked: "0".to_string(),
+            application: auth::APPLICATION_VOICE.to_string(),
+        }) {
+            return refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not write the holder's card: {}", e), "");
+        }
+        match auth::ensure_own_device_card(&db, &mut config) {
+            Ok(card) => card,
+            Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not write this device's card: {}", e), ""),
+        }
+    };
+    tracing::info!("Now hosting account {} ({}) for {}", short(&request.account_id), label, short(&request.holder_id));
+    Json(PairGrantResponse {
+        account_id: request.account_id,
+        device_id: own.device_id,
+        device_name: own.name,
+        certificate_fingerprint: own.certificate_fingerprint,
+        addresses: own.addresses,
+        key_hash: own.key_hash,
+    })
+    .into_response()
+}
+
 /// Count a refusal from an address and say how long to wait before
 /// answering it (AUTH-5).
 fn note_failure(state: &AppState, ip: IpAddr) -> Duration {
@@ -111,8 +395,19 @@ async fn pair_claim(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<PairClaimRequest>,
 ) -> Response {
+    let Some(account) = state.accounts.account(&request.account_id) else {
+        let delay = note_failure(&state, addr.ip());
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::with_code(format!("This server does not host your account ({})", codes::ACCOUNT_UNKNOWN), codes::ACCOUNT_UNKNOWN)),
+        )
+            .into_response();
+    };
     let admitted = {
-        let db = state.db.lock().unwrap();
+        let db = account.db.lock().unwrap();
         crate::pairing::admit_by_token(
             &db,
             &request.token,
@@ -169,17 +464,37 @@ async fn require_device(
     let account = header(headers, auth::HEADER_ACCOUNT).map(str::to_string);
     let device = header(headers, auth::HEADER_DEVICE).map(str::to_string);
     let key = bearer(headers).map(str::to_string);
-    let verdict = {
-        let db = state.db.lock().unwrap();
-        let own_account = db.account_id().unwrap_or_default();
-        auth::verify_request(&db, &own_account, account.as_deref(), device.as_deref(), key.as_deref())
+    let handle = account.as_deref().filter(|a| !a.is_empty()).and_then(|a| state.accounts.account(a));
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let bytes_in = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let verdict = match &handle {
+        Some(handle) => {
+            let db = handle.db.lock().unwrap();
+            let own_account = db.account_id().unwrap_or_default();
+            auth::verify_request(&db, &own_account, account.as_deref(), device.as_deref(), key.as_deref())
+        }
+        None => Err(auth::Refusal {
+            status: 404,
+            code: codes::ACCOUNT_UNKNOWN,
+            sentence: format!("This server does not host your account ({})", codes::ACCOUNT_UNKNOWN),
+        }),
     };
     match verdict {
         Ok(_) => {
             if let Ok(mut failures) = state.failures.lock() {
                 failures.remove(&addr.ip());
             }
-            next.run(request).await
+            let mut request = request;
+            let handle = handle.expect("verified requests have an account");
+            request.extensions_mut().insert(handle.clone());
+            let response = next.run(request).await;
+            audit_request(&state, Some(&handle), device.as_deref(), &method, &path, bytes_in, &response, "");
+            response
         }
         Err(refusal) => {
             let delay = note_failure(&state, addr.ip());
@@ -193,11 +508,13 @@ async fn require_device(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            (
+            let response = (
                 StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::UNAUTHORIZED),
                 Json(ErrorResponse::with_code(refusal.sentence, refusal.code)),
             )
-                .into_response()
+                .into_response();
+            audit_request(&state, handle.as_ref(), device.as_deref(), &method, &path, bytes_in, &response, refusal.code);
+            response
         }
     }
 }
@@ -206,6 +523,7 @@ async fn require_device(
 
 async fn handshake(
     State(state): State<AppState>,
+    Extension(account): Extension<AccountHandle>,
     headers: HeaderMap,
     Json(request): Json<HandshakeRequest>,
 ) -> impl IntoResponse {
@@ -244,7 +562,7 @@ async fn handshake(
     // The account check (ACCT-2, ACCT-3): the two sides must hold the same
     // account, or nothing is exchanged. Never adopts, never corrects.
     let own_account = {
-        let db = state.db.lock().unwrap();
+        let db = account.db.lock().unwrap();
         db.account_id().unwrap_or_default()
     };
     if request.account_id.is_empty() {
@@ -283,7 +601,7 @@ async fn handshake(
     // A handshake starts a peer's operation, and what it applies afterwards
     // must be undoable (SNAP-3).
     {
-        let db = state.db.lock().unwrap();
+        let db = account.db.lock().unwrap();
         if let Err(e) = db.snapshot_before("handshake") {
             tracing::warn!("Could not take a snapshot before the handshake: {}", e);
         }
@@ -293,17 +611,17 @@ async fn handshake(
     }
 
     // Get last sync timestamp for this peer
-    let last_sync = get_peer_last_sync(&state.db, &request.device_id);
+    let last_sync = get_peer_last_sync(&account.db, &request.device_id);
     tracing::debug!("Last sync with this peer: {:?}", last_sync);
 
     // Check if audiofile_directory is configured
     let supports_audiofiles = {
-        let config = state.config.lock().ok();
+        let config = account.config.lock().ok();
         config.map(|c| c.audiofile_directory().is_some()).unwrap_or(false)
     };
 
     let (database_id, cursor) = {
-        let db = state.db.lock().unwrap();
+        let db = account.db.lock().unwrap();
         (db.database_id().unwrap_or_default(), db.current_seq().unwrap_or(0))
     };
 
@@ -324,6 +642,7 @@ async fn handshake(
 
 async fn get_changes(
     State(state): State<AppState>,
+    Extension(account): Extension<AccountHandle>,
     Query(query): Query<ChangesQuery>,
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(1000).min(10000);
@@ -331,7 +650,7 @@ async fn get_changes(
 
     // Get changes from database: cursor feed when asked for, timestamp filter otherwise
     let (changes, latest_timestamp, next_cursor, is_complete, database_id) = {
-        let db = state.db.lock().unwrap();
+        let db = account.db.lock().unwrap();
         let database_id = db.database_id().unwrap_or_default();
         let result = match query.cursor {
             Some(cursor) => db
@@ -387,6 +706,7 @@ async fn get_changes(
 
 async fn apply_changes(
     State(state): State<AppState>,
+    Extension(account): Extension<AccountHandle>,
     Json(request): Json<ApplyRequest>,
 ) -> impl IntoResponse {
     tracing::debug!(
@@ -415,7 +735,7 @@ async fn apply_changes(
 
     // Apply changes
     let (applied, conflicts, errors) = match apply_sync_changes(
-        &state.db,
+        &account.db,
         &request.changes,
         &request.device_id,
         Some(request.device_name.as_str()),
@@ -443,7 +763,7 @@ async fn apply_changes(
 
     // Update sync_peers to track when we last synced with this peer
     // This allows the handshake to return accurate last_sync_timestamp
-    if let Ok(db) = state.db.lock() {
+    if let Ok(db) = account.db.lock() {
         let _ = db.update_peer_sync_time(&request.device_id, Some(&request.device_name));
     }
 
@@ -456,11 +776,11 @@ async fn apply_changes(
     Json(response).into_response()
 }
 
-async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
+async fn get_full_sync(State(state): State<AppState>, Extension(account): Extension<AccountHandle>) -> impl IntoResponse {
     tracing::debug!("GET /sync/full (initial sync request)");
 
     // Get all notes, tags, and note_tags
-    let mut data = match get_full_dataset(&state.db) {
+    let mut data = match get_full_dataset(&account.db) {
         Ok(d) => d,
         Err(e) => {
             tracing::error!("Failed to get full dataset: {}", e);
@@ -486,7 +806,7 @@ async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
     // end of the feed at this moment: a client that applied this dataset can
     // continue incrementally from it.
     let (database_id, cursor) = {
-        let db = state.db.lock().unwrap();
+        let db = account.db.lock().unwrap();
         (db.database_id().unwrap_or_default(), db.current_seq().unwrap_or(0))
     };
     if let Some(obj) = data.as_object_mut() {
@@ -501,11 +821,14 @@ async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
-    // Check if audiofile_directory is configured
-    let supports_audiofiles = {
-        let config = state.config.lock().ok();
-        config.map(|c| c.audiofile_directory().is_some()).unwrap_or(false)
-    };
+    // The health check names no account: a single-account listener answers
+    // for its one account; a host answers false here and truthfully in the
+    // handshake of each account.
+    let supports_audiofiles = state
+        .accounts
+        .single()
+        .map(|a| a.config.lock().map(|c| c.audiofile_directory().is_some()).unwrap_or(false))
+        .unwrap_or(false);
 
     Json(StatusResponse {
         device_id: state.device_id.clone(),
@@ -518,15 +841,15 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Where a recording's file is, from its row, or None if the row does not
 /// exist or no audio directory is configured.
-fn audio_path_for(state: &AppState, audio_id: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+fn audio_path_for(account: &AccountHandle, audio_id: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
     Uuid::parse_str(audio_id).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
     let audiofile_dir = {
-        let config = state.config.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Config lock error".to_string()))?;
+        let config = account.config.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Config lock error".to_string()))?;
         config.audiofile_directory().map(|s| s.to_string())
     }
     .ok_or_else(|| (StatusCode::BAD_REQUEST, "audiofile_directory not configured".to_string()))?;
     let filename = {
-        let db = state.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
+        let db = account.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
         db.get_audio_file(audio_id)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?
             .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Audio file record not found: {}", audio_id)))?
@@ -539,12 +862,12 @@ fn audio_path_for(state: &AppState, audio_id: &str) -> Result<std::path::PathBuf
 /// (FILE-12), from the byte a `Range: bytes=N-` header asks for, with the
 /// whole file's size and SHA-256 in headers so the peer can verify.
 async fn serve_audio_file(
-    State(state): State<AppState>,
+    Extension(account): Extension<AccountHandle>,
     Path(audio_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     tracing::debug!("GET /sync/audio/{}/file", short(&audio_id));
-    let file_path = audio_path_for(&state, &audio_id)?;
+    let file_path = audio_path_for(&account, &audio_id)?;
     if !file_path.is_file() {
         return Err((StatusCode::NOT_FOUND, format!("Audio file not found: {}", audio_id)));
     }
@@ -578,7 +901,7 @@ async fn serve_audio_file(
 /// length when a `Content-Range: bytes N-M/total` says so, verified by the
 /// `X-File-SHA256` header before the rename (FILE-13).
 async fn receive_audio_file(
-    State(state): State<AppState>,
+    Extension(account): Extension<AccountHandle>,
     Path(audio_id): Path<String>,
     headers: HeaderMap,
     request: Request,
@@ -586,7 +909,7 @@ async fn receive_audio_file(
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
-    let file_path = audio_path_for(&state, &audio_id)?;
+    let file_path = audio_path_for(&account, &audio_id)?;
     let content_length: Option<u64> = header(&headers, "content-length").and_then(|v| v.parse().ok());
     let (start, total) = match header(&headers, "content-range").and_then(crate::transfer::parse_content_range) {
         Some((start, total)) => (start, total),
@@ -639,13 +962,13 @@ async fn receive_audio_file(
 /// `POST /sync/audio/missing` (FILE-12): of the ids a sender holds, which
 /// this device lacks, and how many bytes of each it already has in a part.
 async fn missing_audio_files(
-    State(state): State<AppState>,
+    Extension(account): Extension<AccountHandle>,
     Json(request): Json<MissingFilesRequest>,
 ) -> Result<Json<MissingFilesResponse>, (StatusCode, String)> {
     let mut missing = Vec::new();
     let mut partial = std::collections::HashMap::new();
     for audio_id in request.audio_ids {
-        let path = match audio_path_for(&state, &audio_id) {
+        let path = match audio_path_for(&account, &audio_id) {
             Ok(p) => p,
             Err((StatusCode::NOT_FOUND, _)) => {
                 // No row yet: the sender's sync has not reached us; ask for it next time
@@ -964,8 +1287,16 @@ pub fn create_router(
     db: Arc<Mutex<Database>>,
     config: Arc<Mutex<Config>>,
 ) -> Router {
+    let account_id = db.lock().unwrap().account_id().unwrap_or_default();
+    let source: Arc<dyn AccountSource> = Arc::new(SingleAccount { account_id, handle: AccountHandle { db, config: config.clone() } });
+    create_router_for(source, config)
+}
+
+/// The router over any set of accounts; `machine` is the machine's config
+/// (the device identity, the body limit).
+pub fn create_router_for(accounts: Arc<dyn AccountSource>, machine: Arc<Mutex<Config>>) -> Router {
     let (device_id, device_name, max_body_size) = {
-        let cfg = config.lock().unwrap();
+        let cfg = machine.lock().unwrap();
         (
             cfg.device_id_hex().to_string(),
             cfg.device_name().to_string(),
@@ -974,8 +1305,7 @@ pub fn create_router(
     };
 
     let state = AppState {
-        db,
-        config,
+        accounts,
         device_id,
         device_name,
         failures: Arc::new(Mutex::new(HashMap::new())),
@@ -999,6 +1329,7 @@ pub fn create_router(
     Router::new()
         .route("/sync/status", get(status))
         .route("/pair/claim", post(pair_claim))
+        .route("/pair/grant", post(pair_grant))
         .merge(authenticated)
         // The limit applies to the JSON routes; a recording streams past it
         // (FILE-12) because the file route reads its body as a stream
@@ -1064,6 +1395,32 @@ pub async fn start_server(
     port: u16,
     plain_http: bool,
 ) -> VoiceResult<()> {
+    let account_id = db.lock().unwrap().account_id()?;
+    let source: Arc<dyn AccountSource> = Arc::new(SingleAccount { account_id, handle: AccountHandle { db, config: config.clone() } });
+    start_server_for(source, config, host, port, plain_http).await
+}
+
+/// Serve every account of an indexed root (Stage 3, hosting): the machine's
+/// identity and certificate come from the root's own `config.json`, and each
+/// account is opened on its first request. A root without an index gets one,
+/// empty; no default account is made.
+pub async fn start_hosting_server(root: &std::path::Path, host: &str, port: u16, plain_http: bool) -> VoiceResult<()> {
+    crate::accounts::AccountIndex::open(root)?;
+    let machine = Arc::new(Mutex::new(Config::new(Some(root.to_path_buf()))?));
+    let urls = listen_urls(host, port, plain_http);
+    let source: Arc<dyn AccountSource> = Arc::new(IndexedAccounts::new(root, urls));
+    start_server_for(source, machine, host, port, plain_http).await
+}
+
+/// The listener over any set of accounts; `machine` holds the device
+/// identity, the certificate and the body limit.
+pub async fn start_server_for(
+    accounts: Arc<dyn AccountSource>,
+    machine: Arc<Mutex<Config>>,
+    host: &str,
+    port: u16,
+    plain_http: bool,
+) -> VoiceResult<()> {
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| crate::error::VoiceError::Network(format!("{} is not an address: {}", host, e)))?;
@@ -1079,21 +1436,21 @@ pub async fn start_server(
         None
     } else {
         let (cert_path, key_path, fingerprint) = {
-            let cfg = config.lock().unwrap();
+            let cfg = machine.lock().unwrap();
             crate::tls::ensure_server_certificate(&cfg, false)?
         };
         tracing::info!("Certificate fingerprint {}", fingerprint);
         Some(crate::tls::server_config(&cert_path, &key_path)?)
     };
     let urls = listen_urls(host, port, plain_http);
-    {
-        let db_guard = db.lock().unwrap();
-        let mut cfg = config.lock().unwrap();
+    for handle in accounts.open_handles() {
+        let db_guard = handle.db.lock().unwrap();
+        let mut cfg = handle.config.lock().unwrap();
         record_listening(&db_guard, &mut cfg, &urls, true)?;
     }
-    let (db_for_stop, config_for_stop) = (db.clone(), config.clone());
+    let accounts_for_stop = accounts.clone();
 
-    let router = create_router(db, config).into_make_service_with_connect_info::<SocketAddr>();
+    let router = create_router_for(accounts, machine).into_make_service_with_connect_info::<SocketAddr>();
 
     // Create shutdown channel; a previous listener's handle, if any, is dropped
     let (tx, rx) = oneshot::channel::<()>();
@@ -1115,9 +1472,9 @@ pub async fn start_server(
         None => axum_server::bind(addr).handle(handle).serve(router).await,
     };
     *SHUTDOWN_TX.lock().unwrap() = None;
-    {
-        let db_guard = db_for_stop.lock().unwrap();
-        let mut cfg = config_for_stop.lock().unwrap();
+    for handle in accounts_for_stop.open_handles() {
+        let db_guard = handle.db.lock().unwrap();
+        let mut cfg = handle.config.lock().unwrap();
         if let Err(e) = record_listening(&db_guard, &mut cfg, &[], false) {
             tracing::warn!("Could not record that the listener stopped: {}", e);
         }
@@ -1168,16 +1525,18 @@ mod tests {
         use crate::config::Config;
         use crate::sync_client::SyncClient;
 
-        fn state_for(db: Database, dir: &TempDir) -> AppState {
+        fn state_for(db: Database, dir: &TempDir) -> (AppState, AccountHandle) {
             let config = Config::new(Some(dir.path().to_path_buf())).unwrap();
             let device_id = config.device_id_hex().to_string();
-            AppState {
-                db: Arc::new(Mutex::new(db)),
-                config: Arc::new(Mutex::new(config)),
+            let account_id = db.account_id().unwrap();
+            let handle = AccountHandle { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)) };
+            let state = AppState {
+                accounts: Arc::new(SingleAccount { account_id, handle: handle.clone() }),
                 device_id,
                 device_name: "Server".to_string(),
                 failures: Arc::new(Mutex::new(HashMap::new())),
-            }
+            };
+            (state, handle)
         }
 
         fn request(account_id: &str) -> HandshakeRequest {
@@ -1199,11 +1558,11 @@ mod tests {
         async fn the_same_account_is_let_in_and_told_the_account() {
             let (db, dir) = create_test_db();
             let account = db.account_id().unwrap();
-            let state = state_for(db, &dir);
-            let (status, body) = body_of(handshake(State(state.clone()), HeaderMap::new(), Json(request(&account))).await.into_response()).await;
+            let (state, handle) = state_for(db, &dir);
+            let (status, body) = body_of(handshake(State(state), Extension(handle.clone()), HeaderMap::new(), Json(request(&account))).await.into_response()).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["account_id"], account);
-            let db = state.db.lock().unwrap();
+            let db = handle.db.lock().unwrap();
             assert_eq!(db.get_peer_account_id("00000000000070008000000000000099").unwrap(), Some(account));
             assert_eq!(db.list_snapshots().unwrap().len(), 1, "a snapshot before the peer's operation");
         }
@@ -1211,13 +1570,13 @@ mod tests {
         #[tokio::test]
         async fn another_account_is_refused_with_its_code() {
             let (db, dir) = create_test_db();
-            let state = state_for(db, &dir);
+            let (state, handle) = state_for(db, &dir);
             let other = "0199bbbbbbbb7000800000000000000b";
-            let (status, body) = body_of(handshake(State(state.clone()), HeaderMap::new(), Json(request(other))).await.into_response()).await;
+            let (status, body) = body_of(handshake(State(state), Extension(handle.clone()), HeaderMap::new(), Json(request(other))).await.into_response()).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_eq!(body["code"], codes::ACCOUNT_MISMATCH);
             assert!(body["error"].as_str().unwrap().contains("nothing was exchanged"));
-            let db = state.db.lock().unwrap();
+            let db = handle.db.lock().unwrap();
             assert_eq!(db.get_peer_account_id("00000000000070008000000000000099").unwrap(), None);
             assert!(db.list_snapshots().unwrap().is_empty());
         }
@@ -1225,8 +1584,8 @@ mod tests {
         #[tokio::test]
         async fn a_handshake_that_names_no_account_is_refused() {
             let (db, dir) = create_test_db();
-            let state = state_for(db, &dir);
-            let (status, body) = body_of(handshake(State(state), HeaderMap::new(), Json(request(""))).await.into_response()).await;
+            let (state, handle) = state_for(db, &dir);
+            let (status, body) = body_of(handshake(State(state), Extension(handle), HeaderMap::new(), Json(request(""))).await.into_response()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(body["code"], codes::ACCOUNT_MISSING);
         }
@@ -1600,6 +1959,197 @@ mod tests {
             let err = client.join(&setup.to_text()).await.unwrap_err().to_string();
             assert!(err.contains(codes::DEVICE_HOLDS_NOTES), "{}", err);
             assert!(desk.db.lock().unwrap().has_pairing_offer(chrono::Utc::now().timestamp()).unwrap(), "the code was not spent");
+        }
+    }
+
+    mod hosting {
+        use super::*;
+        use crate::auth;
+        use crate::config::Config;
+        use crate::sync_client::SyncClient;
+        use crate::sync_protocol::codes;
+
+        struct Device {
+            db: Arc<Mutex<Database>>,
+            config: Arc<Mutex<Config>>,
+            id: String,
+            _dir: TempDir,
+        }
+
+        fn device(name: &str) -> Device {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new(dir.path().join("notes.db")).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            config.set_device_name(name).unwrap();
+            auth::ensure_own_device_card(&db, &mut config).unwrap();
+            let id = config.device_id_hex().to_string();
+            Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
+        }
+
+        /// A server over an empty indexed root, serving plain http on this
+        /// machine. Returns the root, the source, the machine config, the URL
+        /// and the task.
+        fn host() -> (TempDir, Arc<IndexedAccounts>, Arc<Mutex<Config>>, String, tokio::task::JoinHandle<()>) {
+            let root = TempDir::new().unwrap();
+            crate::accounts::AccountIndex::open(root.path()).unwrap();
+            let mut machine = Config::new(Some(root.path().to_path_buf())).unwrap();
+            machine.set_device_name("Server").unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let source = Arc::new(IndexedAccounts::new(root.path(), vec![url.clone()]));
+            let machine = Arc::new(Mutex::new(machine));
+            let router = create_router_for(source.clone(), machine.clone()).into_make_service_with_connect_info::<SocketAddr>();
+            let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
+            (root, source, machine, url, task)
+        }
+
+        #[tokio::test]
+        async fn a_holder_grants_a_server_its_account_and_a_third_device_joins_through_the_server() {
+            let (root, source, machine, url, task) = host();
+            let index = crate::accounts::AccountIndex::open(root.path()).unwrap();
+            let grant = crate::pairing::offer_hosting(&index, &machine.lock().unwrap(), Some("meirav"), vec![url.clone()]).unwrap();
+            assert!(grant.grant);
+            assert!(grant.account_id.is_empty(), "a server's text names no account");
+            let text = grant.to_text();
+            assert!(text.contains("g=1"));
+
+            // The holder grants
+            let desk = device("Desk");
+            desk.db.lock().unwrap().create_note("על השולחן").unwrap();
+            let account = desk.db.lock().unwrap().account_id().unwrap();
+            let desk_client = SyncClient::new(desk.db.clone(), desk.config.clone()).unwrap();
+            let granted = desk_client.grant_host(&text, "").await.unwrap();
+            assert_eq!(granted.account_id, account);
+            assert_eq!(granted.peer_name, "Server");
+            let server_id = machine.lock().unwrap().device_id_hex().to_string();
+            assert_eq!(granted.peer_id, server_id);
+
+            let listed = index.list().unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!((listed[0].account_id.as_str(), listed[0].label.as_str(), listed[0].hosted, listed[0].is_default), (account.as_str(), "meirav", true, false));
+            assert_eq!(index.default_account().unwrap(), None, "a host makes no default account");
+            let hosted = source.account(&account).unwrap();
+            assert_eq!(hosted.db.lock().unwrap().account_id().unwrap(), account);
+            assert_eq!(hosted.config.lock().unwrap().device_key().len(), 43, "the server holds the key the holder made");
+            let holder_card = hosted.db.lock().unwrap().get_device_card(&desk.id).unwrap().unwrap();
+            assert_eq!(holder_card.key_hash, auth::key_hash(desk.config.lock().unwrap().device_key()));
+            let server_card = desk.db.lock().unwrap().get_device_card(&server_id).unwrap().unwrap();
+            assert_eq!(server_card.key_hash, auth::key_hash(hosted.config.lock().unwrap().device_key()), "the desk holds the hash of the key it made");
+            assert_eq!(server_card.listens, "0", "a card's listens and addresses are the owner's fields; they arrive by sync");
+
+            // The text is spent
+            let another = device("Another");
+            let refused = SyncClient::new(another.db.clone(), another.config.clone()).unwrap().grant_host(&text, "").await;
+            assert!(refused.unwrap_err().to_string().contains(codes::TOKEN_INVALID));
+
+            // The holder delivers to the server
+            let result = desk_client.sync_with_peer(&server_id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(hosted.db.lock().unwrap().get_all_notes().unwrap().len(), 1);
+            let server_card = desk.db.lock().unwrap().get_device_card(&server_id).unwrap().unwrap();
+            assert_eq!(server_card.listens, "1", "after a sync the desk knows the server listens");
+            assert!(server_card.addresses.contains(&url), "{}", server_card.addresses);
+
+            // The server shows a code for the hosted account and a phone joins through it
+            let setup = {
+                let db = hosted.db.lock().unwrap();
+                let cfg = hosted.config.lock().unwrap();
+                crate::pairing::offer(&db, &cfg, vec![url.clone()]).unwrap()
+            };
+            assert_eq!(setup.account_id, account);
+            let phone = device("Phone");
+            let phone_client = SyncClient::new(phone.db.clone(), phone.config.clone()).unwrap();
+            let joined = phone_client.join(&setup.to_text()).await.unwrap();
+            assert_eq!(joined.peer_id, server_id);
+            phone.db.lock().unwrap().create_note("מהטלפון").unwrap();
+            let result = phone_client.sync_with_peer(&server_id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(phone.db.lock().unwrap().get_all_notes().unwrap().len(), 2, "the phone has the desk's note through the server");
+            let result = desk_client.sync_with_peer(&server_id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(desk.db.lock().unwrap().get_all_notes().unwrap().len(), 2, "and the desk has the phone's");
+
+            // The audit log names the devices and the routes, never a key
+            let audit = std::fs::read_to_string(index.directory(&account).join("audit.log")).unwrap();
+            assert!(audit.contains(&format!("{} POST /sync/handshake in=", desk.id)), "{}", audit);
+            assert!(audit.contains(&format!("{} GET /sync/changes", phone.id)), "{}", audit);
+            assert!(!audit.contains(desk.config.lock().unwrap().device_key()));
+            assert!(!audit.contains("מהטלפון"));
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_host_refuses_a_claim_and_a_request_for_an_account_it_does_not_hold() {
+            let (_root, _source, _machine, url, task) = host();
+            let stranger = device("Stranger");
+            let stranger_id = stranger.db.lock().unwrap().account_id().unwrap();
+            let http = reqwest::Client::new();
+            let response = http
+                .get(format!("{}/sync/changes?since=0", url))
+                .header(auth::HEADER_ACCOUNT, &stranger_id)
+                .header(auth::HEADER_DEVICE, &stranger.id)
+                .bearer_auth("x")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 404);
+            let body: ErrorResponse = response.json().await.unwrap();
+            assert_eq!(body.code, codes::ACCOUNT_UNKNOWN);
+
+            let claim = PairClaimRequest {
+                token: "x".repeat(43),
+                account_id: stranger_id,
+                device_id: stranger.id.clone(),
+                device_name: "Stranger".to_string(),
+                certificate_fingerprint: String::new(),
+                addresses: "[]".to_string(),
+                application: String::new(),
+            };
+            let response = http.post(format!("{}/pair/claim", url)).json(&claim).send().await.unwrap();
+            assert_eq!(response.status(), 404);
+
+            // A grant text for another server is refused here
+            let grant = PairGrantRequest {
+                token: "y".repeat(43),
+                account_id: "0".repeat(32),
+                label: String::new(),
+                device_key: "z".repeat(43),
+                holder_id: stranger.id.clone(),
+                holder_name: "Stranger".to_string(),
+                holder_certificate_fingerprint: String::new(),
+                holder_addresses: "[]".to_string(),
+                holder_key_hash: String::new(),
+            };
+            let response = http.post(format!("{}/pair/grant", url)).json(&grant).send().await.unwrap();
+            assert_eq!(response.status(), 403);
+            let body: ErrorResponse = response.json().await.unwrap();
+            assert_eq!(body.code, codes::TOKEN_INVALID);
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_single_account_listener_takes_no_grant() {
+            let desk = device("Desk");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let router = create_router(desk.db.clone(), desk.config.clone()).into_make_service_with_connect_info::<SocketAddr>();
+            let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
+            let grant = PairGrantRequest {
+                token: "y".repeat(43),
+                account_id: "0".repeat(32),
+                label: String::new(),
+                device_key: "z".repeat(43),
+                holder_id: "1".repeat(32),
+                holder_name: "Holder".to_string(),
+                holder_certificate_fingerprint: String::new(),
+                holder_addresses: "[]".to_string(),
+                holder_key_hash: String::new(),
+            };
+            let response = reqwest::Client::new().post(format!("{}/pair/grant", url)).json(&grant).send().await.unwrap();
+            assert_eq!(response.status(), 403, "no token was ever offered");
+            task.abort();
         }
     }
 

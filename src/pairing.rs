@@ -24,7 +24,11 @@ pub const SETUP_TEXT_SCHEME: &str = "voice://pair?";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupText {
     pub version: u32,
+    /// Empty in a grant text: the holder names the account (PAIR-5)
     pub account_id: String,
+    /// A grant text: shown by the empty device (a server); the holder
+    /// posts to it instead of claiming from it
+    pub grant: bool,
     pub token: String,
     pub device_id: String,
     /// The URLs the showing device listens on, first one preferred
@@ -38,13 +42,17 @@ impl SetupText {
     /// `voice://pair?v=1&a=…&t=…&d=…&u=…&f=…`. The fingerprint's 32
     /// bytes travel as 43 base64url characters, not the colon form.
     pub fn to_text(&self) -> String {
-        let mut pairs = vec![
-            ("v", self.version.to_string()),
-            ("a", self.account_id.clone()),
+        let mut pairs = vec![("v", self.version.to_string())];
+        if self.grant {
+            pairs.push(("g", "1".to_string()));
+        } else {
+            pairs.push(("a", self.account_id.clone()));
+        }
+        pairs.extend([
             ("t", self.token.clone()),
             ("d", self.device_id.clone()),
             ("u", self.urls.join(",")),
-        ];
+        ]);
         if !self.certificate_fingerprint.is_empty() {
             pairs.push(("f", compact_fingerprint(&self.certificate_fingerprint)));
         }
@@ -64,6 +72,7 @@ impl SetupText {
             .ok_or_else(|| VoiceError::validation("setup text", format!("A setup text starts with {} ({})", SETUP_TEXT_SCHEME, codes::SETUP_TEXT_INVALID)))?;
         let mut version = 0u32;
         let mut account_id = String::new();
+        let mut grant = false;
         let mut token = String::new();
         let mut device_id = String::new();
         let mut urls = Vec::new();
@@ -76,6 +85,7 @@ impl SetupText {
             match k {
                 "v" => version = v.parse().unwrap_or(0),
                 "a" => account_id = v,
+                "g" => grant = v == "1",
                 "t" => token = v,
                 "d" => device_id = v,
                 "u" => urls = v.split(',').filter(|u| !u.is_empty()).map(str::to_string).collect(),
@@ -86,12 +96,14 @@ impl SetupText {
         if version != 1 {
             return Err(VoiceError::validation("setup text", format!("Setup text version {} is not known ({})", version, codes::SETUP_TEXT_INVALID)));
         }
-        crate::database::validate_account_id(&account_id)
-            .map_err(|_| VoiceError::validation("setup text", format!("The account id is malformed ({})", codes::SETUP_TEXT_INVALID)))?;
+        if !grant {
+            crate::database::validate_account_id(&account_id)
+                .map_err(|_| VoiceError::validation("setup text", format!("The account id is malformed ({})", codes::SETUP_TEXT_INVALID)))?;
+        }
         if token.is_empty() || device_id.len() != 32 || urls.is_empty() {
             return Err(VoiceError::validation("setup text", format!("The setup text is incomplete ({})", codes::SETUP_TEXT_INVALID)));
         }
-        Ok(Self { version, account_id, token, device_id, urls, certificate_fingerprint })
+        Ok(Self { version, account_id, grant, token, device_id, urls, certificate_fingerprint })
     }
 }
 
@@ -129,6 +141,32 @@ pub fn offer(db: &Database, config: &Config, urls: Vec<String>) -> VoiceResult<S
     Ok(SetupText {
         version: 1,
         account_id: db.account_id()?,
+        grant: false,
+        token,
+        device_id: config.device_id_hex().to_string(),
+        urls,
+        certificate_fingerprint,
+    })
+}
+
+/// Offer to host an account (PAIR-5): a grant text shown by a server that
+/// holds no account yet; the holder posts to `/pair/grant`. The token's
+/// hash lives in the index, so the listener finds it in another process.
+pub fn offer_hosting(index: &crate::accounts::AccountIndex, config: &Config, label: Option<&str>, urls: Vec<String>) -> VoiceResult<SetupText> {
+    let token = auth::generate_device_key();
+    let expires_at = Utc::now().timestamp() + TOKEN_LIFETIME_SECONDS;
+    index.offer_hosting_token(&auth::key_hash(&token), label, expires_at)?;
+    let certificate_fingerprint = config
+        .certs_dir()
+        .ok()
+        .map(|d| d.join("server.crt"))
+        .filter(|p| p.is_file())
+        .and_then(|p| crate::tls::compute_fingerprint(&p).ok())
+        .unwrap_or_default();
+    Ok(SetupText {
+        version: 1,
+        account_id: String::new(),
+        grant: true,
         token,
         device_id: config.device_id_hex().to_string(),
         urls,
@@ -207,6 +245,7 @@ mod tests {
         SetupText {
             version: 1,
             account_id: "0199aaaaaaaa7000800000000000000a".to_string(),
+            grant: false,
             token: "tok-en_123".to_string(),
             device_id: "00000000000070008000000000000001".to_string(),
             urls: vec!["https://192.168.1.10:8384".to_string(), "https://desk.local:8384".to_string()],
@@ -232,6 +271,16 @@ mod tests {
         let mut broken = sample();
         broken.urls.clear();
         assert!(SetupText::parse(&broken.to_text()).unwrap_err().to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn a_grant_text_names_no_account_and_says_so() {
+        let mut grant = sample();
+        grant.grant = true;
+        grant.account_id = String::new();
+        let text = grant.to_text();
+        assert!(text.contains("&g=1&") && !text.contains("&a="));
+        assert_eq!(SetupText::parse(&text).unwrap(), grant);
     }
 
     #[test]

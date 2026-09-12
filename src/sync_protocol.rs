@@ -128,6 +128,10 @@ pub struct ApplyResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairClaimRequest {
     pub token: String,
+    /// The account the code was for, so a server that hosts several finds
+    /// the right one
+    #[serde(default)]
+    pub account_id: String,
     pub device_id: String,
     pub device_name: String,
     #[serde(default)]
@@ -151,6 +155,42 @@ pub struct PairClaimResponse {
     pub certificate_fingerprint: String,
     #[serde(default)]
     pub addresses: String,
+}
+
+/// `POST /pair/grant` request body (PAIR-5): the holder of an account gives
+/// an empty device (a server) the account, a key it made for the device,
+/// and its own card, so the device can serve the account and let the
+/// holder in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairGrantRequest {
+    pub token: String,
+    pub account_id: String,
+    #[serde(default)]
+    pub label: String,
+    /// The key the empty device will use as its own for this account
+    pub device_key: String,
+    /// The holder's card, with its key hash
+    pub holder_id: String,
+    pub holder_name: String,
+    #[serde(default)]
+    pub holder_certificate_fingerprint: String,
+    #[serde(default)]
+    pub holder_addresses: String,
+    pub holder_key_hash: String,
+}
+
+/// `POST /pair/grant` response body: the empty device's own card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairGrantResponse {
+    pub account_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    #[serde(default)]
+    pub certificate_fingerprint: String,
+    #[serde(default)]
+    pub addresses: String,
+    #[serde(default)]
+    pub key_hash: String,
 }
 
 /// `POST /sync/audio/missing` request body (FILE-12): the recordings the

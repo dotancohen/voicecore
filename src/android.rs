@@ -431,6 +431,32 @@ impl VoiceClient {
             peer_id: joined.peer_id,
             peer_name: joined.peer_name,
             peer_url: joined.peer_url,
+            granted: false,
+        })
+    }
+
+    /// Use a setup text (Stage 9): a code shown by a device that holds the
+    /// account joins this phone to it (PAIR-4); a grant text shown by a
+    /// server that holds nothing gives that server this phone's account to
+    /// host (PAIR-5). The text says which, in its `g` field.
+    pub fn pair_with(&self, setup_text: String) -> Result<JoinedData, VoiceCoreError> {
+        let grant = crate::pairing::SetupText::parse(&setup_text)?.grant;
+        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
+        let joined = if grant {
+            rt.block_on(sync_client.grant_host(&setup_text, ""))?
+        } else {
+            rt.block_on(sync_client.join(&setup_text))?
+        };
+        Ok(JoinedData {
+            account_id: joined.account_id,
+            peer_id: joined.peer_id,
+            peer_name: joined.peer_name,
+            peer_url: joined.peer_url,
+            granted: grant,
         })
     }
 
@@ -2179,6 +2205,9 @@ pub struct JoinedData {
     pub peer_id: String,
     pub peer_name: String,
     pub peer_url: String,
+    /// True when the text was a grant: the peer now hosts this account
+    /// (PAIR-5); false when this device joined the peer's account (PAIR-4)
+    pub granted: bool,
 }
 
 /// A device of the account, as its card says (CARD-1)

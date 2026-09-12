@@ -65,6 +65,12 @@ impl AccountIndex {
                 created_at INTEGER NOT NULL,
                 last_opened_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS hosting_offers (
+                token_hash TEXT PRIMARY KEY,
+                label TEXT,
+                expires_at INTEGER NOT NULL,
+                failures INTEGER NOT NULL DEFAULT 0
+            );
             "#,
         )?;
         #[cfg(unix)]
@@ -203,6 +209,38 @@ impl AccountIndex {
     pub fn touch(&self, account_id: &str) -> VoiceResult<()> {
         self.conn.execute("UPDATE accounts SET last_opened_at = ? WHERE account_id = ?", params![Utc::now().timestamp(), account_id])?;
         Ok(())
+    }
+
+    /// Offer to host an account (PAIR-5): the hash of the token shown by
+    /// `account host`, with the label the account gets. One offer at a time.
+    pub fn offer_hosting_token(&self, token_hash: &str, label: Option<&str>, expires_at: i64) -> VoiceResult<()> {
+        self.conn.execute("DELETE FROM hosting_offers", [])?;
+        self.conn.execute(
+            "INSERT INTO hosting_offers (token_hash, label, expires_at, failures) VALUES (?, ?, ?, 0)",
+            params![token_hash, label, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Spend the hosting offer, returning its label; None when the token is
+    /// wrong, spent or expired. Five wrong tokens withdraw the offer.
+    pub fn spend_hosting_token(&self, token_hash: &str, now: i64) -> VoiceResult<Option<String>> {
+        self.conn.execute("DELETE FROM hosting_offers WHERE expires_at <= ?", params![now])?;
+        let live: Option<(String, Option<String>, i64)> = self
+            .conn
+            .query_row("SELECT token_hash, label, failures FROM hosting_offers LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        let Some((offered, label, failures)) = live else { return Ok(None) };
+        if crate::auth::hashes_agree(&offered, token_hash) {
+            self.conn.execute("DELETE FROM hosting_offers", [])?;
+            return Ok(Some(label.unwrap_or_default()));
+        }
+        if failures + 1 >= crate::database::PAIRING_GUESSES_ALLOWED {
+            self.conn.execute("DELETE FROM hosting_offers", [])?;
+        } else {
+            self.conn.execute("UPDATE hosting_offers SET failures = failures + 1", [])?;
+        }
+        Ok(None)
     }
 
     /// The hosted accounts (Stage 3).
