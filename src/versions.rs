@@ -2347,17 +2347,20 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Write or update a card. Each field that differs becomes a version;
-    /// an unchanged field writes nothing (VER-1). `revoked` is never written
-    /// here: see [`Database::revoke_device`].
+    /// Write or update the device's own card. A field with no history yet
+    /// gets a deterministic root (VER-3), the same one a peer that admits
+    /// this device writes, so the two histories are one; a field that has a
+    /// history gets an authored version when the value differs and nothing
+    /// otherwise (VER-1). `revoked` is never written here: see
+    /// [`Database::revoke_device`].
     pub fn write_device_card(&self, card: &DeviceCard) -> VoiceResult<()> {
         let id = card.device_id.as_str();
-        self.set_field(ENTITY_DEVICE, id, FIELD_NAME, &card.name, None)?;
-        self.set_field(ENTITY_DEVICE, id, FIELD_CERTIFICATE_FINGERPRINT, &card.certificate_fingerprint, None)?;
-        self.set_field(ENTITY_DEVICE, id, FIELD_ADDRESSES, &card.addresses, None)?;
-        self.set_field(ENTITY_DEVICE, id, FIELD_LISTENS, &card.listens, None)?;
-        self.set_field(ENTITY_DEVICE, id, FIELD_KEY_HASH, &card.key_hash, None)?;
-        self.set_field(ENTITY_DEVICE, id, FIELD_APPLICATION, &card.application, None)?;
+        self.init_field(ENTITY_DEVICE, id, FIELD_NAME, &card.name)?;
+        self.init_field(ENTITY_DEVICE, id, FIELD_CERTIFICATE_FINGERPRINT, &card.certificate_fingerprint)?;
+        self.init_field(ENTITY_DEVICE, id, FIELD_ADDRESSES, &card.addresses)?;
+        self.init_field(ENTITY_DEVICE, id, FIELD_LISTENS, &card.listens)?;
+        self.init_field(ENTITY_DEVICE, id, FIELD_KEY_HASH, &card.key_hash)?;
+        self.init_field(ENTITY_DEVICE, id, FIELD_APPLICATION, &card.application)?;
         if self.head_id(ENTITY_DEVICE, id, FIELD_REVOKED)?.is_none() {
             self.init_field(ENTITY_DEVICE, id, FIELD_REVOKED, "0")?;
         }
