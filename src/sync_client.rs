@@ -44,6 +44,30 @@ pub struct SyncResult {
     /// Problems that did not affect the metadata sync, e.g. a cloud storage
     /// upload that could not be completed and will be retried next time.
     pub warnings: Vec<String>,
+    /// The id of this operation, on every request of it and in every log
+    /// line on both sides (Stage 12).
+    pub request_id: String,
+    /// The peer's clock minus this device's, in seconds, when the two
+    /// differ by more than a minute; 0 otherwise.
+    pub clock_skew_seconds: i64,
+}
+
+/// A difference of clocks below this is not reported.
+pub const CLOCK_SKEW_REPORTED_SECONDS: i64 = 60;
+
+/// The sentence for a clock difference, or None below the threshold.
+pub fn clock_skew_sentence(skew_seconds: i64, peer_name: &str) -> Option<String> {
+    if skew_seconds.abs() <= CLOCK_SKEW_REPORTED_SECONDS {
+        return None;
+    }
+    let minutes = (skew_seconds.abs() + 30) / 60;
+    let relation = if skew_seconds > 0 { "behind" } else { "ahead of" };
+    Some(format!("This device's clock is {} minute{} {} {}'s", minutes, if minutes == 1 { "" } else { "s" }, relation, peer_name))
+}
+
+/// A fresh operation id: 16 hex characters, unique enough for two logs.
+pub fn new_request_id() -> String {
+    Uuid::new_v4().simple().to_string()[..16].to_string()
 }
 
 impl SyncResult {
@@ -76,7 +100,7 @@ pub struct PeerInfo {
 
 /// Page size for the cursor feed, in both directions. Pages are fetched
 /// until the peer reports the feed complete, so this only bounds one request.
-const PULL_LIMIT: i64 = 10000;
+pub const PULL_LIMIT: i64 = 10000;
 
 /// Safety cap on pages per direction per sync (10000 * 1000 changes).
 const MAX_PAGES: usize = 1000;
@@ -107,6 +131,10 @@ pub struct SyncClient {
     clients: Mutex<HashMap<String, Client>>,
     device_id: String,
     device_name: String,
+    /// The id of the operation under way (Stage 12)
+    request_id: Mutex<String>,
+    /// Changes per page of the feed, [`PULL_LIMIT`] unless lowered
+    page_size: Mutex<i64>,
 }
 
 impl SyncClient {
@@ -114,6 +142,7 @@ impl SyncClient {
     /// device's account (PAIR-5): post to its grant text with a key made for
     /// it and this device's card, then add it as a peer.
     pub async fn grant_host(&self, setup_text: &str, label: &str) -> VoiceResult<Joined> {
+        self.begin_operation();
         let setup = crate::pairing::SetupText::parse(setup_text)?;
         if !setup.grant {
             return Err(VoiceError::validation("setup text", format!("This is a code to join with, not a grant text; use 'account join' ({})", codes::SETUP_TEXT_INVALID)));
@@ -176,6 +205,11 @@ impl SyncClient {
         self.clients.lock().unwrap().clear();
         Ok(Joined { account_id, peer_id: reply.device_id, peer_name: reply.device_name, peer_url: url })
     }
+}
+
+/// The first characters of an id, for a sentence.
+fn short_id(id: &str) -> &str {
+    &id[..UUID_SHORT_LEN.min(id.len())]
 }
 
 /// What a successful join gives back.
@@ -259,7 +293,31 @@ impl SyncClient {
             clients: Mutex::new(HashMap::new()),
             device_id,
             device_name,
+            request_id: Mutex::new(String::new()),
+            page_size: Mutex::new(PULL_LIMIT),
         })
+    }
+
+    /// Lower the page size of the feed, for a test of what a cut mid-sync
+    /// leaves, or a device with little memory.
+    pub fn set_page_size(&self, changes_per_page: i64) {
+        *self.page_size.lock().unwrap() = changes_per_page.max(1);
+    }
+
+    fn page_size(&self) -> i64 {
+        *self.page_size.lock().unwrap()
+    }
+
+    /// Start an operation: a new request id for every request of it.
+    fn begin_operation(&self) -> String {
+        let id = new_request_id();
+        *self.request_id.lock().unwrap() = id.clone();
+        id
+    }
+
+    /// The id of the operation under way.
+    pub fn request_id(&self) -> String {
+        self.request_id.lock().unwrap().clone()
     }
 
     /// The HTTP client for a peer's URL (AUTH-7): plain http only to this
@@ -292,6 +350,7 @@ impl SyncClient {
     /// device over TLS pinned to the text's fingerprint, take the account id
     /// and the key it issues, and add the showing device as a peer.
     pub async fn join(&self, setup_text: &str) -> VoiceResult<Joined> {
+        self.begin_operation();
         let setup = crate::pairing::SetupText::parse(setup_text)?;
         {
             let db = self.db.lock().unwrap();
@@ -384,12 +443,21 @@ impl SyncClient {
             .header(crate::auth::HEADER_ACCOUNT, self.account_id())
             .header(crate::auth::HEADER_DEVICE, &self.device_id)
             .header("X-Device-Name", &self.device_name)
+            .header(crate::sync_protocol::HEADER_REQUEST_ID, self.request_id())
             .bearer_auth(key)
     }
 
     /// Sync with a peer: exchange database changes both ways. Files never
     /// move here; see `fetch_audio_files_after_sync` and `send_audio_files_after_sync`.
+    /// One operation, one request id.
     pub async fn sync_with_peer(&self, peer_id: &str) -> SyncResult {
+        self.begin_operation();
+        self.sync_within_operation(peer_id).await
+    }
+
+    /// The sync itself, under the request id of the operation under way
+    /// (a deliver or an exchange begins one and then moves files under it).
+    async fn sync_within_operation(&self, peer_id: &str) -> SyncResult {
         let peer = {
             let config = self.config.lock().unwrap();
             config.get_peer(peer_id).cloned()
@@ -397,19 +465,27 @@ impl SyncClient {
 
         let peer = match peer {
             Some(p) => p,
-            None => return SyncResult::failure(format!("Unknown peer: {}", peer_id)),
+            None => return self.failed(format!("Unknown peer: {}", peer_id)),
         };
 
         let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
+        result.request_id = self.request_id();
 
         // Step 1: Handshake, and find where we stand with this peer
         let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
-            Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
+            Err(e) => return self.failed(format!("Handshake failed: {}", e)),
         };
         if let Err(sentence) = self.check_account(peer_id, &handshake) {
-            return SyncResult::failure(sentence);
+            return self.failed(sentence);
+        }
+        if handshake.server_timestamp != 0 {
+            let skew = handshake.server_timestamp - Utc::now().timestamp();
+            if let Some(sentence) = clock_skew_sentence(skew, &peer.peer_name) {
+                result.clock_skew_seconds = skew;
+                result.warnings.push(sentence);
+            }
         }
         let cursors = self.peer_cursors(peer_id, &handshake, &mut result);
 
@@ -441,8 +517,130 @@ impl SyncClient {
         result
     }
 
+    /// **Check the connection** to a peer (Stage 12): one row per thing
+    /// that can be wrong, each with its refusal code, instead of a log
+    /// search. Nothing is changed by a check.
+    pub async fn check(&self, peer_id: &str) -> Vec<crate::sync_protocol::CheckRow> {
+        use crate::sync_protocol::CheckRow;
+        fn row(name: &str, passed: bool, detail: impl Into<String>, code: &str) -> CheckRow {
+            CheckRow { name: name.to_string(), passed, detail: detail.into(), code: code.to_string() }
+        }
+        self.begin_operation();
+        let mut rows = Vec::new();
+        let peer = {
+            let config = self.config.lock().unwrap();
+            config.get_peer(peer_id).cloned()
+        };
+        let Some(peer) = peer else {
+            rows.push(row("Peer", false, format!("No peer {} is remembered on this device", short_id(peer_id)), ""));
+            return rows;
+        };
+        let pinned = {
+            let config = self.config.lock().unwrap();
+            config.get_peer(peer_id).and_then(|p| p.certificate_fingerprint.clone()).unwrap_or_default()
+        };
+        let https = peer.peer_url.starts_with("https://");
+
+        // 1. Reachable, and the certificate: one request without a key
+        let client = match self.client_for(&peer.peer_url) {
+            Ok(c) => c,
+            Err(e) => {
+                rows.push(row("Reachable", false, e.to_string(), codes::TLS_REQUIRED));
+                return rows;
+            }
+        };
+        match client.get(format!("{}/sync/status", peer.peer_url.trim_end_matches('/'))).timeout(Duration::from_secs(10)).send().await {
+            Ok(response) if response.status().is_success() => {
+                let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+                let name = body.get("device_name").and_then(|v| v.as_str()).unwrap_or("?");
+                let id = body.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+                rows.push(row("Reachable", true, format!("{} answers at {}", name, peer.peer_url), ""));
+                if !id.is_empty() && id != peer_id {
+                    rows.push(row("Device", false, format!("The device at {} is {}, not {}", peer.peer_url, short_id(id), short_id(peer_id)), codes::DEVICE_MISMATCH));
+                }
+                if https {
+                    rows.push(row("Certificate", true, if pinned.is_empty() { "Verified by the system's root certificates".to_string() } else { "The pinned fingerprint matches".to_string() }, ""));
+                } else {
+                    rows.push(row("Certificate", true, "Plain http on this machine itself; no certificate", ""));
+                }
+            }
+            Ok(response) => {
+                rows.push(row("Reachable", false, format!("{} answered with status {}", peer.peer_url, response.status()), ""));
+                return rows;
+            }
+            Err(e) => {
+                let sentence = describe(&e);
+                let certificate = sentence.to_lowercase().contains("certificate") || sentence.to_lowercase().contains("fingerprint");
+                if certificate {
+                    rows.push(row("Reachable", true, format!("Something answers at {}", peer.peer_url), ""));
+                    rows.push(row("Certificate", false, sentence, codes::CERTIFICATE_MISMATCH));
+                } else {
+                    rows.push(row("Reachable", false, format!("{} does not answer: {}", peer.peer_url, sentence), ""));
+                }
+                return rows;
+            }
+        }
+
+        // 2. Account and key: the handshake, which is refused with a code
+        match self.handshake(&peer.peer_url).await {
+            Ok(handshake) => {
+                let own = self.account_id();
+                if handshake.account_id == own {
+                    rows.push(row("Account", true, format!("The peer holds account {}", short_id(&own)), ""));
+                } else {
+                    rows.push(row("Account", false, format!("The peer holds account {}, this device {}", short_id(&handshake.account_id), short_id(&own)), codes::ACCOUNT_MISMATCH));
+                }
+                rows.push(row("Key", true, "This device's key is accepted", ""));
+                if handshake.server_timestamp != 0 {
+                    let skew = handshake.server_timestamp - Utc::now().timestamp();
+                    match clock_skew_sentence(skew, &peer.peer_name) {
+                        Some(sentence) => rows.push(row("Clock", false, sentence, "")),
+                        None => rows.push(row("Clock", true, "The clocks agree to within a minute", "")),
+                    }
+                }
+                if handshake.free_bytes > 0 {
+                    let low = handshake.free_bytes < crate::transfer::FREE_SPACE_MARGIN;
+                    rows.push(row("Free space there", !low, format!("{} MB free on {}", handshake.free_bytes / (1024 * 1024), peer.peer_name), ""));
+                }
+                rows.push(row("Recordings there", true, if handshake.supports_audiofiles { "The peer serves recordings" } else { "The peer serves notes only; no audio directory is configured there" }, ""));
+            }
+            Err(e) => {
+                let sentence = e.to_string();
+                let code = [codes::ACCOUNT_MISMATCH, codes::ACCOUNT_UNKNOWN, codes::ACCOUNT_MISSING, codes::ACCOUNT_DISAGREES]
+                    .into_iter()
+                    .find(|c| sentence.contains(c));
+                match code {
+                    Some(code) => rows.push(row("Account", false, sentence, code)),
+                    None => {
+                        let code = [codes::DEVICE_UNKNOWN, codes::DEVICE_REVOKED, codes::KEY_WRONG, codes::KEY_MISSING, codes::DEVICE_MISMATCH]
+                            .into_iter()
+                            .find(|c| sentence.contains(c))
+                            .unwrap_or("");
+                        rows.push(row("Key", false, sentence, code));
+                    }
+                }
+            }
+        }
+
+        // 3. This side
+        let here = self.audio_directory().unwrap_or_else(|| self.config.lock().unwrap().config_dir().to_path_buf());
+        let free = crate::transfer::free_space(&here);
+        rows.push(row("Free space here", free >= crate::transfer::FREE_SPACE_MARGIN, format!("{} MB free on this device", free / (1024 * 1024)), ""));
+        #[cfg(feature = "server")]
+        rows.push(row("Listener here", true, if crate::sync_server::server_running() { "This device is listening" } else { "This device is not listening; the peer cannot start an operation towards it" }, ""));
+        rows
+    }
+
+    /// A failure that carries the id of the operation under way.
+    fn failed(&self, sentence: String) -> SyncResult {
+        let mut result = SyncResult::failure(sentence);
+        result.request_id = self.request_id();
+        result
+    }
+
     /// Pull changes from a peer (one-way)
     pub async fn pull_from_peer(&self, peer_id: &str) -> SyncResult {
+        self.begin_operation();
         let peer = {
             let config = self.config.lock().unwrap();
             config.get_peer(peer_id).cloned()
@@ -450,18 +648,19 @@ impl SyncClient {
 
         let peer = match peer {
             Some(p) => p,
-            None => return SyncResult::failure(format!("Unknown peer: {}", peer_id)),
+            None => return self.failed(format!("Unknown peer: {}", peer_id)),
         };
 
         let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
+        result.request_id = self.request_id();
 
         let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
-            Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
+            Err(e) => return self.failed(format!("Handshake failed: {}", e)),
         };
         if let Err(sentence) = self.check_account(peer_id, &handshake) {
-            return SyncResult::failure(sentence);
+            return self.failed(sentence);
         }
         let cursors = self.peer_cursors(peer_id, &handshake, &mut result);
 
@@ -484,6 +683,7 @@ impl SyncClient {
 
     /// Push changes to a peer (one-way)
     pub async fn push_to_peer(&self, peer_id: &str) -> SyncResult {
+        self.begin_operation();
         let peer = {
             let config = self.config.lock().unwrap();
             config.get_peer(peer_id).cloned()
@@ -491,18 +691,19 @@ impl SyncClient {
 
         let peer = match peer {
             Some(p) => p,
-            None => return SyncResult::failure(format!("Unknown peer: {}", peer_id)),
+            None => return self.failed(format!("Unknown peer: {}", peer_id)),
         };
 
         let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
+        result.request_id = self.request_id();
 
         let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
-            Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
+            Err(e) => return self.failed(format!("Handshake failed: {}", e)),
         };
         if let Err(sentence) = self.check_account(peer_id, &handshake) {
-            return SyncResult::failure(sentence);
+            return self.failed(sentence);
         }
         let cursors = self.peer_cursors(peer_id, &handshake, &mut result);
         let local_end = self.local_seq();
@@ -529,6 +730,7 @@ impl SyncClient {
     /// dataset from a peer rather than incremental changes. Afterwards the
     /// cursors point at the end of both feeds, so the next sync is incremental.
     pub async fn initial_sync(&self, peer_id: &str) -> SyncResult {
+        self.begin_operation();
         let peer = {
             let config = self.config.lock().unwrap();
             config.get_peer(peer_id).cloned()
@@ -536,19 +738,20 @@ impl SyncClient {
 
         let peer = match peer {
             Some(p) => p,
-            None => return SyncResult::failure(format!("Unknown peer: {}", peer_id)),
+            None => return self.failed(format!("Unknown peer: {}", peer_id)),
         };
 
         let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
+        result.request_id = self.request_id();
 
         // Step 1: Handshake
         let handshake = match self.handshake(peer_url).await {
             Ok(h) => h,
-            Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
+            Err(e) => return self.failed(format!("Handshake failed: {}", e)),
         };
         if let Err(sentence) = self.check_account(peer_id, &handshake) {
-            return SyncResult::failure(sentence);
+            return self.failed(sentence);
         }
 
         // Step 2: Pull the peer's whole feed from the beginning, page by
@@ -727,7 +930,7 @@ impl SyncClient {
         for _ in 0..MAX_PAGES {
             let (changes, next, complete) = {
                 let db = self.db.lock().unwrap();
-                match db.get_changes_after_seq_as_sync_changes(sent, Some(upto), PULL_LIMIT) {
+                match db.get_changes_after_seq_as_sync_changes(sent, Some(upto), self.page_size()) {
                     Ok(page) => page,
                     Err(e) => {
                         errors.push(format!("Failed to get local changes: {}", e));
@@ -940,7 +1143,7 @@ impl SyncClient {
     /// One page of the peer's feed after `cursor`. Returns what was applied,
     /// the cursor to continue from, and whether the feed is exhausted.
     async fn pull_page(&self, peer_url: &str, peer_id: &str, peer_name: &str, cursor: i64) -> VoiceResult<(PullOutcome, i64, bool)> {
-        let url = format!("{}/sync/changes?cursor={}&limit={}", peer_url, cursor, PULL_LIMIT);
+        let url = format!("{}/sync/changes?cursor={}&limit={}", peer_url, cursor, self.page_size());
 
         let response = self
             .authed(self.client_for(peer_url)?.get(&url))
@@ -1373,18 +1576,21 @@ impl SyncClient {
 
     /// **Send** alone, or **fetch** alone, without a sync.
     pub async fn send_to_peer(&self, peer_id: &str) -> SyncResult {
+        self.begin_operation();
         let mut result = SyncResult::success();
         self.move_files(peer_id, &mut result, true, false).await;
         result
     }
 
     pub async fn fetch_from_peer(&self, peer_id: &str) -> SyncResult {
+        self.begin_operation();
         let mut result = SyncResult::success();
         self.move_files(peer_id, &mut result, false, true).await;
         result
     }
 
     async fn move_files(&self, peer_id: &str, result: &mut SyncResult, send: bool, fetch: bool) {
+        result.request_id = self.request_id();
         let Some(peer_url) = self.peer_url_of(peer_id) else {
             result.errors.push(format!("Unknown peer: {}", peer_id));
             result.success = false;
@@ -1710,6 +1916,23 @@ pub async fn sync_all_peers(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_clock_difference_is_a_sentence_only_past_a_minute() {
+        assert_eq!(clock_skew_sentence(59, "Desk"), None);
+        assert_eq!(clock_skew_sentence(-60, "Desk"), None);
+        assert_eq!(clock_skew_sentence(250, "Desk").unwrap(), "This device's clock is 4 minutes behind Desk's");
+        assert_eq!(clock_skew_sentence(-61, "Desk").unwrap(), "This device's clock is 1 minute ahead of Desk's");
+    }
+
+    #[test]
+    fn a_request_id_is_sixteen_hex_characters_and_never_repeats() {
+        let a = new_request_id();
+        let b = new_request_id();
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 
     fn create_test_db_and_config() -> (Arc<Mutex<Database>>, Arc<Mutex<Config>>, TempDir) {
         let temp_dir = TempDir::new().unwrap();

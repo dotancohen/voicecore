@@ -45,6 +45,13 @@ pub fn file_sha256(path: &Path) -> VoiceResult<String> {
     Ok(hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect())
 }
 
+/// The bytes free on the disk that holds `dir` (its parent when it does
+/// not exist yet), or 0 when the answer cannot be had.
+pub fn free_space(dir: &Path) -> u64 {
+    let probe = if dir.exists() { dir.to_path_buf() } else { dir.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")) };
+    fs4::available_space(&probe).unwrap_or(0)
+}
+
 /// Refuse to write `needed` bytes into `dir` when the disk would be left
 /// with less than the margin (FILE-14). The sentence names both numbers.
 pub fn check_free_space(dir: &Path, needed: u64) -> VoiceResult<()> {

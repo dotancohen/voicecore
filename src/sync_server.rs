@@ -34,8 +34,9 @@ use crate::models::{audio_local_path, SyncChange};
 use crate::sync_protocol::{
     codes, ApplyRequest, ApplyResponse, ChangesQuery, ChangesResponse, ErrorResponse, HandshakeRequest,
     HandshakeResponse, MissingFilesRequest, MissingFilesResponse, PairClaimRequest, PairClaimResponse, PairGrantRequest,
-    PairGrantResponse, StatusResponse, HEADER_FILE_SHA256, PROTOCOL_VERSION,
+    PairGrantResponse, StatusResponse, HEADER_FILE_SHA256, HEADER_REQUEST_ID, PROTOCOL_VERSION,
 };
+use tracing::Instrument;
 use crate::UUID_SHORT_LEN;
 
 /// The running listener's shutdown handle; replaced by every start, taken
@@ -237,6 +238,7 @@ fn audit(path: &std::path::Path, line: &str) {
 fn audit_request(
     state: &AppState,
     account: Option<&AccountHandle>,
+    request_id: &str,
     device: Option<&str>,
     method: &str,
     path: &str,
@@ -255,8 +257,9 @@ fn audit_request(
         .unwrap_or_else(|| "-".to_string());
     let outcome = response.status().as_u16();
     let line = format!(
-        "{} {} {} {} in={} out={} {} {}",
+        "{} {} {} {} {} in={} out={} {} {}",
         Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        request_id,
         device.unwrap_or("-"),
         method,
         path,
@@ -465,6 +468,8 @@ async fn require_device(
     let device = header(headers, auth::HEADER_DEVICE).map(str::to_string);
     let key = bearer(headers).map(str::to_string);
     let handle = account.as_deref().filter(|a| !a.is_empty()).and_then(|a| state.accounts.account(a));
+    let request_id = crate::sync_protocol::request_id_or_dash(header(headers, HEADER_REQUEST_ID));
+    let span = tracing::info_span!("request", id = %request_id, device = %device.as_deref().map(short).unwrap_or("-"));
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
     let bytes_in = headers
@@ -492,12 +497,13 @@ async fn require_device(
             let mut request = request;
             let handle = handle.expect("verified requests have an account");
             request.extensions_mut().insert(handle.clone());
-            let response = next.run(request).await;
-            audit_request(&state, Some(&handle), device.as_deref(), &method, &path, bytes_in, &response, "");
+            let response = next.run(request).instrument(span).await;
+            audit_request(&state, Some(&handle), &request_id, device.as_deref(), &method, &path, bytes_in, &response, "");
             response
         }
         Err(refusal) => {
             let delay = note_failure(&state, addr.ip());
+            let _entered = span.enter();
             tracing::warn!(
                 "Refused {} from {} for device {}: {}",
                 request.uri().path(),
@@ -513,7 +519,7 @@ async fn require_device(
                 Json(ErrorResponse::with_code(refusal.sentence, refusal.code)),
             )
                 .into_response();
-            audit_request(&state, handle.as_ref(), device.as_deref(), &method, &path, bytes_in, &response, refusal.code);
+            audit_request(&state, handle.as_ref(), &request_id, device.as_deref(), &method, &path, bytes_in, &response, refusal.code);
             response
         }
     }
@@ -614,10 +620,11 @@ async fn handshake(
     let last_sync = get_peer_last_sync(&account.db, &request.device_id);
     tracing::debug!("Last sync with this peer: {:?}", last_sync);
 
-    // Check if audiofile_directory is configured
-    let supports_audiofiles = {
-        let config = account.config.lock().ok();
-        config.map(|c| c.audiofile_directory().is_some()).unwrap_or(false)
+    // Whether recordings are served, and how much room the disk has
+    let (supports_audiofiles, free_bytes) = {
+        let config = account.config.lock().unwrap();
+        let dir = config.audiofile_directory().map(std::path::PathBuf::from).unwrap_or_else(|| config.config_dir().to_path_buf());
+        (config.audiofile_directory().is_some(), crate::transfer::free_space(&dir))
     };
 
     let (database_id, cursor) = {
@@ -633,6 +640,7 @@ async fn handshake(
         last_sync_timestamp: last_sync,
         server_timestamp: Utc::now().timestamp(),
         supports_audiofiles,
+        free_bytes,
         database_id,
         cursor,
     };
@@ -1318,7 +1326,9 @@ pub fn create_router_for(accounts: Arc<dyn AccountSource>, machine: Arc<Mutex<Co
 
     let authenticated = Router::new()
         .route("/sync/handshake", post(handshake))
-        .route("/sync/changes", get(get_changes))
+        // The feed is compressed when the caller accepts it (Stage 12); the
+        // file routes never are, a recording is compressed already
+        .route("/sync/changes", get(get_changes).layer(tower_http::compression::CompressionLayer::new().gzip(true)))
         .route("/sync/apply", post(apply_changes))
         .route("/sync/full", get(get_full_sync))
         .route("/sync/audio/missing", post(missing_audio_files))
@@ -2046,7 +2056,9 @@ mod tests {
             // The holder delivers to the server
             let result = desk_client.sync_with_peer(&server_id).await;
             assert!(result.success, "{:?}", result.errors);
+            assert_eq!(result.request_id.len(), 16, "the operation has an id");
             assert_eq!(hosted.db.lock().unwrap().get_all_notes().unwrap().len(), 1);
+            let sync_request_id = result.request_id.clone();
             let server_card = desk.db.lock().unwrap().get_device_card(&server_id).unwrap().unwrap();
             assert_eq!(server_card.listens, "1", "after a sync the desk knows the server listens");
             assert!(server_card.addresses.contains(&url), "{}", server_card.addresses);
@@ -2072,7 +2084,8 @@ mod tests {
 
             // The audit log names the devices and the routes, never a key
             let audit = std::fs::read_to_string(index.directory(&account).join("audit.log")).unwrap();
-            assert!(audit.contains(&format!("{} POST /sync/handshake in=", desk.id)), "{}", audit);
+            assert!(audit.contains(&format!("{} {} POST /sync/handshake in=", sync_request_id, desk.id)), "{}", audit);
+            assert!(audit.contains(&format!("{} {} GET /sync/changes", sync_request_id, desk.id)), "the same id on every request of the operation: {}", audit);
             assert!(audit.contains(&format!("{} GET /sync/changes", phone.id)), "{}", audit);
             assert!(!audit.contains(desk.config.lock().unwrap().device_key()));
             assert!(!audit.contains("מהטלפון"));
@@ -2149,6 +2162,192 @@ mod tests {
             };
             let response = reqwest::Client::new().post(format!("{}/pair/grant", url)).json(&grant).send().await.unwrap();
             assert_eq!(response.status(), 403, "no token was ever offered");
+            task.abort();
+        }
+    }
+
+    mod robustness {
+        use super::*;
+        use crate::auth;
+        use crate::config::Config;
+        use crate::sync_client::SyncClient;
+        use crate::sync_protocol::codes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Device {
+            db: Arc<Mutex<Database>>,
+            config: Arc<Mutex<Config>>,
+            id: String,
+            _dir: TempDir,
+        }
+
+        fn device(name: &str) -> Device {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new(dir.path().join("notes.db")).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            config.set_device_name(name).unwrap();
+            auth::ensure_own_device_card(&db, &mut config).unwrap();
+            let id = config.device_id_hex().to_string();
+            Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
+        }
+
+        /// Two devices of one account, mutually admitted; B served plain
+        /// http through `wrap`, which may add a layer to the router.
+        fn pair(wrap: impl FnOnce(Router) -> Router) -> (Device, Device, String, tokio::task::JoinHandle<()>) {
+            let a = device("A");
+            let b = device("B");
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            b.db.lock().unwrap().move_to_account(&account).unwrap();
+            let card_a = a.db.lock().unwrap().get_device_card(&a.id).unwrap().unwrap();
+            let card_b = b.db.lock().unwrap().get_device_card(&b.id).unwrap().unwrap();
+            a.db.lock().unwrap().admit_device_card(&card_b).unwrap();
+            b.db.lock().unwrap().admit_device_card(&card_a).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let router = wrap(create_router(b.db.clone(), b.config.clone())).into_make_service_with_connect_info::<SocketAddr>();
+            let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
+            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            (a, b, url, task)
+        }
+
+        /// A page is committed before the next is requested: when the
+        /// connection dies mid-sync, the cursor stands at the end of the
+        /// last page applied, and the next sync continues from there.
+        #[tokio::test]
+        async fn a_sync_cut_after_the_first_page_keeps_that_page_and_continues_next_time() {
+            let feed_requests = Arc::new(AtomicUsize::new(0));
+            let counter = feed_requests.clone();
+            let (a, b, _url, task) = pair(move |router| {
+                router.layer(middleware::from_fn(move |request: Request, next: Next| {
+                    let counter = counter.clone();
+                    async move {
+                        if request.uri().path() == "/sync/changes" && counter.fetch_add(1, Ordering::SeqCst) == 1 {
+                            // The second page never arrives
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        next.run(request).await
+                    }
+                }))
+            });
+            // Several pages of changes on B: cards and a tag first, then notes
+            let page = 40;
+            let total = 43;
+            {
+                let db = b.db.lock().unwrap();
+                for i in 0..total {
+                    db.create_note(&format!("note {}", i)).unwrap();
+                }
+            }
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            client.set_page_size(page as i64);
+            let first = client.sync_with_peer(&b.id).await;
+            assert!(!first.success, "the cut is an error, not silence");
+            assert!(first.pulled > 0, "the first page was applied");
+            let notes_after_cut = a.db.lock().unwrap().get_all_notes().unwrap().len();
+            assert!(notes_after_cut > 0 && notes_after_cut < total, "{} of {} notes arrived before the cut", notes_after_cut, total);
+            let (received, _sent, _) = a.db.lock().unwrap().get_peer_cursors(&b.id).unwrap();
+            assert!(received > 0, "the first page's cursor was saved");
+
+            let second = client.sync_with_peer(&b.id).await;
+            assert!(second.success, "{:?}", second.errors);
+            assert_eq!(a.db.lock().unwrap().get_all_notes().unwrap().len(), total, "nothing was lost");
+
+            // B's feed, split at the cursor the cut left: the notes A had
+            // after the cut are exactly the notes of the part before it, and
+            // the second run asked only for the part after it
+            let (notes_before, after) = {
+                let db = b.db.lock().unwrap();
+                let before = db.get_changes_after_seq_as_sync_changes(0, Some(received), 100_000).unwrap().0;
+                let after = db.get_changes_after_seq_as_sync_changes(received, None, 100_000).unwrap().0;
+                let notes: std::collections::HashSet<&str> = before.iter().filter(|c| c.entity_type == "note").map(|c| c.entity_id.as_str()).collect();
+                (notes.len(), after.iter().filter(|c| c.device_id != a.id).count() as i64)
+            };
+            assert_eq!(notes_after_cut, notes_before, "the page before the cut was applied whole, and nothing past it");
+            let (final_cursor, _, _) = a.db.lock().unwrap().get_peer_cursors(&b.id).unwrap();
+            assert!(final_cursor > received, "the cursor moved on");
+            let requests = feed_requests.load(Ordering::SeqCst) as i64;
+            let whole_feed_pages = (received + after + page as i64 - 1) / page as i64 + 1;
+            let pages_after = after / page as i64 + 1;
+            assert!(requests <= 1 + 1 + pages_after, "one page, the cut, then the rest from the saved cursor: {} requests for {} changes after the cut, {} pages", requests, after, pages_after);
+            assert!(1 + 1 + pages_after < 1 + 1 + whole_feed_pages, "the bound tells a restart from zero apart");
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn the_feed_is_gzipped_when_the_caller_accepts_it_and_plain_otherwise() {
+            let (a, b, url, task) = pair(|r| r);
+            {
+                let db = b.db.lock().unwrap();
+                for i in 0..200 {
+                    db.create_note(&format!("a note with enough text to be worth compressing, number {}", i)).unwrap();
+                }
+            }
+            let key = a.config.lock().unwrap().device_key().to_string();
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            let raw = reqwest::Client::builder().no_gzip().build().unwrap();
+            let response = raw
+                .get(format!("{}/sync/changes?cursor=0&limit=1000", url))
+                .header(auth::HEADER_ACCOUNT, &account)
+                .header(auth::HEADER_DEVICE, &a.id)
+                .header("accept-encoding", "gzip")
+                .bearer_auth(&key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers().get("content-encoding").map(|v| v.to_str().unwrap()), Some("gzip"));
+            let compressed = response.bytes().await.unwrap().len();
+            let response = raw
+                .get(format!("{}/sync/changes?cursor=0&limit=1000", url))
+                .header(auth::HEADER_ACCOUNT, &account)
+                .header(auth::HEADER_DEVICE, &a.id)
+                .bearer_auth(&key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.headers().get("content-encoding"), None);
+            let plain = response.bytes().await.unwrap().len();
+            assert!(compressed * 4 < plain, "gzip: {} bytes, plain: {}", compressed, plain);
+
+            // The ordinary client understands it: a sync brings every note
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let result = client.sync_with_peer(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(a.db.lock().unwrap().get_all_notes().unwrap().len(), 200);
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_connection_check_names_what_passes_and_what_is_refused() {
+            let (a, b, url, task) = pair(|r| r);
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let rows = client.check(&b.id).await;
+            let by_name = |name: &str| rows.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("no row {} in {:?}", name, rows));
+            assert!(by_name("Reachable").passed, "{:?}", rows);
+            assert!(by_name("Certificate").passed);
+            assert!(by_name("Account").passed);
+            assert!(by_name("Key").passed);
+            assert!(by_name("Clock").passed);
+            assert!(by_name("Free space here").passed);
+            assert!(by_name("Free space there").passed);
+            assert!(by_name("Listener here").detail.contains("not listening"));
+
+            // A stranger of the same account: reachable, but its key is unknown there
+            let stranger = device("Stranger");
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            stranger.db.lock().unwrap().move_to_account(&account).unwrap();
+            stranger.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            let rows = SyncClient::new(stranger.db.clone(), stranger.config.clone()).unwrap().check(&b.id).await;
+            let key = rows.iter().find(|r| r.name == "Key").unwrap();
+            assert!(!key.passed);
+            assert_eq!(key.code, codes::DEVICE_UNKNOWN);
+
+            // Nobody at the address
+            stranger.config.lock().unwrap().add_peer("00000000000070008000000000000001", "Nobody", "http://127.0.0.1:1", None, true).unwrap();
+            let rows = SyncClient::new(stranger.db.clone(), stranger.config.clone()).unwrap().check("00000000000070008000000000000001").await;
+            assert_eq!(rows.len(), 1);
+            assert!(!rows[0].passed && rows[0].name == "Reachable", "{:?}", rows);
             task.abort();
         }
     }

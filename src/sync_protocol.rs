@@ -72,6 +72,10 @@ pub struct HandshakeResponse {
     pub server_timestamp: i64,
     #[serde(default)]
     pub supports_audiofiles: bool,
+    /// Bytes free on the responder's disk, for the connection check (Stage
+    /// 12); 0 when unknown.
+    #[serde(default)]
+    pub free_bytes: u64,
     /// Identity of the responder's database; a change means the peer must
     /// forget its cursors.
     #[serde(default)]
@@ -212,6 +216,30 @@ pub struct MissingFilesResponse {
 /// The header a sender puts the whole file's hex SHA-256 in, so the
 /// receiver can verify what it assembled (FILE-13).
 pub const HEADER_FILE_SHA256: &str = "x-file-sha256";
+
+/// One id per operation (a button press), sent on every request of it and
+/// written in every log line on both sides (Stage 12).
+pub const HEADER_REQUEST_ID: &str = "x-request-id";
+
+/// The shape of a request id: up to 32 characters of hex, made by the
+/// initiator. Anything else is replaced by "-" in the logs.
+pub fn request_id_or_dash(value: Option<&str>) -> String {
+    match value {
+        Some(v) if !v.is_empty() && v.len() <= 32 && v.chars().all(|c| c.is_ascii_hexdigit()) => v.to_string(),
+        _ => "-".to_string(),
+    }
+}
+
+/// One row of a connection check (Stage 12): what was checked, whether it
+/// passed, a sentence, and the refusal code when there is one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckRow {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+    #[serde(default)]
+    pub code: String,
+}
 
 /// `GET /sync/status` response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]

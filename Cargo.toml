@@ -39,7 +39,7 @@ serde_json = "1.0"
 uuid = { version = "1.11", features = ["v7", "v4", "serde"] }
 
 # HTTP client - base config (TLS features added per-platform below)
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "gzip"] }
 
 # Cloud storage (optional - file-storage feature)
 # rust-s3 is much lighter than aws-sdk-s3 and needs no native C build.
@@ -52,7 +52,7 @@ axum = { version = "0.7", features = ["json"], optional = true }
 # HTTPS for the server; the crypto provider is the one rustls is built with below
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
 tower = { version = "0.5", optional = true }
-tower-http = { version = "0.6", features = ["cors"], optional = true }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip"], optional = true }
 # Streaming a recording in and out of the server without holding it in memory
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 
@@ -116,11 +116,11 @@ uniffi = { version = "0.28", features = ["build"] }
 
 # Desktop (Linux, macOS, Windows): use aws-lc (default, better performance)
 [target.'cfg(not(target_os = "android"))'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "gzip", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 
 # Android: use ring (better cross-compilation support). "rustls-tls" bundles the
 # Mozilla root certificates, which Android does not expose to rustls otherwise.
 [target.'cfg(target_os = "android")'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "gzip", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

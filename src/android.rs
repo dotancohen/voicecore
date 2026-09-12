@@ -199,6 +199,19 @@ pub struct SyncResultData {
     pub error_message: Option<String>,
     /// Non-fatal problems, e.g. a cloud upload that will be retried next sync
     pub warnings: Vec<String>,
+    /// The id of the operation, on every request of it and in both logs
+    pub request_id: String,
+    /// The peer's clock minus this phone's, in seconds, past a minute; else 0
+    pub clock_skew_seconds: i64,
+}
+
+/// One row of a connection check (Stage 12)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CheckRowData {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+    pub code: String,
 }
 
 /// Configuration for sync server connection
@@ -391,6 +404,8 @@ impl VoiceClient {
                 Some(result.errors.join("; "))
             },
             warnings: result.warnings,
+            request_id: result.request_id,
+            clock_skew_seconds: result.clock_skew_seconds,
         })
     }
 
@@ -433,6 +448,18 @@ impl VoiceClient {
             peer_url: joined.peer_url,
             granted: false,
         })
+    }
+
+    /// Check the connection to a peer (Stage 12): one row per thing that
+    /// can be wrong, each with its refusal code. Nothing is changed.
+    pub fn check_connection(&self, peer_id: String) -> Result<Vec<CheckRowData>, VoiceCoreError> {
+        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
+        let rows = rt.block_on(sync_client.check(&peer_id));
+        Ok(rows.into_iter().map(|r| CheckRowData { name: r.name, passed: r.passed, detail: r.detail, code: r.code }).collect())
     }
 
     /// Use a setup text (Stage 9): a code shown by a device that holds the
@@ -608,6 +635,8 @@ impl VoiceClient {
             bytes_moved: result.bytes_moved,
             error_message: if result.errors.is_empty() { None } else { Some(result.errors.join("; ")) },
             warnings: result.warnings,
+            request_id: result.request_id,
+            clock_skew_seconds: result.clock_skew_seconds,
         })
     }
 
@@ -683,6 +712,8 @@ impl VoiceClient {
                 Some(result.errors.join("; "))
             },
             warnings: result.warnings,
+            request_id: result.request_id,
+            clock_skew_seconds: result.clock_skew_seconds,
         })
     }
 
