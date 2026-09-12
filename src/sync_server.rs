@@ -28,7 +28,7 @@ use crate::database::Database;
 use crate::error::VoiceResult;
 use crate::models::SyncChange;
 use crate::sync_protocol::{
-    ApplyRequest, ApplyResponse, ChangesQuery, ChangesResponse, ErrorResponse, HandshakeRequest,
+    codes, ApplyRequest, ApplyResponse, ChangesQuery, ChangesResponse, ErrorResponse, HandshakeRequest,
     HandshakeResponse, StatusResponse, PROTOCOL_VERSION,
 };
 use crate::UUID_SHORT_LEN;
@@ -43,6 +43,11 @@ struct AppState {
     config: Arc<Mutex<Config>>,
     device_id: String,
     device_name: String,
+}
+
+/// The first characters of an id, for a sentence.
+fn short(id: &str) -> &str {
+    &id[..UUID_SHORT_LEN.min(id.len())]
 }
 
 // Route handlers
@@ -63,11 +68,60 @@ async fn handshake(
         tracing::warn!("Invalid device_id format: {}", request.device_id);
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Invalid device_id format".to_string(),
-            }),
+            Json(ErrorResponse::new("Invalid device_id format".to_string())),
         )
             .into_response();
+    }
+
+    // The account check (ACCT-2, ACCT-3): the two sides must hold the same
+    // account, or nothing is exchanged. Never adopts, never corrects.
+    let own_account = {
+        let db = state.db.lock().unwrap();
+        db.account_id().unwrap_or_default()
+    };
+    if request.account_id.is_empty() {
+        tracing::warn!("Handshake from {} named no account", short(&request.device_id));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::with_code(
+                format!("The handshake named no account ({})", codes::ACCOUNT_MISSING),
+                codes::ACCOUNT_MISSING,
+            )),
+        )
+            .into_response();
+    }
+    if request.account_id != own_account {
+        tracing::warn!(
+            "Refused {}: it holds account {}, this device holds {}",
+            short(&request.device_id),
+            short(&request.account_id),
+            short(&own_account)
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::with_code(
+                format!(
+                    "This device holds account {}, not {}; nothing was exchanged ({})",
+                    short(&own_account),
+                    short(&request.account_id),
+                    codes::ACCOUNT_MISMATCH
+                ),
+                codes::ACCOUNT_MISMATCH,
+            )),
+        )
+            .into_response();
+    }
+
+    // A handshake starts a peer's operation, and what it applies afterwards
+    // must be undoable (SNAP-3).
+    {
+        let db = state.db.lock().unwrap();
+        if let Err(e) = db.snapshot_before("handshake") {
+            tracing::warn!("Could not take a snapshot before the handshake: {}", e);
+        }
+        if let Err(e) = db.set_peer_account_id(&request.device_id, Some(&request.device_name), &request.account_id) {
+            tracing::warn!("Could not record the peer's account: {}", e);
+        }
     }
 
     // Get last sync timestamp for this peer
@@ -89,6 +143,7 @@ async fn handshake(
         device_id: state.device_id.clone(),
         device_name: state.device_name.clone(),
         protocol_version: PROTOCOL_VERSION.to_string(),
+        account_id: own_account,
         last_sync_timestamp: last_sync,
         server_timestamp: Utc::now().timestamp(),
         supports_audiofiles,
@@ -127,9 +182,7 @@ async fn get_changes(
                 tracing::error!("Failed to get changes: {}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
+                    Json(ErrorResponse::new(e.to_string())),
                 )
                     .into_response();
             }
@@ -187,9 +240,7 @@ async fn apply_changes(
         tracing::warn!("Invalid device_id format: {}", request.device_id);
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Invalid device_id format".to_string(),
-            }),
+            Json(ErrorResponse::new("Invalid device_id format".to_string())),
         )
             .into_response();
     }
@@ -208,9 +259,7 @@ async fn apply_changes(
             tracing::error!("Failed to apply changes: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
+                Json(ErrorResponse::new(e.to_string())),
             )
                 .into_response();
         }
@@ -249,9 +298,7 @@ async fn get_full_sync(State(state): State<AppState>) -> impl IntoResponse {
             tracing::error!("Failed to get full dataset: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
+                Json(ErrorResponse::new(e.to_string())),
             )
                 .into_response();
         }
@@ -793,6 +840,112 @@ mod tests {
         let db_path = temp_dir.path().join("test.db");
         let db = Database::new(db_path.to_str().unwrap()).unwrap();
         (db, temp_dir)
+    }
+
+    mod account_identity {
+        use super::*;
+        use axum::extract::{Json, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use crate::config::Config;
+        use crate::sync_client::SyncClient;
+
+        fn state_for(db: Database, dir: &TempDir) -> AppState {
+            let config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let device_id = config.device_id_hex().to_string();
+            AppState {
+                db: Arc::new(Mutex::new(db)),
+                config: Arc::new(Mutex::new(config)),
+                device_id,
+                device_name: "Server".to_string(),
+            }
+        }
+
+        fn request(account_id: &str) -> HandshakeRequest {
+            HandshakeRequest {
+                device_id: "00000000000070008000000000000099".to_string(),
+                device_name: "Phone".to_string(),
+                protocol_version: PROTOCOL_VERSION.to_string(),
+                account_id: account_id.to_string(),
+            }
+        }
+
+        async fn body_of(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        }
+
+        #[tokio::test]
+        async fn the_same_account_is_let_in_and_told_the_account() {
+            let (db, dir) = create_test_db();
+            let account = db.account_id().unwrap();
+            let state = state_for(db, &dir);
+            let (status, body) = body_of(handshake(State(state.clone()), Json(request(&account))).await.into_response()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["account_id"], account);
+            let db = state.db.lock().unwrap();
+            assert_eq!(db.get_peer_account_id("00000000000070008000000000000099").unwrap(), Some(account));
+            assert_eq!(db.list_snapshots().unwrap().len(), 1, "a snapshot before the peer's operation");
+        }
+
+        #[tokio::test]
+        async fn another_account_is_refused_with_its_code() {
+            let (db, dir) = create_test_db();
+            let state = state_for(db, &dir);
+            let other = "0199bbbbbbbb7000800000000000000b";
+            let (status, body) = body_of(handshake(State(state.clone()), Json(request(other))).await.into_response()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["code"], codes::ACCOUNT_MISMATCH);
+            assert!(body["error"].as_str().unwrap().contains("nothing was exchanged"));
+            let db = state.db.lock().unwrap();
+            assert_eq!(db.get_peer_account_id("00000000000070008000000000000099").unwrap(), None);
+            assert!(db.list_snapshots().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_handshake_that_names_no_account_is_refused() {
+            let (db, dir) = create_test_db();
+            let state = state_for(db, &dir);
+            let (status, body) = body_of(handshake(State(state), Json(request(""))).await.into_response()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], codes::ACCOUNT_MISSING);
+        }
+
+        /// The whole path, over a real socket: a device of one account syncs
+        /// with a device of another, and nothing crosses in either direction.
+        #[tokio::test]
+        async fn a_mismatched_pair_exchanges_nothing() {
+            let server_dir = TempDir::new().unwrap();
+            let server_db = Database::new(server_dir.path().join("notes.db")).unwrap();
+            server_db.create_note("של השרת").unwrap();
+            let server_state_db = Arc::new(Mutex::new(server_db));
+            let server_config = Arc::new(Mutex::new(Config::new(Some(server_dir.path().to_path_buf())).unwrap()));
+            let server_device = server_config.lock().unwrap().device_id_hex().to_string();
+            let router = create_router(server_state_db.clone(), server_config);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+            let client_dir = TempDir::new().unwrap();
+            let client_db = Database::new(client_dir.path().join("notes.db")).unwrap();
+            client_db.create_note("של הלקוח").unwrap();
+            let client_db = Arc::new(Mutex::new(client_db));
+            let mut client_config = Config::new(Some(client_dir.path().to_path_buf())).unwrap();
+            client_config.add_peer(&server_device, "Server", &url, None, true).unwrap();
+            let client = SyncClient::new(client_db.clone(), Arc::new(Mutex::new(client_config))).unwrap();
+
+            let result = client.sync_with_peer(&server_device).await;
+
+            assert!(!result.success);
+            assert!(result.errors.iter().any(|e| e.contains(codes::ACCOUNT_MISMATCH)), "{:?}", result.errors);
+            assert_eq!(result.pulled, 0);
+            assert_eq!(result.pushed, 0);
+            assert_eq!(server_state_db.lock().unwrap().get_all_notes().unwrap().len(), 1, "the server kept only its own note");
+            assert_eq!(client_db.lock().unwrap().get_all_notes().unwrap().len(), 1, "the client kept only its own note");
+            assert_eq!(client_db.lock().unwrap().get_peer_cursors(&server_device).unwrap(), (0, 0, None));
+            serving.abort();
+        }
     }
 
     /// Create a SyncChange for testing

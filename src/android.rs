@@ -382,6 +382,46 @@ impl VoiceClient {
         })
     }
 
+    /// The account this phone's database belongs to (ACCT-1). A phone has no
+    /// account index; its one database carries the id.
+    pub fn account_id(&self) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db.account_id()?)
+    }
+
+    /// Move this database, notes and all, to another account (ACCT-5). The
+    /// deliberate way to merge accounts; a snapshot is taken first and every
+    /// peer is forgotten.
+    pub fn move_to_account(&self, account_id: String) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.move_to_account(&account_id)?;
+        Ok(())
+    }
+
+    /// Copy the database into its snapshot directory now; returns the path.
+    pub fn snapshot(&self) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db.snapshot()?.to_string_lossy().to_string())
+    }
+
+    /// Every snapshot beside the database, newest first.
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .list_snapshots()?
+            .into_iter()
+            .map(|s| SnapshotData { name: s.name, path: s.path, size_bytes: s.size_bytes, note_count: s.note_count })
+            .collect())
+    }
+
+    /// Replace the database with a snapshot (SNAP-4); the state replaced is
+    /// snapshotted first, so this is undoable too.
+    pub fn restore_snapshot(&self, name: String) -> Result<(), VoiceCoreError> {
+        let mut db = self.db.lock().unwrap();
+        db.restore_snapshot(&name)?;
+        Ok(())
+    }
+
     /// Clear sync state to force a full re-sync from scratch
     ///
     /// This deletes the sync peer record, causing the next sync to start
@@ -1964,6 +2004,17 @@ fn conflict_to_data(c: crate::versions::ConflictRow) -> ConflictData {
         created_at: stamp(c.created_at, None, None),
         resolved_at: stamp_opt(c.resolved_at, None, None),
     }
+}
+
+/// One snapshot of the database, as listed by `list_snapshots`
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SnapshotData {
+    /// File name, `notes-<UTC time>.db`; what `restore_snapshot` takes
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    /// Notes in the snapshot that are not in the trash
+    pub note_count: i64,
 }
 
 /// Result of uploading recordings to the bucket

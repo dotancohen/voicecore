@@ -12,12 +12,27 @@ use crate::models::SyncChange;
 /// The protocol version both sides announce in the handshake and the status.
 pub const PROTOCOL_VERSION: &str = "1.1";
 
+/// The codes a refusal carries, so a sentence on a screen and a line in a
+/// log can be matched to the rule that produced them.
+pub mod codes {
+    /// The handshake named no account.
+    pub const ACCOUNT_MISSING: &str = "ACCOUNT_MISSING";
+    /// The two sides hold different accounts; nothing is exchanged.
+    pub const ACCOUNT_MISMATCH: &str = "ACCOUNT_MISMATCH";
+    /// A database opened for one account already belongs to another.
+    pub const ACCOUNT_DISAGREES: &str = "ACCOUNT_DISAGREES";
+}
+
 /// `POST /sync/handshake` request body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeRequest {
     pub device_id: String,
     pub device_name: String,
     pub protocol_version: String,
+    /// The account the caller holds (ACCT-2). Empty means "none named",
+    /// which is refused.
+    #[serde(default)]
+    pub account_id: String,
 }
 
 /// `POST /sync/handshake` response body.
@@ -26,6 +41,10 @@ pub struct HandshakeResponse {
     pub device_id: String,
     pub device_name: String,
     pub protocol_version: String,
+    /// The account the responder holds (ACCT-2), so the caller can check it
+    /// reached the account it meant to.
+    #[serde(default)]
+    pub account_id: String,
     pub last_sync_timestamp: Option<i64>,
     #[serde(default)]
     pub server_timestamp: i64,
@@ -96,4 +115,17 @@ pub struct StatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+    /// One of [`codes`], or empty for an error that has none.
+    #[serde(default)]
+    pub code: String,
+}
+
+impl ErrorResponse {
+    pub fn new(error: impl Into<String>) -> Self {
+        Self { error: error.into(), code: String::new() }
+    }
+
+    pub fn with_code(error: impl Into<String>, code: &str) -> Self {
+        Self { error: error.into(), code: code.to_string() }
+    }
 }

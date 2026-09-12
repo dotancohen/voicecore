@@ -21,7 +21,8 @@ use crate::database::Database;
 use crate::error::{VoiceError, VoiceResult};
 use crate::models::{audio_local_path, SyncChange};
 use crate::sync_protocol::{
-    ApplyRequest, ApplyResponse, ChangesResponse, HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION,
+    codes, ApplyRequest, ApplyResponse, ChangesResponse, ErrorResponse, HandshakeRequest, HandshakeResponse,
+    PROTOCOL_VERSION,
 };
 use crate::UUID_SHORT_LEN;
 
@@ -146,6 +147,9 @@ impl SyncClient {
             Ok(h) => h,
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
+        if let Err(sentence) = self.check_account(peer_id, &handshake) {
+            return SyncResult::failure(sentence);
+        }
         let cursors = self.peer_cursors(peer_id, &handshake, &mut result);
 
         // Everything written locally up to here is what this sync pushes;
@@ -153,6 +157,7 @@ impl SyncClient {
         let local_end = self.local_seq();
 
         // Step 2: Pull, page by page, saving the cursor after every page
+        self.snapshot_before("sync", &mut result);
         let pull = self.pull_all(peer_url, peer_id, &peer.peer_name, cursors.received).await;
         result.pulled = pull.applied;
         result.conflicts += pull.conflicts;
@@ -194,8 +199,12 @@ impl SyncClient {
             Ok(h) => h,
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
+        if let Err(sentence) = self.check_account(peer_id, &handshake) {
+            return SyncResult::failure(sentence);
+        }
         let cursors = self.peer_cursors(peer_id, &handshake, &mut result);
 
+        self.snapshot_before("pull", &mut result);
         let pull = self.pull_all(peer_url, peer_id, &peer.peer_name, cursors.received).await;
         result.pulled = pull.applied;
         result.conflicts = pull.conflicts;
@@ -231,6 +240,9 @@ impl SyncClient {
             Ok(h) => h,
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
+        if let Err(sentence) = self.check_account(peer_id, &handshake) {
+            return SyncResult::failure(sentence);
+        }
         let cursors = self.peer_cursors(peer_id, &handshake, &mut result);
         let local_end = self.local_seq();
 
@@ -274,6 +286,9 @@ impl SyncClient {
             Ok(h) => h,
             Err(e) => return SyncResult::failure(format!("Handshake failed: {}", e)),
         };
+        if let Err(sentence) = self.check_account(peer_id, &handshake) {
+            return SyncResult::failure(sentence);
+        }
 
         // Step 2: Pull the peer's whole feed from the beginning, page by
         // page. (One JSON document for the whole dataset, as /sync/full
@@ -282,6 +297,7 @@ impl SyncClient {
         if let Err(e) = self.save_peer_cursors(peer_id, Some(0), Some(0), Some(handshake.database_id.as_str())) {
             result.errors.push(format!("Failed to reset cursors: {}", e));
         }
+        self.snapshot_before("initial sync", &mut result);
         let pull = self.pull_all(peer_url, peer_id, &peer.peer_name, 0).await;
         result.pulled = pull.applied;
         result.conflicts = pull.conflicts;
@@ -308,6 +324,55 @@ impl SyncClient {
     /// Where we stand with a peer. If the peer's database identity changed
     /// (it was reset or replaced) both cursors restart from zero: everything
     /// is exchanged again, which is safe because applying is idempotent.
+    /// The account this database belongs to.
+    fn account_id(&self) -> String {
+        self.db.lock().ok().and_then(|db| db.account_id().ok()).unwrap_or_default()
+    }
+
+    /// The account check on the caller's side (ACCT-3): the peer must hold
+    /// the same account as this database, or nothing is exchanged. Returns
+    /// the sentence to refuse with. Never adopts.
+    fn check_account(&self, peer_id: &str, handshake: &HandshakeResponse) -> Result<(), String> {
+        let own = self.account_id();
+        if handshake.account_id.is_empty() {
+            return Err(format!("The peer named no account ({})", codes::ACCOUNT_MISSING));
+        }
+        if handshake.account_id != own {
+            let before = self
+                .db
+                .lock()
+                .ok()
+                .and_then(|db| db.get_peer_account_id(peer_id).ok().flatten());
+            let mut sentence = format!(
+                "The peer holds account {}; this device holds {}; nothing was exchanged",
+                &handshake.account_id[..UUID_SHORT_LEN.min(handshake.account_id.len())],
+                &own[..UUID_SHORT_LEN.min(own.len())]
+            );
+            if let Some(before) = before {
+                if before == own {
+                    sentence.push_str(". This peer used to hold this account; the device at its address has changed");
+                }
+            }
+            sentence.push_str(&format!(" ({})", codes::ACCOUNT_MISMATCH));
+            tracing::warn!("{}", sentence);
+            return Err(sentence);
+        }
+        if let Ok(db) = self.db.lock() {
+            let _ = db.set_peer_account_id(peer_id, Some(&handshake.device_name), &handshake.account_id);
+        }
+        Ok(())
+    }
+
+    /// A snapshot before this device applies anything (SNAP-3); an in-memory
+    /// database has nothing to snapshot and is skipped.
+    fn snapshot_before(&self, what: &str, result: &mut SyncResult) {
+        if let Ok(db) = self.db.lock() {
+            if let Err(e) = db.snapshot_before(what) {
+                result.warnings.push(format!("Could not take a snapshot before {}: {}", what, e));
+            }
+        }
+    }
+
     fn peer_cursors(&self, peer_id: &str, handshake: &HandshakeResponse, result: &mut SyncResult) -> PeerCursors {
         let (received, sent, known_db) = {
             let db = self.db.lock().unwrap();
@@ -576,6 +641,7 @@ impl SyncClient {
             device_id: self.device_id.clone(),
             device_name: self.device_name.clone(),
             protocol_version: PROTOCOL_VERSION.to_string(),
+            account_id: self.account_id(),
         };
 
         let response = self
@@ -587,10 +653,15 @@ impl SyncClient {
             .map_err(|e| VoiceError::Network(e.to_string()))?;
 
         if !response.status().is_success() {
-            return Err(VoiceError::Sync(format!(
-                "Handshake failed with status {}",
-                response.status()
-            )));
+            let status = response.status();
+            // A refusal carries a sentence and a code; pass both on.
+            let body = response.text().await.unwrap_or_default();
+            if let Ok(refusal) = serde_json::from_str::<ErrorResponse>(&body) {
+                if !refusal.error.is_empty() {
+                    return Err(VoiceError::Sync(refusal.error));
+                }
+            }
+            return Err(VoiceError::Sync(format!("Handshake failed with status {}", status)));
         }
 
         response

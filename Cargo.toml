@@ -29,7 +29,7 @@ file-storage = ["dep:rust-s3"]
 tokio = { version = "1.42", features = ["rt", "sync", "time", "macros", "fs"] }
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled", "blob"] }
+rusqlite = { version = "0.32", features = ["bundled", "blob", "backup"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

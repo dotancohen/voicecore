@@ -6,7 +6,7 @@
 //! UUIDs are stored as BLOB (16 bytes) and converted to hex strings for JSON output.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::Utc;
@@ -273,15 +273,47 @@ fn uuid_bytes_to_hex(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// An account id is 32 lowercase hex characters, like every other id.
+pub fn validate_account_id(account_id: &str) -> VoiceResult<()> {
+    if account_id.len() == 32 && account_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(VoiceError::validation("account_id", "must be 32 hex characters"))
+    }
+}
+
+/// The first characters of an id, for a sentence.
+fn short(id: &str) -> &str {
+    &id[..crate::UUID_SHORT_LEN.min(id.len())]
+}
+
 /// Database wrapper for SQLite operations
 pub struct Database {
     conn: Connection,
+    /// Where the file is, so a snapshot can be written beside it. None for
+    /// an in-memory database.
+    path: Option<PathBuf>,
+}
+
+/// How many snapshots are kept beside a database (SNAP-2).
+pub const SNAPSHOTS_KEPT: usize = 5;
+
+/// One snapshot of a database, as listed by [`Database::list_snapshots`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    /// File name, `notes-<UTC time>.db`
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    /// Notes in the snapshot that are not in the trash
+    pub note_count: i64,
 }
 
 impl Database {
     /// Create a new database connection
     pub fn new<P: AsRef<Path>>(db_path: P) -> VoiceResult<Self> {
-        let conn = Connection::open(db_path)?;
+        let path = db_path.as_ref().to_path_buf();
+        let conn = Connection::open(&path)?;
 
         // Enable WAL mode for better concurrent access
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -294,7 +326,7 @@ impl Database {
         // from other connections that may have written and closed
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
 
-        let mut db = Self { conn };
+        let mut db = Self { conn, path: Some(path) };
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
         db.migrate_timestamps_to_unix()?;
@@ -311,7 +343,7 @@ impl Database {
     /// Create an in-memory database (for testing)
     pub fn new_in_memory() -> VoiceResult<Self> {
         let conn = Connection::open_in_memory()?;
-        let mut db = Self { conn };
+        let mut db = Self { conn, path: None };
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
         db.migrate_timestamps_to_unix()?;
@@ -323,6 +355,44 @@ impl Database {
         db.migrate_add_sync_sequence()?;
         db.migrate_add_timezone_columns()?;
         Ok(db)
+    }
+
+    /// Open a database that belongs to `account_id` (ACCT-4).
+    ///
+    /// A fresh database takes the id. One that already has it opens as usual.
+    /// One that carries another account's id is refused, never corrected:
+    /// the database is authoritative for its own account.
+    pub fn new_for_account<P: AsRef<Path>>(db_path: P, account_id: &str) -> VoiceResult<Self> {
+        validate_account_id(account_id)?;
+        let db = Self::new(db_path)?;
+        let existing = db.account_id()?;
+        if existing == account_id {
+            return Ok(db);
+        }
+        if db.has_notes()? || db.has_synced()? {
+            return Err(VoiceError::Sync(format!(
+                "This database belongs to account {}, not {} ({})",
+                short(&existing),
+                short(account_id),
+                crate::sync_protocol::codes::ACCOUNT_DISAGREES
+            )));
+        }
+        // Created a moment ago with a random id and never used: it is the
+        // caller's to name.
+        db.set_account_id(account_id)?;
+        Ok(db)
+    }
+
+    /// Whether any note, in the trash or out of it, exists.
+    fn has_notes(&self) -> VoiceResult<bool> {
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
+    /// Whether this database has ever exchanged anything with a peer.
+    fn has_synced(&self) -> VoiceResult<bool> {
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM sync_peers", [], |r| r.get(0))?;
+        Ok(n > 0)
     }
 
     /// Initialize database schema
@@ -3212,6 +3282,174 @@ impl Database {
             .query_row("SELECT value FROM sync_meta WHERE key = 'database_id'", [], |r| r.get(0))
             .optional()?
             .unwrap_or_default())
+    }
+
+    /// The account this database belongs to (ACCT-1): 32 hex characters,
+    /// the same on every device of the account, different on every other.
+    pub fn account_id(&self) -> VoiceResult<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM sync_meta WHERE key = 'account_id'", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    fn set_account_id(&self, account_id: &str) -> VoiceResult<()> {
+        validate_account_id(account_id)?;
+        self.conn.execute(
+            "INSERT INTO sync_meta (key, value) VALUES ('account_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![account_id],
+        )?;
+        Ok(())
+    }
+
+    /// Move this database, notes and all, to another account (ACCT-5).
+    ///
+    /// The deliberate way to merge two accounts, never reached by pairing:
+    /// a snapshot is taken first, the account id is rewritten, and every
+    /// peer's cursors are forgotten so that the next sync exchanges
+    /// everything. The notes stay; their ids cannot collide.
+    pub fn move_to_account(&self, account_id: &str) -> VoiceResult<()> {
+        validate_account_id(account_id)?;
+        self.snapshot_before("account move")?;
+        self.set_account_id(account_id)?;
+        self.conn.execute("DELETE FROM sync_peers", [])?;
+        Ok(())
+    }
+
+    /// The account a known peer held at its last handshake, if recorded.
+    pub fn get_peer_account_id(&self, peer_device_id: &str) -> VoiceResult<Option<String>> {
+        let peer_uuid = Uuid::parse_str(peer_device_id)
+            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT peer_account_id FROM sync_peers WHERE peer_id = ?",
+                params![peer_uuid.as_bytes().to_vec()],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record the account a peer holds, after a handshake that agreed.
+    pub fn set_peer_account_id(&self, peer_device_id: &str, peer_name: Option<&str>, account_id: &str) -> VoiceResult<()> {
+        let peer_uuid = Uuid::parse_str(peer_device_id)
+            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+        let peer_bytes = peer_uuid.as_bytes().to_vec();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, '')",
+            params![peer_bytes, peer_name],
+        )?;
+        self.conn.execute(
+            "UPDATE sync_peers SET peer_account_id = ?, peer_name = COALESCE(?, peer_name) WHERE peer_id = ?",
+            params![account_id, peer_name, peer_bytes],
+        )?;
+        Ok(())
+    }
+
+    // ============================================================================
+    // Snapshots (SNAP-1..SNAP-4): a copy of the database before anything
+    // irreversible, so that any sync, move or restore can be undone.
+    // ============================================================================
+
+    /// The directory snapshots are written to: `snapshots/` beside the
+    /// database file. None for an in-memory database.
+    pub fn snapshot_directory(&self) -> Option<PathBuf> {
+        let path = self.path.as_ref()?;
+        Some(path.parent().unwrap_or_else(|| Path::new(".")).join("snapshots"))
+    }
+
+    /// Copy the whole database into the snapshot directory with SQLite's
+    /// backup API, which gives a consistent copy without blocking readers,
+    /// and delete all but the newest [`SNAPSHOTS_KEPT`]. Returns the path.
+    pub fn snapshot(&self) -> VoiceResult<PathBuf> {
+        let dir = self
+            .snapshot_directory()
+            .ok_or_else(|| VoiceError::DatabaseOperation("An in-memory database has nowhere to snapshot to".to_string()))?;
+        std::fs::create_dir_all(&dir)?;
+        let stamp = Utc::now().format("%Y%m%d-%H%M%S%.3f");
+        let mut path = dir.join(format!("notes-{}.db", stamp));
+        let mut n = 1;
+        while path.exists() {
+            path = dir.join(format!("notes-{}-{}.db", stamp, n));
+            n += 1;
+        }
+        {
+            let mut dst = Connection::open(&path)?;
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut dst)?;
+            backup.run_to_completion(1000, std::time::Duration::from_millis(5), None)?;
+        }
+        for old in self.list_snapshots()?.into_iter().skip(SNAPSHOTS_KEPT) {
+            let _ = std::fs::remove_file(&old.path);
+        }
+        Ok(path)
+    }
+
+    /// Take a snapshot and say why in the log; an in-memory database is
+    /// skipped silently, because there is nothing on disk to lose.
+    pub fn snapshot_before(&self, what: &str) -> VoiceResult<()> {
+        if self.path.is_none() {
+            return Ok(());
+        }
+        let path = self.snapshot()?;
+        tracing::info!("Snapshot before {}: {}", what, path.display());
+        Ok(())
+    }
+
+    /// Every snapshot beside this database, newest first.
+    pub fn list_snapshots(&self) -> VoiceResult<Vec<SnapshotInfo>> {
+        let dir = match self.snapshot_directory() {
+            Some(d) if d.is_dir() => d,
+            _ => return Ok(Vec::new()),
+        };
+        // Newest first, by the file's own time, so that two snapshots taken
+        // within one second still list in the order they were made.
+        let mut entries: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(&dir)?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !(name.starts_with("notes-") && name.ends_with(".db")) {
+                    return None;
+                }
+                let modified = e.metadata().and_then(|m| m.modified()).ok()?;
+                Some((modified, name))
+            })
+            .collect();
+        entries.sort();
+        entries.reverse();
+        let mut out = Vec::new();
+        for (_, name) in entries {
+            let path = dir.join(&name);
+            let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let note_count = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|c| c.query_row("SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL", [], |r| r.get::<_, i64>(0)))
+                .unwrap_or(-1);
+            out.push(SnapshotInfo { name, path: path.to_string_lossy().to_string(), size_bytes, note_count });
+        }
+        Ok(out)
+    }
+
+    /// Replace this database's contents with a snapshot's (SNAP-4). The
+    /// state being replaced is snapshotted first, so a restore is itself
+    /// undoable. `name` is a file name from [`Database::list_snapshots`].
+    pub fn restore_snapshot(&mut self, name: &str) -> VoiceResult<()> {
+        let dir = self
+            .snapshot_directory()
+            .ok_or_else(|| VoiceError::DatabaseOperation("An in-memory database has no snapshots".to_string()))?;
+        if name.contains('/') || name.contains('\\') || !name.starts_with("notes-") || !name.ends_with(".db") {
+            return Err(VoiceError::validation("snapshot", format!("{} is not a snapshot name", name)));
+        }
+        let path = dir.join(name);
+        if !path.is_file() {
+            return Err(VoiceError::NotFound(format!("No snapshot named {}", name)));
+        }
+        self.snapshot_before("restore")?;
+        let src = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let backup = rusqlite::backup::Backup::new(&src, &mut self.conn)?;
+        backup.run_to_completion(1000, std::time::Duration::from_millis(5), None)?;
+        Ok(())
     }
 
     /// Per-peer cursor state: (cursor into the peer's feed, our own seq last
@@ -6347,6 +6585,133 @@ impl Database {
 mod tests {
     use super::*;
 
+    mod account_identity {
+        use super::*;
+        use tempfile::TempDir;
+
+        const ACCOUNT_A: &str = "0199aaaaaaaa7000800000000000000a";
+        const ACCOUNT_B: &str = "0199bbbbbbbb7000800000000000000b";
+
+        #[test]
+        fn a_new_database_has_an_account_id_of_its_own() {
+            let db = Database::new_in_memory().unwrap();
+            let id = db.account_id().unwrap();
+            assert_eq!(id.len(), 32);
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+            let other = Database::new_in_memory().unwrap();
+            assert_ne!(other.account_id().unwrap(), id, "two databases never share an account by chance");
+        }
+
+        #[test]
+        fn a_fresh_database_takes_the_account_it_is_opened_for() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("notes.db");
+            let db = Database::new_for_account(&path, ACCOUNT_A).unwrap();
+            assert_eq!(db.account_id().unwrap(), ACCOUNT_A);
+            drop(db);
+            let again = Database::new_for_account(&path, ACCOUNT_A).unwrap();
+            assert_eq!(again.account_id().unwrap(), ACCOUNT_A);
+        }
+
+        #[test]
+        fn a_database_with_notes_refuses_another_account_and_is_not_corrected() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("notes.db");
+            let db = Database::new_for_account(&path, ACCOUNT_A).unwrap();
+            db.create_note("פתק ראשון").unwrap();
+            drop(db);
+            let err = match Database::new_for_account(&path, ACCOUNT_B) {
+                Ok(_) => panic!("a database with notes must not change account"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("ACCOUNT_DISAGREES"), "{}", err);
+            assert_eq!(Database::new(&path).unwrap().account_id().unwrap(), ACCOUNT_A);
+        }
+
+        #[test]
+        fn an_account_id_must_be_thirty_two_hex_characters() {
+            assert!(validate_account_id(ACCOUNT_A).is_ok());
+            assert!(validate_account_id("short").is_err());
+            assert!(validate_account_id("zzzzaaaaaaaa7000800000000000000a").is_err());
+        }
+
+        #[test]
+        fn moving_to_another_account_keeps_the_notes_and_forgets_the_peers() {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new_for_account(dir.path().join("notes.db"), ACCOUNT_A).unwrap();
+            let note = db.create_note("נשאר").unwrap();
+            let peer = "00000000000070008000000000000099";
+            db.set_peer_cursors(peer, Some("Desk"), Some(7), Some(9), Some("db1")).unwrap();
+            db.set_peer_account_id(peer, None, ACCOUNT_A).unwrap();
+
+            db.move_to_account(ACCOUNT_B).unwrap();
+
+            assert_eq!(db.account_id().unwrap(), ACCOUNT_B);
+            assert!(db.get_note(&note).unwrap().is_some());
+            assert_eq!(db.get_peer_cursors(peer).unwrap(), (0, 0, None));
+            assert_eq!(db.get_peer_account_id(peer).unwrap(), None);
+            assert_eq!(db.list_snapshots().unwrap().len(), 1, "the move was snapshotted first");
+        }
+
+        #[test]
+        fn a_peer_s_account_is_remembered() {
+            let db = Database::new_in_memory().unwrap();
+            let peer = "00000000000070008000000000000099";
+            assert_eq!(db.get_peer_account_id(peer).unwrap(), None);
+            db.set_peer_account_id(peer, Some("Phone"), ACCOUNT_A).unwrap();
+            assert_eq!(db.get_peer_account_id(peer).unwrap(), Some(ACCOUNT_A.to_string()));
+        }
+    }
+
+    mod snapshots {
+        use super::*;
+        use tempfile::TempDir;
+
+        #[test]
+        fn an_in_memory_database_has_no_snapshots_and_skips_them_silently() {
+            let db = Database::new_in_memory().unwrap();
+            assert!(db.snapshot_directory().is_none());
+            assert!(db.snapshot().is_err());
+            db.snapshot_before("a test").unwrap();
+            assert!(db.list_snapshots().unwrap().is_empty());
+        }
+
+        #[test]
+        fn the_newest_five_are_kept_and_a_restore_brings_a_note_back() {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::new(dir.path().join("notes.db")).unwrap();
+            assert_eq!(db.snapshot_directory().unwrap(), dir.path().join("snapshots"));
+            let note = db.create_note("לפני המחיקה").unwrap();
+
+            for _ in 0..6 {
+                db.snapshot().unwrap();
+            }
+            let listed = db.list_snapshots().unwrap();
+            assert_eq!(listed.len(), SNAPSHOTS_KEPT, "the sixth snapshot deletes the first");
+            assert!(listed.iter().all(|s| s.note_count == 1));
+            assert!(listed.iter().all(|s| s.size_bytes > 0));
+            let newest = listed[0].name.clone();
+
+            db.delete_note(&note).unwrap();
+            assert!(db.get_note(&note).unwrap().is_none());
+
+            db.restore_snapshot(&newest).unwrap();
+            assert!(db.get_note(&note).unwrap().is_some(), "the note is back");
+            // The state before the restore was snapshotted, so the restore is undoable too.
+            let after = db.list_snapshots().unwrap();
+            assert_eq!(after.len(), SNAPSHOTS_KEPT);
+            assert!(after[0].note_count == 0, "the newest snapshot is the state the restore replaced");
+        }
+
+        #[test]
+        fn a_restore_refuses_a_name_that_is_not_a_snapshot() {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::new(dir.path().join("notes.db")).unwrap();
+            assert!(db.restore_snapshot("../notes.db").is_err());
+            assert!(db.restore_snapshot("notes-nothing.db").is_err());
+        }
+    }
+
     #[test]
     fn test_create_database() {
         let db = Database::new_in_memory().unwrap();
@@ -6912,7 +7277,21 @@ impl Database {
                 params![Uuid::now_v7().simple().to_string()],
             )?;
         }
-        for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT"] {
+        // The account this database belongs to (ACCT-1). Minted here so that
+        // every database has one from its first moment; a device that is
+        // paired later takes the account's id instead (ACCT-4).
+        let has_account: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sync_meta WHERE key = 'account_id'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_account == 0 {
+            self.conn.execute(
+                "INSERT INTO sync_meta (key, value) VALUES ('account_id', ?)",
+                params![Uuid::now_v7().simple().to_string()],
+            )?;
+        }
+        for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT", "peer_account_id TEXT"] {
             let name = col.split(' ').next().unwrap_or_default();
             if !self.column_exists("sync_peers", name)? {
                 self.conn.execute(&format!("ALTER TABLE sync_peers ADD COLUMN {}", col), [])?;
