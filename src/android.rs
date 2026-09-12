@@ -239,11 +239,14 @@ impl VoiceClient {
         })?;
 
         // Initialize config
-        let config = Config::new(Some(data_path.clone()))?;
+        let mut config = Config::new(Some(data_path.clone()))?;
 
         // Initialize database
         let db_path = data_path.join("notes.db");
         let db = Database::new(&db_path)?;
+
+        // This phone's key for its account, and its own card (AUTH-1)
+        crate::auth::ensure_own_device_card(&db, &mut config)?;
 
         Ok(Arc::new(Self {
             config: Arc::new(Mutex::new(config)),
@@ -387,6 +390,31 @@ impl VoiceClient {
     pub fn account_id(&self) -> Result<String, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         Ok(db.account_id()?)
+    }
+
+    /// Every device of the account, by its card (CARD-1).
+    pub fn list_devices(&self) -> Result<Vec<DeviceCardData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .list_device_cards()?
+            .into_iter()
+            .map(|c| DeviceCardData {
+                device_id: c.device_id,
+                name: c.name,
+                certificate_fingerprint: c.certificate_fingerprint,
+                addresses: c.addresses,
+                listens: c.listens == "1",
+                revoked: c.revoked == "1",
+                application: c.application,
+            })
+            .collect())
+    }
+
+    /// Revoke a device of the account (AUTH-6): one way, and it travels.
+    pub fn revoke_device(&self, device_id: String) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.revoke_device(&device_id)?;
+        Ok(())
     }
 
     /// Move this database, notes and all, to another account (ACCT-5). The
@@ -2004,6 +2032,19 @@ fn conflict_to_data(c: crate::versions::ConflictRow) -> ConflictData {
         created_at: stamp(c.created_at, None, None),
         resolved_at: stamp_opt(c.resolved_at, None, None),
     }
+}
+
+/// A device of the account, as its card says (CARD-1)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DeviceCardData {
+    pub device_id: String,
+    pub name: String,
+    pub certificate_fingerprint: String,
+    /// JSON list of the URLs it listens on, or empty
+    pub addresses: String,
+    pub listens: bool,
+    pub revoked: bool,
+    pub application: String,
 }
 
 /// One snapshot of the database, as listed by `list_snapshots`

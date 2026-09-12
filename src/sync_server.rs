@@ -8,14 +8,17 @@
 //! - /sync/status - Health check
 //! - /sync/audio/:id/file - One recording's bytes: GET serves it to a fetching peer, POST receives it from a sending peer
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -23,6 +26,7 @@ use chrono::Utc;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use crate::auth;
 use crate::config::Config;
 use crate::database::Database;
 use crate::error::VoiceResult;
@@ -43,17 +47,108 @@ struct AppState {
     config: Arc<Mutex<Config>>,
     device_id: String,
     device_name: String,
+    /// Refusals per source address, for the delay that slows a guesser
+    /// (AUTH-5): count and the time of the last one.
+    failures: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
 }
+
+/// After this many refusals from one address, each further refusal waits
+/// before answering; the wait doubles up to [`MAX_DELAY`].
+const FREE_FAILURES: u32 = 3;
+const MAX_DELAY: Duration = Duration::from_secs(8);
+/// Counters older than this are forgotten, and the map is emptied when it
+/// grows past [`MAX_TRACKED_ADDRESSES`], so memory stays bounded.
+const FAILURE_MEMORY: Duration = Duration::from_secs(600);
+const MAX_TRACKED_ADDRESSES: usize = 10_000;
 
 /// The first characters of an id, for a sentence.
 fn short(id: &str) -> &str {
     &id[..UUID_SHORT_LEN.min(id.len())]
 }
 
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// The bearer token of an `Authorization` header, if there is one.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    header(headers, "authorization")
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// Every route but the health check passes through here (AUTH-3): the
+/// account must be this one, the device must have a card that is not
+/// revoked, and the key must hash to the card's hash. A refusal is a
+/// sentence with its code, and repeated refusals from one address are
+/// answered ever more slowly (AUTH-5). The key itself is never logged.
+async fn require_device(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let account = header(headers, auth::HEADER_ACCOUNT).map(str::to_string);
+    let device = header(headers, auth::HEADER_DEVICE).map(str::to_string);
+    let key = bearer(headers).map(str::to_string);
+    let verdict = {
+        let db = state.db.lock().unwrap();
+        let own_account = db.account_id().unwrap_or_default();
+        auth::verify_request(&db, &own_account, account.as_deref(), device.as_deref(), key.as_deref())
+    };
+    match verdict {
+        Ok(_) => {
+            if let Ok(mut failures) = state.failures.lock() {
+                failures.remove(&addr.ip());
+            }
+            next.run(request).await
+        }
+        Err(refusal) => {
+            let delay = {
+                let mut failures = state.failures.lock().unwrap();
+                let now = Instant::now();
+                if failures.len() > MAX_TRACKED_ADDRESSES {
+                    failures.clear();
+                }
+                let entry = failures.entry(addr.ip()).or_insert((0, now));
+                if now.duration_since(entry.1) > FAILURE_MEMORY {
+                    entry.0 = 0;
+                }
+                entry.0 += 1;
+                entry.1 = now;
+                if entry.0 > FREE_FAILURES {
+                    let doublings = (entry.0 - FREE_FAILURES).min(3);
+                    Duration::from_secs(1 << doublings).min(MAX_DELAY)
+                } else {
+                    Duration::ZERO
+                }
+            };
+            tracing::warn!(
+                "Refused {} from {} for device {}: {}",
+                request.uri().path(),
+                addr.ip(),
+                device.as_deref().map(short).unwrap_or("-"),
+                refusal.code
+            );
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            (
+                StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::UNAUTHORIZED),
+                Json(ErrorResponse::with_code(refusal.sentence, refusal.code)),
+            )
+                .into_response()
+        }
+    }
+}
+
 // Route handlers
 
 async fn handshake(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<HandshakeRequest>,
 ) -> impl IntoResponse {
     tracing::debug!(
@@ -71,6 +166,21 @@ async fn handshake(
             Json(ErrorResponse::new("Invalid device_id format".to_string())),
         )
             .into_response();
+    }
+
+    // The body and the headers must agree about who is calling, or a device
+    // could act under another's name with its own key.
+    if let Some(named) = header(&headers, auth::HEADER_DEVICE) {
+        if named != request.device_id {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::with_code(
+                    format!("The handshake names device {} but the request was made by {} ({})", short(&request.device_id), short(named), codes::DEVICE_MISMATCH),
+                    codes::DEVICE_MISMATCH,
+                )),
+            )
+                .into_response();
+        }
     }
 
     // The account check (ACCT-2, ACCT-3): the two sides must hold the same
@@ -761,6 +871,7 @@ pub fn create_router(
         config,
         device_id,
         device_name,
+        failures: Arc::new(Mutex::new(HashMap::new())),
     };
 
     tracing::info!(
@@ -768,45 +879,93 @@ pub fn create_router(
         max_body_size / 1024 / 1024
     );
 
-    Router::new()
+    let authenticated = Router::new()
         .route("/sync/handshake", post(handshake))
         .route("/sync/changes", get(get_changes))
         .route("/sync/apply", post(apply_changes))
         .route("/sync/full", get(get_full_sync))
-        .route("/sync/status", get(status))
         .route("/sync/audio/:audio_id/file", get(serve_audio_file))
         .route("/sync/audio/:audio_id/file", post(receive_audio_file))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
+
+    Router::new()
+        .route("/sync/status", get(status))
+        .merge(authenticated)
         // Body limit is configurable via sync.max_sync_file_size_mb in config
         .layer(DefaultBodyLimit::max(max_body_size))
         .with_state(state)
 }
 
-/// Start the sync server
+/// Start the sync server: HTTPS with this device's own certificate (made
+/// under `certs/` if missing), or plain HTTP when `plain_http` is set, which
+/// is allowed only on a loopback address, for a reverse proxy in front or a
+/// test on this machine (AUTH-7). The listener's certificate fingerprint is
+/// written to its own device card so peers can pin it from the card.
 pub async fn start_server(
     db: Arc<Mutex<Database>>,
     config: Arc<Mutex<Config>>,
+    host: &str,
     port: u16,
+    plain_http: bool,
 ) -> VoiceResult<()> {
-    let router = create_router(db, config);
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| crate::error::VoiceError::Network(format!("{} is not an address: {}", host, e)))?;
+    if plain_http && !addr.ip().is_loopback() {
+        return Err(crate::error::VoiceError::Network(format!(
+            "Plain http is allowed only on this machine itself, not on {} ({})",
+            host,
+            codes::TLS_REQUIRED
+        )));
+    }
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let tls = if plain_http {
+        None
+    } else {
+        let (cert_path, key_path, fingerprint) = {
+            let cfg = config.lock().unwrap();
+            crate::tls::ensure_server_certificate(&cfg, false)?
+        };
+        tracing::info!("Certificate fingerprint {}", fingerprint);
+        Some(crate::tls::server_config(&cert_path, &key_path)?)
+    };
+    {
+        let db_guard = db.lock().unwrap();
+        let mut cfg = config.lock().unwrap();
+        crate::auth::ensure_own_device_card(&db_guard, &mut cfg)?;
+    }
+
+    let router = create_router(db, config).into_make_service_with_connect_info::<SocketAddr>();
 
     // Create shutdown channel
     let (tx, rx) = oneshot::channel::<()>();
     SHUTDOWN_TX.get_or_init(|| Mutex::new(Some(tx)));
+    let handle = axum_server::Handle::new();
+    let stopper = handle.clone();
+    tokio::spawn(async move {
+        rx.await.ok();
+        stopper.graceful_shutdown(Some(Duration::from_secs(5)));
+    });
 
-    tracing::info!("Starting sync server on {}", addr);
+    tracing::info!("Starting sync server on {} ({})", addr, if plain_http { "plain http" } else { "https" });
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| crate::error::VoiceError::Network(e.to_string()))?;
-
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            rx.await.ok();
-        })
-        .await
-        .map_err(|e| crate::error::VoiceError::Network(e.to_string()))?;
+    match tls {
+        Some(server_config) => {
+            let rustls = axum_server::tls_rustls::RustlsConfig::from_config(server_config);
+            axum_server::bind_rustls(addr, rustls)
+                .handle(handle)
+                .serve(router)
+                .await
+                .map_err(|e| crate::error::VoiceError::Network(e.to_string()))?;
+        }
+        None => {
+            axum_server::bind(addr)
+                .handle(handle)
+                .serve(router)
+                .await
+                .map_err(|e| crate::error::VoiceError::Network(e.to_string()))?;
+        }
+    }
 
     Ok(())
 }
@@ -858,6 +1017,7 @@ mod tests {
                 config: Arc::new(Mutex::new(config)),
                 device_id,
                 device_name: "Server".to_string(),
+                failures: Arc::new(Mutex::new(HashMap::new())),
             }
         }
 
@@ -881,7 +1041,7 @@ mod tests {
             let (db, dir) = create_test_db();
             let account = db.account_id().unwrap();
             let state = state_for(db, &dir);
-            let (status, body) = body_of(handshake(State(state.clone()), Json(request(&account))).await.into_response()).await;
+            let (status, body) = body_of(handshake(State(state.clone()), HeaderMap::new(), Json(request(&account))).await.into_response()).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["account_id"], account);
             let db = state.db.lock().unwrap();
@@ -894,7 +1054,7 @@ mod tests {
             let (db, dir) = create_test_db();
             let state = state_for(db, &dir);
             let other = "0199bbbbbbbb7000800000000000000b";
-            let (status, body) = body_of(handshake(State(state.clone()), Json(request(other))).await.into_response()).await;
+            let (status, body) = body_of(handshake(State(state.clone()), HeaderMap::new(), Json(request(other))).await.into_response()).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_eq!(body["code"], codes::ACCOUNT_MISMATCH);
             assert!(body["error"].as_str().unwrap().contains("nothing was exchanged"));
@@ -907,7 +1067,7 @@ mod tests {
         async fn a_handshake_that_names_no_account_is_refused() {
             let (db, dir) = create_test_db();
             let state = state_for(db, &dir);
-            let (status, body) = body_of(handshake(State(state), Json(request(""))).await.into_response()).await;
+            let (status, body) = body_of(handshake(State(state), HeaderMap::new(), Json(request(""))).await.into_response()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(body["code"], codes::ACCOUNT_MISSING);
         }
@@ -925,7 +1085,9 @@ mod tests {
             let router = create_router(server_state_db.clone(), server_config);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
-            let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let serving = tokio::spawn(async move {
+                axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
+            });
 
             let client_dir = TempDir::new().unwrap();
             let client_db = Database::new(client_dir.path().join("notes.db")).unwrap();
@@ -938,13 +1100,238 @@ mod tests {
             let result = client.sync_with_peer(&server_device).await;
 
             assert!(!result.success);
-            assert!(result.errors.iter().any(|e| e.contains(codes::ACCOUNT_MISMATCH)), "{:?}", result.errors);
+            // The headers name an account the server does not hold, so the
+            // refusal comes before the handshake body is even read (AUTH-3).
+            assert!(result.errors.iter().any(|e| e.contains(codes::ACCOUNT_UNKNOWN)), "{:?}", result.errors);
             assert_eq!(result.pulled, 0);
             assert_eq!(result.pushed, 0);
             assert_eq!(server_state_db.lock().unwrap().get_all_notes().unwrap().len(), 1, "the server kept only its own note");
             assert_eq!(client_db.lock().unwrap().get_all_notes().unwrap().len(), 1, "the client kept only its own note");
             assert_eq!(client_db.lock().unwrap().get_peer_cursors(&server_device).unwrap(), (0, 0, None));
             serving.abort();
+        }
+    }
+
+    mod authentication {
+        use super::*;
+        use crate::auth;
+        use crate::config::Config;
+        use crate::sync_client::SyncClient;
+        use crate::sync_protocol::codes;
+
+        /// A device with its own database, config and key.
+        struct Device {
+            db: Arc<Mutex<Database>>,
+            config: Arc<Mutex<Config>>,
+            id: String,
+            _dir: TempDir,
+        }
+
+        fn device(name: &str) -> Device {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new(dir.path().join("notes.db")).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            config.set_device_name(name).unwrap();
+            auth::ensure_own_device_card(&db, &mut config).unwrap();
+            let id = config.device_id_hex().to_string();
+            Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
+        }
+
+        /// Let `caller` into `server`'s account: its card, with its key hash.
+        fn admit(server: &Device, caller: &Device) {
+            let card = caller.db.lock().unwrap().get_device_card(&caller.id).unwrap().unwrap();
+            server.db.lock().unwrap().write_device_card(&card).unwrap();
+        }
+
+        /// Serve a device on this machine, plain or with its own certificate.
+        /// Returns the URL, the fingerprint (TLS only) and the task.
+        fn serve(server: &Device, tls: bool) -> (String, String, tokio::task::JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let router = create_router(server.db.clone(), server.config.clone())
+                .into_make_service_with_connect_info::<SocketAddr>();
+            if tls {
+                let (cert, key, fingerprint) = {
+                    let cfg = server.config.lock().unwrap();
+                    crate::tls::ensure_server_certificate(&cfg, false).unwrap()
+                };
+                let config = axum_server::tls_rustls::RustlsConfig::from_config(crate::tls::server_config(&cert, &key).unwrap());
+                let task = tokio::spawn(async move {
+                    axum_server::from_tcp_rustls(listener, config).serve(router).await.unwrap();
+                });
+                (format!("https://127.0.0.1:{}", port), fingerprint, task)
+            } else {
+                let task = tokio::spawn(async move {
+                    axum_server::from_tcp(listener).serve(router).await.unwrap();
+                });
+                (format!("http://127.0.0.1:{}", port), String::new(), task)
+            }
+        }
+
+        fn client(caller: &Device, server: &Device, url: &str, pin: Option<&str>) -> SyncClient {
+            caller.config.lock().unwrap().add_peer(&server.id, "Server", url, pin, true).unwrap();
+            SyncClient::new(caller.db.clone(), caller.config.clone()).unwrap()
+        }
+
+        /// Make the two devices one account, as pairing will.
+        fn same_account(a: &Device, b: &Device) {
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            b.db.lock().unwrap().move_to_account(&account).unwrap();
+        }
+
+        #[tokio::test]
+        async fn the_health_check_is_open_and_everything_else_needs_a_key() {
+            let server = device("Server");
+            let (url, _, task) = serve(&server, false);
+            let http = reqwest::Client::new();
+
+            let status = http.get(format!("{}/sync/status", url)).send().await.unwrap();
+            assert_eq!(status.status(), 200);
+
+            let bare = http.get(format!("{}/sync/changes", url)).send().await.unwrap();
+            assert_eq!(bare.status(), 404, "no account named");
+            let body: serde_json::Value = bare.json().await.unwrap();
+            assert_eq!(body["code"], codes::ACCOUNT_UNKNOWN);
+
+            let account = server.db.lock().unwrap().account_id().unwrap();
+            let no_key = http
+                .get(format!("{}/sync/changes", url))
+                .header(auth::HEADER_ACCOUNT, &account)
+                .header(auth::HEADER_DEVICE, "00000000000070008000000000000099")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(no_key.status(), 401);
+            let body: serde_json::Value = no_key.json().await.unwrap();
+            assert_eq!(body["code"], codes::KEY_MISSING);
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_paired_device_syncs_and_an_unpaired_or_revoked_one_is_refused() {
+            let server = device("Server");
+            let phone = device("Phone");
+            let stranger = device("Stranger");
+            same_account(&server, &phone);
+            same_account(&server, &stranger);
+            admit(&server, &phone);
+            server.db.lock().unwrap().create_note("על השרת").unwrap();
+            let (url, _, task) = serve(&server, false);
+
+            let result = client(&phone, &server, &url, None).sync_with_peer(&server.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(phone.db.lock().unwrap().get_all_notes().unwrap().len(), 1);
+
+            let result = client(&stranger, &server, &url, None).sync_with_peer(&server.id).await;
+            assert!(!result.success);
+            assert!(result.errors.iter().any(|e| e.contains(codes::DEVICE_UNKNOWN)), "{:?}", result.errors);
+            assert!(stranger.db.lock().unwrap().get_all_notes().unwrap().is_empty());
+
+            server.db.lock().unwrap().revoke_device(&phone.id).unwrap();
+            let result = client(&phone, &server, &url, None).sync_with_peer(&server.id).await;
+            assert!(!result.success);
+            assert!(result.errors.iter().any(|e| e.contains(codes::DEVICE_REVOKED)), "{:?}", result.errors);
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_wrong_key_is_refused_and_repeated_refusals_are_answered_slowly() {
+            let server = device("Server");
+            let phone = device("Phone");
+            same_account(&server, &phone);
+            admit(&server, &phone);
+            let (url, _, task) = serve(&server, false);
+            let account = server.db.lock().unwrap().account_id().unwrap();
+            let http = reqwest::Client::new();
+            let mut elapsed = Vec::new();
+            for _ in 0..(FREE_FAILURES + 1) {
+                let started = Instant::now();
+                let resp = http
+                    .get(format!("{}/sync/changes", url))
+                    .header(auth::HEADER_ACCOUNT, &account)
+                    .header(auth::HEADER_DEVICE, &phone.id)
+                    .bearer_auth("not-the-key")
+                    .send()
+                    .await
+                    .unwrap();
+                elapsed.push(started.elapsed());
+                assert_eq!(resp.status(), 401);
+                let body: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(body["code"], codes::KEY_WRONG);
+            }
+            assert!(elapsed[0] < Duration::from_millis(500), "the first refusals are immediate");
+            assert!(elapsed[FREE_FAILURES as usize] >= Duration::from_secs(1), "the fourth waits: {:?}", elapsed);
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_handshake_must_name_the_device_that_makes_it() {
+            let server = device("Server");
+            let phone = device("Phone");
+            same_account(&server, &phone);
+            admit(&server, &phone);
+            let (url, _, task) = serve(&server, false);
+            let account = server.db.lock().unwrap().account_id().unwrap();
+            let key = phone.config.lock().unwrap().device_key().to_string();
+            let resp = reqwest::Client::new()
+                .post(format!("{}/sync/handshake", url))
+                .header(auth::HEADER_ACCOUNT, &account)
+                .header(auth::HEADER_DEVICE, &phone.id)
+                .bearer_auth(&key)
+                .json(&HandshakeRequest {
+                    device_id: "00000000000070008000000000000099".to_string(),
+                    device_name: "Someone else".to_string(),
+                    protocol_version: PROTOCOL_VERSION.to_string(),
+                    account_id: account.clone(),
+                })
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["code"], codes::DEVICE_MISMATCH);
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn tls_is_verified_by_the_pin_and_never_off() {
+            let server = device("Server");
+            let phone = device("Phone");
+            same_account(&server, &phone);
+            admit(&server, &phone);
+            server.db.lock().unwrap().create_note("מוצפן").unwrap();
+            let (url, fingerprint, task) = serve(&server, true);
+            assert!(fingerprint.starts_with("SHA256:"));
+
+            let result = client(&phone, &server, &url, Some(&fingerprint)).sync_with_peer(&server.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(phone.db.lock().unwrap().get_all_notes().unwrap().len(), 1);
+
+            let wrong = fingerprint.replace(|c: char| c.is_ascii_hexdigit(), "0");
+            let result = client(&phone, &server, &url, Some(&wrong)).sync_with_peer(&server.id).await;
+            assert!(!result.success);
+            assert!(result.errors.iter().any(|e| e.contains(codes::CERTIFICATE_MISMATCH)), "{:?}", result.errors);
+
+            // No pin: the self-signed certificate is checked against the
+            // system roots and fails, because verification is never off.
+            phone.config.lock().unwrap().remove_peer(&server.id).unwrap();
+            let result = client(&phone, &server, &url, None).sync_with_peer(&server.id).await;
+            assert!(!result.success, "an unpinned self-signed certificate must not be accepted");
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn plain_http_is_refused_before_any_connection_unless_it_is_this_machine() {
+            let phone = device("Phone");
+            let server = device("Server");
+            let client = client(&phone, &server, "http://10.255.255.1:8384", None);
+            let result = client.sync_with_peer(&server.id).await;
+            assert!(!result.success);
+            assert!(result.errors.iter().any(|e| e.contains(codes::TLS_REQUIRED)), "{:?}", result.errors);
+
+            let refused = start_server(server.db.clone(), server.config.clone(), "0.0.0.0", 0, true).await;
+            assert!(refused.unwrap_err().to_string().contains(codes::TLS_REQUIRED));
         }
     }
 

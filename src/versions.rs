@@ -56,6 +56,45 @@ pub enum FieldKind {
     Deleted,
 }
 
+/// A device of the account (CARD-1). Every field is versioned; `revoked`
+/// merges as Membership so that "1" always wins.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceCard {
+    pub device_id: String,
+    pub name: String,
+    /// `SHA256:aa:bb:…` of the certificate the device listens with, or empty
+    pub certificate_fingerprint: String,
+    /// JSON list of URLs, or empty
+    pub addresses: String,
+    /// "1" while listening
+    pub listens: String,
+    /// Hex SHA-256 of the device's key
+    pub key_hash: String,
+    /// "1" once revoked
+    pub revoked: String,
+    /// "voice", or another application later
+    pub application: String,
+}
+
+impl DeviceCard {
+    pub fn is_revoked(&self) -> bool {
+        self.revoked == "1"
+    }
+
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            device_id: row.get(0)?,
+            name: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            certificate_fingerprint: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            addresses: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            listens: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            key_hash: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            revoked: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            application: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+        })
+    }
+}
+
 /// A registered versioned field.
 #[derive(Debug, Clone, Copy)]
 pub struct FieldSpec {
@@ -71,6 +110,8 @@ pub const ENTITY_TAG: &str = "tag";
 pub const ENTITY_NOTE_TAG: &str = "note_tag";
 pub const ENTITY_NOTE_ATTACHMENT: &str = "note_attachment";
 pub const ENTITY_SETTING: &str = "setting";
+/// A device of the account: its card (CARD-1). The entity id is the device id.
+pub const ENTITY_DEVICE: &str = "device";
 
 pub const FIELD_CONTENT: &str = "content";
 pub const FIELD_STATE: &str = "state";
@@ -80,6 +121,18 @@ pub const FIELD_PARENT: &str = "parent";
 pub const FIELD_ACTIVE: &str = "active";
 pub const FIELD_DELETED: &str = "deleted";
 pub const FIELD_VALUE: &str = "value";
+/// Device card fields (CARD-1).
+pub const FIELD_CERTIFICATE_FINGERPRINT: &str = "certificate_fingerprint";
+/// JSON list of the URLs the device listens on.
+pub const FIELD_ADDRESSES: &str = "addresses";
+/// "1" while the device listens, "0" otherwise.
+pub const FIELD_LISTENS: &str = "listens";
+/// Hex SHA-256 of the device's key (AUTH-2); the key itself is nowhere else.
+pub const FIELD_KEY_HASH: &str = "key_hash";
+/// "1" once any device revoked this one; Membership kind, so "1" always wins.
+pub const FIELD_REVOKED: &str = "revoked";
+/// Which application the device runs ("voice"; later others, see PROTO-11).
+pub const FIELD_APPLICATION: &str = "application";
 /// The attachment of a note that stands for it: the recording played when
 /// the note is opened, and the one whose transcription the list shows.
 pub const FIELD_PRIMARY_ATTACHMENT: &str = "primary_attachment";
@@ -105,6 +158,13 @@ pub const FIELD_REGISTRY: &[FieldSpec] = &[
     FieldSpec { entity_type: ENTITY_NOTE_TAG, field: FIELD_ACTIVE, kind: FieldKind::Membership },
     FieldSpec { entity_type: ENTITY_NOTE_ATTACHMENT, field: FIELD_ACTIVE, kind: FieldKind::Membership },
     FieldSpec { entity_type: ENTITY_SETTING, field: FIELD_VALUE, kind: FieldKind::Scalar },
+    FieldSpec { entity_type: ENTITY_DEVICE, field: FIELD_NAME, kind: FieldKind::Scalar },
+    FieldSpec { entity_type: ENTITY_DEVICE, field: FIELD_CERTIFICATE_FINGERPRINT, kind: FieldKind::Scalar },
+    FieldSpec { entity_type: ENTITY_DEVICE, field: FIELD_ADDRESSES, kind: FieldKind::Scalar },
+    FieldSpec { entity_type: ENTITY_DEVICE, field: FIELD_LISTENS, kind: FieldKind::Scalar },
+    FieldSpec { entity_type: ENTITY_DEVICE, field: FIELD_KEY_HASH, kind: FieldKind::Scalar },
+    FieldSpec { entity_type: ENTITY_DEVICE, field: FIELD_REVOKED, kind: FieldKind::Membership },
+    FieldSpec { entity_type: ENTITY_DEVICE, field: FIELD_APPLICATION, kind: FieldKind::Scalar },
 ];
 
 /// Look up how a field merges. `None` means the field is not versioned.
@@ -727,6 +787,17 @@ impl Database {
             CREATE TABLE IF NOT EXISTS synced_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT,
+                modified_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS devices (
+                device_id TEXT PRIMARY KEY,
+                name TEXT,
+                certificate_fingerprint TEXT,
+                addresses TEXT,
+                listens TEXT,
+                key_hash TEXT,
+                revoked TEXT,
+                application TEXT,
                 modified_at INTEGER
             );
             CREATE TABLE IF NOT EXISTS field_deferred (
@@ -2212,8 +2283,94 @@ impl Database {
                     params![entity_id, head.content, ts],
                 )?;
             }
+            (ENTITY_DEVICE, field) => {
+                // Every card field is a column of the same name; the list is
+                // closed, so the column name never comes from data.
+                let column = match field {
+                    FIELD_NAME => "name",
+                    FIELD_CERTIFICATE_FINGERPRINT => "certificate_fingerprint",
+                    FIELD_ADDRESSES => "addresses",
+                    FIELD_LISTENS => "listens",
+                    FIELD_KEY_HASH => "key_hash",
+                    FIELD_REVOKED => "revoked",
+                    FIELD_APPLICATION => "application",
+                    _ => return Ok(()),
+                };
+                // A revocation is one way (CARD-2): once the column says "1",
+                // no version, however it arrived, writes "0" over it. The
+                // Membership kind settles concurrent writes the same way.
+                let set = if field == FIELD_REVOKED {
+                    "revoked = CASE WHEN devices.revoked = '1' THEN '1' ELSE excluded.revoked END".to_string()
+                } else {
+                    format!("{col} = excluded.{col}", col = column)
+                };
+                conn.execute(
+                    &format!(
+                        "INSERT INTO devices (device_id, {col}, modified_at) VALUES (?, ?, ?)
+                         ON CONFLICT(device_id) DO UPDATE SET {set}, modified_at = excluded.modified_at",
+                        col = column,
+                        set = set
+                    ),
+                    params![entity_id, head.content, ts],
+                )?;
+            }
             _ => {}
         }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Device cards (CARD-1..CARD-4): one per device of the account, each
+    // field a version like any other, so the list of devices travels.
+    // ------------------------------------------------------------------
+
+    /// One device's card, as the `devices` table holds it.
+    pub fn get_device_card(&self, device_id: &str) -> VoiceResult<Option<DeviceCard>> {
+        Ok(self
+            .connection()
+            .query_row(
+                "SELECT device_id, name, certificate_fingerprint, addresses, listens, key_hash, revoked, application
+                 FROM devices WHERE device_id = ?",
+                params![device_id],
+                DeviceCard::from_row,
+            )
+            .optional()?)
+    }
+
+    /// Every card of the account, by device name.
+    pub fn list_device_cards(&self) -> VoiceResult<Vec<DeviceCard>> {
+        let mut stmt = self.connection().prepare(
+            "SELECT device_id, name, certificate_fingerprint, addresses, listens, key_hash, revoked, application
+             FROM devices ORDER BY name, device_id",
+        )?;
+        let rows = stmt.query_map([], DeviceCard::from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Write or update a card. Each field that differs becomes a version;
+    /// an unchanged field writes nothing (VER-1). `revoked` is never written
+    /// here: see [`Database::revoke_device`].
+    pub fn write_device_card(&self, card: &DeviceCard) -> VoiceResult<()> {
+        let id = card.device_id.as_str();
+        self.set_field(ENTITY_DEVICE, id, FIELD_NAME, &card.name, None)?;
+        self.set_field(ENTITY_DEVICE, id, FIELD_CERTIFICATE_FINGERPRINT, &card.certificate_fingerprint, None)?;
+        self.set_field(ENTITY_DEVICE, id, FIELD_ADDRESSES, &card.addresses, None)?;
+        self.set_field(ENTITY_DEVICE, id, FIELD_LISTENS, &card.listens, None)?;
+        self.set_field(ENTITY_DEVICE, id, FIELD_KEY_HASH, &card.key_hash, None)?;
+        self.set_field(ENTITY_DEVICE, id, FIELD_APPLICATION, &card.application, None)?;
+        if self.head_id(ENTITY_DEVICE, id, FIELD_REVOKED)?.is_none() {
+            self.init_field(ENTITY_DEVICE, id, FIELD_REVOKED, "0")?;
+        }
+        Ok(())
+    }
+
+    /// Mark a device revoked (AUTH-6). One way: the field's kind is
+    /// Membership, so once any device wrote "1" every merge keeps it.
+    pub fn revoke_device(&self, device_id: &str) -> VoiceResult<()> {
+        if self.get_device_card(device_id)?.is_none() {
+            return Err(VoiceError::NotFound(format!("No device card for {}", device_id)));
+        }
+        self.set_field(ENTITY_DEVICE, device_id, FIELD_REVOKED, "1", None)?;
         Ok(())
     }
 

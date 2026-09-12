@@ -97,9 +97,25 @@ struct PeerCursors {
 pub struct SyncClient {
     db: Arc<Mutex<Database>>,
     config: Arc<Mutex<Config>>,
-    client: Client,
+    /// One verified client per (peer URL, pinned fingerprint)
+    clients: Mutex<HashMap<String, Client>>,
     device_id: String,
     device_name: String,
+}
+
+/// A request error with every cause behind it, so that a refused
+/// certificate says so instead of "error sending request".
+fn describe(error: &reqwest::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !parts.iter().any(|p| p.contains(&text)) {
+            parts.push(text);
+        }
+        source = cause.source();
+    }
+    parts.join(": ")
 }
 
 impl SyncClient {
@@ -110,20 +126,66 @@ impl SyncClient {
             (cfg.device_id_hex().to_string(), cfg.device_name().to_string())
         };
 
-        let client = Client::builder()
-            // A page can be a few megabytes over a slow link
-            .timeout(Duration::from_secs(180))
-            .danger_accept_invalid_certs(true) // For TOFU - we verify fingerprints manually
-            .build()
-            .map_err(|e| VoiceError::Network(e.to_string()))?;
-
         Ok(Self {
             db,
             config,
-            client,
+            clients: Mutex::new(HashMap::new()),
             device_id,
             device_name,
         })
+    }
+
+    /// The HTTP client for a peer's URL (AUTH-7): plain http only to this
+    /// machine itself; https verified against the fingerprint pinned for the
+    /// peer when there is one, against the system's root certificates when
+    /// there is none. Verification is never off. Clients are kept per
+    /// (URL, pin) so a changed pin builds a new one.
+    fn client_for(&self, peer_url: &str) -> VoiceResult<Client> {
+        let url = reqwest::Url::parse(peer_url)
+            .map_err(|e| VoiceError::Network(format!("{} is not a URL: {}", peer_url, e)))?;
+        let host = url.host_str().unwrap_or("");
+        let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1") || host.starts_with("127.");
+        if url.scheme() == "http" && !loopback {
+            return Err(VoiceError::Network(format!(
+                "{} is plain http; a device key must not cross a network in clear ({})",
+                peer_url,
+                codes::TLS_REQUIRED
+            )));
+        }
+        let pin = {
+            let config = self.config.lock().unwrap();
+            config
+                .peers()
+                .iter()
+                .find(|p| p.peer_url.trim_end_matches('/') == peer_url.trim_end_matches('/'))
+                .and_then(|p| p.certificate_fingerprint.clone())
+                .unwrap_or_default()
+        };
+        let cache_key = format!("{}\n{}", peer_url, pin);
+        if let Some(client) = self.clients.lock().unwrap().get(&cache_key) {
+            return Ok(client.clone());
+        }
+        // A page can be a few megabytes over a slow link
+        let builder = Client::builder().timeout(Duration::from_secs(180));
+        let builder = if pin.is_empty() {
+            builder
+        } else {
+            builder.use_preconfigured_tls(crate::tls::pinned_client_config(&pin)?)
+        };
+        let client = builder.build().map_err(|e| VoiceError::Network(describe(&e)))?;
+        self.clients.lock().unwrap().insert(cache_key, client.clone());
+        Ok(client)
+    }
+
+    /// The three headers every request carries (AUTH-3): the account, the
+    /// device, and the device's key as a bearer token.
+    fn authed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let key = self.config.lock().map(|c| c.device_key().to_string()).unwrap_or_default();
+        request
+            .header(crate::auth::HEADER_ACCOUNT, self.account_id())
+            .header(crate::auth::HEADER_DEVICE, &self.device_id)
+            .header("X-Device-Name", &self.device_name)
+            .bearer_auth(key)
     }
 
     /// Sync with a peer: exchange database changes both ways. Files never
@@ -527,12 +589,11 @@ impl SyncClient {
             changes: Vec::new(),
         };
         let response = self
-            .client
-            .post(format!("{}/sync/apply", peer_url))
+            .authed(self.client_for(peer_url)?.post(format!("{}/sync/apply", peer_url)))
             .json(&request)
             .send()
             .await
-            .map_err(|e| VoiceError::Network(e.to_string()))?;
+            .map_err(|e| VoiceError::Network(describe(&e)))?;
         if !response.status().is_success() {
             return Err(VoiceError::Sync(format!("Retry request failed with status {}", response.status())));
         }
@@ -579,8 +640,16 @@ impl SyncClient {
             }
         };
 
-        match self
-            .client
+        let client = match self.client_for(&peer.peer_url) {
+            Ok(c) => c,
+            Err(e) => {
+                let mut result = HashMap::new();
+                result.insert("reachable".to_string(), serde_json::Value::Bool(false));
+                result.insert("error".to_string(), serde_json::Value::String(e.to_string()));
+                return result;
+            }
+        };
+        match client
             .get(format!("{}/sync/status", peer.peer_url))
             .send()
             .await
@@ -645,12 +714,11 @@ impl SyncClient {
         };
 
         let response = self
-            .client
-            .post(format!("{}/sync/handshake", peer_url))
+            .authed(self.client_for(peer_url)?.post(format!("{}/sync/handshake", peer_url)))
             .json(&request)
             .send()
             .await
-            .map_err(|e| VoiceError::Network(e.to_string()))?;
+            .map_err(|e| VoiceError::Network(describe(&e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -676,11 +744,10 @@ impl SyncClient {
         let url = format!("{}/sync/changes?cursor={}&limit={}", peer_url, cursor, PULL_LIMIT);
 
         let response = self
-            .client
-            .get(&url)
+            .authed(self.client_for(peer_url)?.get(&url))
             .send()
             .await
-            .map_err(|e| VoiceError::Network(e.to_string()))?;
+            .map_err(|e| VoiceError::Network(describe(&e)))?;
 
         if !response.status().is_success() {
             return Err(VoiceError::Sync(format!(
@@ -784,12 +851,11 @@ impl SyncClient {
         };
 
         let response = self
-            .client
-            .post(format!("{}/sync/apply", peer_url))
+            .authed(self.client_for(peer_url)?.post(format!("{}/sync/apply", peer_url)))
             .json(&request)
             .send()
             .await
-            .map_err(|e| VoiceError::Network(e.to_string()))?;
+            .map_err(|e| VoiceError::Network(describe(&e)))?;
 
         if !response.status().is_success() {
             return Err(VoiceError::Sync(format!(
@@ -830,13 +896,10 @@ impl SyncClient {
         let url = format!("{}/sync/audio/{}/file", peer_url, audio_id);
 
         let response = self
-            .client
-            .get(&url)
-            .header("X-Device-ID", &self.device_id)
-            .header("X-Device-Name", &self.device_name)
+            .authed(self.client_for(peer_url)?.get(&url))
             .send()
             .await
-            .map_err(|e| VoiceError::Network(format!("Failed to download audio {}: {}", audio_id, e)))?;
+            .map_err(|e| VoiceError::Network(format!("Failed to fetch audio {}: {}", audio_id, describe(&e))))?;
 
         if !response.status().is_success() {
             // Try to get error message from response body
@@ -936,16 +999,13 @@ impl SyncClient {
         let bytes_len = bytes.len() as u64;
 
         let response = self
-            .client
-            .post(&url)
-            .header("X-Device-ID", &self.device_id)
-            .header("X-Device-Name", &self.device_name)
+            .authed(self.client_for(peer_url)?.post(&url))
             .header("Content-Type", "application/octet-stream")
             .body(bytes)
             .send()
             .await
             .map_err(|e| {
-                VoiceError::Network(format!("Failed to upload audio {}: {}", audio_id, e))
+                VoiceError::Network(format!("Failed to send audio {}: {}", audio_id, describe(&e)))
             })?;
 
         if !response.status().is_success() {

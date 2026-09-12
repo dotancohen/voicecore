@@ -96,6 +96,10 @@ pub struct SyncConfig {
     /// synced to peers; intended for desktop and server installations only.
     #[serde(default)]
     pub mirror_audio_files: bool,
+    /// This device's key for the account (AUTH-1): 43 base64url characters,
+    /// held in clear only here, hashed on every other device's card.
+    #[serde(default)]
+    pub device_key: String,
 }
 
 fn default_server_port() -> u16 {
@@ -114,6 +118,7 @@ impl Default for SyncConfig {
             peers: Vec::new(),
             max_sync_file_size_mb: default_max_sync_file_size_mb(),
             mirror_audio_files: false,
+            device_key: String::new(),
         }
     }
 }
@@ -408,6 +413,18 @@ impl Config {
     /// Check if sync is enabled
     pub fn is_sync_enabled(&self) -> bool {
         self.data.sync.enabled
+    }
+
+    /// This device's key for the account, or empty before one was made.
+    pub fn device_key(&self) -> &str {
+        &self.data.sync.device_key
+    }
+
+    /// Store this device's key (made by `auth::ensure_own_device_card`, or
+    /// issued at pairing).
+    pub fn set_device_key(&mut self, key: &str) -> VoiceResult<()> {
+        self.data.sync.device_key = key.to_string();
+        self.save()
     }
 
     /// Enable or disable sync

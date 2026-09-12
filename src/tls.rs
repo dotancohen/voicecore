@@ -12,6 +12,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::sync_protocol::codes;
 use crate::error::{VoiceError, VoiceResult};
 
 /// Certificate validity period (10 years in days)
@@ -70,58 +71,104 @@ pub fn verify_fingerprint(cert_path: &Path, expected_fingerprint: &str) -> Voice
     Ok(actual_fingerprint.to_lowercase() == expected_fingerprint.to_lowercase())
 }
 
-/// Trust On First Use certificate verifier
-pub struct TOFUVerifier<'a> {
-    config: &'a Config,
+/// The crypto provider this build of rustls uses: aws-lc on the desktop,
+/// ring on Android (see Cargo.toml). Every TLS configuration is built with
+/// it explicitly, so no process-wide default has to be installed.
+pub fn crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    #[cfg(not(target_os = "android"))]
+    {
+        std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    }
+    #[cfg(target_os = "android")]
+    {
+        std::sync::Arc::new(rustls::crypto::ring::default_provider())
+    }
 }
 
-impl<'a> TOFUVerifier<'a> {
-    pub fn new(config: &'a Config) -> Self {
-        Self { config }
-    }
+/// The TLS configuration a listener serves with: its own certificate and
+/// key from `certs/`, no client certificates (the device key in the request
+/// is what authenticates the caller, AUTH-3).
+pub fn server_config(cert_path: &Path, key_path: &Path) -> VoiceResult<std::sync::Arc<rustls::ServerConfig>> {
+    use std::io::BufReader;
+    let certs = rustls_pemfile::certs(&mut BufReader::new(fs::File::open(cert_path)?))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VoiceError::Tls(format!("Cannot read the certificate: {}", e)))?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(fs::File::open(key_path)?))
+        .map_err(|e| VoiceError::Tls(format!("Cannot read the key: {}", e)))?
+        .ok_or_else(|| VoiceError::Tls("The key file holds no private key".to_string()))?;
+    let config = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| VoiceError::Tls(e.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| VoiceError::Tls(e.to_string()))?;
+    Ok(std::sync::Arc::new(config))
+}
 
-    /// Verify a peer's certificate using TOFU
-    ///
-    /// Returns (is_trusted, fingerprint, error_message)
-    pub fn verify_peer(&self, peer_id: &str, peer_cert_pem: &[u8]) -> (bool, String, Option<String>) {
-        let actual_fingerprint = match compute_fingerprint_from_pem(peer_cert_pem) {
-            Ok(fp) => fp,
-            Err(e) => return (false, String::new(), Some(format!("Failed to compute fingerprint: {}", e))),
-        };
+/// Verifies a peer by the fingerprint pinned for it and nothing else
+/// (AUTH-7): the certificate is self-signed, so no root could vouch for it,
+/// and the pin came over a channel that already authenticated the peer.
+#[derive(Debug)]
+struct PinnedVerifier {
+    fingerprint: String,
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+}
 
-        // Get stored fingerprint for this peer
-        let peer = match self.config.get_peer(peer_id) {
-            Some(p) => p,
-            None => return (false, actual_fingerprint, Some("Unknown peer".to_string())),
-        };
-
-        let stored_fingerprint = &peer.certificate_fingerprint;
-
-        match stored_fingerprint {
-            None => {
-                // First connection - TOFU: trust the fingerprint
-                // Note: The caller should update the config to store the fingerprint
-                (true, actual_fingerprint, None)
-            }
-            Some(stored) => {
-                // Verify fingerprint matches
-                if actual_fingerprint.to_lowercase() == stored.to_lowercase() {
-                    (true, actual_fingerprint, None)
-                } else {
-                    (
-                        false,
-                        actual_fingerprint.clone(),
-                        Some(format!(
-                            "Certificate fingerprint mismatch! Expected: {}, Got: {}. \
-                             This could indicate a man-in-the-middle attack or \
-                             the peer regenerated their certificate.",
-                            stored, actual_fingerprint
-                        )),
-                    )
-                }
-            }
+impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let actual = compute_fingerprint_from_der(end_entity.as_ref());
+        if actual.eq_ignore_ascii_case(&self.fingerprint) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "The peer's certificate is {}, not the pinned {} ({})",
+                actual, self.fingerprint, codes::CERTIFICATE_MISMATCH
+            )))
         }
     }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// A client configuration that accepts exactly one certificate: the one
+/// whose SHA-256 fingerprint is `fingerprint`.
+pub fn pinned_client_config(fingerprint: &str) -> VoiceResult<rustls::ClientConfig> {
+    let provider = crypto_provider();
+    let verifier = std::sync::Arc::new(PinnedVerifier { fingerprint: fingerprint.to_string(), provider: provider.clone() });
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| VoiceError::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Ok(config)
 }
 
 /// Generate a self-signed certificate

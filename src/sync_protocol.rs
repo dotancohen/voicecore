@@ -21,6 +21,22 @@ pub mod codes {
     pub const ACCOUNT_MISMATCH: &str = "ACCOUNT_MISMATCH";
     /// A database opened for one account already belongs to another.
     pub const ACCOUNT_DISAGREES: &str = "ACCOUNT_DISAGREES";
+    /// The request names an account this server does not hold.
+    pub const ACCOUNT_UNKNOWN: &str = "ACCOUNT_UNKNOWN";
+    /// The request carries no device key, or no device id.
+    pub const KEY_MISSING: &str = "KEY_MISSING";
+    /// The account holds no card for the device named in the request.
+    pub const DEVICE_UNKNOWN: &str = "DEVICE_UNKNOWN";
+    /// The device's card is marked revoked.
+    pub const DEVICE_REVOKED: &str = "DEVICE_REVOKED";
+    /// The key does not hash to the device card's key hash.
+    pub const KEY_WRONG: &str = "KEY_WRONG";
+    /// The handshake body names a device other than the headers do.
+    pub const DEVICE_MISMATCH: &str = "DEVICE_MISMATCH";
+    /// A peer's address is plain http and not this machine.
+    pub const TLS_REQUIRED: &str = "TLS_REQUIRED";
+    /// The peer's certificate is not the pinned one.
+    pub const CERTIFICATE_MISMATCH: &str = "CERTIFICATE_MISMATCH";
 }
 
 /// `POST /sync/handshake` request body.
