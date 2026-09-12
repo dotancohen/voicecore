@@ -173,7 +173,7 @@ pub fn admit_by_token(
         revoked: "0".to_string(),
         application: if application.is_empty() { auth::APPLICATION_VOICE.to_string() } else { application.to_string() },
     };
-    db.write_device_card(&card).map_err(|e| format!("Could not write the device's card: {}", e))?;
+    db.admit_device_card(&card).map_err(|e| format!("Could not write the device's card: {}", e))?;
     Ok(key)
 }
 

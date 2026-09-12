@@ -2364,6 +2364,26 @@ impl Database {
         Ok(())
     }
 
+    /// Write another device's card, as pairing does (CARD-3): each field
+    /// becomes a deterministic root when it has no history yet, so the
+    /// device's own later writes build on it and two devices that learn the
+    /// same card write the same versions; nothing here conflicts with what
+    /// the device says about itself. `listens` and `addresses` are the
+    /// owner's alone and are only given their empty roots.
+    pub fn admit_device_card(&self, card: &DeviceCard) -> VoiceResult<()> {
+        let id = card.device_id.as_str();
+        self.init_field(ENTITY_DEVICE, id, FIELD_NAME, &card.name)?;
+        self.init_field(ENTITY_DEVICE, id, FIELD_CERTIFICATE_FINGERPRINT, &card.certificate_fingerprint)?;
+        self.init_field(ENTITY_DEVICE, id, FIELD_KEY_HASH, &card.key_hash)?;
+        self.init_field(ENTITY_DEVICE, id, FIELD_APPLICATION, &card.application)?;
+        for (field, value) in [(FIELD_ADDRESSES, ""), (FIELD_LISTENS, "0"), (FIELD_REVOKED, "0")] {
+            if self.head_id(ENTITY_DEVICE, id, field)?.is_none() {
+                self.init_field(ENTITY_DEVICE, id, field, value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Mark a device revoked (AUTH-6). One way: the field's kind is
     /// Membership, so once any device wrote "1" every merge keeps it.
     pub fn revoke_device(&self, device_id: &str) -> VoiceResult<()> {

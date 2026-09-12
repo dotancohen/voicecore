@@ -282,7 +282,7 @@ impl SyncClient {
             if db.account_id()? != reply.account_id {
                 db.move_to_account(&reply.account_id)?;
             }
-            db.write_device_card(&crate::versions::DeviceCard {
+            db.admit_device_card(&crate::versions::DeviceCard {
                 device_id: reply.device_id.clone(),
                 name: reply.device_name.clone(),
                 certificate_fingerprint: reply.certificate_fingerprint.clone(),

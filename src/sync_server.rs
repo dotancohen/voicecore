@@ -1299,7 +1299,7 @@ mod tests {
         /// Let `caller` into `server`'s account: its card, with its key hash.
         fn admit(server: &Device, caller: &Device) {
             let card = caller.db.lock().unwrap().get_device_card(&caller.id).unwrap().unwrap();
-            server.db.lock().unwrap().write_device_card(&card).unwrap();
+            server.db.lock().unwrap().admit_device_card(&card).unwrap();
         }
 
         /// Serve a device on this machine, plain or with its own certificate.
@@ -1639,8 +1639,8 @@ mod tests {
             b.db.lock().unwrap().move_to_account(&account).unwrap();
             let card_a = a.db.lock().unwrap().get_device_card(&a.id).unwrap().unwrap();
             let card_b = b.db.lock().unwrap().get_device_card(&b.id).unwrap().unwrap();
-            a.db.lock().unwrap().write_device_card(&card_b).unwrap();
-            b.db.lock().unwrap().write_device_card(&card_a).unwrap();
+            a.db.lock().unwrap().admit_device_card(&card_b).unwrap();
+            b.db.lock().unwrap().admit_device_card(&card_a).unwrap();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
