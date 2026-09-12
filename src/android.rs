@@ -392,6 +392,39 @@ impl VoiceClient {
         Ok(db.account_id()?)
     }
 
+    /// Show a code (PAIR-1): make a token and return the setup text. `urls`
+    /// are where this phone listens.
+    pub fn offer_code(&self, urls: Vec<String>) -> Result<String, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let cfg = self.config.lock().unwrap();
+        Ok(crate::pairing::offer(&db, &cfg, urls)?.to_text())
+    }
+
+    /// Hide the code: withdraw the offer.
+    pub fn withdraw_code(&self) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        crate::pairing::withdraw(&db)?;
+        Ok(())
+    }
+
+    /// Join an account from a setup text (PAIR-4): a scanned QR code or a
+    /// pasted text. Refused before any network if this phone holds notes of
+    /// another account.
+    pub fn join(&self, setup_text: String) -> Result<JoinedData, VoiceCoreError> {
+        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
+        let joined = rt.block_on(sync_client.join(&setup_text))?;
+        Ok(JoinedData {
+            account_id: joined.account_id,
+            peer_id: joined.peer_id,
+            peer_name: joined.peer_name,
+            peer_url: joined.peer_url,
+        })
+    }
+
     /// Every device of the account, by its card (CARD-1).
     pub fn list_devices(&self) -> Result<Vec<DeviceCardData>, VoiceCoreError> {
         let db = self.db.lock().unwrap();
@@ -2032,6 +2065,15 @@ fn conflict_to_data(c: crate::versions::ConflictRow) -> ConflictData {
         created_at: stamp(c.created_at, None, None),
         resolved_at: stamp_opt(c.resolved_at, None, None),
     }
+}
+
+/// What a successful join gives back
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct JoinedData {
+    pub account_id: String,
+    pub peer_id: String,
+    pub peer_name: String,
+    pub peer_url: String,
 }
 
 /// A device of the account, as its card says (CARD-1)

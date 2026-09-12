@@ -33,7 +33,7 @@ use crate::error::VoiceResult;
 use crate::models::SyncChange;
 use crate::sync_protocol::{
     codes, ApplyRequest, ApplyResponse, ChangesQuery, ChangesResponse, ErrorResponse, HandshakeRequest,
-    HandshakeResponse, StatusResponse, PROTOCOL_VERSION,
+    HandshakeResponse, PairClaimRequest, PairClaimResponse, StatusResponse, PROTOCOL_VERSION,
 };
 use crate::UUID_SHORT_LEN;
 
@@ -78,6 +78,80 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
+/// Count a refusal from an address and say how long to wait before
+/// answering it (AUTH-5).
+fn note_failure(state: &AppState, ip: IpAddr) -> Duration {
+    let mut failures = state.failures.lock().unwrap();
+    let now = Instant::now();
+    if failures.len() > MAX_TRACKED_ADDRESSES {
+        failures.clear();
+    }
+    let entry = failures.entry(ip).or_insert((0, now));
+    if now.duration_since(entry.1) > FAILURE_MEMORY {
+        entry.0 = 0;
+    }
+    entry.0 += 1;
+    entry.1 = now;
+    if entry.0 > FREE_FAILURES {
+        let doublings = (entry.0 - FREE_FAILURES).min(3);
+        Duration::from_secs(1 << doublings).min(MAX_DELAY)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// `POST /pair/claim` (PAIR-3): a reading device presents the token from
+/// the code and receives a key of its own. Authenticated by the token
+/// alone, so it sits outside the device-key middleware; a wrong token
+/// counts like any other refusal from that address.
+async fn pair_claim(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(request): Json<PairClaimRequest>,
+) -> Response {
+    let admitted = {
+        let db = state.db.lock().unwrap();
+        crate::pairing::admit_by_token(
+            &db,
+            &request.token,
+            &request.device_id,
+            &request.device_name,
+            &request.certificate_fingerprint,
+            &request.addresses,
+            &request.application,
+        )
+        .map(|key| (key, db.account_id().unwrap_or_default(), db.get_device_card(&state.device_id).ok().flatten()))
+    };
+    match admitted {
+        Ok((device_key, account_id, own_card)) => {
+            tracing::info!("Paired {} ({}) into account {}", short(&request.device_id), request.device_name, short(&account_id));
+            if let Ok(mut failures) = state.failures.lock() {
+                failures.remove(&addr.ip());
+            }
+            let (certificate_fingerprint, addresses) = own_card
+                .map(|c| (c.certificate_fingerprint, c.addresses))
+                .unwrap_or_default();
+            Json(PairClaimResponse {
+                account_id,
+                device_key,
+                device_id: state.device_id.clone(),
+                device_name: state.device_name.clone(),
+                certificate_fingerprint,
+                addresses,
+            })
+            .into_response()
+        }
+        Err(sentence) => {
+            let delay = note_failure(&state, addr.ip());
+            tracing::warn!("Refused a pairing claim from {}: {}", addr.ip(), codes::TOKEN_INVALID);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            (StatusCode::FORBIDDEN, Json(ErrorResponse::with_code(sentence, codes::TOKEN_INVALID))).into_response()
+        }
+    }
+}
+
 /// Every route but the health check passes through here (AUTH-3): the
 /// account must be this one, the device must have a card that is not
 /// revoked, and the key must hash to the card's hash. A refusal is a
@@ -106,25 +180,7 @@ async fn require_device(
             next.run(request).await
         }
         Err(refusal) => {
-            let delay = {
-                let mut failures = state.failures.lock().unwrap();
-                let now = Instant::now();
-                if failures.len() > MAX_TRACKED_ADDRESSES {
-                    failures.clear();
-                }
-                let entry = failures.entry(addr.ip()).or_insert((0, now));
-                if now.duration_since(entry.1) > FAILURE_MEMORY {
-                    entry.0 = 0;
-                }
-                entry.0 += 1;
-                entry.1 = now;
-                if entry.0 > FREE_FAILURES {
-                    let doublings = (entry.0 - FREE_FAILURES).min(3);
-                    Duration::from_secs(1 << doublings).min(MAX_DELAY)
-                } else {
-                    Duration::ZERO
-                }
-            };
+            let delay = note_failure(&state, addr.ip());
             tracing::warn!(
                 "Refused {} from {} for device {}: {}",
                 request.uri().path(),
@@ -890,6 +946,7 @@ pub fn create_router(
 
     Router::new()
         .route("/sync/status", get(status))
+        .route("/pair/claim", post(pair_claim))
         .merge(authenticated)
         // Body limit is configurable via sync.max_sync_file_size_mb in config
         .layer(DefaultBodyLimit::max(max_body_size))
@@ -1332,6 +1389,115 @@ mod tests {
 
             let refused = start_server(server.db.clone(), server.config.clone(), "0.0.0.0", 0, true).await;
             assert!(refused.unwrap_err().to_string().contains(codes::TLS_REQUIRED));
+        }
+    }
+
+    mod pairing {
+        use super::*;
+        use crate::auth;
+        use crate::config::Config;
+        use crate::sync_client::SyncClient;
+        use crate::sync_protocol::codes;
+
+        struct Device {
+            db: Arc<Mutex<Database>>,
+            config: Arc<Mutex<Config>>,
+            id: String,
+            _dir: TempDir,
+        }
+
+        fn device(name: &str) -> Device {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new(dir.path().join("notes.db")).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            config.set_device_name(name).unwrap();
+            auth::ensure_own_device_card(&db, &mut config).unwrap();
+            let id = config.device_id_hex().to_string();
+            Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
+        }
+
+        /// Serve with the device's own certificate; return its URL and the task.
+        fn serve_tls(server: &Device) -> (String, tokio::task::JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (cert, key, _) = {
+                let cfg = server.config.lock().unwrap();
+                crate::tls::ensure_server_certificate(&cfg, false).unwrap()
+            };
+            // The fingerprint is on the card once the certificate exists
+            {
+                let db = server.db.lock().unwrap();
+                let mut cfg = server.config.lock().unwrap();
+                auth::ensure_own_device_card(&db, &mut cfg).unwrap();
+            }
+            let router = create_router(server.db.clone(), server.config.clone())
+                .into_make_service_with_connect_info::<SocketAddr>();
+            let config = axum_server::tls_rustls::RustlsConfig::from_config(crate::tls::server_config(&cert, &key).unwrap());
+            let task = tokio::spawn(async move {
+                axum_server::from_tcp_rustls(listener, config).serve(router).await.unwrap();
+            });
+            (format!("https://127.0.0.1:{}", port), task)
+        }
+
+        #[tokio::test]
+        async fn a_fresh_device_joins_from_the_code_and_then_syncs_both_ways() {
+            let desk = device("Desk");
+            desk.db.lock().unwrap().create_note("על השולחן").unwrap();
+            let (url, task) = serve_tls(&desk);
+            let setup = {
+                let db = desk.db.lock().unwrap();
+                let cfg = desk.config.lock().unwrap();
+                crate::pairing::offer(&db, &cfg, vec![url.clone()]).unwrap()
+            };
+            assert!(!setup.certificate_fingerprint.is_empty(), "the listener's fingerprint is in the code");
+            let text = setup.to_text();
+
+            let phone = device("Phone");
+            assert_ne!(phone.db.lock().unwrap().account_id().unwrap(), setup.account_id);
+            let client = SyncClient::new(phone.db.clone(), phone.config.clone()).unwrap();
+
+            let joined = client.join(&text).await.unwrap();
+
+            assert_eq!(joined.account_id, setup.account_id);
+            assert_eq!(joined.peer_id, desk.id);
+            assert_eq!(phone.db.lock().unwrap().account_id().unwrap(), setup.account_id, "the phone took the account");
+            let key = phone.config.lock().unwrap().device_key().to_string();
+            assert_eq!(key.len(), 43);
+            let card_on_desk = desk.db.lock().unwrap().get_device_card(&phone.id).unwrap().unwrap();
+            assert_eq!(card_on_desk.key_hash, auth::key_hash(&key), "the desk holds the phone's key hash");
+            let peers = phone.config.lock().unwrap().peers().to_vec();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].certificate_fingerprint.as_deref(), Some(setup.certificate_fingerprint.as_str()), "the fingerprint is pinned");
+
+            // The token is spent
+            let again = device("Another");
+            let refused = SyncClient::new(again.db.clone(), again.config.clone()).unwrap().join(&text).await;
+            assert!(refused.unwrap_err().to_string().contains(codes::TOKEN_INVALID));
+
+            // And now an ordinary sync works, with the key and the pin
+            phone.db.lock().unwrap().create_note("מהטלפון").unwrap();
+            let result = client.sync_with_peer(&desk.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(phone.db.lock().unwrap().get_all_notes().unwrap().len(), 2);
+            assert_eq!(desk.db.lock().unwrap().get_all_notes().unwrap().len(), 2);
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_device_with_notes_refuses_the_code_before_any_connection() {
+            let desk = device("Desk");
+            let setup = {
+                let db = desk.db.lock().unwrap();
+                let cfg = desk.config.lock().unwrap();
+                crate::pairing::offer(&db, &cfg, vec!["https://127.0.0.1:1".to_string()]).unwrap()
+            };
+            let phone = device("Phone");
+            phone.db.lock().unwrap().create_note("כבר יש לי").unwrap();
+            let client = SyncClient::new(phone.db.clone(), phone.config.clone()).unwrap();
+            let err = client.join(&setup.to_text()).await.unwrap_err().to_string();
+            assert!(err.contains(codes::DEVICE_HOLDS_NOTES), "{}", err);
+            assert!(desk.db.lock().unwrap().has_pairing_offer(chrono::Utc::now().timestamp()).unwrap(), "the code was not spent");
         }
     }
 

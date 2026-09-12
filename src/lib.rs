@@ -32,6 +32,7 @@ pub mod sync_apply;
 pub mod sync_client;
 #[cfg(feature = "server")]
 pub mod auth;
+pub mod pairing;
 pub mod sync_protocol;
 pub mod sync_server;
 pub mod tls;

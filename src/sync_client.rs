@@ -103,6 +103,44 @@ pub struct SyncClient {
     device_name: String,
 }
 
+/// What a successful join gives back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Joined {
+    pub account_id: String,
+    pub peer_id: String,
+    pub peer_name: String,
+    pub peer_url: String,
+}
+
+/// Plain http is accepted only to this machine itself (AUTH-7).
+fn check_scheme(peer_url: &str) -> VoiceResult<()> {
+    let url = reqwest::Url::parse(peer_url)
+        .map_err(|e| VoiceError::Network(format!("{} is not a URL: {}", peer_url, e)))?;
+    let host = url.host_str().unwrap_or("");
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1") || host.starts_with("127.");
+    if url.scheme() == "http" && !loopback {
+        return Err(VoiceError::Network(format!(
+            "{} is plain http; a device key must not cross a network in clear ({})",
+            peer_url,
+            codes::TLS_REQUIRED
+        )));
+    }
+    Ok(())
+}
+
+/// A client verified by `pin` when there is one, by the system roots when
+/// there is none. Verification is never off.
+fn build_client(pin: &str) -> VoiceResult<Client> {
+    // A page can be a few megabytes over a slow link
+    let builder = Client::builder().timeout(Duration::from_secs(180));
+    let builder = if pin.is_empty() {
+        builder
+    } else {
+        builder.use_preconfigured_tls(crate::tls::pinned_client_config(pin)?)
+    };
+    builder.build().map_err(|e| VoiceError::Network(e.to_string()))
+}
+
 /// A request error with every cause behind it, so that a refused
 /// certificate says so instead of "error sending request".
 fn describe(error: &reqwest::Error) -> String {
@@ -141,17 +179,7 @@ impl SyncClient {
     /// there is none. Verification is never off. Clients are kept per
     /// (URL, pin) so a changed pin builds a new one.
     fn client_for(&self, peer_url: &str) -> VoiceResult<Client> {
-        let url = reqwest::Url::parse(peer_url)
-            .map_err(|e| VoiceError::Network(format!("{} is not a URL: {}", peer_url, e)))?;
-        let host = url.host_str().unwrap_or("");
-        let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1") || host.starts_with("127.");
-        if url.scheme() == "http" && !loopback {
-            return Err(VoiceError::Network(format!(
-                "{} is plain http; a device key must not cross a network in clear ({})",
-                peer_url,
-                codes::TLS_REQUIRED
-            )));
-        }
+        check_scheme(peer_url)?;
         let pin = {
             let config = self.config.lock().unwrap();
             config
@@ -165,16 +193,94 @@ impl SyncClient {
         if let Some(client) = self.clients.lock().unwrap().get(&cache_key) {
             return Ok(client.clone());
         }
-        // A page can be a few megabytes over a slow link
-        let builder = Client::builder().timeout(Duration::from_secs(180));
-        let builder = if pin.is_empty() {
-            builder
-        } else {
-            builder.use_preconfigured_tls(crate::tls::pinned_client_config(&pin)?)
-        };
-        let client = builder.build().map_err(|e| VoiceError::Network(describe(&e)))?;
+        let client = build_client(&pin)?;
         self.clients.lock().unwrap().insert(cache_key, client.clone());
         Ok(client)
+    }
+
+    /// Join an account from a setup text (PAIR-4): refuse if this device
+    /// holds another account's notes, then present the token to the showing
+    /// device over TLS pinned to the text's fingerprint, take the account id
+    /// and the key it issues, and add the showing device as a peer.
+    pub async fn join(&self, setup_text: &str) -> VoiceResult<Joined> {
+        let setup = crate::pairing::SetupText::parse(setup_text)?;
+        {
+            let db = self.db.lock().unwrap();
+            crate::pairing::check_can_join(&db, &setup)?;
+        }
+        let own_fingerprint = {
+            let config = self.config.lock().unwrap();
+            config
+                .certs_dir()
+                .ok()
+                .map(|d| d.join("server.crt"))
+                .filter(|p| p.is_file())
+                .and_then(|p| crate::tls::compute_fingerprint(&p).ok())
+                .unwrap_or_default()
+        };
+        let request = crate::sync_protocol::PairClaimRequest {
+            token: setup.token.clone(),
+            device_id: self.device_id.clone(),
+            device_name: self.device_name.clone(),
+            certificate_fingerprint: own_fingerprint,
+            addresses: String::new(),
+            application: crate::auth::APPLICATION_VOICE.to_string(),
+        };
+        let client = build_client(&setup.certificate_fingerprint)?;
+        let mut last_error = String::new();
+        let mut reply: Option<(String, crate::sync_protocol::PairClaimResponse)> = None;
+        for url in &setup.urls {
+            check_scheme(url)?;
+            match client.post(format!("{}/pair/claim", url.trim_end_matches('/'))).json(&request).send().await {
+                Ok(response) if response.status().is_success() => {
+                    let body: crate::sync_protocol::PairClaimResponse = response
+                        .json()
+                        .await
+                        .map_err(|e| VoiceError::Sync(format!("Could not read the pairing reply: {}", e)))?;
+                    reply = Some((url.clone(), body));
+                    break;
+                }
+                Ok(response) => {
+                    let body = response.text().await.unwrap_or_default();
+                    let sentence = serde_json::from_str::<ErrorResponse>(&body).map(|r| r.error).unwrap_or(body);
+                    return Err(VoiceError::Sync(if sentence.is_empty() { "The pairing was refused".to_string() } else { sentence }));
+                }
+                Err(e) => last_error = describe(&e),
+            }
+        }
+        let (url, reply) = reply.ok_or_else(|| VoiceError::Network(format!("Could not reach device {}: {}", &setup.device_id[..UUID_SHORT_LEN.min(setup.device_id.len())], last_error)))?;
+        if reply.account_id != setup.account_id {
+            return Err(VoiceError::Sync(format!(
+                "The device answered for account {}, but the code was for {} ({})",
+                &reply.account_id[..UUID_SHORT_LEN.min(reply.account_id.len())],
+                &setup.account_id[..UUID_SHORT_LEN.min(setup.account_id.len())],
+                codes::ACCOUNT_MISMATCH
+            )));
+        }
+        {
+            let db = self.db.lock().unwrap();
+            if db.account_id()? != reply.account_id {
+                db.move_to_account(&reply.account_id)?;
+            }
+            db.write_device_card(&crate::versions::DeviceCard {
+                device_id: reply.device_id.clone(),
+                name: reply.device_name.clone(),
+                certificate_fingerprint: reply.certificate_fingerprint.clone(),
+                addresses: reply.addresses.clone(),
+                listens: "1".to_string(),
+                key_hash: String::new(),
+                revoked: "0".to_string(),
+                application: crate::auth::APPLICATION_VOICE.to_string(),
+            })?;
+            let mut config = self.config.lock().unwrap();
+            config.set_device_key(&reply.device_key)?;
+            let pin = if setup.certificate_fingerprint.is_empty() { None } else { Some(setup.certificate_fingerprint.as_str()) };
+            config.add_peer(&reply.device_id, &reply.device_name, &url, pin, true)?;
+            config.set_sync_enabled(true)?;
+            crate::auth::ensure_own_device_card(&db, &mut config)?;
+        }
+        self.clients.lock().unwrap().clear();
+        Ok(Joined { account_id: reply.account_id, peer_id: reply.device_id, peer_name: reply.device_name, peer_url: url })
     }
 
     /// The three headers every request carries (AUTH-3): the account, the

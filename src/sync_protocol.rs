@@ -37,6 +37,12 @@ pub mod codes {
     pub const TLS_REQUIRED: &str = "TLS_REQUIRED";
     /// The peer's certificate is not the pinned one.
     pub const CERTIFICATE_MISMATCH: &str = "CERTIFICATE_MISMATCH";
+    /// The pairing token is unknown, spent, expired or mistyped.
+    pub const TOKEN_INVALID: &str = "TOKEN_INVALID";
+    /// The setup text could not be read.
+    pub const SETUP_TEXT_INVALID: &str = "SETUP_TEXT_INVALID";
+    /// This device holds notes of another account and will not be paired over them.
+    pub const DEVICE_HOLDS_NOTES: &str = "DEVICE_HOLDS_NOTES";
 }
 
 /// `POST /sync/handshake` request body.
@@ -115,6 +121,36 @@ pub struct ApplyResponse {
     pub applied: i64,
     pub conflicts: i64,
     pub errors: Vec<String>,
+}
+
+/// `POST /pair/claim` request body (PAIR-3): the reading device presents the
+/// token from the code and describes itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairClaimRequest {
+    pub token: String,
+    pub device_id: String,
+    pub device_name: String,
+    #[serde(default)]
+    pub certificate_fingerprint: String,
+    /// JSON list of URLs the reader listens on, or empty
+    #[serde(default)]
+    pub addresses: String,
+    #[serde(default)]
+    pub application: String,
+}
+
+/// `POST /pair/claim` response body: the account, the key made for the
+/// reader, and the shower's own card so the reader can reach it back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairClaimResponse {
+    pub account_id: String,
+    pub device_key: String,
+    pub device_id: String,
+    pub device_name: String,
+    #[serde(default)]
+    pub certificate_fingerprint: String,
+    #[serde(default)]
+    pub addresses: String,
 }
 
 /// `GET /sync/status` response body.

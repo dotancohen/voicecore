@@ -298,6 +298,9 @@ pub struct Database {
 /// How many snapshots are kept beside a database (SNAP-2).
 pub const SNAPSHOTS_KEPT: usize = 5;
 
+/// Wrong tokens a shown code survives before it is withdrawn (PAIR-2).
+pub const PAIRING_GUESSES_ALLOWED: i64 = 5;
+
 /// One snapshot of a database, as listed by [`Database::list_snapshots`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotInfo {
@@ -3347,6 +3350,58 @@ impl Database {
             params![account_id, peer_name, peer_bytes],
         )?;
         Ok(())
+    }
+
+    // ============================================================================
+    // Pairing offers (PAIR-2): a token is single-use, lives ten minutes, and
+    // dies after five wrong guesses. Only its hash is kept.
+    // ============================================================================
+
+    /// Record a freshly shown token. Older offers are dropped: one code at a
+    /// time.
+    pub fn offer_pairing_token(&self, token_hash: &str, expires_at: i64) -> VoiceResult<()> {
+        self.conn.execute("DELETE FROM pairing_offers", [])?;
+        self.conn.execute(
+            "INSERT INTO pairing_offers (token_hash, expires_at, failures) VALUES (?, ?, 0)",
+            params![token_hash, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Withdraw every offer, when the code is hidden or spent.
+    pub fn withdraw_pairing_offers(&self) -> VoiceResult<()> {
+        self.conn.execute("DELETE FROM pairing_offers", [])?;
+        Ok(())
+    }
+
+    /// Spend the offer whose hash this is, if it is live. A wrong hash
+    /// counts against the live offer, and the fifth wrong one withdraws it.
+    /// Returns true when the token was accepted and spent.
+    pub fn spend_pairing_token(&self, token_hash: &str, now: i64) -> VoiceResult<bool> {
+        self.conn.execute("DELETE FROM pairing_offers WHERE expires_at <= ?", params![now])?;
+        let live: Option<(String, i64)> = self
+            .conn
+            .query_row("SELECT token_hash, failures FROM pairing_offers LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((offered, failures)) = live else { return Ok(false) };
+        if crate::auth::hashes_agree(&offered, token_hash) {
+            self.conn.execute("DELETE FROM pairing_offers", [])?;
+            return Ok(true);
+        }
+        if failures + 1 >= PAIRING_GUESSES_ALLOWED {
+            self.conn.execute("DELETE FROM pairing_offers", [])?;
+        } else {
+            self.conn.execute("UPDATE pairing_offers SET failures = failures + 1", [])?;
+        }
+        Ok(false)
+    }
+
+    /// Whether a code is currently offered (live and not spent).
+    pub fn has_pairing_offer(&self, now: i64) -> VoiceResult<bool> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pairing_offers WHERE expires_at > ?", params![now], |r| r.get(0))?;
+        Ok(n > 0)
     }
 
     // ============================================================================
@@ -7291,6 +7346,17 @@ impl Database {
                 params![Uuid::now_v7().simple().to_string()],
             )?;
         }
+        // Pairing offers (PAIR-2): the hash of a token shown in a code, until
+        // it is spent, expired or guessed at too often. Local, never synced.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS pairing_offers (
+                token_hash TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL,
+                failures INTEGER NOT NULL DEFAULT 0
+            );
+            "#,
+        )?;
         for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT", "peer_account_id TEXT"] {
             let name = col.split(' ').next().unwrap_or_default();
             if !self.column_exists("sync_peers", name)? {
