@@ -434,6 +434,62 @@ impl VoiceClient {
         })
     }
 
+    /// Start listening for peers (Stage 6): HTTPS with this phone's own
+    /// certificate, on a thread of its own. Returns the URLs peers can use.
+    /// Never started by the core itself; the application's switch starts it.
+    pub fn start_listener(&self, port: u16) -> Result<Vec<String>, VoiceCoreError> {
+        if crate::sync_server::server_running() {
+            return Err(VoiceCoreError::Sync { msg: "The listener is already running".to_string() });
+        }
+        let urls = crate::sync_server::listen_urls("0.0.0.0", port, false);
+        let db = self.db.clone();
+        let config = self.config.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        std::thread::Builder::new()
+            .name("voice-listener".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("Failed to create runtime: {}", e)));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                if let Err(e) = rt.block_on(crate::sync_server::start_server(db, config, "0.0.0.0", port, false)) {
+                    tracing::error!("Listener stopped with an error: {}", e);
+                }
+            })
+            .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to start the listener thread: {}", e) })?;
+        ready_rx
+            .recv()
+            .map_err(|_| VoiceCoreError::Sync { msg: "The listener thread ended before it started".to_string() })?
+            .map_err(|msg| VoiceCoreError::Sync { msg })?;
+        Ok(urls)
+    }
+
+    /// Stop listening. The card says so once the listener has wound down.
+    pub fn stop_listener(&self) {
+        crate::sync_server::stop_server();
+    }
+
+    pub fn listener_running(&self) -> bool {
+        crate::sync_server::server_running()
+    }
+
+    /// The fingerprint of this phone's certificate, making the certificate
+    /// if there is none yet: what a peer pins, and what the sync screen shows.
+    pub fn certificate_fingerprint(&self) -> Result<String, VoiceCoreError> {
+        let cfg = self.config.lock().unwrap();
+        let (_, _, fingerprint) = crate::tls::ensure_server_certificate(&cfg, false)?;
+        Ok(fingerprint)
+    }
+
+    /// Where this phone would be reachable at `port`, for the sync screen.
+    pub fn listen_urls(&self, port: u16) -> Vec<String> {
+        crate::sync_server::listen_urls("0.0.0.0", port, false)
+    }
+
     /// Every device of the account, by its card (CARD-1).
     pub fn list_devices(&self) -> Result<Vec<DeviceCardData>, VoiceCoreError> {
         let db = self.db.lock().unwrap();

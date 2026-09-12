@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -38,8 +38,9 @@ use crate::sync_protocol::{
 };
 use crate::UUID_SHORT_LEN;
 
-/// Server shutdown handle
-static SHUTDOWN_TX: OnceLock<Mutex<Option<oneshot::Sender<()>>>> = OnceLock::new();
+/// The running listener's shutdown handle; replaced by every start, taken
+/// by a stop, so a listener can be started again after it stopped.
+static SHUTDOWN_TX: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
 
 /// Shared server state
 #[derive(Clone)]
@@ -1014,10 +1015,31 @@ pub fn listen_urls(host: &str, port: u16, plain_http: bool) -> Vec<String> {
     if host != "0.0.0.0" && host != "::" && !host.is_empty() {
         return vec![format!("{}://{}:{}", scheme, host, port)];
     }
-    match hostname_of_this_machine() {
-        Some(name) => vec![format!("{}://{}:{}", scheme, name, port)],
-        None => Vec::new(),
+    let mut urls: Vec<String> = if_addrs::get_if_addrs()
+        .map(|ifs| {
+            ifs.into_iter()
+                .filter(|i| !i.is_loopback())
+                .filter_map(|i| match i.ip() {
+                    std::net::IpAddr::V4(v4) if v4.is_private() || v4.is_link_local() => Some(format!("{}://{}:{}", scheme, v4, port)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    urls.sort();
+    if let Some(name) = hostname_of_this_machine() {
+        urls.push(format!("{}://{}:{}", scheme, name, port));
     }
+    urls
+}
+
+/// Say on this device's own card that it listens at `urls`, or that it
+/// stopped (CARD-1 `listens`, `addresses`).
+pub fn record_listening(db: &Database, config: &mut Config, urls: &[String], listening: bool) -> VoiceResult<()> {
+    let mut card = crate::auth::ensure_own_device_card(db, config)?;
+    card.listens = if listening { "1" } else { "0" }.to_string();
+    card.addresses = if listening { serde_json::to_string(urls).unwrap_or_default() } else { card.addresses };
+    db.write_device_card(&card)
 }
 
 #[cfg(feature = "desktop")]
@@ -1063,17 +1085,19 @@ pub async fn start_server(
         tracing::info!("Certificate fingerprint {}", fingerprint);
         Some(crate::tls::server_config(&cert_path, &key_path)?)
     };
+    let urls = listen_urls(host, port, plain_http);
     {
         let db_guard = db.lock().unwrap();
         let mut cfg = config.lock().unwrap();
-        crate::auth::ensure_own_device_card(&db_guard, &mut cfg)?;
+        record_listening(&db_guard, &mut cfg, &urls, true)?;
     }
+    let (db_for_stop, config_for_stop) = (db.clone(), config.clone());
 
     let router = create_router(db, config).into_make_service_with_connect_info::<SocketAddr>();
 
-    // Create shutdown channel
+    // Create shutdown channel; a previous listener's handle, if any, is dropped
     let (tx, rx) = oneshot::channel::<()>();
-    SHUTDOWN_TX.get_or_init(|| Mutex::new(Some(tx)));
+    *SHUTDOWN_TX.lock().unwrap() = Some(tx);
     let handle = axum_server::Handle::new();
     let stopper = handle.clone();
     tokio::spawn(async move {
@@ -1083,36 +1107,37 @@ pub async fn start_server(
 
     tracing::info!("Starting sync server on {} ({})", addr, if plain_http { "plain http" } else { "https" });
 
-    match tls {
+    let served = match tls {
         Some(server_config) => {
             let rustls = axum_server::tls_rustls::RustlsConfig::from_config(server_config);
-            axum_server::bind_rustls(addr, rustls)
-                .handle(handle)
-                .serve(router)
-                .await
-                .map_err(|e| crate::error::VoiceError::Network(e.to_string()))?;
+            axum_server::bind_rustls(addr, rustls).handle(handle).serve(router).await
         }
-        None => {
-            axum_server::bind(addr)
-                .handle(handle)
-                .serve(router)
-                .await
-                .map_err(|e| crate::error::VoiceError::Network(e.to_string()))?;
+        None => axum_server::bind(addr).handle(handle).serve(router).await,
+    };
+    *SHUTDOWN_TX.lock().unwrap() = None;
+    {
+        let db_guard = db_for_stop.lock().unwrap();
+        let mut cfg = config_for_stop.lock().unwrap();
+        if let Err(e) = record_listening(&db_guard, &mut cfg, &[], false) {
+            tracing::warn!("Could not record that the listener stopped: {}", e);
         }
     }
-
+    served.map_err(|e| crate::error::VoiceError::Network(e.to_string()))?;
     Ok(())
 }
 
 /// Stop the sync server
 pub fn stop_server() {
-    if let Some(mutex) = SHUTDOWN_TX.get() {
-        if let Ok(mut guard) = mutex.lock() {
-            if let Some(tx) = guard.take() {
-                let _ = tx.send(());
-            }
+    if let Ok(mut guard) = SHUTDOWN_TX.lock() {
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(());
         }
     }
+}
+
+/// Whether a listener is running in this process.
+pub fn server_running() -> bool {
+    SHUTDOWN_TX.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
 // ============================================================================
@@ -1744,6 +1769,61 @@ mod tests {
             let body: crate::sync_protocol::MissingFilesResponse = resp.json().await.unwrap();
             assert_eq!(body.missing, vec![id_a], "B lacks A's file, holds its own, and ignores an id it has no row for");
             task.abort();
+        }
+    }
+
+    mod listener {
+        use super::*;
+        use crate::config::Config;
+
+        fn free_port() -> u16 {
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        }
+
+        async fn wait_for(url: &str) -> bool {
+            let http = reqwest::Client::new();
+            for _ in 0..50 {
+                if http.get(format!("{}/sync/status", url)).send().await.map(|r| r.status() == 200).unwrap_or(false) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        #[tokio::test]
+        async fn a_listener_says_so_on_its_card_stops_when_asked_and_can_start_again() {
+            let dir = TempDir::new().unwrap();
+            let db = Arc::new(Mutex::new(Database::new(dir.path().join("notes.db")).unwrap()));
+            let config = Arc::new(Mutex::new(Config::new(Some(dir.path().to_path_buf())).unwrap()));
+            let device_id = config.lock().unwrap().device_id_hex().to_string();
+            let port = free_port();
+            let url = format!("http://127.0.0.1:{}", port);
+
+            for round in 0..2 {
+                let (db2, config2) = (db.clone(), config.clone());
+                let serving = tokio::spawn(async move { start_server(db2, config2, "127.0.0.1", port, true).await });
+                assert!(wait_for(&url).await, "round {}: the listener answers", round);
+                assert!(server_running());
+                let card = db.lock().unwrap().get_device_card(&device_id).unwrap().unwrap();
+                assert_eq!(card.listens, "1");
+                assert!(card.addresses.contains(&url), "{}", card.addresses);
+
+                stop_server();
+                let outcome = tokio::time::timeout(Duration::from_secs(10), serving).await.expect("the listener stops").unwrap();
+                assert!(outcome.is_ok(), "{:?}", outcome.err());
+                assert!(!server_running());
+                let card = db.lock().unwrap().get_device_card(&device_id).unwrap().unwrap();
+                assert_eq!(card.listens, "0", "round {}: the card says the listener stopped", round);
+            }
+        }
+
+        #[test]
+        fn listen_urls_name_private_addresses_and_the_host() {
+            let urls = listen_urls("0.0.0.0", 8384, false);
+            assert!(urls.iter().all(|u| u.starts_with("https://") && u.ends_with(":8384")), "{:?}", urls);
+            assert!(!urls.iter().any(|u| u.contains("127.0.0.1")), "loopback is not an address for a peer");
+            assert_eq!(listen_urls("192.168.1.10", 1, true), vec!["http://192.168.1.10:1"]);
         }
     }
 

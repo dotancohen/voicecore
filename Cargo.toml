@@ -87,6 +87,8 @@ dirs = { version = "5.0", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Free space on a disk, before a file is written
 fs4 = "0.13"
+# The addresses this machine listens on, for the code and the card
+if-addrs = "0.13"
 
 # Base64
 base64 = "0.22"
