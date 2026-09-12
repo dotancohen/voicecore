@@ -953,6 +953,31 @@ pub fn create_router(
         .with_state(state)
 }
 
+/// Where a listener is reachable, for its own card, for a code and for a
+/// person typing the address: `https://<host>:<port>`. A listener bound to
+/// one address reports that address; one bound to every address reports
+/// this machine's host name.
+pub fn listen_urls(host: &str, port: u16, plain_http: bool) -> Vec<String> {
+    let scheme = if plain_http { "http" } else { "https" };
+    if host != "0.0.0.0" && host != "::" && !host.is_empty() {
+        return vec![format!("{}://{}:{}", scheme, host, port)];
+    }
+    match hostname_of_this_machine() {
+        Some(name) => vec![format!("{}://{}:{}", scheme, name, port)],
+        None => Vec::new(),
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn hostname_of_this_machine() -> Option<String> {
+    hostname::get().ok().map(|h| h.to_string_lossy().to_string()).filter(|h| !h.is_empty())
+}
+
+#[cfg(not(feature = "desktop"))]
+fn hostname_of_this_machine() -> Option<String> {
+    None
+}
+
 /// Start the sync server: HTTPS with this device's own certificate (made
 /// under `certs/` if missing), or plain HTTP when `plain_http` is set, which
 /// is allowed only on a loopback address, for a reverse proxy in front or a
