@@ -5518,6 +5518,75 @@ impl Database {
         Ok(transcriptions)
     }
 
+    /// The most recent transcriptions, newest first.
+    ///
+    /// What a transcription queue view shows once the work is done: every
+    /// finished and failed transcription in the order it was asked for, with
+    /// its `service_response`, which is where the length of the recording and
+    /// the clock, processor and memory cost of the work are recorded.
+    ///
+    /// `service` narrows it to one transcription service (`local_whisper` for
+    /// work done on this device); `None` returns every service. `limit` is a
+    /// screenful, not a history: a queue view shows the last few dozen.
+    pub fn get_recent_transcriptions(
+        &self,
+        service: Option<&str>,
+        limit: u32,
+    ) -> VoiceResult<Vec<TranscriptionRow>> {
+        let sql = format!(
+            r#"
+            SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at,
+                   created_at_offset, created_at_zone
+            FROM transcriptions
+            WHERE deleted_at IS NULL {}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            "#,
+            if service.is_some() { "AND service = ?" } else { "" }
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let read = |row: &rusqlite::Row| -> rusqlite::Result<TranscriptionRow> {
+            let id_bytes: Vec<u8> = row.get(0)?;
+            let audio_file_id_bytes: Vec<u8> = row.get(1)?;
+            let device_id_bytes: Vec<u8> = row.get(8)?;
+            Ok(TranscriptionRow {
+                id: uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
+                audio_file_id: uuid_bytes_to_hex(&audio_file_id_bytes).unwrap_or_default(),
+                content: row.get(2)?,
+                content_segments: row.get(3)?,
+                service: row.get(4)?,
+                service_arguments: row.get(5)?,
+                service_response: row.get(6)?,
+                state: row.get(7)?,
+                device_id: uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default(),
+                created_at: row.get(9)?,
+                modified_at: row.get(10)?,
+                deleted_at: row.get(11)?,
+                created_at_offset: row.get::<_, Option<i64>>(12)?.and_then(|o| i32::try_from(o).ok()),
+                created_at_zone: row.get(13)?,
+            })
+        };
+
+        let mut transcriptions = Vec::new();
+        match service {
+            Some(name) => {
+                let rows = stmt.query_map(params![name, limit], read)?;
+                for row in rows {
+                    transcriptions.push(row?);
+                }
+            }
+            None => {
+                let rows = stmt.query_map(params![limit], read)?;
+                for row in rows {
+                    transcriptions.push(row?);
+                }
+            }
+        }
+
+        Ok(transcriptions)
+    }
+
     /// Delete a transcription (soft delete)
     pub fn delete_transcription(&self, transcription_id: &str) -> VoiceResult<bool> {
         let id_uuid = Uuid::parse_str(transcription_id)
@@ -6329,6 +6398,65 @@ mod tests {
         assert!(tag_names.contains(&"_marked"));
         assert!(tag_names.contains(&"_nonsynced"));
         assert!(tag_names.contains(&"_too-big"));
+    }
+
+    #[test]
+    fn test_get_recent_transcriptions_newest_first() {
+        // What a transcription queue shows under "Completed": the work that is
+        // done, newest first, whichever recording it belongs to.
+        let db = Database::new_in_memory().unwrap();
+        let first = db.create_audio_file("הקלטה-1.opus", None).unwrap();
+        let second = db.create_audio_file("הקלטה-2.opus", None).unwrap();
+
+        let older = db
+            .create_transcription(&first, "שלום", None, "local_whisper", None, None, None)
+            .unwrap();
+        let newer = db
+            .create_transcription(&second, "עולם", None, "local_whisper", None, None, None)
+            .unwrap();
+
+        let rows = db.get_recent_transcriptions(None, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Both were made in the same second, so the tie is broken by insertion
+        // order: the newest row comes first either way.
+        assert_eq!(rows[0].id, newer);
+        assert_eq!(rows[1].id, older);
+    }
+
+    #[test]
+    fn test_get_recent_transcriptions_by_service_and_limit() {
+        let db = Database::new_in_memory().unwrap();
+        let audio = db.create_audio_file("הקלטה.opus", None).unwrap();
+        db.create_transcription(&audio, "a", None, "local_whisper", None, None, None)
+            .unwrap();
+        db.create_transcription(&audio, "b", None, "speechtext_ai", None, None, None)
+            .unwrap();
+        db.create_transcription(&audio, "c", None, "local_whisper", None, None, None)
+            .unwrap();
+
+        let local = db.get_recent_transcriptions(Some("local_whisper"), 10).unwrap();
+        assert_eq!(local.len(), 2);
+        assert!(local.iter().all(|t| t.service == "local_whisper"));
+
+        let one = db.get_recent_transcriptions(None, 1).unwrap();
+        assert_eq!(one.len(), 1, "a queue view is a screenful, not a history");
+    }
+
+    #[test]
+    fn test_get_recent_transcriptions_leaves_out_deleted() {
+        let db = Database::new_in_memory().unwrap();
+        let audio = db.create_audio_file("הקלטה.opus", None).unwrap();
+        let kept = db
+            .create_transcription(&audio, "kept", None, "local_whisper", None, None, None)
+            .unwrap();
+        let gone = db
+            .create_transcription(&audio, "gone", None, "local_whisper", None, None, None)
+            .unwrap();
+        db.delete_transcription(&gone).unwrap();
+
+        let rows = db.get_recent_transcriptions(None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, kept);
     }
 
     #[test]

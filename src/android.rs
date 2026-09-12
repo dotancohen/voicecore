@@ -977,6 +977,51 @@ impl VoiceClient {
             .collect())
     }
 
+    /// The most recent transcriptions, newest first.
+    ///
+    /// What the transcription queue shows under "Completed": the work that is
+    /// done, with the `service_response` that records how long the recording
+    /// was and what the work cost in clock time, processor time and memory.
+    ///
+    /// `service` narrows it to one service (`local_whisper` is work this phone
+    /// did); None returns every service.
+    pub fn get_recent_transcriptions(
+        &self,
+        service: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<TranscriptionData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        let transcriptions = db.get_recent_transcriptions(service.as_deref(), limit)?;
+
+        Ok(transcriptions
+            .into_iter()
+            .map(|t| TranscriptionData {
+                id: t.id,
+                audio_file_id: t.audio_file_id,
+                content: t.content,
+                content_segments: t.content_segments,
+                service: t.service,
+                service_arguments: t.service_arguments,
+                service_response: t.service_response,
+                state: t.state,
+                device_id: t.device_id,
+                created_at: stamp(t.created_at, t.created_at_offset, t.created_at_zone.clone()),
+                modified_at: stamp_opt(t.modified_at, None, None),
+                deleted_at: stamp_opt(t.deleted_at, None, None),
+            })
+            .collect())
+    }
+
+    /// The notes a recording is attached to, as hex ids.
+    ///
+    /// A recording is normally on one note. The queue view uses this to say
+    /// which note each transcription belongs to, so the user can look at it.
+    pub fn get_notes_for_audio_file(&self, audio_file_id: String) -> Result<Vec<String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.get_notes_for_audio_file(&audio_file_id)
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
     /// Get a single transcription by ID
     pub fn get_transcription(&self, transcription_id: String) -> Result<Option<TranscriptionData>, VoiceCoreError> {
         let db = self.db.lock().unwrap();
