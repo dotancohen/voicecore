@@ -30,14 +30,29 @@ pub fn audio_file_extension(filename: &str) -> String {
     }
 }
 
-/// Name of an audio file on disk: `{audio_id}.{ext}`.
-pub fn audio_stored_filename(audio_id: &str, filename: &str) -> String {
-    format!("{}.{}", audio_id, audio_file_extension(filename))
+/// How many characters of the id end a recording's file name: the random
+/// tail of a UUID7, since its head is the clock and repeats within a minute.
+pub const RECORDING_ID_TAIL: usize = 8;
+
+/// The name of a recording's file on disk (Stage 13), a person can read:
+/// `2026_09_21_14_30_59-abcdefgh.ogg`, the recording's start (its
+/// `file_created_at`, at the offset it was recorded in; the import time
+/// when the file carries no date), a hyphen, the last eight characters of
+/// its id, and the extension of the original name. Written once to
+/// `audio_files.local_name`, which is local and the only way a file is
+/// found.
+pub fn recording_file_name(audio_id: &str, filename: &str, moment: i64, offset_seconds: Option<i32>) -> String {
+    use chrono::{FixedOffset, Local, TimeZone};
+    let offset = offset_seconds.and_then(FixedOffset::east_opt).unwrap_or_else(|| *Local::now().offset());
+    let when = offset.timestamp_opt(moment, 0).single().unwrap_or_else(|| offset.timestamp_opt(0, 0).unwrap());
+    let tail_start = audio_id.len().saturating_sub(RECORDING_ID_TAIL);
+    format!("{}-{}.{}", when.format("%Y_%m_%d_%H_%M_%S"), &audio_id[tail_start..], audio_file_extension(filename))
 }
 
-/// Full local path of an audio file: `{audiofile_directory}/{audio_id}.{ext}`.
-pub fn audio_local_path(audiofile_directory: &std::path::Path, audio_id: &str, filename: &str) -> std::path::PathBuf {
-    audiofile_directory.join(audio_stored_filename(audio_id, filename))
+/// Full local path of a recording: the audio directory and the row's
+/// `local_name`.
+pub fn audio_local_path(audiofile_directory: &std::path::Path, local_name: &str) -> std::path::PathBuf {
+    audiofile_directory.join(local_name)
 }
 
 /// Represents a note in the system.
@@ -349,11 +364,6 @@ impl AudioFile {
         audio_file_extension(&self.filename)
     }
 
-    /// Get the stored filename (uuid.extension)
-    pub fn stored_filename(&self) -> String {
-        audio_stored_filename(&self.id_hex(), &self.filename)
-    }
-
     /// Check if the audio file is deleted
     pub fn is_deleted(&self) -> bool {
         self.deleted_at.is_some()
@@ -623,20 +633,13 @@ mod tests {
     }
 
     #[test]
-    fn test_audio_stored_filename_and_path() {
-        assert_eq!(audio_stored_filename("0123abcd", "Voice Memo.WAV"), "0123abcd.wav");
-        let p = audio_local_path(std::path::Path::new("/tmp/audio"), "0123abcd", "x.Mp3");
-        assert_eq!(p, std::path::PathBuf::from("/tmp/audio/0123abcd.mp3"));
-    }
-
-    #[test]
-    fn test_audio_file_stored_filename() {
-        let device_id = Uuid::now_v7();
-        let audio_file = AudioFile::new("original.wav".to_string(), None, device_id);
-
-        let stored = audio_file.stored_filename();
-        assert!(stored.ends_with(".wav"));
-        assert_eq!(stored.len(), 32 + 1 + 3); // uuid + dot + ext
+    fn a_recording_is_named_by_its_start_at_its_own_offset_and_the_tail_of_its_id() {
+        // 2026-09-21 14:30:59 in a zone three hours east: 11:30:59 UTC
+        let name = recording_file_name("0199aaaaaaaa7000800000000abcdefgh", "Voice Memo.WAV", 1789990259, Some(3 * 3600));
+        assert_eq!(name, "2026_09_21_14_30_59-abcdefgh.wav");
+        let p = audio_local_path(std::path::Path::new("/tmp/audio"), &name);
+        assert_eq!(p, std::path::PathBuf::from("/tmp/audio/2026_09_21_14_30_59-abcdefgh.wav"));
+        assert!(recording_file_name("short", "x", 0, Some(0)).starts_with("1970_01_01_00_00_00-short."));
     }
 
     #[test]

@@ -252,6 +252,8 @@ pub struct AudioFileRow {
     pub modified_at_zone: Option<String>,
     pub deleted_at_offset: Option<i32>,
     pub deleted_at_zone: Option<String>,
+    /// The file's name in the audio directory (Stage 13): local, never synced
+    pub local_name: String,
 }
 
 /// Transcription data returned from database queries
@@ -3627,14 +3629,14 @@ impl Database {
         let mut recordings = 0i64;
         if let Some(dir) = audio_dir {
             let mut stmt = self.conn.prepare(
-                r#"SELECT lower(hex(a.id)), a.filename FROM audio_files a
+                r#"SELECT COALESCE(a.local_name, '') FROM audio_files a
                    WHERE a.deleted_at IS NULL AND a.storage_key IS NULL
                      AND NOT EXISTS (SELECT 1 FROM audio_file_copies c WHERE c.audio_id = a.id)"#,
             )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             for row in rows {
-                let (id, filename) = row?;
-                if crate::models::audio_local_path(dir, &id, &filename).is_file() {
+                let local_name = row?;
+                if !local_name.is_empty() && crate::models::audio_local_path(dir, &local_name).is_file() {
                     recordings += 1;
                 }
             }
@@ -4878,6 +4880,10 @@ impl Database {
             // carries no zone of its own.
             let _ = self.stamp_local_zone("audio_files", &id_hex, "file_created_at");
         }
+        // The file's name on this device (Stage 13), at this device's offset
+        let moment = file_created_at.unwrap_or_else(|| Utc::now().timestamp());
+        let local_name = crate::models::recording_file_name(&id_hex, filename, moment, crate::timezone::stamp_offset());
+        self.conn.execute("UPDATE audio_files SET local_name = ? WHERE id = ?", params![local_name, uuid_bytes])?;
         Ok(id_hex)
     }
 
@@ -4897,7 +4903,7 @@ impl Database {
             SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name
             FROM audio_files
             WHERE id = ?
             "#,
@@ -4928,7 +4934,7 @@ impl Database {
                    af.summary, af.device_id, af.modified_at, af.deleted_at,
                    af.storage_provider, af.storage_key, af.storage_uploaded_at,
                    af.imported_at_offset, af.imported_at_zone, af.file_created_at_offset, af.file_created_at_zone,
-                   af.modified_at_offset, af.modified_at_zone, af.deleted_at_offset, af.deleted_at_zone
+                   af.modified_at_offset, af.modified_at_zone, af.deleted_at_offset, af.deleted_at_zone, af.local_name
             FROM audio_files af
             INNER JOIN note_attachments na ON af.id = na.attachment_id
             WHERE na.note_id = ?
@@ -4990,7 +4996,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name
             FROM audio_files
             ORDER BY imported_at DESC
             "#,
@@ -5114,7 +5120,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name
             FROM audio_files
             WHERE duration_seconds IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -5164,6 +5170,7 @@ impl Database {
             modified_at_zone: row.get(17)?,
             deleted_at_offset: row.get::<_, Option<i64>>(18)?.and_then(|o| i32::try_from(o).ok()),
             deleted_at_zone: row.get(19)?,
+            local_name: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
         })
     }
 
@@ -5182,7 +5189,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name
             FROM audio_files
             WHERE storage_provider IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -5606,16 +5613,21 @@ impl Database {
         // Which transcription stands for this recording, when the sender
         // named one. A hint like every other row value (VER-4).
         primary_transcription_id: Option<&str>,
+        // The offset the recording was made in, for its file name (Stage 13)
+        file_created_at_offset: Option<i32>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
         let device_id = get_local_device_id();
+        // Named on arrival at the recording's own offset (Stage 13); kept once written
+        let local_name = crate::models::recording_file_name(id, filename, file_created_at.unwrap_or(imported_at), file_created_at_offset);
 
         self.conn.execute(
             r#"
-            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at, local_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                local_name = COALESCE(NULLIF(audio_files.local_name, ''), excluded.local_name),
                 -- Metadata written by the importing device: the newer row
                 -- wins column by column, an older row fills in only what is
                 -- missing here. summary and deleted_at are versioned: heads
@@ -5660,6 +5672,7 @@ impl Database {
                 storage_provider,
                 storage_key,
                 storage_uploaded_at,
+                local_name,
             ],
         )?;
 
@@ -7300,6 +7313,7 @@ mod tests {
             Some("audio/synced.mp3"), // storage_key
             Some(1700000002), // storage_uploaded_at,
             None,
+            None,
         ).unwrap();
 
         // Verify storage info was applied
@@ -7507,6 +7521,24 @@ impl Database {
             );
             "#,
         )?;
+        // The recording's file name a person can read (Stage 13): local, never
+        // synced, written once; rows from before are named the same way
+        if !self.column_exists("audio_files", "local_name")? {
+            self.conn.execute("ALTER TABLE audio_files ADD COLUMN local_name TEXT", [])?;
+        }
+        {
+            let unnamed: Vec<(Vec<u8>, String, i64, Option<i64>, Option<i64>)> = {
+                let mut stmt = self.conn.prepare("SELECT id, filename, imported_at, file_created_at, file_created_at_offset FROM audio_files WHERE local_name IS NULL OR local_name = ''")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for (id, filename, imported_at, file_created_at, offset) in unnamed {
+                let id_hex = uuid_bytes_to_hex(&id).unwrap_or_default();
+                let name = crate::models::recording_file_name(&id_hex, &filename, file_created_at.unwrap_or(imported_at), offset.and_then(|o| i32::try_from(o).ok()));
+                self.conn.execute("UPDATE audio_files SET local_name = ? WHERE id = ?", params![name, id])?;
+            }
+        }
+
         // Which peers hold a copy of which recording (Stage 10): written by a
         // send, by a fetch, by a receive, and by a peer's missing-list
         // request. Local, never synced; it answers "is this one safe".

@@ -883,11 +883,7 @@ impl VoiceClient {
             None => return Ok(None),
         };
 
-        let path = crate::models::audio_local_path(
-            std::path::Path::new(&audiofile_dir),
-            &audio_file.id,
-            &audio_file.filename,
-        );
+        let path = crate::models::audio_local_path(std::path::Path::new(&audiofile_dir), &audio_file.local_name);
 
         // Only return path if file exists
         if path.is_file() {
@@ -2058,11 +2054,7 @@ impl VoiceClient {
             None => return Ok(false),
         };
 
-        let path = crate::models::audio_local_path(
-            std::path::Path::new(&audiofile_dir),
-            &audio_file.id,
-            &audio_file.filename,
-        );
+        let path = crate::models::audio_local_path(std::path::Path::new(&audiofile_dir), &audio_file.local_name);
         Ok(path.is_file())
     }
 

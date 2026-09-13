@@ -1478,7 +1478,7 @@ impl SyncClient {
         let local: Vec<_> = rows
             .into_iter()
             .filter(|r| r.deleted_at.is_none())
-            .map(|r| (r.id.clone(), audio_local_path(audiofile_directory, &r.id, &r.filename)))
+            .map(|r| (r.id.clone(), audio_local_path(audiofile_directory, &r.local_name)))
             .filter(|(_, path)| path.is_file())
             .collect();
         if local.is_empty() {
@@ -1517,7 +1517,7 @@ impl SyncClient {
         let mut fetched = 0i64;
         let mut bytes = 0u64;
         for row in rows.into_iter().filter(|r| r.deleted_at.is_none()) {
-            let path = audio_local_path(audiofile_directory, &row.id, &row.filename);
+            let path = audio_local_path(audiofile_directory, &row.local_name);
             if path.is_file() {
                 continue;
             }
@@ -1538,7 +1538,7 @@ impl SyncClient {
             let held: Vec<String> = match self.db.lock().unwrap().get_all_audio_files() {
                 Ok(rows) => rows
                     .into_iter()
-                    .filter(|r| r.deleted_at.is_none() && audio_local_path(audiofile_directory, &r.id, &r.filename).is_file())
+                    .filter(|r| r.deleted_at.is_none() && audio_local_path(audiofile_directory, &r.local_name).is_file())
                     .map(|r| r.id)
                     .collect(),
                 Err(_) => Vec::new(),

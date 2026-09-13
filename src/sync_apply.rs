@@ -353,6 +353,7 @@ pub fn apply_one(
                 data["storage_key"].as_str(),
                 data["storage_uploaded_at"].as_i64(),
                 data["primary_transcription_id"].as_str(),
+                data["file_created_at_offset"].as_i64().and_then(|o| i32::try_from(o).ok()),
             )?;
             db.apply_zones_by_id(
                 "audio_files",

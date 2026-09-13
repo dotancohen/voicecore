@@ -904,14 +904,14 @@ fn audio_path_for(account: &AccountHandle, audio_id: &str) -> Result<std::path::
         config.audiofile_directory().map(|s| s.to_string())
     }
     .ok_or_else(|| (StatusCode::BAD_REQUEST, "audiofile_directory not configured".to_string()))?;
-    let filename = {
+    let local_name = {
         let db = account.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
         db.get_audio_file(audio_id)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?
             .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Audio file record not found: {}", audio_id)))?
-            .filename
+            .local_name
     };
-    Ok(audio_local_path(std::path::Path::new(&audiofile_dir), audio_id, &filename))
+    Ok(audio_local_path(std::path::Path::new(&audiofile_dir), &local_name))
 }
 
 /// `GET /sync/audio/:id/file`: stream one recording to a fetching peer
@@ -2583,14 +2583,19 @@ mod tests {
             (a, b, url, task)
         }
 
+        /// Where a recording's file is on `d`: what its row says (Stage 13).
+        fn path_of(d: &Device, audio_id: &str) -> std::path::PathBuf {
+            let local_name = d.db.lock().unwrap().get_audio_file(audio_id).unwrap().unwrap().local_name;
+            audio_local_path(&d.audio, &local_name)
+        }
+
         /// A note with one recording of `size` bytes on `d`.
         fn recording(d: &Device, size: usize) -> (String, std::path::PathBuf) {
-            let db = d.db.lock().unwrap();
             let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let source = d._dir.path().join("source.ogg");
             std::fs::write(&source, &content).unwrap();
-            let (_note_id, audio_id) = db.import_audio_file("source.ogg", None, None).unwrap();
-            let path = audio_local_path(&d.audio, &audio_id, "source.ogg");
+            let (_note_id, audio_id) = d.db.lock().unwrap().import_audio_file("source.ogg", None, None).unwrap();
+            let path = path_of(d, &audio_id);
             std::fs::rename(&source, &path).unwrap();
             (audio_id, path)
         }
@@ -2606,9 +2611,9 @@ mod tests {
             assert!(result.success, "{:?}", result.errors);
             assert_eq!((result.sent, result.fetched), (1, 1));
             assert_eq!(result.bytes_moved, 500_000);
-            let on_b = audio_local_path(&b.audio, &id_a, "source.ogg");
+            let on_b = path_of(&b, &id_a);
             assert_eq!(std::fs::read(&on_b).unwrap(), std::fs::read(&path_a).unwrap(), "A's recording arrived on B whole");
-            let on_a = audio_local_path(&a.audio, &id_b, "source.ogg");
+            let on_a = path_of(&a, &id_b);
             assert_eq!(std::fs::read(&on_a).unwrap(), std::fs::read(&path_b).unwrap(), "B's recording arrived on A whole");
             assert!(!crate::transfer::part_path(&on_a).exists());
 
@@ -2670,13 +2675,13 @@ mod tests {
             let result = client.deliver(&b.id).await;
             assert!(result.success, "{:?}", result.errors);
             assert_eq!((result.sent, result.fetched), (1, 0));
-            assert!(audio_local_path(&b.audio, &id_a, "source.ogg").is_file());
-            assert!(!audio_local_path(&a.audio, &id_b, "source.ogg").is_file(), "deliver fetches nothing");
+            assert!(path_of(&b, &id_a).is_file());
+            assert!(!path_of(&a, &id_b).is_file(), "deliver fetches nothing");
 
             let fetched = client.fetch_from_peer(&b.id).await;
             assert!(fetched.success, "{:?}", fetched.errors);
             assert_eq!(fetched.fetched, 1);
-            assert!(audio_local_path(&a.audio, &id_b, "source.ogg").is_file());
+            assert!(path_of(&a, &id_b).is_file());
             task.abort();
         }
 
@@ -2690,10 +2695,10 @@ mod tests {
             assert!(client.sync_with_peer(&b.id).await.success);
 
             // B already holds the first 40,000 bytes of A's recording: a send continues from there
-            let on_b = audio_local_path(&b.audio, &id_a, "source.ogg");
+            let on_b = path_of(&b, &id_a);
             std::fs::write(crate::transfer::part_path(&on_b), &std::fs::read(&path_a).unwrap()[..40_000]).unwrap();
             // A already holds the first 25,000 bytes of B's recording: a fetch continues from there
-            let on_a = audio_local_path(&a.audio, &id_b, "source.ogg");
+            let on_a = path_of(&a, &id_b);
             std::fs::write(crate::transfer::part_path(&on_a), &std::fs::read(&path_b).unwrap()[..25_000]).unwrap();
 
             let result = client.exchange(&b.id).await;
@@ -2710,7 +2715,7 @@ mod tests {
             let (id_b, path_b) = recording(&b, 50_000);
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
             assert!(client.sync_with_peer(&b.id).await.success);
-            let on_a = audio_local_path(&a.audio, &id_b, "source.ogg");
+            let on_a = path_of(&a, &id_b);
             std::fs::write(crate::transfer::part_path(&on_a), vec![0u8; 10_000]).unwrap();
 
             // The first attempt assembles a wrong file, finds the hash does not agree and discards the part;
@@ -3354,6 +3359,7 @@ mod tests {
             audio_data.get("storage_key").and_then(|v| v.as_str()),
             audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
             None,
+            None,
         ).unwrap();
 
         // Apply attachment to Instance B
@@ -3468,6 +3474,7 @@ mod tests {
             audio_data.get("storage_provider").and_then(|v| v.as_str()),
             audio_data.get("storage_key").and_then(|v| v.as_str()),
             audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
+            None,
             None,
         ).unwrap();
 
@@ -4207,7 +4214,7 @@ mod tests {
         let audio = a.create_audio_file("הקלטה.mp3", None).unwrap();
         a.update_audio_file_storage(&audio, "s3", &format!("audio/{}.mp3", audio)).unwrap();
         // An older copy of the row (from a peer that never saw the upload)
-        a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None).unwrap();
+        a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None, None).unwrap();
         let row = a.get_audio_file_raw(&audio).unwrap().unwrap();
         assert_eq!(row["storage_key"].as_str().unwrap(), format!("audio/{}.mp3", audio));
         assert_eq!(row["storage_provider"].as_str().unwrap(), "s3");

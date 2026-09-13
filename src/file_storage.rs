@@ -300,7 +300,7 @@ pub async fn upload_pending_audio_files(
     }
 
     for (index, audio_file) in pending_files.into_iter().enumerate() {
-        let local_path = audio_local_path(audiofile_directory, &audio_file.id, &audio_file.filename);
+        let local_path = audio_local_path(audiofile_directory, &audio_file.local_name);
 
         if !local_path.is_file() {
             tracing::debug!(
@@ -417,7 +417,7 @@ pub async fn download_audio_file(
         .map_err(|e| FileStorageError::Config(format!("Failed to read audio file record: {}", e)))?
         .ok_or_else(|| FileStorageError::NotFound(format!("Audio file record {} not found", audio_file_id)))?;
 
-    let local_path = audio_local_path(audiofile_directory, &audio_file.id, &audio_file.filename);
+    let local_path = audio_local_path(audiofile_directory, &audio_file.local_name);
     if local_path.is_file() {
         return Ok(DownloadOutcome::AlreadyLocal);
     }
@@ -472,7 +472,7 @@ async fn download_audio_file_set<S: FileStorageService>(
     let total = audio_files.len();
 
     for (index, audio_file) in audio_files.into_iter().enumerate() {
-        let local_path = audio_local_path(audiofile_directory, &audio_file.id, &audio_file.filename);
+        let local_path = audio_local_path(audiofile_directory, &audio_file.local_name);
         if local_path.is_file() {
             result.already_local += 1;
             continue;
@@ -533,7 +533,7 @@ pub async fn download_audio_files_for_note(
         .map_err(|e| FileStorageError::Config(format!("Failed to read audio files for note: {}", e)))?;
 
     let needs_cloud = audio_files.iter().any(|af| {
-        !audio_local_path(audiofile_directory, &af.id, &af.filename).is_file()
+        !audio_local_path(audiofile_directory, &af.local_name).is_file()
             && af.storage_key.is_some()
     });
 
@@ -541,7 +541,7 @@ pub async fn download_audio_files_for_note(
         // Nothing to fetch: report counts without touching the network.
         let mut result = DownloadMissingResult::default();
         for af in &audio_files {
-            if audio_local_path(audiofile_directory, &af.id, &af.filename).is_file() {
+            if audio_local_path(audiofile_directory, &af.local_name).is_file() {
                 result.already_local += 1;
             } else {
                 result.not_in_cloud += 1;
@@ -756,7 +756,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
 
             let local = row(&db, "מקומי.MP3", true);
-            std::fs::write(audio_local_path(&dir, &local.id, &local.filename), b"x").unwrap();
+            std::fs::write(audio_local_path(&dir, &local.local_name), b"x").unwrap();
             let not_uploaded = row(&db, "not-yet.ogg", false);
             let remote = row(&db, "בענן.WAV", true);
 
@@ -770,8 +770,9 @@ mod tests {
             assert_eq!(result.downloaded, 1);
             assert_eq!(result.failed, 0);
             assert!(result.errors.is_empty());
-            // Downloaded to the lowercase-extension path
-            assert!(dir.join(format!("{}.wav", remote.id)).is_file());
+            // Downloaded to the path the row names (Stage 13)
+            assert!(remote.local_name.ends_with(".wav") && remote.local_name.contains('-'), "{}", remote.local_name);
+            assert!(dir.join(&remote.local_name).is_file());
         }
 
         #[tokio::test]
@@ -835,7 +836,7 @@ mod tests {
             );
 
             let local = row(&db, "local.mp3", true);
-            std::fs::write(audio_local_path(&dir, &local.id, &local.filename), b"x").unwrap();
+            std::fs::write(audio_local_path(&dir, &local.local_name), b"x").unwrap();
             assert_eq!(
                 download_audio_file(&db, &dir, &local.id).await.unwrap(),
                 DownloadOutcome::AlreadyLocal
