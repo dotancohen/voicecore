@@ -1574,6 +1574,15 @@ pub async fn start_server_for(
     }
     let accounts_for_stop = accounts.clone();
 
+    // The periodic backup of every open account (SNAP-5), for as long as
+    // the listener runs; 0 hours turns it off
+    let backup = machine.lock().unwrap().backup().clone();
+    let backup_task = if backup.interval_hours > 0 {
+        Some(spawn_periodic_backup(accounts.clone(), Duration::from_secs(u64::from(backup.interval_hours) * 3600), backup.keep as usize))
+    } else {
+        None
+    };
+
     let router = create_router_for(accounts, machine).into_make_service_with_connect_info::<SocketAddr>();
 
     // Create shutdown channel; a previous listener's handle, if any, is dropped
@@ -1596,6 +1605,9 @@ pub async fn start_server_for(
         None => axum_server::bind(addr).handle(handle).serve(router).await,
     };
     *SHUTDOWN_TX.lock().unwrap() = None;
+    if let Some(task) = backup_task {
+        task.abort();
+    }
     for handle in accounts_for_stop.open_handles() {
         let db_guard = handle.db.lock().unwrap();
         let mut cfg = handle.config.lock().unwrap();
@@ -1605,6 +1617,60 @@ pub async fn start_server_for(
     }
     served.map_err(|e| crate::error::VoiceError::Network(e.to_string()))?;
     Ok(())
+}
+
+/// Copy every open account's database to its backup directory, keeping the
+/// newest `keep` (SNAP-5). Returns the copies made, with the accounts that
+/// could not be copied as sentences.
+pub fn backup_open_accounts(accounts: &dyn AccountSource, keep: usize) -> (Vec<std::path::PathBuf>, Vec<String>) {
+    let mut made = Vec::new();
+    let mut failed = Vec::new();
+    for handle in accounts.open_handles() {
+        let db = handle.db.lock().unwrap();
+        let config = handle.config.lock().unwrap();
+        let account = db.account_id().unwrap_or_default();
+        let dir = config.backup_directory(&account);
+        match db.backup_to(&dir, keep) {
+            Ok(path) => {
+                tracing::info!("Backed up account {} to {}", short(&account), path.display());
+                made.push(path);
+            }
+            Err(e) => failed.push(format!("Account {} was not backed up: {}", short(&account), e)),
+        }
+    }
+    (made, failed)
+}
+
+/// The periodic backup task (SNAP-5): every `interval`, every open account.
+/// The first copy is made one interval after the start, not at once, so a
+/// listener restarted often does not fill the directory.
+pub fn spawn_periodic_backup(accounts: Arc<dyn AccountSource>, interval: Duration, keep: usize) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let (_, failed) = backup_open_accounts(accounts.as_ref(), keep);
+            for sentence in failed {
+                tracing::warn!("{}", sentence);
+            }
+        }
+    })
+}
+
+/// Whether an account's periodic backup is due: no copy yet, or the newest
+/// older than the interval.
+pub fn backup_due(config: &Config, account_id: &str) -> bool {
+    let backup = config.backup();
+    if backup.interval_hours == 0 {
+        return false;
+    }
+    let dir = config.backup_directory(account_id);
+    let newest = Database::backups_in(&dir).ok().and_then(|c| c.into_iter().next());
+    match newest.and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok()) {
+        Some(modified) => modified.elapsed().map(|age| age >= Duration::from_secs(u64::from(backup.interval_hours) * 3600)).unwrap_or(true),
+        None => true,
+    }
 }
 
 /// Stop the sync server
@@ -2075,6 +2141,46 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_device_with_notes_moves_to_another_account_by_its_code_and_tags_with_one_path_become_one() {
+            let desk = device("Desk");
+            {
+                let db = desk.db.lock().unwrap();
+                let work = db.create_tag("עבודה", None).unwrap();
+                let note = db.create_note("על השולחן").unwrap();
+                db.add_tag_to_note(&note, &work).unwrap();
+            }
+            let (url, task) = serve_tls(&desk);
+            let setup = {
+                let db = desk.db.lock().unwrap();
+                let cfg = desk.config.lock().unwrap();
+                crate::pairing::offer(&db, &cfg, vec![url.clone()]).unwrap()
+            };
+            let phone = device("Phone");
+            let phone_note = {
+                let db = phone.db.lock().unwrap();
+                let work = db.create_tag("עבודה", None).unwrap();
+                let note = db.create_note("מהטלפון, בחשבון אחר").unwrap();
+                db.add_tag_to_note(&note, &work).unwrap();
+                note
+            };
+            let client = SyncClient::new(phone.db.clone(), phone.config.clone()).unwrap();
+            assert!(client.join(&setup.to_text()).await.unwrap_err().to_string().contains(codes::DEVICE_HOLDS_NOTES), "a join refuses; a move is deliberate");
+
+            let (joined, merged) = client.move_to(&setup.to_text()).await.unwrap();
+            assert_eq!(joined.account_id, setup.account_id);
+            assert_eq!(merged, 1, "the two 'עבודה' tags became one");
+            assert_eq!(phone.db.lock().unwrap().account_id().unwrap(), setup.account_id);
+            assert!(!phone.db.lock().unwrap().list_snapshots().unwrap().is_empty(), "a snapshot first");
+            let desk_notes = desk.db.lock().unwrap().get_all_notes().unwrap();
+            assert_eq!(desk_notes.len(), 2, "the phone's note reached the desk");
+            let tags_on_desk = desk.db.lock().unwrap().get_all_tags().unwrap();
+            assert_eq!(tags_on_desk.iter().filter(|t| t.name == "עבודה").count(), 1, "one tag on the desk, not two");
+            let phone_tags = phone.db.lock().unwrap().get_note_tags(&phone_note).unwrap();
+            assert_eq!(phone_tags.len(), 1, "the phone's note keeps its tag, now the shared one");
+            task.abort();
+        }
+
+        #[tokio::test]
         async fn a_device_with_notes_refuses_the_code_before_any_connection() {
             let desk = device("Desk");
             let setup = {
@@ -2282,6 +2388,53 @@ mod tests {
             let response = reqwest::Client::new().post(format!("{}/pair/grant", url)).json(&grant).send().await.unwrap();
             assert_eq!(response.status(), 403, "no token was ever offered");
             task.abort();
+        }
+    }
+
+    mod periodic_backup {
+        use super::*;
+        use crate::config::Config;
+
+        #[test]
+        fn a_copy_is_made_the_newest_are_kept_and_the_due_check_reads_the_directory() {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new(dir.path().join("notes.db")).unwrap();
+            db.create_note("לגיבוי").unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let account = db.account_id().unwrap();
+            assert!(backup_due(&config, &account), "nothing copied yet");
+            let target = config.backup_directory(&account);
+            assert_eq!(target, dir.path().join("backups").join(&account));
+
+            let first = db.backup_to(&target, 2).unwrap();
+            assert!(first.is_file());
+            let copy = Database::new(&first).unwrap();
+            assert_eq!(copy.get_all_notes().unwrap().len(), 1, "the copy holds the note");
+            assert!(!backup_due(&config, &account), "just copied");
+            db.backup_to(&target, 2).unwrap();
+            db.backup_to(&target, 2).unwrap();
+            assert_eq!(Database::backups_in(&target).unwrap().len(), 2, "only the newest two are kept");
+
+            config.set_backup(crate::config::BackupConfig { interval_hours: 0, directory: String::new(), keep: 2 }).unwrap();
+            assert!(!backup_due(&config, &account), "0 hours turns it off");
+            config.set_backup(crate::config::BackupConfig { interval_hours: 24, directory: dir.path().join("elsewhere").to_string_lossy().to_string(), keep: 2 }).unwrap();
+            assert_eq!(config.backup_directory(&account), dir.path().join("elsewhere").join(&account));
+        }
+
+        #[tokio::test]
+        async fn the_task_copies_every_open_account_each_interval() {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new(dir.path().join("notes.db")).unwrap();
+            let account = db.account_id().unwrap();
+            let config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let handle = AccountHandle { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)) };
+            let source: Arc<dyn AccountSource> = Arc::new(SingleAccount { account_id: account.clone(), handle: handle.clone() });
+            let task = spawn_periodic_backup(source, Duration::from_millis(60), 3);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            task.abort();
+            let target = handle.config.lock().unwrap().backup_directory(&account);
+            let copies = Database::backups_in(&target).unwrap();
+            assert!(!copies.is_empty() && copies.len() <= 3, "{} copies", copies.len());
         }
     }
 

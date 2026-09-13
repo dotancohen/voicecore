@@ -492,6 +492,24 @@ impl VoiceClient {
         Ok(rows.into_iter().map(|r| CheckRowData { name: r.name, passed: r.passed, detail: r.detail, code: r.code }).collect())
     }
 
+    /// Move this phone to another account by its code (Stage 1): the
+    /// deliberate way to merge two accounts. The interface asks for the full
+    /// current account id typed by hand before calling this.
+    pub fn move_to_account_by_code(&self, setup_text: String, typed_current_id: String) -> Result<MovedData, VoiceCoreError> {
+        let current = self.db.lock().unwrap().account_id()?;
+        if typed_current_id.trim() != current {
+            return Err(VoiceCoreError::Sync { msg: "Type the full id of the account being given up, as proof that this is meant".to_string() });
+        }
+        let notes = self.db.lock().unwrap().get_all_notes()?.len() as i64;
+        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
+        let (joined, merged) = rt.block_on(sync_client.move_to(&setup_text))?;
+        Ok(MovedData { account_id: joined.account_id, peer_name: joined.peer_name, notes_moved: notes, tags_merged: merged as i64 })
+    }
+
     /// Use a setup text (Stage 9): a code shown by a device that holds the
     /// account joins this phone to it (PAIR-4); a grant text shown by a
     /// server that holds nothing gives that server this phone's account to
@@ -2221,6 +2239,15 @@ fn conflict_to_data(c: crate::versions::ConflictRow) -> ConflictData {
         created_at: stamp(c.created_at, None, None),
         resolved_at: stamp_opt(c.resolved_at, None, None),
     }
+}
+
+/// What a move to another account gives back (Stage 1)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MovedData {
+    pub account_id: String,
+    pub peer_name: String,
+    pub notes_moved: i64,
+    pub tags_merged: i64,
 }
 
 /// What a successful join gives back

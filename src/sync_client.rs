@@ -356,6 +356,43 @@ impl SyncClient {
             let db = self.db.lock().unwrap();
             crate::pairing::check_can_join(&db, &setup)?;
         }
+        self.claim_and_take(&setup).await
+    }
+
+    /// **Move this device to another account** by its code (Stage 1): the
+    /// deliberate way to merge two accounts, for a device that holds notes.
+    /// A snapshot is taken, the code is claimed for a key of the other
+    /// account, the account id is rewritten and every peer forgotten, the
+    /// notes stay (their ids cannot collide), the other account's tags are
+    /// pulled and tags with one path become one, and then everything is
+    /// exchanged. Returns what was joined and how many tags were merged.
+    pub async fn move_to(&self, setup_text: &str) -> VoiceResult<(Joined, usize)> {
+        self.begin_operation();
+        let setup = crate::pairing::SetupText::parse(setup_text)?;
+        if setup.grant {
+            return Err(VoiceError::validation("setup text", format!("This is a grant text, not a code ({})", codes::SETUP_TEXT_INVALID)));
+        }
+        if self.account_id() == setup.account_id {
+            return Err(VoiceError::validation("setup text", "That is already this device's account".to_string()));
+        }
+        let joined = self.claim_and_take(&setup).await?;
+        // The other account's tags first, so tags with one path become one
+        // before this device's notes travel
+        let pulled = self.pull_from_peer(&joined.peer_id).await;
+        if !pulled.success {
+            return Err(VoiceError::Sync(format!("Moved, but the other account could not be read: {}", pulled.errors.join("; "))));
+        }
+        let merged = self.db.lock().unwrap().merge_duplicate_tag_paths()?;
+        let exchanged = self.sync_with_peer(&joined.peer_id).await;
+        if !exchanged.success {
+            return Err(VoiceError::Sync(format!("Moved, but the first exchange failed: {}", exchanged.errors.join("; "))));
+        }
+        Ok((joined, merged))
+    }
+
+    /// Claim a code and take the account it names (PAIR-3, PAIR-4): the
+    /// shared part of joining and moving.
+    async fn claim_and_take(&self, setup: &crate::pairing::SetupText) -> VoiceResult<Joined> {
         let own_fingerprint = {
             let config = self.config.lock().unwrap();
             config
@@ -369,6 +406,7 @@ impl SyncClient {
         if setup.grant {
             return Err(VoiceError::validation("setup text", format!("This is a grant text, shown by a device that holds no account; use 'account grant-host' with it ({})", codes::SETUP_TEXT_INVALID)));
         }
+        let setup = setup.clone();
         let request = crate::sync_protocol::PairClaimRequest {
             token: setup.token.clone(),
             account_id: setup.account_id.clone(),

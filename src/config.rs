@@ -460,6 +460,18 @@ impl Config {
         &self.data.backup
     }
 
+    /// Where an account's periodic backups go (SNAP-5): the configured
+    /// directory, else `<root>/backups/<account id>/`. Never inside the
+    /// recordings folder.
+    pub fn backup_directory(&self, account_id: &str) -> PathBuf {
+        let configured = self.data.backup.directory.trim();
+        if configured.is_empty() {
+            self.certs_root.join("backups").join(account_id)
+        } else {
+            PathBuf::from(configured).join(account_id)
+        }
+    }
+
     pub fn set_backup(&mut self, backup: BackupConfig) -> VoiceResult<()> {
         self.data.backup = backup;
         self.save()

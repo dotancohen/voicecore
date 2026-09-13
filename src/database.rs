@@ -3484,6 +3484,111 @@ impl Database {
         Ok(path)
     }
 
+    /// The periodic backup (SNAP-5): quiesce (the caller holds the database's
+    /// lock, so no writer runs; the write-ahead log is checkpointed and
+    /// truncated), copy with the backup API into `dir/notes-<time>.db`, and
+    /// keep the newest `keep`. Readers are never blocked. Returns the path.
+    pub fn backup_to(&self, dir: &Path, keep: usize) -> VoiceResult<PathBuf> {
+        if self.path.is_none() {
+            return Err(VoiceError::DatabaseOperation("An in-memory database has nothing to back up".to_string()));
+        }
+        std::fs::create_dir_all(dir)?;
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+        let mut path = dir.join(format!("notes-{}.db", stamp));
+        let mut n = 1;
+        while path.exists() {
+            path = dir.join(format!("notes-{}-{}.db", stamp, n));
+            n += 1;
+        }
+        {
+            let mut dst = Connection::open(&path)?;
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut dst)?;
+            backup.run_to_completion(1000, std::time::Duration::from_millis(5), None)?;
+        }
+        let mut copies = Self::backups_in(dir)?;
+        copies.sort_by(|a, b| b.cmp(a));
+        for old in copies.into_iter().skip(keep.max(1)) {
+            let _ = std::fs::remove_file(&old);
+        }
+        Ok(path)
+    }
+
+    /// The backup copies in a directory, newest first.
+    pub fn backups_in(dir: &Path) -> VoiceResult<Vec<PathBuf>> {
+        let mut copies: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("notes-") && n.ends_with(".db")).unwrap_or(false))
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        copies.sort_by(|a, b| b.cmp(a));
+        Ok(copies)
+    }
+
+    /// Two tags with one path (name under name from the root) become one
+    /// (Stage 1, the account move): the older id is kept, the other's notes
+    /// and children move to it through the versioned links, and it is
+    /// deleted. Returns how many were merged.
+    pub fn merge_duplicate_tag_paths(&self) -> VoiceResult<usize> {
+        let tags = self.get_all_tags()?;
+        let by_id: HashMap<String, TagRow> = tags.iter().map(|t| (t.id.clone(), t.clone())).collect();
+        fn path_of(tag: &TagRow, by_id: &HashMap<String, TagRow>) -> String {
+            let mut parts = vec![tag.name.clone()];
+            let mut parent = tag.parent_id.clone();
+            let mut guard = 0;
+            while let Some(pid) = parent {
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                match by_id.get(&pid) {
+                    Some(p) => {
+                        parts.push(p.name.clone());
+                        parent = p.parent_id.clone();
+                    }
+                    None => break,
+                }
+            }
+            parts.reverse();
+            parts.join("/")
+        }
+        let mut by_path: HashMap<String, Vec<TagRow>> = HashMap::new();
+        for tag in &tags {
+            by_path.entry(path_of(tag, &by_id)).or_default().push(tag.clone());
+        }
+        let mut merged = 0;
+        // Shallow paths first, so a merged parent's children fold into the kept parent
+        let mut groups: Vec<(String, Vec<TagRow>)> = by_path.into_iter().filter(|(_, g)| g.len() > 1).collect();
+        groups.sort_by_key(|(path, _)| path.matches('/').count());
+        for (_, mut group) in groups {
+            group.sort_by(|a, b| a.id.cmp(&b.id));
+            let keep = group[0].clone();
+            for duplicate in &group[1..] {
+                let notes: Vec<Vec<u8>> = {
+                    let mut stmt = self.conn.prepare("SELECT note_id FROM note_tags WHERE tag_id = ? AND deleted_at IS NULL")?;
+                    let dup = Uuid::parse_str(&duplicate.id).map_err(|e| VoiceError::validation("tag_id", e.to_string()))?;
+                    let rows = stmt.query_map(params![dup.as_bytes().to_vec()], |r| r.get::<_, Vec<u8>>(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for note in notes {
+                    let note_hex = uuid_bytes_to_hex(&note).unwrap_or_default();
+                    let _ = self.add_tag_to_note(&note_hex, &keep.id);
+                    let _ = self.remove_tag_from_note(&note_hex, &duplicate.id);
+                }
+                for child in tags.iter().filter(|t| t.parent_id.as_deref() == Some(duplicate.id.as_str())) {
+                    let _ = self.reparent_tag(&child.id, Some(&keep.id));
+                }
+                self.delete_tag(&duplicate.id)?;
+                merged += 1;
+            }
+        }
+        Ok(merged)
+    }
+
     /// Take a snapshot and say why in the log; an in-memory database is
     /// skipped silently, because there is nothing on disk to lose.
     pub fn snapshot_before(&self, what: &str) -> VoiceResult<()> {
