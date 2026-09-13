@@ -559,6 +559,17 @@ impl SyncClient {
     /// move here; see `deliver` and `exchange`.
     /// One operation, one request id.
     pub async fn sync_with_peer(&self, peer_id: &str) -> SyncResult {
+        // What this device holds is stated before the push (FILE-22): a file
+        // removed from the folder by hand is known to be gone everywhere
+        let (audio_dir, here) = match self.config.lock() {
+            Ok(c) => (c.audiofile_directory().map(std::path::PathBuf::from), c.device_id_hex().to_string()),
+            Err(_) => (None, String::new()),
+        };
+        if let Some(dir) = audio_dir {
+            if let Err(e) = self.db.lock().unwrap().check_files_here(&dir, &here) {
+                tracing::warn!("The files on this device were not compared with what it has stated: {}", e);
+            }
+        }
         self.begin_operation();
         self.sync_within_operation(peer_id).await
     }
@@ -1791,6 +1802,10 @@ impl SyncClient {
                 Ok(n) => {
                     fetched += 1;
                     bytes += n;
+                    let here = self.config.lock().map(|c| c.device_id_hex().to_string()).unwrap_or_default();
+                    if let Err(e) = self.db.lock().unwrap().set_file_location(&row.id, &here, true) {
+                        tracing::warn!("Could not record that this device holds {}: {}", short_id(&row.id), e);
+                    }
                     self.note_copy(&row.id, peer_id);
                     self.report("fetch", fetched, total, bytes, format!("Fetched recording {} of {}", fetched, total));
                 }
@@ -1979,7 +1994,8 @@ impl SyncClient {
             crate::file_storage::FileStorageError::Config("Failed to lock database".to_string())
         })?;
         let key = self.config.lock().ok().and_then(|c| c.recording_key());
-        let result = crate::file_storage::download_missing_audio_files(&db, audiofile_directory, key.as_ref()).await?;
+        let here = self.config.lock().map(|c| c.device_id_hex().to_string()).unwrap_or_default();
+        let result = crate::file_storage::download_missing_audio_files(&db, audiofile_directory, key.as_ref(), &here).await?;
         if result.downloaded > 0 {
             tracing::info!("Downloaded {} audio files from cloud storage", result.downloaded);
         }
@@ -1997,7 +2013,8 @@ impl SyncClient {
             crate::file_storage::FileStorageError::Config("Failed to lock database".to_string())
         })?;
         let key = self.config.lock().ok().and_then(|c| c.recording_key());
-        crate::file_storage::download_audio_file(&db, audiofile_directory, audio_file_id, key.as_ref()).await
+        let here = self.config.lock().map(|c| c.device_id_hex().to_string()).unwrap_or_default();
+        crate::file_storage::download_audio_file(&db, audiofile_directory, audio_file_id, key.as_ref(), &here).await
     }
 
     /// Download all missing audio files attached to a note on demand.
@@ -2011,7 +2028,8 @@ impl SyncClient {
             crate::file_storage::FileStorageError::Config("Failed to lock database".to_string())
         })?;
         let key = self.config.lock().ok().and_then(|c| c.recording_key());
-        crate::file_storage::download_audio_files_for_note(&db, audiofile_directory, note_id, key.as_ref()).await
+        let here = self.config.lock().map(|c| c.device_id_hex().to_string()).unwrap_or_default();
+        crate::file_storage::download_audio_files_for_note(&db, audiofile_directory, note_id, key.as_ref(), &here).await
     }
 
 }

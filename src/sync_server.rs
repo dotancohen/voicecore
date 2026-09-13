@@ -1055,6 +1055,7 @@ async fn serve_audio_file(
 /// length when a `Content-Range: bytes N-M/total` says so, verified by the
 /// `X-File-SHA256` header before the rename (FILE-13).
 async fn receive_audio_file(
+    State(state): State<AppState>,
     Extension(account): Extension<AccountHandle>,
     Extension(caller): Extension<CallerDevice>,
     Path(audio_id): Path<String>,
@@ -1104,6 +1105,7 @@ async fn receive_audio_file(
         if total == 0 {
             crate::transfer::complete(&file_path, now_have, expected_hash.as_deref())
                 .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            note_here(&account, &audio_id, &state.device_id);
             note_copy(&account, &audio_id, &caller.0);
             return Ok((StatusCode::OK, "OK"));
         }
@@ -1112,8 +1114,16 @@ async fn receive_audio_file(
     crate::transfer::complete(&file_path, total, expected_hash.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!("Received audio file {} ({} bytes)", short(&audio_id), total);
+    note_here(&account, &audio_id, &state.device_id);
     note_copy(&account, &audio_id, &caller.0);
     Ok((StatusCode::OK, "OK"))
+}
+
+/// This device holds a file it received whole (FILE-22).
+fn note_here(account: &AccountHandle, audio_id: &str, device_id: &str) {
+    if let Err(e) = account.db.lock().unwrap().set_file_location(audio_id, device_id, true) {
+        tracing::warn!("Could not record that this device holds {}: {}", short(audio_id), e);
+    }
 }
 
 /// The sender of a whole file holds it (Stage 10).
@@ -3088,13 +3098,13 @@ mod tests {
             assert!(!crate::transfer::part_path(&on_a).exists());
 
             // Both sides now know where the copies are (Stage 10)
-            let a_knows = |id: &str| a.db.lock().unwrap().copies_of(id).unwrap().iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>();
-            let b_knows = |id: &str| b.db.lock().unwrap().copies_of(id).unwrap().iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>();
+            let a_knows = |id: &str| a.db.lock().unwrap().copies_of(id, &a.id).unwrap().iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>();
+            let b_knows = |id: &str| b.db.lock().unwrap().copies_of(id, &b.id).unwrap().iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>();
             assert_eq!(a_knows(&id_a), vec![b.id.clone()], "A sent its recording to B");
             assert_eq!(a_knows(&id_b), vec![b.id.clone()], "A fetched B's, so B holds it");
             assert_eq!(b_knows(&id_a), vec![a.id.clone()], "B received A's, so A holds it");
             assert_eq!(b_knows(&id_b), vec![a.id.clone()], "B served its own to A");
-            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 }, "everything of A's is somewhere else too");
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 }, "everything of A's is somewhere else too");
             let peers = a.db.lock().unwrap().peer_summaries().unwrap();
             assert_eq!(peers.len(), 1);
             assert_eq!(peers[0].last_operation.as_deref(), Some("exchange"));
@@ -3158,29 +3168,29 @@ mod tests {
         #[tokio::test]
         async fn what_is_on_this_device_only_is_counted_until_it_is_elsewhere() {
             let (a, b, _url, task) = pair();
-            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 });
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 });
             a.db.lock().unwrap().create_note("רק כאן").unwrap();
             let (_id, _path) = recording(&a, 1000);
-            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 1, recordings: 1 }, "a note and a recording, on this device only");
-            assert_eq!(a.db.lock().unwrap().not_duplicated(None).unwrap(), crate::database::NotDuplicated { notes: 1, recordings: 0 }, "without an audio directory no recording is counted");
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap(), crate::database::NotDuplicated { notes: 1, recordings: 1 }, "a note and a recording, on this device only");
+            assert_eq!(a.db.lock().unwrap().not_duplicated(None, &a.id).unwrap(), crate::database::NotDuplicated { notes: 1, recordings: 0 }, "without an audio directory no recording is counted");
 
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
             let synced = client.sync_with_peer(&b.id).await;
             assert!(synced.success, "{:?}", synced.errors);
-            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 1 }, "the note was sent; the file was not");
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 1 }, "the note was sent; the file was not");
 
             let delivered = client.deliver(&b.id).await;
             assert!(delivered.success, "{:?}", delivered.errors);
-            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 });
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 });
 
             // A note that came from B is not "on this device only"; an edit of it here is, until sent
             b.db.lock().unwrap().create_note("מ-B").unwrap();
             let synced = client.sync_with_peer(&b.id).await;
             assert!(synced.success);
-            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap().notes, 0);
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap().notes, 0);
             let from_b = a.db.lock().unwrap().get_all_notes().unwrap().into_iter().find(|n| n.content == "מ-B").unwrap();
             a.db.lock().unwrap().update_note(&from_b.id, "מ-B, ערוך כאן").unwrap();
-            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap().notes, 1);
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap().notes, 1);
             task.abort();
         }
 
@@ -3200,6 +3210,55 @@ mod tests {
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(b.db.lock().unwrap().get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(expected.as_str()), "the peer received it with the row");
             assert_eq!(crate::transfer::file_sha256(&path_of(&b, &id)).unwrap(), expected);
+            task.abort();
+        }
+
+        /// FILE-22 between two instances: a delivery makes the receiver state
+        /// its copy, and the sender learns it at the next sync; a fetch makes
+        /// the fetcher state its copy; a copy removed to save space, and a file
+        /// deleted by hand from the folder, are known on the other device.
+        #[tokio::test]
+        async fn where_each_copy_is_is_known_on_both_devices() {
+            let (a, b, _url, task) = pair();
+            let (id_a, path_a) = recording(&a, 4000);
+            let (id_b, _) = recording(&b, 3000);
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let holding = |d: &Device, id: &str| -> Vec<String> {
+                let mut places = d.db.lock().unwrap().places_holding(id).unwrap();
+                places.sort();
+                places
+            };
+            let mut both = vec![a.id.clone(), b.id.clone()];
+            both.sort();
+
+            let result = client.exchange(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!((result.sent, result.fetched), (1, 1));
+            assert_eq!(holding(&b, &id_a), both, "the receiver states its copy, and the sender's");
+            assert_eq!(holding(&a, &id_b), both, "the fetcher states its copy, and the peer's");
+            let synced = client.sync_with_peer(&b.id).await;
+            assert!(synced.success, "{:?}", synced.errors);
+            for id in [&id_a, &id_b] {
+                assert_eq!(holding(&a, id), both);
+                assert_eq!(holding(&b, id), both);
+            }
+
+            // A copy removed to save space on A, and B's file deleted from B's folder by hand
+            a.db.lock().unwrap().remove_local_copy(&id_a, &a.audio, &a.id).unwrap();
+            assert!(!path_a.exists());
+            std::fs::remove_file(path_of(&b, &id_b)).unwrap();
+            let synced = client.sync_with_peer(&b.id).await;
+            assert!(synced.success, "{:?}", synced.errors);
+            let b_client = {
+                // B learns A's removal from A's push; A learns B's deletion when B states it
+                b.db.lock().unwrap().check_files_here(&b.audio, &b.id).unwrap();
+                client.sync_with_peer(&b.id).await
+            };
+            assert!(b_client.success, "{:?}", b_client.errors);
+            assert_eq!(holding(&b, &id_a), vec![b.id.clone()], "B knows A removed its copy");
+            assert_eq!(holding(&a, &id_b), vec![a.id.clone()], "A knows B's file is gone");
+            assert_eq!(a.db.lock().unwrap().file_locations(&id_a).unwrap(), b.db.lock().unwrap().file_locations(&id_a).unwrap());
+            assert_eq!(a.db.lock().unwrap().file_locations(&id_b).unwrap(), b.db.lock().unwrap().file_locations(&id_b).unwrap());
             task.abort();
         }
 
@@ -4052,6 +4111,8 @@ mod tests {
             "region": "us-east-1",
         });
         db.set_file_storage_config("s3", Some(&config_json)).unwrap();
+        // Where a copy is (FILE-22): the upload states that the bucket holds it
+        db.update_audio_file_storage(&audio_id, "s3", "test.mp3", false).unwrap();
 
         // A note emptied out of the trash: the purge travels too, or the
         // other devices would keep the note for ever.

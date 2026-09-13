@@ -367,6 +367,27 @@ pub struct Database {
     renamed_recordings: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
+/// The place in `file_locations` that stands for the account's bucket (FILE-22).
+pub const PLACE_CLOUD: &str = "cloud";
+
+/// The account's upload limit when the storage configuration names none (FILE-23).
+pub const DEFAULT_MAX_UPLOAD_MB: u64 = 100;
+
+/// Where one copy of a recording is or was (FILE-22): a device of the
+/// account, by id, or the bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileLocation {
+    pub audio_id: String,
+    /// A device id (32 hex characters), or [`PLACE_CLOUD`]
+    pub place: String,
+    /// Whether the place holds the file, as last stated
+    pub present: bool,
+    /// When that was stated, in milliseconds
+    pub changed_at: i64,
+    /// The device that stated it
+    pub changed_by: String,
+}
+
 /// How many snapshots are kept beside a database (SNAP-2).
 pub const SNAPSHOTS_KEPT: usize = 5;
 
@@ -2242,6 +2263,7 @@ impl Database {
             }
             ENTITY_AUDIO_FILE => {
                 self.conn.execute("DELETE FROM audio_files WHERE id = ?", params![entity_id.to_vec()])?;
+                self.conn.execute("DELETE FROM file_locations WHERE audio_id = ?", params![entity_id.to_vec()])?;
             }
             ENTITY_TRANSCRIPTION => {
                 self.conn.execute("DELETE FROM transcriptions WHERE id = ?", params![entity_id.to_vec()])?;
@@ -4022,6 +4044,15 @@ impl Database {
         let path = crate::models::audio_local_path(audio_dir, &row.disk_name);
         let hash = crate::transfer::file_sha256(&path)?;
         self.set_content_hash(audio_id, &hash)?;
+        // The file is here, whole: its size (FILE-23). Which device holds it
+        // is stated by the caller that knows the device (FILE-22)
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let id = Uuid::parse_str(&row.id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
+            self.conn.execute(
+                "UPDATE audio_files SET size_bytes = ?, modified_at = COALESCE(modified_at, imported_at) WHERE id = ? AND size_bytes IS NOT ?",
+                params![meta.len() as i64, id.as_bytes().to_vec(), meta.len() as i64],
+            )?;
+        }
         Ok(hash)
     }
 
@@ -4133,28 +4164,216 @@ impl Database {
         Ok(())
     }
 
-    /// A peer holds a copy of a recording (Stage 10).
+    /// A peer holds a copy of a recording (Stage 10): this device saw it
+    /// send the file, receive it whole, or say that it holds it (FILE-22).
+    /// The peer's own statement replaces this one when it is newer.
     pub fn record_copy(&self, audio_id: &str, peer_id: &str) -> VoiceResult<()> {
-        let audio = Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
         let peer = Uuid::parse_str(peer_id).map_err(|e| VoiceError::validation("peer_id", e.to_string()))?;
-        self.conn.execute(
-            "INSERT INTO audio_file_copies (audio_id, peer_id, at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(audio_id, peer_id) DO UPDATE SET at = ?3",
-            params![audio.as_bytes().to_vec(), peer.as_bytes().to_vec(), Utc::now().timestamp()],
-        )?;
+        self.set_file_location(audio_id, &peer.simple().to_string(), true)?;
         Ok(())
     }
 
-    /// The peers known to hold a copy of a recording, and when that was
-    /// learnt; the bucket is `storage_key` on the row, this device the file.
-    pub fn copies_of(&self, audio_id: &str) -> VoiceResult<Vec<CopyRow>> {
+    /// The other devices known to hold a copy of a recording, and when that
+    /// was stated (seconds); the bucket and this device (`here`) are in
+    /// [`Database::file_locations`].
+    pub fn copies_of(&self, audio_id: &str, here: &str) -> VoiceResult<Vec<CopyRow>> {
+        Ok(self
+            .file_locations(audio_id)?
+            .into_iter()
+            .filter(|l| l.present && l.place != PLACE_CLOUD && l.place != here)
+            .map(|l| CopyRow { peer_id: l.place, at: l.changed_at / 1000 })
+            .collect())
+    }
+
+    // ========================================================================
+    // Where the copies of a recording are (FILE-22)
+    // ========================================================================
+
+    /// State that a place holds a recording's file, or no longer does.
+    /// Returns whether anything changed: a statement that repeats the one
+    /// already there is not written again. A new statement is always later
+    /// than the one it replaces, so it wins everywhere it travels.
+    pub fn set_file_location(&self, audio_id: &str, place: &str, present: bool) -> VoiceResult<bool> {
         let audio = Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
-        let mut stmt = self.conn.prepare("SELECT peer_id, at FROM audio_file_copies WHERE audio_id = ? ORDER BY at")?;
+        let place = if place == PLACE_CLOUD {
+            PLACE_CLOUD.to_string()
+        } else {
+            Uuid::parse_str(place).map_err(|e| VoiceError::validation("place", e.to_string()))?.simple().to_string()
+        };
+        let existing: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT present, changed_at FROM file_locations WHERE audio_id = ? AND place = ?",
+                params![audio.as_bytes().to_vec(), place],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if existing.is_some_and(|(was, _)| (was != 0) == present) {
+            return Ok(false);
+        }
+        let now = Utc::now().timestamp_millis();
+        let changed_at = existing.map_or(now, |(_, at)| now.max(at + 1));
+        self.conn.execute(
+            "INSERT INTO file_locations (audio_id, place, present, changed_at, changed_by, sync_received_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+             ON CONFLICT(audio_id, place) DO UPDATE SET present = ?3, changed_at = ?4, changed_by = ?5, sync_received_at = NULL",
+            params![audio.as_bytes().to_vec(), place, present as i64, changed_at, get_local_device_id().as_bytes().to_vec()],
+        )?;
+        Ok(true)
+    }
+
+    /// A location statement from a peer (FILE-22): kept when it is newer
+    /// than the one here, by time and then by the id of the device that
+    /// made it, so every device keeps the same statement whatever the order
+    /// the statements arrive in.
+    pub fn apply_sync_file_location(&self, audio_id: &str, place: &str, present: bool, changed_at: i64, changed_by: Option<&str>, sync_received_at: i64) -> VoiceResult<bool> {
+        let audio = Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
+        if place != PLACE_CLOUD && Uuid::parse_str(place).is_err() {
+            return Err(VoiceError::validation("place", format!("{} is neither a device nor the cloud", place)));
+        }
+        let by = match changed_by {
+            Some(text) => Some(Uuid::parse_str(text).map_err(|e| VoiceError::validation("changed_by", e.to_string()))?.as_bytes().to_vec()),
+            None => None,
+        };
+        let changed = self.conn.execute(
+            "INSERT INTO file_locations (audio_id, place, present, changed_at, changed_by, sync_received_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(audio_id, place) DO UPDATE SET present = excluded.present, changed_at = excluded.changed_at,
+                 changed_by = excluded.changed_by, sync_received_at = excluded.sync_received_at
+             WHERE excluded.changed_at > file_locations.changed_at
+                OR (excluded.changed_at = file_locations.changed_at
+                    AND (COALESCE(excluded.changed_by, x'') > COALESCE(file_locations.changed_by, x'')
+                         OR (COALESCE(excluded.changed_by, x'') = COALESCE(file_locations.changed_by, x'')
+                             AND excluded.present > file_locations.present)))",
+            params![audio.as_bytes().to_vec(), place, present as i64, changed_at, by, sync_received_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Every statement about where a recording's copies are, the bucket first.
+    pub fn file_locations(&self, audio_id: &str) -> VoiceResult<Vec<FileLocation>> {
+        let audio = Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT place, present, changed_at, changed_by FROM file_locations WHERE audio_id = ?
+             ORDER BY place != 'cloud', changed_at",
+        )?;
+        let id_hex = audio.simple().to_string();
         let rows = stmt.query_map(params![audio.as_bytes().to_vec()], |r| {
-            let peer: Vec<u8> = r.get(0)?;
-            Ok(CopyRow { peer_id: Uuid::from_slice(&peer).map(|u| u.simple().to_string()).unwrap_or_default(), at: r.get(1)? })
+            let by: Option<Vec<u8>> = r.get(3)?;
+            Ok(FileLocation {
+                audio_id: id_hex.clone(),
+                place: r.get(0)?,
+                present: r.get::<_, i64>(1)? != 0,
+                changed_at: r.get(2)?,
+                changed_by: by.and_then(|b| uuid_bytes_to_hex(&b)).unwrap_or_default(),
+            })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The places that hold a recording's file, as last stated.
+    pub fn places_holding(&self, audio_id: &str) -> VoiceResult<Vec<String>> {
+        Ok(self.file_locations(audio_id)?.into_iter().filter(|l| l.present).map(|l| l.place).collect())
+    }
+
+    /// Compare what this device has stated about its own copies with its
+    /// audio folder, and state what changed (FILE-22): a file that is here
+    /// now, and a file that was here and is gone. A folder that is not there
+    /// at all (a card or a drive not mounted) says nothing about the files,
+    /// so nothing is stated. `here` is this device's id, from its
+    /// configuration. Returns (now here, now gone).
+    pub fn check_files_here(&self, audio_dir: &Path, here: &str) -> VoiceResult<(usize, usize)> {
+        if !audio_dir.is_dir() {
+            return Ok((0, 0));
+        }
+        let _ = self.apply_pending_file_renames(audio_dir);
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, COALESCE(a.disk_name, ''), l.present FROM audio_files a
+             LEFT JOIN file_locations l ON l.audio_id = a.id AND l.place = ?
+             WHERE a.deleted_at IS NULL",
+        )?;
+        let rows: Vec<(Vec<u8>, String, Option<i64>)> = stmt
+            .query_map(params![here], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let (mut arrived, mut gone) = (0, 0);
+        for (id, disk_name, stated) in rows {
+            let id_hex = uuid_bytes_to_hex(&id).unwrap_or_default();
+            let is_here = !disk_name.is_empty() && crate::models::audio_local_path(audio_dir, &disk_name).is_file();
+            match (stated, is_here) {
+                (Some(0) | None, true) => {
+                    self.set_file_location(&id_hex, here, true)?;
+                    arrived += 1;
+                }
+                (Some(1), false) => {
+                    self.set_file_location(&id_hex, here, false)?;
+                    gone += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok((arrived, gone))
+    }
+
+    /// Remove this device's copy of a recording to save space, leaving the
+    /// recording and every other copy (FILE-22). Refused when no other place
+    /// is known to hold the file, because the file would then be gone.
+    /// `here` is this device's id, from its configuration.
+    pub fn remove_local_copy(&self, audio_id: &str, audio_dir: &Path, here: &str) -> VoiceResult<()> {
+        let row = self.get_audio_file(audio_id)?.ok_or_else(|| VoiceError::NotFound(audio_id.to_string()))?;
+        let path = crate::models::audio_local_path(audio_dir, &row.disk_name);
+        if !path.is_file() {
+            return Err(VoiceError::validation("audio_id", format!("{} is not on this device", row.disk_name)));
+        }
+        let elsewhere: Vec<String> = self.places_holding(&row.id)?.into_iter().filter(|p| p != here).collect();
+        if elsewhere.is_empty() {
+            return Err(VoiceError::validation(
+                "audio_id",
+                format!("{} is on this device only; it can be removed from here once the bucket or another device holds it", row.disk_name),
+            ));
+        }
+        std::fs::remove_file(&path)?;
+        self.set_file_location(&row.id, here, false)?;
+        Ok(())
+    }
+
+    /// The account's upload limit in bytes (FILE-23): `max_upload_mb` in the
+    /// synced storage configuration, the same on every device.
+    pub fn max_upload_bytes(&self) -> VoiceResult<u64> {
+        let mb = self
+            .get_file_storage_config()?
+            .and_then(|saved| saved.get("config").cloned())
+            .and_then(|c| match c { serde_json::Value::String(text) => serde_json::from_str(&text).ok(), other => Some(other) })
+            .and_then(|c: serde_json::Value| c.get("max_upload_mb").and_then(|v| v.as_u64()))
+            .unwrap_or(DEFAULT_MAX_UPLOAD_MB);
+        Ok(mb.saturating_mul(1024 * 1024))
+    }
+
+    /// Set the account's upload limit, in the synced storage configuration.
+    pub fn set_max_upload_mb(&self, mb: u64) -> VoiceResult<()> {
+        if mb == 0 {
+            return Err(VoiceError::validation("max_upload_mb", "The upload limit is at least 1 MB"));
+        }
+        let saved = self.get_file_storage_config()?.ok_or_else(|| VoiceError::Config("No bucket is configured yet".to_string()))?;
+        let provider = saved.get("provider").and_then(|p| p.as_str()).unwrap_or("none").to_string();
+        let mut config = saved.get("config").cloned()
+            .and_then(|c| match c { serde_json::Value::String(text) => serde_json::from_str(&text).ok(), other => Some(other) })
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(map) = config.as_object_mut() {
+            map.insert("max_upload_mb".to_string(), serde_json::Value::Number(mb.into()));
+        }
+        self.set_file_storage_config(&provider, Some(&config))
+    }
+
+    /// The size of a recording's file, from a peer's row (FILE-23): a file's
+    /// bytes never change, so a size already here is kept.
+    pub fn apply_sync_size_bytes(&self, audio_id: &str, size_bytes: i64) -> VoiceResult<()> {
+        let id = Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
+        self.conn.execute(
+            "UPDATE audio_files SET size_bytes = ? WHERE id = ? AND size_bytes IS NULL",
+            params![size_bytes, id.as_bytes().to_vec()],
+        )?;
+        Ok(())
     }
 
     /// What is on this device only (Stage 10): notes whose head version was
@@ -4165,7 +4384,7 @@ impl Database {
     /// note row that was itself written here, and its `seq` is above every
     /// peer's sent cursor. `audio_dir` is where the files are, and without
     /// it no recording counts.
-    pub fn not_duplicated(&self, audio_dir: Option<&Path>) -> VoiceResult<NotDuplicated> {
+    pub fn not_duplicated(&self, audio_dir: Option<&Path>, here: &str) -> VoiceResult<NotDuplicated> {
         let max_sent: i64 = self
             .conn
             .query_row("SELECT COALESCE(MAX(last_sent_seq), 0) FROM sync_peers", [], |r| r.get(0))?;
@@ -4185,9 +4404,9 @@ impl Database {
             let mut stmt = self.conn.prepare(
                 r#"SELECT COALESCE(a.disk_name, '') FROM audio_files a
                    WHERE a.deleted_at IS NULL AND a.storage_key IS NULL
-                     AND NOT EXISTS (SELECT 1 FROM audio_file_copies c WHERE c.audio_id = a.id)"#,
+                     AND NOT EXISTS (SELECT 1 FROM file_locations l WHERE l.audio_id = a.id AND l.present = 1 AND l.place != ?1)"#,
             )?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map(params![here], |r| r.get::<_, String>(0))?;
             for row in rows {
                 let disk_name = row?;
                 if !disk_name.is_empty() && crate::models::audio_local_path(dir, &disk_name).is_file() {
@@ -4452,16 +4671,16 @@ impl Database {
 
         // Audio files
         {
-            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64, String, Option<String>);
+            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64, String, Option<String>, Option<i64>);
             let rows: Vec<AudioRow> = self.feed_query(
-                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted, disk_name, waveform_levels", "audio_files",
+                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes", "audio_files",
                 "sync_received_at >= ?1 OR modified_at >= ?1 OR imported_at >= ?1",
                 "COALESCE(sync_received_at, modified_at, imported_at)", "COALESCE(modified_at, imported_at)",
                 filter, limit,
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(23)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), row.get::<_, Option<String>>(21)?.unwrap_or_default(), row.get::<_, Option<String>>(22)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(24)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), row.get::<_, Option<String>>(21)?.unwrap_or_default(), row.get::<_, Option<String>>(22)?, row.get::<_, Option<i64>>(23)?)),
             )?;
             saturated |= rows.len() as i64 >= limit;
-            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted, disk_name, waveform_levels) in rows {
+            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes) in rows {
                 let timestamp = modified_at.unwrap_or(imported_at);
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
                 let mut data = serde_json::Map::new();
@@ -4479,6 +4698,7 @@ impl Database {
                 data.insert("storage_encrypted".to_string(), serde_json::Value::Bool(storage_encrypted != 0));
                 data.insert("disk_name".to_string(), serde_json::Value::String(disk_name));
                 data.insert("waveform_levels".to_string(), str_val(waveform_levels));
+                data.insert("size_bytes".to_string(), size_bytes.map_or(serde_json::Value::Null, |n| serde_json::Value::Number(n.into())));
                 data.insert(
                     "primary_transcription_id".to_string(),
                     str_val(primary_transcription.and_then(|b| uuid_bytes_to_hex(&b))),
@@ -4629,6 +4849,31 @@ impl Database {
                     zone.map_or(serde_json::Value::Null, serde_json::Value::String),
                 );
                 items.push((seq, purged_at, change("purge", id_hex, "delete", purged_at, seq, data)));
+            }
+        }
+
+        // Where the copies of recordings are (FILE-22)
+        {
+            let rows: Vec<(Vec<u8>, String, i64, i64, Option<Vec<u8>>, i64)> = self.feed_query(
+                "audio_id, place, present, changed_at, changed_by", "file_locations",
+                "changed_at >= ?1 * 1000", "changed_at", "changed_at",
+                filter, limit,
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, Option<i64>>(5)?.unwrap_or(0))),
+            )?;
+            saturated |= rows.len() as i64 >= limit;
+            for (audio_bytes, place, present, changed_at, changed_by, seq) in rows {
+                let audio_hex = uuid_bytes_to_hex(&audio_bytes).unwrap_or_default();
+                let mut data = serde_json::Map::new();
+                data.insert("audio_file_id".to_string(), serde_json::Value::String(audio_hex.clone()));
+                data.insert("place".to_string(), serde_json::Value::String(place.clone()));
+                data.insert("present".to_string(), serde_json::Value::Bool(present != 0));
+                data.insert("changed_at".to_string(), serde_json::Value::Number(changed_at.into()));
+                data.insert(
+                    "changed_by".to_string(),
+                    changed_by.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, serde_json::Value::String),
+                );
+                let timestamp = changed_at / 1000;
+                items.push((seq, timestamp, change("file_location", format!("{}:{}", audio_hex, place), "update", timestamp, seq, data)));
             }
         }
 
@@ -5826,6 +6071,9 @@ impl Database {
             "#,
             params![storage_provider, storage_key, encrypted as i64, device_id.as_bytes().to_vec(), uuid_bytes],
         )?;
+        if updated > 0 {
+            self.set_file_location(&resolved_id, PLACE_CLOUD, true)?;
+        }
 
         Ok(updated > 0)
     }
@@ -5855,6 +6103,9 @@ impl Database {
             "#,
             params![device_id.as_bytes().to_vec(), uuid_bytes],
         )?;
+        if updated > 0 {
+            self.set_file_location(&resolved_id, PLACE_CLOUD, false)?;
+        }
 
         Ok(updated > 0)
     }
@@ -7443,6 +7694,261 @@ impl Database {
 mod tests {
     use super::*;
 
+    mod file_locations {
+        use super::*;
+        use crate::models::FileOrigin;
+
+        const PHONE: &str = "01a0952602bc70808f15a84d31aaa8d2";
+        const LAPTOP: &str = "01a09526aaaa70808f15a84d31aaa8d2";
+        /// The device each test runs as
+        const HERE: &str = "01a09526bbbb70808f15a84d31aaa8d2";
+
+        fn two() -> (Database, Database, tempfile::TempDir) {
+            let temp = tempfile::TempDir::new().unwrap();
+            (Database::new(temp.path().join("a.db")).unwrap(), Database::new(temp.path().join("b.db")).unwrap(), temp)
+        }
+
+        /// Everything `from` has, applied on `to`, as a sync would.
+        fn sync(from: &Database, to: &Database) {
+            let (changes, _, _) = from.get_changes_after_seq_as_sync_changes(0, None, 10_000).unwrap();
+            crate::sync_apply::apply_changes(to, &changes, LAPTOP, None, 1_800_000_000).unwrap();
+        }
+
+        fn stated(db: &Database, audio_id: &str) -> Vec<(String, bool)> {
+            db.file_locations(audio_id).unwrap().into_iter().map(|l| (l.place, l.present)).collect()
+        }
+
+        /// FILE-22: a statement is written once, a repeat writes nothing, and
+        /// a new statement is always later than the one it replaces.
+        #[test]
+        fn a_statement_is_written_once_and_a_new_one_is_later_than_the_last() {
+            let (db, _, _t) = two();
+            let id = db.create_audio_file("שיחה.ogg", None, None, FileOrigin::Imported, None).unwrap();
+            assert!(db.set_file_location(&id, PHONE, true).unwrap());
+            assert!(!db.set_file_location(&id, PHONE, true).unwrap(), "the same statement again changes nothing");
+            let first = db.file_locations(&id).unwrap()[0].changed_at;
+            // A statement from the future, as a peer with a fast clock would send
+            db.apply_sync_file_location(&id, PHONE, true, first + 60_000, Some(LAPTOP), 1).unwrap();
+            assert!(db.set_file_location(&id, PHONE, false).unwrap());
+            let after = &db.file_locations(&id).unwrap()[0];
+            assert!(!after.present);
+            assert!(after.changed_at > first + 60_000, "a new statement is later than the one it replaces, whatever this clock says");
+            assert!(db.set_file_location(&id, "not a place", true).is_err());
+        }
+
+        /// FILE-22: two statements about one place settle the same way on both
+        /// devices, whichever arrives first: the later wins, and at the same
+        /// moment the device with the larger id, and then presence.
+        #[test]
+        fn statements_about_one_place_settle_the_same_in_either_order() {
+            for (first, second) in [((1_000, PHONE, true), (2_000, LAPTOP, false)), ((2_000, LAPTOP, false), (1_000, PHONE, true))] {
+                let (db, _, _t) = two();
+                let id = db.create_audio_file("סדר.ogg", None, None, FileOrigin::Imported, None).unwrap();
+                for (at, by, present) in [first, second] {
+                    db.apply_sync_file_location(&id, "cloud", present, at, Some(by), 1).unwrap();
+                }
+                assert_eq!(stated(&db, &id), vec![("cloud".to_string(), false)], "the later statement wins");
+            }
+            for order in [[(PHONE, true), (LAPTOP, false)], [(LAPTOP, false), (PHONE, true)]] {
+                let (db, _, _t) = two();
+                let id = db.create_audio_file("שוויון.ogg", None, None, FileOrigin::Imported, None).unwrap();
+                for (by, present) in order {
+                    db.apply_sync_file_location(&id, "cloud", present, 5_000, Some(by), 1).unwrap();
+                }
+                assert_eq!(stated(&db, &id), vec![("cloud".to_string(), false)], "at one moment the larger device id wins");
+            }
+            for order in [[true, false], [false, true]] {
+                let (db, _, _t) = two();
+                let id = db.create_audio_file("אותו מכשיר.ogg", None, None, FileOrigin::Imported, None).unwrap();
+                for present in order {
+                    db.apply_sync_file_location(&id, "cloud", present, 5_000, Some(PHONE), 1).unwrap();
+                }
+                assert_eq!(stated(&db, &id), vec![("cloud".to_string(), true)], "one device, one moment: presence wins, in either order");
+            }
+        }
+
+        /// FILE-22, the owner's case: one device removes its copy while
+        /// another uploads the file to the bucket. Neither statement undoes
+        /// the other, and after syncing both devices know both.
+        #[test]
+        fn a_copy_removed_on_one_device_while_another_uploads_is_known_on_both() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (phone, laptop) = (Database::new(temp.path().join("phone.db")).unwrap(), Database::new(temp.path().join("laptop.db")).unwrap());
+            let dir = temp.path().join("audio");
+            std::fs::create_dir_all(&dir).unwrap();
+            let id = phone.create_audio_file("ישיבה.m4a", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
+            let name = phone.get_audio_file(&id).unwrap().unwrap().disk_name;
+            std::fs::write(dir.join(&name), b"the recording").unwrap();
+            phone.store_content_hash(&id, &dir).unwrap();
+            // The phone and the laptop both hold it, and each says so
+            assert_eq!(phone.check_files_here(&dir, PHONE).unwrap(), (1, 0));
+            phone.apply_sync_file_location(&id, LAPTOP, true, 1_000, Some(LAPTOP), 1).unwrap();
+            sync(&phone, &laptop);
+
+            // At once: the laptop uploads it; the phone removes its copy to save space
+            laptop.update_audio_file_storage(&id, "s3", "abc.m4a", false).unwrap();
+            phone.remove_local_copy(&id, &dir, PHONE).unwrap();
+            assert!(!dir.join(&name).exists());
+
+            sync(&phone, &laptop);
+            sync(&laptop, &phone);
+            for db in [&phone, &laptop] {
+                let places: std::collections::HashMap<String, bool> = stated(db, &id).into_iter().collect();
+                assert_eq!(places.get("cloud"), Some(&true), "the upload is known");
+                assert_eq!(places.get(PHONE), Some(&false), "the removal is known");
+                assert_eq!(places.get(LAPTOP), Some(&true));
+            }
+            assert_eq!(phone.file_locations(&id).unwrap(), laptop.file_locations(&id).unwrap());
+        }
+
+        /// FILE-22: this device's own copies are compared with its folder: a
+        /// file removed by hand is stated gone, a file put back is stated here,
+        /// and a folder that is not there states nothing.
+        #[test]
+        fn the_folder_is_compared_with_what_this_device_has_stated() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let db = Database::new(temp.path().join("a.db")).unwrap();
+            let dir = temp.path().join("audio");
+            std::fs::create_dir_all(&dir).unwrap();
+            let id = db.create_audio_file("תיקייה.ogg", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
+            let name = db.get_audio_file(&id).unwrap().unwrap().disk_name;
+            assert_eq!(db.check_files_here(&dir, HERE).unwrap(), (0, 0), "no file, nothing stated before: nothing to say");
+            std::fs::write(dir.join(&name), b"bytes").unwrap();
+            assert_eq!(db.check_files_here(&dir, HERE).unwrap(), (1, 0));
+            assert_eq!(stated(&db, &id), vec![(HERE.to_string(), true)]);
+            assert_eq!(db.check_files_here(&dir, HERE).unwrap(), (0, 0), "nothing changed, nothing stated");
+
+            std::fs::remove_file(dir.join(&name)).unwrap();
+            assert_eq!(db.check_files_here(&temp.path().join("not mounted"), HERE).unwrap(), (0, 0));
+            assert_eq!(stated(&db, &id), vec![(HERE.to_string(), true)], "a missing folder is not a missing file");
+            assert_eq!(db.check_files_here(&dir, HERE).unwrap(), (0, 1));
+            assert_eq!(stated(&db, &id), vec![(HERE.to_string(), false)]);
+        }
+
+        /// FILE-22: a copy is removed from this device only when another place
+        /// holds the file; the file on disk goes, the recording stays.
+        #[test]
+        fn the_only_copy_is_never_removed() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let db = Database::new(temp.path().join("a.db")).unwrap();
+            let dir = temp.path().join("audio");
+            std::fs::create_dir_all(&dir).unwrap();
+            let id = db.create_audio_file("יחיד.ogg", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
+            let name = db.get_audio_file(&id).unwrap().unwrap().disk_name;
+            std::fs::write(dir.join(&name), b"only here").unwrap();
+            db.store_content_hash(&id, &dir).unwrap();
+
+            let refused = db.remove_local_copy(&id, &dir, HERE).unwrap_err().to_string();
+            assert!(refused.contains("on this device only"), "{}", refused);
+            assert!(dir.join(&name).is_file());
+
+            db.set_file_location(&id, PHONE, true).unwrap();
+            db.set_file_location(&id, PHONE, false).unwrap();
+            assert!(db.remove_local_copy(&id, &dir, HERE).is_err(), "a device that no longer holds it is not a copy");
+
+            db.update_audio_file_storage(&id, "s3", "k.ogg", false).unwrap();
+            db.check_files_here(&dir, HERE).unwrap();
+            db.remove_local_copy(&id, &dir, HERE).unwrap();
+            assert!(!dir.join(&name).exists());
+            assert!(db.get_audio_file(&id).unwrap().unwrap().deleted_at.is_none(), "the recording stays");
+            assert_eq!(stated(&db, &id).into_iter().find(|(p, _)| p == HERE), Some((HERE.to_string(), false)), "this device states that it no longer holds it");
+            assert!(db.remove_local_copy(&id, &dir, HERE).unwrap_err().to_string().contains("not on this device"));
+        }
+
+        /// FILE-22, FILE-23: the hash states the size; the storage columns
+        /// state the bucket's copy; this device's copy is stated by the check.
+        #[test]
+        fn the_hash_states_the_size_and_the_storage_columns_state_the_bucket() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let db = Database::new(temp.path().join("a.db")).unwrap();
+            let dir = temp.path().join("audio");
+            std::fs::create_dir_all(&dir).unwrap();
+            let id = db.create_audio_file("גודל.wav", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
+            let name = db.get_audio_file(&id).unwrap().unwrap().disk_name;
+            std::fs::write(dir.join(&name), vec![7u8; 12_345]).unwrap();
+            db.store_content_hash(&id, &dir).unwrap();
+            let size: Option<i64> = db.conn.query_row("SELECT size_bytes FROM audio_files", [], |r| r.get(0)).unwrap();
+            assert_eq!(size, Some(12_345));
+            assert!(db.places_holding(&id).unwrap().is_empty(), "the hash names no device");
+            db.check_files_here(&dir, HERE).unwrap();
+            assert_eq!(db.places_holding(&id).unwrap(), vec![HERE.to_string()]);
+
+            db.update_audio_file_storage(&id, "s3", "k.wav", false).unwrap();
+            assert_eq!(db.places_holding(&id).unwrap(), vec!["cloud".to_string(), HERE.to_string()]);
+            db.clear_audio_file_storage(&id).unwrap();
+            assert_eq!(db.places_holding(&id).unwrap(), vec![HERE.to_string()]);
+
+            let (changes, _, _) = db.get_changes_after_seq_as_sync_changes(0, None, 1000).unwrap();
+            let row = changes.iter().find(|c| c.entity_type == "audio_file").unwrap();
+            assert_eq!(row.data["size_bytes"], 12_345, "the size travels with the recording");
+            let other = Database::new(temp.path().join("b.db")).unwrap();
+            crate::sync_apply::apply_changes(&other, &changes, LAPTOP, None, 1).unwrap();
+            let size: Option<i64> = other.conn.query_row("SELECT size_bytes FROM audio_files", [], |r| r.get(0)).unwrap();
+            assert_eq!(size, Some(12_345));
+            assert_eq!(other.file_locations(&id).unwrap(), db.file_locations(&id).unwrap(), "every statement travels");
+        }
+
+        /// FILE-22: locations go with a purged recording, and a peer's
+        /// statement about a purged recording is dropped.
+        #[test]
+        fn locations_go_with_a_purged_recording_and_do_not_come_back() {
+            let (a, b, _t) = two();
+            let note = a.create_note("למחיקה").unwrap();
+            let id = a.create_audio_file("נמחק.ogg", None, None, FileOrigin::Imported, None).unwrap();
+            a.attach_to_note(&note, &id, "audio_file").unwrap();
+            a.set_file_location(&id, PHONE, true).unwrap();
+            let (before, _, _) = a.get_changes_after_seq_as_sync_changes(0, None, 1000).unwrap();
+            a.delete_note(&note).unwrap();
+            a.purge_note(&note).unwrap();
+            assert!(a.file_locations(&id).unwrap().is_empty());
+            // A peer that has not heard of the purge sends the old statement
+            crate::sync_apply::apply_changes(&a, &before, LAPTOP, None, 1).unwrap();
+            assert!(a.file_locations(&id).unwrap().is_empty(), "a purged recording's location does not come back");
+            let _ = b;
+        }
+
+        /// FILE-22: an older database keeps what it knew; the bucket holds what
+        /// a row says was uploaded, a peer what it was seen to hold. Nothing
+        /// on disk is read for it.
+        #[test]
+        fn an_older_database_knows_the_copies_its_rows_recorded() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("older.db");
+            let (uploaded, sent) = {
+                let db = Database::new(&path).unwrap();
+                let uploaded = db.create_audio_file("בענן.ogg", None, None, FileOrigin::Imported, None).unwrap();
+                let sent = db.create_audio_file("אצל עמית.ogg", None, None, FileOrigin::Imported, None).unwrap();
+                // The state of a database written before locations existed
+                db.conn.execute_batch("DROP TABLE file_locations; DROP TRIGGER IF EXISTS trg_file_locations_seq_insert; DROP TRIGGER IF EXISTS trg_file_locations_seq_update;").unwrap();
+                db.conn.execute("UPDATE audio_files SET storage_provider = 's3', storage_key = 'k.ogg', storage_uploaded_at = 1735689600 WHERE id = ?", params![Uuid::parse_str(&uploaded).unwrap().as_bytes().to_vec()]).unwrap();
+                db.conn.execute("INSERT INTO audio_file_copies (audio_id, peer_id, at) VALUES (?, ?, 1735689700)", params![Uuid::parse_str(&sent).unwrap().as_bytes().to_vec(), Uuid::parse_str(PHONE).unwrap().as_bytes().to_vec()]).unwrap();
+                (uploaded, sent)
+            };
+            let db = Database::new(&path).unwrap();
+            assert_eq!(stated(&db, &uploaded), vec![("cloud".to_string(), true)]);
+            assert_eq!(db.file_locations(&uploaded).unwrap()[0].changed_at, 1_735_689_600_000);
+            assert_eq!(stated(&db, &sent), vec![(PHONE.to_string(), true)]);
+            assert_eq!(db.copies_of(&sent, HERE).unwrap()[0].peer_id, PHONE);
+            let (changes, _, _) = db.get_changes_after_seq_as_sync_changes(0, None, 1000).unwrap();
+            assert_eq!(changes.iter().filter(|c| c.entity_type == "file_location").count(), 2, "what it knew is published");
+        }
+
+        /// FILE-23: the upload limit is the account's, in the synced storage
+        /// configuration, 100 MB until it is set.
+        #[test]
+        fn the_upload_limit_is_the_accounts_and_travels_with_the_storage_configuration() {
+            let (a, b, _t) = two();
+            assert_eq!(a.max_upload_bytes().unwrap(), 100 * 1024 * 1024);
+            assert!(a.set_max_upload_mb(50).is_err(), "no bucket yet");
+            a.set_file_storage_config("s3", Some(&serde_json::json!({"bucket": "voice-abc", "region": "eu-central-1", "access_key_id": "k", "secret_access_key": "s"}))).unwrap();
+            assert!(a.set_max_upload_mb(0).is_err());
+            a.set_max_upload_mb(250).unwrap();
+            assert_eq!(a.max_upload_bytes().unwrap(), 250 * 1024 * 1024);
+            sync(&a, &b);
+            assert_eq!(b.max_upload_bytes().unwrap(), 250 * 1024 * 1024, "every device of the account has the same limit");
+        }
+    }
+
     /// FILE-20: the levels a waveform is drawn from are kept with the
     /// recording, travel in the feed, give bars without the audio, are never
     /// erased by a row without them, and a newer row's replace an older's.
@@ -8451,6 +8957,46 @@ impl Database {
             );
             "#,
         )?;
+        // Where each copy of a recording is (FILE-22): synced, one row per
+        // recording and place, the newest statement about a place wins
+        let locations_are_new: bool = self
+            .conn
+            .query_row("SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table' AND name = 'file_locations'", [], |r| r.get(0))?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS file_locations (
+                audio_id BLOB NOT NULL,
+                place TEXT NOT NULL,
+                present INTEGER NOT NULL,
+                changed_at INTEGER NOT NULL,
+                changed_by BLOB,
+                sync_received_at INTEGER,
+                PRIMARY KEY (audio_id, place)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_locations_place ON file_locations(place, present);
+            "#,
+        )?;
+        if locations_are_new {
+            // What this database already knew, from its own rows: the bucket
+            // holds what a row says was uploaded, and a peer holds what it was
+            // seen to hold. Nothing on disk is read or changed here.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO file_locations (audio_id, place, present, changed_at, changed_by)
+                 SELECT id, 'cloud', 1, COALESCE(storage_uploaded_at, modified_at, imported_at) * 1000, device_id
+                 FROM audio_files WHERE storage_key IS NOT NULL AND storage_provider IS NOT NULL",
+                [],
+            )?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO file_locations (audio_id, place, present, changed_at, changed_by)
+                 SELECT audio_id, lower(hex(peer_id)), 1, at * 1000, NULL FROM audio_file_copies",
+                [],
+            )?;
+        }
+        // The size of the file in bytes (FILE-23): synced, so every device
+        // can say that a recording is over the account's upload limit
+        if !self.column_exists("audio_files", "size_bytes")? {
+            self.conn.execute("ALTER TABLE audio_files ADD COLUMN size_bytes INTEGER", [])?;
+        }
         for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT", "peer_account_id TEXT", "last_operation TEXT", "peer_entity_types TEXT"] {
             let name = col.split(' ').next().unwrap_or_default();
             if !self.column_exists("sync_peers", name)? {
@@ -8492,15 +9038,16 @@ impl Database {
         )?;
 
         // (table, columns whose change means "publish again")
-        let tables: [(&str, &[&str]); 9] = [
+        let tables: [(&str, &[&str]); 10] = [
             ("field_versions", &["published"]),
             ("notes", &["content", "modified_at", "deleted_at", "primary_attachment_id"]),
             ("tags", &["name", "parent_id", "modified_at", "deleted_at"]),
             ("note_tags", &["modified_at", "deleted_at"]),
             ("note_attachments", &["modified_at", "deleted_at"]),
-            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256", "storage_encrypted", "disk_name", "waveform_levels"]),
+            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256", "storage_encrypted", "disk_name", "waveform_levels", "size_bytes"]),
             ("transcriptions", &["content", "content_segments", "service_response", "state", "modified_at", "deleted_at"]),
             ("file_storage_config", &["provider", "config", "modified_at"]),
+            ("file_locations", &["present", "changed_at", "changed_by"]),
             // A purge is written once and never changed, so it only needs
             // the insert trigger.
             ("purges", &[]),

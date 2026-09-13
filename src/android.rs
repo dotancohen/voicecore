@@ -1277,15 +1277,16 @@ impl VoiceClient {
         let db = self.db.lock().unwrap();
         let cfg = self.config.lock().unwrap();
         let dir = cfg.audiofile_directory().map(std::path::PathBuf::from);
-        let counts = db.not_duplicated(dir.as_deref())?;
+        let counts = db.not_duplicated(dir.as_deref(), cfg.device_id_hex())?;
         Ok(NotDuplicatedData { notes: counts.notes, recordings: counts.recordings })
     }
 
     /// Where the copies of a recording are (Stage 10): the peers known to
     /// hold it; the bucket is `storage_key` on the row, this phone the file.
     pub fn copies_of(&self, audio_id: String) -> Result<Vec<CopyData>, VoiceCoreError> {
+        let here = self.config.lock().unwrap().device_id_hex().to_string();
         let db = self.db.lock().unwrap();
-        Ok(db.copies_of(&audio_id)?.into_iter().map(|c| CopyData { peer_id: c.peer_id, at: c.at }).collect())
+        Ok(db.copies_of(&audio_id, &here)?.into_iter().map(|c| CopyData { peer_id: c.peer_id, at: c.at }).collect())
     }
 
     /// Every peer dealt with: when it was last reached and by what.

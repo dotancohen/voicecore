@@ -274,7 +274,7 @@ impl Fleet {
 
     fn step(&mut self, rng: &mut Rng) {
         let d = rng.below(self.dbs.len());
-        let op = rng.below(27);
+        let op = rng.below(29);
         if self.debug {
             eprintln!("step device {} op {}", d, op);
         }
@@ -512,6 +512,17 @@ impl Fleet {
                     }
                 }
             }
+            27 | 28 => {
+                // A place states that it holds a recording's file, or no
+                // longer does (FILE-22): the bucket, or one of two devices
+                let audio = self.audio_files(d);
+                if let Some(id) = Self::pick(rng, &audio) {
+                    let place = ["cloud", "01a0952602bc70808f15a84d31aaa8d2", "01a09526aaaa70808f15a84d31aaa8d2"][rng.below(3)];
+                    if self.dbs[d].set_file_location(id, place, rng.below(2) == 0).unwrap() {
+                        self.note_effect("location");
+                    }
+                }
+            }
             _ => {
                 // Accept a random open conflict on this device
                 let conflicts = self.dbs[d].get_conflicts(false).unwrap();
@@ -558,6 +569,7 @@ impl Fleet {
         q("SELECT hex(id), filename, summary, storage_provider, storage_key, deleted_at IS NULL FROM audio_files ORDER BY 1");
         q("SELECT hex(id), hex(audio_file_id), content, state, deleted_at IS NULL FROM transcriptions ORDER BY 1");
         q("SELECT key, value FROM synced_settings ORDER BY 1");
+        q("SELECT hex(audio_id), place, present, changed_at, hex(changed_by) FROM file_locations ORDER BY 1, 2");
         // Open conflicts must agree everywhere. Resolved records may differ:
         // a device that merged a partial page can have flagged and then
         // superseded a conflict the others never saw.
@@ -758,7 +770,7 @@ fn add_effects(total: &mut HashMap<&'static str, usize>, run: HashMap<&'static s
 /// behind the dead merge (attachments that could never converge) then took
 /// one run to appear once merging worked.
 fn assert_operations_covered(total: &HashMap<&'static str, usize>, what_ran: &str) {
-    for what in ["note", "merge", "tag_note", "untag_note", "reparent_tag", "attachment", "purge"] {
+    for what in ["note", "merge", "tag_note", "untag_note", "reparent_tag", "attachment", "purge", "location"] {
         assert!(
             total.get(what).copied().unwrap_or(0) > 0,
             "{}: not one {} took effect in the whole test; those code paths were not tested",
@@ -802,7 +814,7 @@ fn four_devices_converge_with_large_pages() {
 #[test]
 fn pages_of_one_and_duplicate_deliveries() {
     let mut effects = HashMap::new();
-    for seed in 300..=312 {
+    for seed in 300..=340 {
         add_effects(&mut effects, run(seed, Options { devices: 3, steps: 60, page: 1, topology: Topology::Mesh, duplicate_one_in: 3 }));
     }
     assert_operations_covered(&effects, "pages of one with duplicate deliveries");

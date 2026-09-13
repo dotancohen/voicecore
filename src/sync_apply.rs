@@ -49,7 +49,7 @@ fn entity_order(entity_type: &str) -> u8 {
     match entity_type {
         "field_version" => 0,
         "note" | "tag" | "audio_file" | "file_storage_config" => 1,
-        "note_tag" | "note_attachment" | "transcription" => 2,
+        "note_tag" | "note_attachment" | "transcription" | "file_location" => 2,
         _ => 3,
     }
 }
@@ -170,6 +170,9 @@ fn purged_already(db: &Database, change: &SyncChange) -> VoiceResult<bool> {
     let mut candidates: Vec<(&str, &str)> = Vec::new();
     match change.entity_type.as_str() {
         "purge" => return Ok(false),
+        "file_location" => {
+            candidates.push((ENTITY_AUDIO_FILE, change.data["audio_file_id"].as_str().unwrap_or("")));
+        }
         "field_version" => {
             let of_type = change.data["entity_type"].as_str().unwrap_or("");
             let of_id = change.data["entity_id"].as_str().unwrap_or("");
@@ -358,6 +361,9 @@ pub fn apply_one(
                 data["disk_name"].as_str(),
                 data["waveform_levels"].as_str(),
             )?;
+            if let Some(size) = data["size_bytes"].as_i64() {
+                db.apply_sync_size_bytes(&change.entity_id, size)?;
+            }
             db.apply_zones_by_id(
                 "audio_files",
                 &change.entity_id,
@@ -366,6 +372,21 @@ pub fn apply_one(
             )?;
             touch_entity(touched, ENTITY_AUDIO_FILE, &change.entity_id);
             Ok(ApplyResult::Applied)
+        }
+        "file_location" => {
+            let audio_id = data["audio_file_id"].as_str().unwrap_or("");
+            let place = data["place"].as_str().unwrap_or("");
+            let Some(changed_at) = data["changed_at"].as_i64() else {
+                tracing::warn!("file_location without a time: {}", change.entity_id);
+                return Ok(ApplyResult::Skipped);
+            };
+            if audio_id.is_empty() || place.is_empty() {
+                tracing::warn!("file_location without a recording or a place: {}", change.entity_id);
+                return Ok(ApplyResult::Skipped);
+            }
+            let present = data["present"].as_bool().unwrap_or(false);
+            let kept = db.apply_sync_file_location(audio_id, place, present, changed_at, data["changed_by"].as_str(), sync_received_at)?;
+            Ok(if kept { ApplyResult::Applied } else { ApplyResult::Skipped })
         }
         "file_storage_config" => {
             let provider = data["provider"].as_str().unwrap_or("none");
@@ -394,4 +415,5 @@ pub const ALL_SYNC_ENTITY_TYPES: &[&str] = &[
     "file_storage_config",
     "field_version",
     "purge",
+    "file_location",
 ];

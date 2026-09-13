@@ -376,6 +376,8 @@ pub struct UploadPendingResult {
     pub failed: usize,
     /// Number of files not attempted because an earlier remote failure stopped the batch
     pub deferred: usize,
+    /// Number of files not uploaded because they are larger than the account's upload limit (FILE-23)
+    pub too_large: usize,
     /// Error messages for failed uploads
     pub errors: Vec<String>,
 }
@@ -431,6 +433,7 @@ pub async fn upload_files_with<S: FileStorageService>(
     if encrypt && recording_key.is_none() {
         return Err(FileStorageError::Config(NO_RECORDING_KEY.to_string()));
     }
+    let limit = db.max_upload_bytes().map_err(|e| FileStorageError::Config(e.to_string()))?;
 
     tracing::debug!(count = pending_files.len(), "Audio file records pending upload");
 
@@ -468,6 +471,14 @@ pub async fn upload_files_with<S: FileStorageService>(
                 "Pending audio file is not on this device; another device will upload it"
             );
             result.skipped += 1;
+            continue;
+        }
+
+        // The account's upload limit (FILE-23): a larger file stays where it is
+        let size = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
+        if size > limit {
+            tracing::info!(audio_id = %audio_file.id, size_bytes = size, limit_bytes = limit, "Larger than the account's upload limit; not uploaded");
+            result.too_large += 1;
             continue;
         }
 
@@ -660,6 +671,8 @@ pub async fn download_audio_file(
     audiofile_directory: &Path,
     audio_file_id: &str,
     recording_key: Option<&crate::crypto::RecordingKey>,
+    // This device's id, from its configuration: it holds the file after the download (FILE-22)
+    here: &str,
 ) -> Result<DownloadOutcome, FileStorageError> {
     // Names changed by a sync or a collision reach the disk first (FILE-15)
     if let Err(e) = db.apply_pending_file_renames(audiofile_directory) {
@@ -699,12 +712,37 @@ pub async fn download_audio_file(
         "Downloading audio file from cloud storage"
     );
 
-    let bytes = storage.download(&storage_key, &local_path).await?;
+    let bytes = match storage.download(&storage_key, &local_path).await {
+        Ok(bytes) => bytes,
+        Err(FileStorageError::NotFound(key)) => {
+            // The bucket does not hold it any more (FILE-22)
+            if let Err(e) = db.set_file_location(&audio_file.id, crate::database::PLACE_CLOUD, false) {
+                tracing::warn!("Could not record that the bucket lacks {}: {}", audio_file.id, e);
+            }
+            return Err(FileStorageError::NotFound(key));
+        }
+        Err(e) => return Err(e),
+    };
     let bytes = decrypt_downloaded(&audio_file, &local_path, recording_key).await?.unwrap_or(bytes);
     verify_downloaded(&audio_file, &local_path)?;
+    if let Err(e) = db.set_file_location(&audio_file.id, here, true) {
+        tracing::warn!("Could not record that this device holds {}: {}", audio_file.id, e);
+    }
 
     tracing::info!(audio_id = %audio_file.id, size_bytes = bytes, "Downloaded audio file");
     Ok(DownloadOutcome::Downloaded(bytes))
+}
+
+/// The recordings of a batch that are on this device after it (FILE-22).
+#[cfg(feature = "file-storage")]
+fn note_downloaded(db: &Database, audiofile_directory: &Path, asked: &[(String, String)], here: &str) {
+    for (id, disk_name) in asked {
+        if audio_local_path(audiofile_directory, disk_name).is_file() {
+            if let Err(e) = db.set_file_location(id, here, true) {
+                tracing::warn!("Could not record that this device holds {}: {}", id, e);
+            }
+        }
+    }
 }
 
 /// A downloaded object that is encrypted (ENC-4): opened with the recording
@@ -843,6 +881,7 @@ pub async fn download_audio_files_for_note(
     audiofile_directory: &Path,
     note_id: &str,
     recording_key: Option<&crate::crypto::RecordingKey>,
+    here: &str,
 ) -> Result<DownloadMissingResult, FileStorageError> {
     // Names changed by a sync or a collision reach the disk first (FILE-15)
     if let Err(e) = db.apply_pending_file_renames(audiofile_directory) {
@@ -876,7 +915,10 @@ pub async fn download_audio_files_for_note(
         )
     })?;
 
-    Ok(download_audio_file_set(&storage, audiofile_directory, audio_files, recording_key).await)
+    let asked: Vec<(String, String)> = audio_files.iter().map(|a| (a.id.clone(), a.disk_name.clone())).collect();
+    let result = download_audio_file_set(&storage, audiofile_directory, audio_files, recording_key).await;
+    note_downloaded(db, audiofile_directory, &asked, here);
+    Ok(result)
 }
 
 /// Download every non-deleted audio file that is in cloud storage but not on
@@ -889,6 +931,7 @@ pub async fn download_missing_audio_files(
     db: &Database,
     audiofile_directory: &Path,
     recording_key: Option<&crate::crypto::RecordingKey>,
+    here: &str,
 ) -> Result<DownloadMissingResult, FileStorageError> {
     // Names changed by a sync or a collision reach the disk first (FILE-15)
     if let Err(e) = db.apply_pending_file_renames(audiofile_directory) {
@@ -909,7 +952,10 @@ pub async fn download_missing_audio_files(
         .filter(|af| af.deleted_at.is_none())
         .collect();
 
-    Ok(download_audio_file_set(&storage, audiofile_directory, audio_files, recording_key).await)
+    let asked: Vec<(String, String)> = audio_files.iter().map(|a| (a.id.clone(), a.disk_name.clone())).collect();
+    let result = download_audio_file_set(&storage, audiofile_directory, audio_files, recording_key).await;
+    note_downloaded(db, audiofile_directory, &asked, here);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1221,6 +1267,28 @@ mod tests {
             (db, temp)
         }
 
+        /// FILE-23: a file larger than the account's upload limit is not
+        /// uploaded, is counted as such, and stays waiting; a smaller one goes.
+        #[tokio::test]
+        async fn a_file_over_the_accounts_upload_limit_stays_where_it_is() {
+            let (db, temp) = setup();
+            let dir = temp.path().join("audio");
+            std::fs::create_dir_all(&dir).unwrap();
+            db.set_file_storage_config("s3", Some(&serde_json::json!({"bucket": "b", "region": "eu-central-1", "access_key_id": "k", "secret_access_key": "s"}))).unwrap();
+            db.set_max_upload_mb(1).unwrap();
+            let big = row(&db, "הרצאה ארוכה.wav", false);
+            std::fs::write(audio_local_path(&dir, &big.disk_name), vec![1u8; 1024 * 1024 + 1]).unwrap();
+            let small = row(&db, "קצר.ogg", false);
+            std::fs::write(audio_local_path(&dir, &small.disk_name), vec![2u8; 1024 * 1024]).unwrap();
+            let storage = FakeStorage { objects: Default::default(), downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
+            let pending = db.get_audio_files_pending_upload().unwrap();
+            let result = upload_files_with(&storage, &db, &dir, pending, None, None, None).await.unwrap();
+            assert_eq!((result.uploaded, result.too_large, result.failed), (1, 1, 0), "{:?}", result.errors);
+            assert!(db.get_audio_file(&big.id).unwrap().unwrap().storage_key.is_none());
+            assert!(db.get_audio_file(&small.id).unwrap().unwrap().storage_key.is_some(), "exactly the limit is allowed");
+            assert_eq!(db.places_holding(&small.id).unwrap().first().map(String::as_str), Some("cloud"));
+        }
+
         fn row(db: &Database, filename: &str, in_cloud: bool) -> AudioFileRow {
             let id = db.create_audio_file(filename, None, None, crate::models::FileOrigin::Imported, None).unwrap();
             if in_cloud {
@@ -1299,7 +1367,7 @@ mod tests {
             let (db, temp) = setup();
             let dir = temp.path().join("audio");
             row(&db, "a.mp3", false);
-            let result = download_missing_audio_files(&db, &dir, None).await.unwrap();
+            let result = download_missing_audio_files(&db, &dir, None, "01a09526bbbb70808f15a84d31aaa8d2").await.unwrap();
             assert_eq!(result.downloaded, 0);
             assert!(result.errors.is_empty());
         }
@@ -1312,26 +1380,26 @@ mod tests {
 
             let pending = row(&db, "pending.mp3", false);
             assert_eq!(
-                download_audio_file(&db, &dir, &pending.id, None).await.unwrap(),
+                download_audio_file(&db, &dir, &pending.id, None, "01a09526bbbb70808f15a84d31aaa8d2").await.unwrap(),
                 DownloadOutcome::NotInCloud
             );
 
             let local = row(&db, "local.mp3", true);
             std::fs::write(audio_local_path(&dir, &local.disk_name), b"x").unwrap();
             assert_eq!(
-                download_audio_file(&db, &dir, &local.id, None).await.unwrap(),
+                download_audio_file(&db, &dir, &local.id, None, "01a09526bbbb70808f15a84d31aaa8d2").await.unwrap(),
                 DownloadOutcome::AlreadyLocal
             );
 
             // In cloud, not local, no config on this device: a clear Config error
             let remote = row(&db, "remote.mp3", true);
-            match download_audio_file(&db, &dir, &remote.id, None).await {
+            match download_audio_file(&db, &dir, &remote.id, None, "01a09526bbbb70808f15a84d31aaa8d2").await {
                 Err(FileStorageError::Config(_)) => {}
                 other => panic!("expected Config error, got {:?}", other.map(|_| ())),
             }
 
             // Unknown id
-            match download_audio_file(&db, &dir, "00000000000070008000000000000099", None).await {
+            match download_audio_file(&db, &dir, "00000000000070008000000000000099", None, "01a09526bbbb70808f15a84d31aaa8d2").await {
                 Err(FileStorageError::NotFound(_)) => {}
                 other => panic!("expected NotFound, got {:?}", other.map(|_| ())),
             }
@@ -1347,7 +1415,7 @@ mod tests {
             let pending = row(&db, "pending.mp3", false);
             db.attach_to_note(&note_id, &pending.id, "audio_file").unwrap();
 
-            let result = download_audio_files_for_note(&db, &dir, &note_id, None).await.unwrap();
+            let result = download_audio_files_for_note(&db, &dir, &note_id, None, "01a09526bbbb70808f15a84d31aaa8d2").await.unwrap();
             assert_eq!(result.not_in_cloud, 1);
             assert_eq!(result.downloaded, 0);
         }
