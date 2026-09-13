@@ -1,40 +1,64 @@
 # VoiceCore: The Rust Core Library for Voice
 
-- **Purpose**: VoiceCore provides the foundational functionality for Voice, a note-taking application with hierarchical tags and peer-to-peer synchronization.
-- **Architecture**: Pure Rust library designed for integration with Python bindings (desktop/server) and native Android applications.
-- **No Dependencies on System Libraries**: Uses bundled SQLite and pure-Rust TLS, eliminating the need for OpenSSL or other native dependencies.
+- **Purpose**: VoiceCore is the shared core of the Voice Family: notes with hierarchical tags, recordings and their transcriptions, versioned fields, accounts, pairing and peer-to-peer sync.
+- **Architecture**: one Rust library used by the desktop and server (Python, through PyO3 in `Voice/rust/voice-python`) and by the Android application (Kotlin, through UniFFI in `src/android.rs`).
+- **No system libraries**: SQLite is bundled and TLS is pure Rust (rustls), so no OpenSSL or other native library is needed.
+
+The numbered rules this code implements (for example `PROTO-12`) are in
+`../SYNC_SPECIFICATION.md`; the words used for sync are defined in
+`../TECHNICAL-DECISIONS.md` 4.5.
 
 ## Features
 
-- **Note Management**: Full CRUD operations with soft-delete semantics for sync compatibility.
-- **Trash bin**: a deleted note keeps its history and its recordings and can be recovered (`get_deleted_notes`, `undelete_note`), or removed for good (`purge_note`), which travels to every device and cannot be undone.
-- **Hierarchical Tags**: Tree-structured tag system with parent-child relationships.
-- **Full-Text Search**: Search notes by content and/or tag filters, with support for hierarchical tag paths.
-- **Peer-to-Peer Sync**: Bidirectional synchronization protocol with multiple devices.
+- **Notes**: create, read, edit and delete, with deletion recorded as a versioned field.
+- **Trash bin**: a deleted note keeps its history and its recordings and can be recovered (`get_deleted_notes`, `undelete_note`), or removed for good (`purge_note`), which travels to every device and cannot be undone (PURGE-1..PURGE-9).
+- **Hierarchical tags**: a tree of tags with parent-child relationships.
+- **Search**: notes by text and by tag, with hierarchical tag paths.
 - **Versioned fields**: every editable value has a Git-like history; concurrent edits are merged three-way and flagged, never overwritten.
-- **Configuration Management**: Device identity, peer management, and theme settings.
-- **TLS/TOFU Security**: Self-signed certificate generation with Trust-On-First-Use verification.
+- **Accounts**: every database belongs to one account; one installation can hold several (ACCT-1..ACCT-10).
+- **Device keys and cards**: every request between devices is authenticated by a device key whose hash is on the device's card (AUTH-1..AUTH-9, CARD-1..CARD-3).
+- **Pairing**: a fresh device joins an account by reading a code (PAIR-1..PAIR-5).
+- **Sync**: database changes exchanged with a peer through a resumable cursor feed, protocol version 2.0 (PROTO-12, PROTO-13).
+- **Recording files**: uploaded to and downloaded from a bucket (S3 or S3-compatible), or sent to and fetched from a peer; a sync never moves a file (FILE-12, `TECHNICAL-DECISIONS.md` 4.5).
+- **Encryption of recordings in the bucket**: optional, AES-256-GCM in chunks (ENC-1..ENC-4).
+- **Snapshots and backups**: a copy of the database before anything that rewrites it in one step, and a periodic backup (SNAP-1..SNAP-5).
+- **Issues**: what the user should know about, computed on request (ISSUE-1).
+- **TLS**: every listener serves HTTPS with its own self-signed certificate, pinned by fingerprint (AUTH-7).
 
 ## Architecture
 
 ```
 src/
-├── lib.rs              # Library entry point and public API re-exports
-├── models.rs           # Core data structures (Note, Tag, NoteTag)
-├── database.rs         # SQLite data access layer
-├── error.rs            # Error types and handling
-├── validation.rs       # Input validation utilities
-├── config.rs           # Configuration management
-├── sync_client.rs      # Peer-to-peer sync client
-├── sync_server.rs      # Sync server (Axum-based)
-├── sync_protocol.rs    # The protocol's messages, shared by client and server
-├── versions.rs         # Versioned fields: history, three-way merge, conflicts
-├── sync_apply.rs       # Applying a batch of sync changes (shared by server and client)
-├── conflicts.rs        # Thin conflict manager over versions.rs
-├── merge.rs            # Text merging algorithms
-├── search.rs           # Search and filtering
-├── timezone.rs         # The timezone an action happened in
-└── tls.rs              # TLS/certificate management
+├── lib.rs                # Library entry point and public API re-exports
+├── models.rs             # Core data structures (Note, Tag, NoteTag, NoteAttachment, AudioFile, Transcription, SyncChange)
+├── database.rs           # SQLite data access, the change feed, snapshots and backups
+├── error.rs              # Error types
+├── validation.rs         # Input validation
+├── config.rs             # config.json: device identity, peers, storage, backup, keys
+├── accounts.rs           # Several accounts on one installation (feature "server")
+├── auth.rs               # Device keys, device cards, request verification
+├── pairing.rs            # Setup texts, pairing tokens, admission by token
+├── sync_protocol.rs      # The protocol's messages, headers and refusal codes
+├── sync_client.rs        # Sync, send, fetch, deliver, exchange, join, grant, check
+├── sync_server.rs        # The listener (Axum): routes, authentication, hosting, backups
+├── sync_apply.rs         # Applying a batch of sync changes (shared by server and client)
+├── versions.rs           # Versioned fields: history, three-way merge, conflicts, device cards, settings
+├── conflicts.rs          # Thin conflict layer over versions.rs
+├── merge.rs              # Text merging algorithms
+├── search.rs             # Parser for combined tag and text search queries
+├── file_storage.rs       # Upload to and download from the bucket (feature "file-storage")
+├── file_storage_s3.rs    # S3 and S3-compatible storage service (feature "file-storage")
+├── bucket_setup.rs       # Creating and hardening the bucket (feature "file-storage")
+├── transfer.rs           # Streamed, resumable, hash-verified file transfer between instances
+├── crypto.rs             # Encryption of recordings in the bucket
+├── issues.rs             # What the user should know about (ISSUE-1)
+├── waveform.rs           # Waveform levels kept with a recording (FILE-20)
+├── timezone.rs           # The timezone an action happened in
+├── tls.rs                # Certificates, fingerprints, pinned TLS configurations
+├── android.rs            # UniFFI bindings for Android (feature "uniffi")
+├── convergence_tests.rs  # Property tests over random multi-device fleets (tests only)
+├── timezone_tests.rs     # Timezone tests (tests only)
+└── bin/uniffi-bindgen.rs # Kotlin binding generator (feature "uniffi")
 ```
 
 ### Times and timezones
@@ -52,9 +76,10 @@ each user-visible timestamp has two columns beside it:
 
 They are written for `created_at`, `modified_at` and `deleted_at` on notes,
 tags, note-tag links, attachments and transcriptions, for `imported_at` and
-`file_created_at` on audio files, and for `created_at` on every field version.
-Sync bookkeeping (`sync_received_at`, `last_sync_at`, `seq`) and the cloud
-upload time have none: no screen shows them.
+`file_created_at` on audio files, for `purged_at` on purges, and for
+`created_at` on every field version. Sync bookkeeping (`sync_received_at`,
+`last_sync_at`, `seq`) and the bucket upload time (`storage_uploaded_at`) have
+none: no screen shows them (TZ-1, TZ-2).
 
 This is what lets a note recorded at 15:20 in Jerusalem still read 15:20 after
 its author flies to New York. A reader renders the instant at the recorded
@@ -63,36 +88,59 @@ a device that never reported one, falls back to the reader's own timezone.
 
 The offset cannot be recovered from the instant afterwards, so the platform
 tells the core its timezone with `timezone::set_local_timezone(offset, name)`
-at start and whenever it changes. Android in particular keeps the zone in its
-framework, where a native library cannot see it. Locale and the 12 or 24-hour
-preference are deliberately **not** stored: they belong to whoever is reading,
-not to the event, and each interface applies its own.
+at start and whenever it changes (TZ-5). Android in particular keeps the zone
+in its framework, where a native library cannot see it. Locale and the 12 or
+24-hour preference are deliberately **not** stored: they belong to whoever is
+reading, not to the event, and each interface applies its own.
 
 ### Module Overview
 
 | Module | Purpose |
 |--------|---------|
-| `models` | Core data structures: `Note`, `Tag`, `NoteTag` with UUID7 identifiers |
-| `database` | SQLite persistence with comprehensive CRUD and query operations |
-| `error` | `VoiceError` enum and `ValidationError` for detailed error handling |
-| `validation` | UUID, datetime, tag path, and content validation utilities |
-| `config` | JSON-based configuration with device identity and peer management |
-| `sync_client` | Async HTTP client for pulling/pushing changes to peers |
-| `sync_server` | Axum-based REST server for receiving sync requests |
-| `sync_protocol` | The request and response types of the protocol, one definition for both sides |
-| `versions` | Field version graph, three-way merge, conflict records, synced settings |
-| `sync_apply` | Applying incoming changes in dependency order with retry of failures |
-| `conflicts` | Thin conflict manager over `versions` |
-| `merge` | Line-by-line diff and 3-way merge algorithms |
-| `search` | Parser for combined tag and text search queries |
-| `tls` | Self-signed certificate generation and TOFU verification |
+| `models` | Core data structures with UUID7 identifiers; `audio_local_path`, `audio_file_extension`, `AUDIO_FILE_FORMATS` (FILE-21) |
+| `database` | SQLite persistence: CRUD, queries, the cursor feed (`get_changes_after_seq`), the timestamp feed (`get_changes_since`), row-apply upserts, snapshots (`snapshot`, `restore_snapshot`), backups (`backup_to`), account identity (`account_id`, `move_to_account`) |
+| `error` | `VoiceError` and `ValidationError` |
+| `validation` | UUID, datetime text, tag name, tag path, note content and search query validation |
+| `config` | `config.json`: device id and name, device key and recording key (wrapped by a `SecretWrapper` on the phone, AUTH-9), peers, sync settings, bucket settings, backup settings, public URL |
+| `accounts` | The account index `accounts.db` of an installation root, hosting offers, and `resolve` (ACCT-6..ACCT-9); compiled with feature `server` |
+| `auth` | Device keys, key hashes, the device's own card, and `verify_request` (AUTH-1..AUTH-6, CARD-1, CARD-2) |
+| `pairing` | Setup texts (`voice://pair?...`), tokens, `offer`, `offer_hosting`, `admit_by_token`, `check_can_join` (PAIR-1..PAIR-5) |
+| `sync_protocol` | Request and response types, `PROTOCOL_VERSION`, refusal codes, header names, one definition for both sides |
+| `sync_client` | `SyncClient`: `sync_with_peer`, `pull_from_peer`, `push_to_peer`, `initial_sync`, `send_to_peer`, `fetch_from_peer`, `deliver`, `exchange`, `join`, `grant_host`, `move_to`, `check`, `adopt_peers_from_cards`, cancel and progress (FILE-17) |
+| `sync_server` | The listener: routes, the device-key middleware, the LAN gate, refusal delays, hosting several accounts (`IndexedAccounts`), the request log per hosted account, the periodic backup, the idle stop |
+| `sync_apply` | Applying incoming changes in dependency order, with retry of failures and the purge check |
+| `versions` | Field version graph, three-way merge, conflict records, synced settings, device cards |
+| `conflicts` | Thin conflict layer over `versions` |
+| `merge` | Line-by-line diff and three-way merge algorithms |
+| `search` | Parser for combined tag and text search queries (`parse_search_input`, `execute_search`) |
+| `file_storage` | Upload to the bucket in parts (FILE-19), download, the storage key (`storage_key_for`), re-upload encrypted (ENC-3) |
+| `file_storage_s3` | `S3StorageService` over rust-s3 0.37 or newer (FILE-24) |
+| `bucket_setup` | The bucket wizard's calls: policy, lifecycle rules, TLS-only policy, signed requests, explained failures (BUCKET-1..BUCKET-5) |
+| `transfer` | Part files, completion by length and SHA-256, `Range` and `Content-Range` parsing, free space checks, stall timeouts (FILE-13, FILE-14) |
+| `crypto` | The recording key and the chunked AES-256-GCM format (ENC-1, ENC-2) |
+| `issues` | Recordings not in the bucket and why, orphaned rows, tags whose names contain whitespace (ISSUE-1) |
+| `waveform` | Encoding, decoding and drawing waveform levels (FILE-20) |
+| `timezone` | The local offset and IANA zone name reported by the platform |
+| `tls` | Self-signed certificate generation, fingerprints, the server configuration, the pinned client configuration |
+| `android` | `VoiceClient` and the records, errors and callback interfaces exposed to Kotlin |
 
 ## Requirements
 
-- Rust 1.70 or higher (2021 edition)
-- No external system dependencies (SQLite is bundled)
+- Rust with the 2021 edition. `Cargo.toml` declares no minimum Rust version.
+- No external system libraries (SQLite is bundled, TLS is rustls).
 
 ## Building
+
+### Features
+
+| Feature | Default | What it adds |
+|---------|---------|--------------|
+| `server` | yes | The listener: axum, axum-server, tower, tower-http, tokio-util; the `accounts` module |
+| `desktop` | yes | Host name detection and the default configuration directory (`hostname`, `dirs`) |
+| `file-storage` | yes | The bucket: rust-s3, tokio-util; the `file_storage`, `file_storage_s3` and `bucket_setup` modules |
+| `uniffi` | no | The UniFFI bindings (`android` module) and the `uniffi-bindgen` binary |
+
+Without `desktop`, `Config::new` requires a configuration directory.
 
 ### As a Standalone Library
 
@@ -100,11 +148,8 @@ not to the event, and each interface applies its own.
 cargo build --release
 ```
 
-### Running Tests
-
-```bash
-cargo test
-```
+Builds go to `VoiceFamily/.cargo-target` (`../TECHNICAL-DECISIONS.md` 7.4), not
+to a `target/` directory under the crate.
 
 ### Building Documentation
 
@@ -117,27 +162,30 @@ cargo doc --open
 ### Basic Note Operations
 
 ```rust
-use voicecore::{Database, Config};
+use voicecore::{Config, Database};
 
-// Initialize with default config directory (~/.config/voice)
-let config = Config::new(None)?;
-let mut db = Database::new(config.database_file())?;
+// The configuration directory: the given one, or ~/.config/voice with feature "desktop".
+// The second argument is an optional SecretWrapper (the phone's Keystore; none on the desktop).
+let config = Config::new(None, None)?;
+let db = Database::new(config.database_file())?;
 
-// Create a note
+// Create a note; returns its id as 32 hex characters
 let note_id = db.create_note("My first note")?;
 
-// Update note content
+// Edit its content (a new version of the field)
 db.update_note(&note_id, "Updated content")?;
 
-// Get a note
-let note = db.get_note(&note_id)?;
-println!("Note content: {}", note.content);
+// Read a note
+if let Some(note) = db.get_note(&note_id)? {
+    println!("Note content: {}", note.content);
+}
 
 // List all notes
-let notes = db.get_notes()?;
+let notes = db.get_all_notes()?;
 
-// Delete a note (soft-delete for sync)
+// Delete a note: it goes to the trash and can be recovered
 db.delete_note(&note_id)?;
+db.undelete_note(&note_id)?;
 ```
 
 ### Tag Operations
@@ -149,51 +197,49 @@ let work_id = db.create_tag("Work", None)?;
 // Create a child tag
 let projects_id = db.create_tag("Projects", Some(&work_id))?;
 
-// Associate a tag with a note
-db.add_note_tag(&note_id, &work_id)?;
+// Add a tag to a note
+db.add_tag_to_note(&note_id, &work_id)?;
 
-// Get all tags
-let tags = db.get_tags()?;
-
-// Get tags in hierarchical order
-let tree = db.get_tags_hierarchical()?;
+// Read all tags, and the tags of one note
+let tags = db.get_all_tags()?;
+let note_tags = db.get_note_tags(&note_id)?;
 ```
 
 ### Search
 
 ```rust
-// Search by text content
+// Parse and run a search as typed by the user: text and tag terms
+// (hierarchical paths such as Europe/France/Paris are accepted)
+let result = voicecore::search::execute_search(&db, "quarterly tag:Work")?;
+
+// Or search directly: text, and groups of tag ids
 let results = db.search_notes(Some("meeting notes"), None)?;
-
-// Search by tag
-let results = db.search_notes(None, Some(vec!["Work"]))?;
-
-// Combined search (text AND tag)
-let results = db.search_notes(Some("quarterly"), Some(vec!["Work", "Reports"]))?;
-
-// Search with hierarchical tag path
-let results = db.search_notes(None, Some(vec!["Europe/France/Paris"]))?;
+let groups = vec![vec![work_id.clone()]];
+let results = db.search_notes(None, Some(&groups))?;
 ```
 
 ### Synchronization
 
 ```rust
-use voicecore::{SyncClient, SyncServer};
 use std::sync::{Arc, Mutex};
+use voicecore::sync_client::SyncClient;
 
-// Initialize sync client
 let db = Arc::new(Mutex::new(Database::new(&db_path)?));
-let config = Arc::new(Mutex::new(Config::new(None)?));
-let sync_client = SyncClient::new(db.clone(), config.clone())?;
+let config = Arc::new(Mutex::new(Config::new(None, None)?));
+let client = SyncClient::new(db.clone(), config.clone())?;
 
-// Sync with a peer
-let result = sync_client.sync_with_peer("peer_device_id").await?;
-println!("Pulled: {}, Pushed: {}, Conflicts: {}",
-    result.pulled, result.pushed, result.conflicts);
+// Sync with a peer: database changes only, both directions
+let result = client.sync_with_peer("peer_device_id").await;
+println!("Pulled: {}, Pushed: {}, Conflicts: {}, Request {}",
+    result.pulled, result.pushed, result.conflicts, result.request_id);
 
-// Start sync server
-let server = SyncServer::new(db, config);
-server.start("0.0.0.0", 8384).await?;
+// Deliver (sync, then send) and exchange (sync, then send and fetch)
+let result = client.deliver("peer_device_id").await;
+let result = client.exchange("peer_device_id").await;
+
+// Listen for peers: HTTPS on this device's certificate; the last argument is plain_http,
+// which is allowed only on a loopback address (AUTH-7)
+voicecore::sync_server::start_server(db, config, "0.0.0.0", 8384, false).await?;
 ```
 
 ### Conflict Resolution
@@ -207,7 +253,7 @@ so every device records the same conflict with the same id.
 ```rust
 // Unresolved conflicts, newest first
 for c in db.get_conflicts(false)? {
-    println!("{} {} {}: {} vs {}", c.entity_type, c.entity_id, c.field,
+    println!("{} {} {} ({}): {} vs {}", c.entity_type, c.entity_id, c.field, c.kind,
              c.device_a_name.unwrap_or_default(), c.device_b_name.unwrap_or_default());
 }
 
@@ -224,43 +270,50 @@ db.update_note(&note_id, "טקסט מתוקן")?;
 let versions = db.get_field_history("note", &note_id, "content")?;
 ```
 
-Merge rules by field kind:
+Merge rules by field kind (`FIELD_REGISTRY` in `versions.rs`, MERGE-T, MERGE-S, MERGE-F, MERGE-M, MERGE-D):
 
 | Kind | Fields | Concurrent change |
 |------|--------|-------------------|
 | Text | note.content, transcription.content, audio_file.summary | diff3 line merge; overlapping edits kept between `<<<<<<< VERSION A` / `>>>>>>> VERSION B` markers and flagged |
-| Scalar | tag.name, tag.parent, setting.value | later version wins, flagged |
+| Scalar | note.primary_attachment, audio_file.primary_transcription, tag.name, tag.parent, setting.value, device.name, device.certificate_fingerprint, device.addresses, device.listens, device.key_hash, device.application | later version wins, flagged |
 | Flags | transcription.state | per-flag union/intersection against the base, flagged only when the same flag was toggled both ways |
-| Membership | note_tag.active, note_attachment.active | disagreement keeps the link attached, flagged |
-| Deleted | *.deleted | disagreement keeps the entity alive, flagged; a delete that did not see a concurrent edit is overridden by the edit (delete conflict) |
+| Membership | note_tag.active, note_attachment.active, device.revoked | disagreement keeps the link attached (a device stays revoked), flagged |
+| Deleted | note.deleted, transcription.deleted, audio_file.deleted, tag.deleted | disagreement keeps the entity alive, flagged; a delete that did not see a concurrent edit is overridden by the edit (delete conflict) |
 
 ### Configuration
 
 ```rust
-// Load or create config
-let mut config = Config::new(Some("/path/to/config/dir"))?;
+use std::path::PathBuf;
 
-// Get device identity
-println!("Device ID: {}", config.device_id());
+// Load or create config
+let mut config = Config::new(Some(PathBuf::from("/path/to/config/dir")), None)?;
+
+// Device identity
+println!("Device ID: {}", config.device_id_hex());
 println!("Device Name: {}", config.device_name());
 
-// Add a sync peer
+// Add a sync peer: id, name, URL, pinned certificate fingerprint, whether an existing entry may be replaced
 config.add_peer(
-    "a1b2c3d4e5f67890",  // peer device ID
-    "HomeServer",         // peer name
-    "https://sync.example.com"  // peer URL
+    "0199aaaaaaaa70008000000000000001",
+    "HomeServer",
+    "https://192.168.1.20:8384",
+    Some("SHA256:aa:bb:..."),
+    false,
 )?;
 
 // List configured peers
-let peers = config.get_peers();
+let peers = config.peers();
 
-// Remove a peer
-config.remove_peer("a1b2c3d4e5f67890")?;
+// Remove a peer (returns whether one was removed)
+config.remove_peer("0199aaaaaaaa70008000000000000001")?;
 ```
 
 ## API Reference
 
 ### Core Types
+
+The structures in `models.rs`. Database queries return row structures with
+integer timestamps instead (`NoteRow`, `TagRow`, ... in `database.rs`).
 
 #### Note
 
@@ -268,10 +321,10 @@ config.remove_peer("a1b2c3d4e5f67890")?;
 pub struct Note {
     pub id: Uuid,                           // UUID7 identifier
     pub created_at: DateTime<Utc>,          // Creation timestamp
-    pub content: String,                    // Note content (max 100KB)
-    pub device_id: Uuid,                    // Creating device ID
+    pub content: String,                    // Note content
+    pub device_id: Uuid,                    // Device that last modified the note
     pub modified_at: Option<DateTime<Utc>>, // Last modification
-    pub deleted_at: Option<DateTime<Utc>>,  // Soft-delete timestamp
+    pub deleted_at: Option<DateTime<Utc>>,  // Deletion timestamp (in the trash)
 }
 ```
 
@@ -280,8 +333,8 @@ pub struct Note {
 ```rust
 pub struct Tag {
     pub id: Uuid,                           // UUID7 identifier
-    pub name: String,                       // Tag name (max 255 chars)
-    pub device_id: Uuid,                    // Creating device ID
+    pub name: String,                       // Tag name (at most 100 bytes)
+    pub device_id: Uuid,                    // Device that last modified the tag
     pub parent_id: Option<Uuid>,            // Parent tag for hierarchy
     pub created_at: Option<DateTime<Utc>>,  // Creation timestamp
     pub modified_at: Option<DateTime<Utc>>, // Last modification
@@ -297,7 +350,7 @@ pub struct NoteTag {
     pub created_at: DateTime<Utc>,          // Association creation
     pub device_id: Uuid,                    // Creating device ID
     pub modified_at: Option<DateTime<Utc>>, // Last modification
-    pub deleted_at: Option<DateTime<Utc>>,  // Soft-delete timestamp
+    pub deleted_at: Option<DateTime<Utc>>,  // When the association was removed
 }
 ```
 
@@ -305,243 +358,502 @@ pub struct NoteTag {
 
 ```rust
 pub enum VoiceError {
-    Validation(ValidationError),  // Input validation failures
-    Database(String),             // SQLite errors
-    Sync(String),                 // Synchronization errors
-    Network(String),              // HTTP/connection errors
-    Tls(String),                  // Certificate errors
-    Config(String),               // Configuration errors
-    NotFound(String),             // Entity not found
-    Conflict(String),             // Sync conflicts
+    Validation { field: String, message: String },
+    Database(rusqlite::Error),
+    DatabaseOperation(String),
+    Sync(String),
+    Network(String),
+    Tls(String),
+    Config(String),
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    Uuid(uuid::Error),
+    NotFound(String),
+    Conflict(String),
+    Other(String),
 }
 
-pub enum ValidationError {
-    InvalidUuid(String),
-    InvalidDatetime(String),
-    InvalidTagName(String),
-    InvalidTagPath(String),
-    ContentTooLong(usize),
-    EmptyContent,
-    // ... additional variants
+pub struct ValidationError {
+    pub field: String,
+    pub message: String,
 }
 ```
+
+A refusal between devices carries, besides its sentence, one of the codes in
+`sync_protocol::codes` (see "Refusal codes" below).
 
 ### Sync Types
 
 ```rust
 pub struct SyncResult {
     pub success: bool,
-    pub pulled: i64,      // Changes received from peer
-    pub pushed: i64,      // Changes sent to peer
-    pub conflicts: i64,   // Conflicts detected
-    pub errors: Vec<String>,
-}
-
-pub enum ResolutionChoice {
-    KeepLocal,   // Use local version
-    KeepRemote,  // Use remote version
-    Merge,       // Manual merge (with conflict markers)
-    KeepBoth,    // For delete conflicts: restore deleted note
+    pub pulled: i64,              // Changes received from the peer
+    pub pushed: i64,              // Changes sent to the peer
+    pub conflicts: i64,           // Conflicts flagged
+    pub sent: i64,                // Recordings sent to the peer (deliver, exchange, send)
+    pub fetched: i64,             // Recordings fetched from the peer (exchange, fetch)
+    pub bytes_moved: u64,         // Bytes of recordings moved in either direction
+    pub errors: Vec<String>,      // Problems that made the operation incomplete
+    pub warnings: Vec<String>,    // Problems that did not affect the database changes
+    pub request_id: String,       // The operation's id, on every request and log line (DIAG-2)
+    pub clock_skew_seconds: i64,  // The peer's clock minus this device's, past one minute (DIAG-3)
 }
 ```
 
 ## Database Schema
 
-VoiceCore uses SQLite with UUID7 as BLOB primary keys.
+VoiceCore uses SQLite with UUID7 as BLOB primary keys. The schema is created in
+`Database::init_database()` and extended by the `migrate_*` functions called
+after it.
 
 ### Core Tables
 
 | Table | Purpose |
 |-------|---------|
-| `notes` | Note content with timestamps and soft-delete |
+| `notes` | Note content with timestamps and deletion |
 | `tags` | Hierarchical tag definitions |
 | `note_tags` | Many-to-many note-tag associations |
+| `note_attachments` | Recordings attached to notes |
+| `audio_files` | Recording metadata: `disk_name`, `content_sha256`, `size_bytes`, `waveform_levels`, bucket location, `storage_encrypted` |
+| `transcriptions` | Transcriptions of recordings, with their flags (`state`) |
+| `devices` | Denormalised device cards (CARD-1) |
 
 ### Sync Infrastructure
 
 | Table | Purpose |
 |-------|---------|
-| `sync_peers` | Configured peer devices and last sync times |
-| `sync_failures` | Failed sync operations for retry |
+| `sync_peers` | Known peers: cursors, last sync time and operation (PROOF-3), the remembered address, the account at the last agreeing handshake (ACCT-3), the entity types the peer declared (PROTO-13) |
+| `sync_failures` | Changes that could not be applied, kept for retry |
 | `field_versions` | Append-only version graph of every editable field |
 | `field_heads` | Current head version per field |
 | `field_conflicts` | Merges that need a human, with the two versions and devices |
+| `field_deferred` | Fields whose row could not be written yet (HEAD-7) |
 | `synced_settings` | Settings shared by every device (denormalised heads) |
 | `purges` | What was removed for good, so that no peer can bring it back |
-| `sync_sequence`, `sync_meta` | Write-order counter and `database_id` for the cursor feed; every syncable table has a `seq` column stamped by triggers |
+| `file_storage_config` | The single-row bucket configuration, synced |
+| `file_locations` | Where each copy of a recording is, synced (FILE-22) |
+| `sync_sequence`, `sync_meta` | Write-order counter, `database_id` and `account_id`; every syncable table has a `seq` column stamped by triggers |
+| `audio_file_copies` | Which peers hold a recording, local (PROOF-2) |
+| `upload_parts` | Journal of multipart uploads to the bucket (FILE-19) |
+| `purged_objects` | Bucket objects waiting for their purge tag (BUCKET-2) |
+| `pending_file_renames` | Renames of recordings waiting for a caller that knows the audio folder (FILE-15) |
+| `pairing_offers` | Hashes of the tokens of shown codes, local (PAIR-2) |
 
-### Schema Versioning
+The conflict tables of the first sync design (`conflicts_note_content` and the
+others) are still created and are dropped again by a migration; `field_conflicts`
+replaced them.
 
-The database includes a `schema_version` table for migrations. Current schema version: 1.
+The account index `accounts.db` (tables `accounts` and `hosting_offers`) is a
+separate file in the installation root, not part of an account's database.
+
+## Accounts
+
+Every database belongs to one account, `sync_meta.account_id`: 32 hex
+characters, the same on every device of the account (ACCT-1). A database is
+authoritative for its own account: `Database::new_for_account(path, id)` gives a
+fresh, unused database the id, and a database that holds notes or has synced
+under another id is refused with `ACCOUNT_DISAGREES` (ACCT-4). The only way a
+database changes account is `move_to_account`, which takes a snapshot first,
+rewrites the id and forgets every peer (ACCT-5).
+
+One installation root can hold several accounts (`accounts.rs`, ACCT-6..ACCT-9):
+
+```text
+<root>/
+  config.json        machine: device id and name, listen port, backup, public URL
+  accounts.db        the index, never synced
+  certs/
+  <account id>/      notes.db  config.json  audio/  snapshots/
+```
+
+`accounts::resolve(root, selector, create_default)` opens the account named by
+id, unique id prefix or label, else the default. A root that holds `notes.db` or
+`config.json` and no index is the account itself (the phone, a test directory).
+The index is only an index: a disagreement with the database inside an account
+directory is reported, never corrected. A **hosted** account is served for
+someone else and is never the default.
+
+## Authentication
+
+Every device holds one **device key** per account: 32 random bytes as 43
+base64url characters (`auth::generate_device_key`), in clear only in that
+device's `config.json` (wrapped on the phone, AUTH-9). Every other device holds
+its hex SHA-256 on the device's card (`key_hash`); hashes are compared in
+constant time (AUTH-1, AUTH-2).
+
+The **device card** is the entity `device`, id = the device id, with the
+versioned fields `name`, `certificate_fingerprint`, `addresses` (JSON list of
+URLs), `listens` (`"0"` / `"1"`), `key_hash`, `revoked` and `application`. The
+cards travel in the feed as `field_version` changes, so every device of the
+account knows every other (CARD-1). A device writes its own card at every start
+(`auth::ensure_own_device_card`); `revoked` can be set by any device and cleared
+by none (CARD-2). After every sync the cards become the peer list (CARD-3,
+`SyncClient::adopt_peers_from_cards`).
+
+### Request headers
+
+Every authenticated route carries:
+
+| Header | Value |
+|--------|-------|
+| `X-Account-ID` | The account the request is for (`auth::HEADER_ACCOUNT`) |
+| `X-Device-ID` | The calling device (`auth::HEADER_DEVICE`) |
+| `Authorization` | `Bearer <device key>` |
+| `X-Request-ID` | Optional: the operation's id, up to 32 hex characters, written in the logs of both sides (DIAG-2) |
+
+The middleware `require_device` checks, in this order (`auth::verify_request`,
+AUTH-3): an account the server does not hold (404 `ACCOUNT_UNKNOWN`), a missing
+key or device (401 `KEY_MISSING`), a device with no card (401 `DEVICE_UNKNOWN`),
+a revoked card (401 `DEVICE_REVOKED`), a key that does not hash to the card's
+hash (401 `KEY_WRONG`). After three refusals from one address, each further
+refusal is answered after a wait of 2, 4 and then 8 seconds; a success clears the
+count; counts are forgotten after ten minutes and the table is emptied past ten
+thousand addresses (AUTH-5). The key is never written to a log or an error.
+
+A listener over one directory serves its one account (`SingleAccount`); a
+listener over an indexed root (`start_hosting_server`) serves every account of
+the index through `IndexedAccounts`, opening each on its first request and
+keeping at most 64 open, and writes a request log `audit.log` beside each hosted
+account's database, rotated at 5 MiB (AUTH-4, AUTH-8).
+
+The LAN gate `lan_only_gate` refuses a caller whose address is not private, link-local
+or loopback with 403 `NOT_ON_LAN` unless the machine has a `public_url`
+(LISTEN-3). In `create_router_for` it is attached with `route_layer` to the open
+routes (`/sync/status`, `/pair/claim`, `/pair/grant`); the authenticated routes
+are merged into the router after that layer.
+
+### Refusal codes
+
+Every error response is `{"error": "<sentence>", "code": "<code>"}`; `code` is
+empty for an error that has none. The codes (`sync_protocol::codes`):
+
+| Code | Meaning |
+|------|---------|
+| `ACCOUNT_MISSING` | The handshake named no account (400) |
+| `ACCOUNT_MISMATCH` | The two sides hold different accounts; nothing is exchanged (403) |
+| `ACCOUNT_DISAGREES` | A database opened for one account already belongs to another |
+| `ACCOUNT_UNKNOWN` | The request names an account this server does not hold (404) |
+| `KEY_MISSING` | The request carries no device key, or no device id (401) |
+| `DEVICE_UNKNOWN` | The account holds no card for the device (401) |
+| `DEVICE_REVOKED` | The device's card is marked revoked (401) |
+| `KEY_WRONG` | The key does not hash to the card's key hash (401) |
+| `DEVICE_MISMATCH` | The handshake body names a device other than the headers do (400) |
+| `TLS_REQUIRED` | Plain http to or on an address that is not this machine |
+| `CERTIFICATE_MISMATCH` | The peer's certificate is not the pinned one |
+| `TOKEN_INVALID` | The pairing or grant token is unknown, spent, expired or mistyped (403) |
+| `SETUP_TEXT_INVALID` | The setup text, or a grant, could not be read |
+| `DEVICE_HOLDS_NOTES` | This device holds notes of another account and will not be paired over them |
+| `PROTOCOL_TOO_OLD` | The peer speaks a protocol version below 2 (426) |
+| `NOT_ON_LAN` | The caller is not on a private network and this listener has no public address (403) |
+
+## Pairing
+
+The device that holds the account **shows a code** (`pairing::offer`): a setup
+text `voice://pair?v=1&a=<account>&t=<token>&d=<device id>&u=<url,...>&f=<fingerprint>`,
+also drawn as a QR code. The fingerprint's 32 bytes travel as 43 base64url
+characters. The token lives ten minutes (`TOKEN_LIFETIME_SECONDS`); only its hash
+is kept, in `pairing_offers`; the first right token spends it and the fifth wrong
+token withdraws it (PAIR-1, PAIR-2).
+
+- **Claim** (PAIR-3, PAIR-4): the reading device (`SyncClient::join`) refuses a
+  code for another account when it holds notes (`DEVICE_HOLDS_NOTES`,
+  `pairing::check_can_join`), then posts `/pair/claim` over TLS pinned to the
+  fingerprint in the text. The shower (`pairing::admit_by_token`) makes a device
+  key for the reader, writes the reader's card with the key's hash, and answers
+  with the account id, the key, its own card and, when it holds one, the
+  account's recording key (ENC-1).
+- **Grant** (PAIR-5): a server that holds no account shows a grant text (`g=1`,
+  no account id; `pairing::offer_hosting`, token hashed in the root's
+  `hosting_offers`). The holder (`SyncClient::grant_host`) makes a key for the
+  server and posts `/pair/grant` with the account id, that key, its own card, a
+  label and the recording key when it has one. The server registers the account
+  as hosted, stores the key, admits the holder's card, writes its own card and
+  answers with it.
 
 ## Sync Protocol
 
-This section documents the sync protocol for implementing new clients (e.g., mobile apps, web clients).
+This section documents the sync protocol for implementing new clients.
 
 ### Protocol Overview
 
-VoiceCore uses a bidirectional sync protocol where any device can act as both client and server. The protocol supports:
-- Incremental sync (only changes since last sync)
-- Full sync (complete dataset transfer for initial sync or recovery)
-- Audio file metadata (binaries live in cloud storage, see below)
-- Conflict detection and resolution
+Transport is HTTPS. A listener serves its own self-signed certificate
+(`certs/server.crt`, made when missing); a caller verifies a peer by its pinned
+fingerprint, or against the system's root certificates when no fingerprint is
+pinned. Plain http is accepted only to and on a loopback address (AUTH-7). All
+timestamps are Unix seconds as JSON integers.
+
+The protocol version is `2.0` (`sync_protocol::PROTOCOL_VERSION`). A handshake
+from a peer whose major version is below 2 is refused with HTTP 426 and
+`PROTOCOL_TOO_OLD`, "Update Voice on <device name>"; nothing negotiates with
+version 1 (PROTO-12). The handshake carries `application` and `entity_types`,
+so another application can share the account's tags without ever seeing a note
+(PROTO-13).
+
+A **sync** exchanges database changes with a peer, both directions, and moves no
+file. Recording files move only by **upload** and **download** (the bucket) and
+by **send** and **fetch** (a peer); **deliver** is sync then send, and
+**exchange** is sync then send and fetch (`TECHNICAL-DECISIONS.md` 4.5).
 
 ### Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/sync/handshake` | Device discovery and identity exchange |
-| `GET` | `/sync/changes?since=<timestamp>&limit=<n>` | Pull changes since timestamp |
-| `POST` | `/sync/apply` | Apply remote changes to local database |
-| `GET` | `/sync/full` | Full dataset for initial sync |
-| `GET` | `/sync/status` | Health check and server info |
-| `GET` | `/sync/audio/<audio_id>/file` | Fetch a recording's file from this peer, resumable with `Range` (FILE-12, FILE-13) |
-| `POST` | `/sync/audio/<audio_id>/file` | Send a recording's file to this peer, resumable with `Content-Range` (FILE-12, FILE-13) |
+| Method | Path | Authentication | Description |
+|--------|------|----------------|-------------|
+| `POST` | `/sync/handshake` | device key | Identity, account and protocol check; `database_id` and cursor |
+| `GET` | `/sync/changes?cursor=<n>&limit=<m>&types=<a,b>` | device key | One page of the cursor feed (primary) |
+| `GET` | `/sync/changes?since=<unix seconds>&limit=<m>` | device key | Timestamp feed, kept for tools |
+| `POST` | `/sync/apply` | device key | Apply a batch of the caller's changes |
+| `GET` | `/sync/full` | device key | The whole dataset as one document, kept for tools |
+| `POST` | `/sync/audio/missing` | device key | Of the recording ids the caller names, the ones this instance lacks (FILE-12) |
+| `GET` | `/sync/audio/<audio_id>/file` | device key | Fetch a recording's file from this peer, resumable with `Range` (FILE-12, FILE-13) |
+| `POST` | `/sync/audio/<audio_id>/file` | device key | Send a recording's file to this peer, resumable with `Content-Range` (FILE-12, FILE-13) |
+| `GET` | `/sync/status` | none | Health check and identity |
+| `POST` | `/pair/claim` | token | A reading device claims a key with a code's token (PAIR-3) |
+| `POST` | `/pair/grant` | token | A holder gives an empty server the account (PAIR-5) |
+
+The changes feed is gzip-compressed when the caller sends
+`Accept-Encoding: gzip`; the file routes never are (DIAG-5). The listener's body
+limit (`sync.max_sync_file_size_mb`) applies to the JSON routes; a file sent to
+`POST /sync/audio/<audio_id>/file` is read as a stream past it.
 
 ### Endpoint Details
 
 #### POST /sync/handshake
 
-Exchange device identities and determine last sync timestamp.
-
-**Request:**
+**Request** (`HandshakeRequest`):
 ```json
 {
-    "device_id": "018d1234abcd5678...",
-    "device_name": "My Android Phone",
-    "protocol_version": "1.0"
+    "device_id": "0199aaaaaaaa70008000000000000001",
+    "device_name": "Phone",
+    "protocol_version": "2.0",
+    "account_id": "0199bbbbbbbb7000800000000000000b",
+    "application": "voice",
+    "entity_types": []
 }
 ```
 
-**Response:**
+`entity_types` empty means every type. The server remembers the declared types
+for the caller (`set_peer_entity_types`).
+
+**Response** (`HandshakeResponse`):
 ```json
 {
-    "device_id": "018d5678efgh9012...",
-    "device_name": "Home Server",
-    "protocol_version": "1.0",
+    "device_id": "0199cccccccc70008000000000000002",
+    "device_name": "Desk",
+    "protocol_version": "2.0",
+    "account_id": "0199bbbbbbbb7000800000000000000b",
+    "application": "voice",
     "last_sync_timestamp": 1705314600,
     "server_timestamp": 1705320000,
     "supports_audiofiles": true,
+    "free_bytes": 52341234567,
     "database_id": "0193...",
     "cursor": 4821
 }
 ```
 
-`database_id` identifies the database; when a peer sees it change it forgets its cursors and exchanges everything again. `cursor` is the end of the feed at handshake time. `protocol_version` is `"1.1"`.
+The checks, in the order the handler runs them after the device-key middleware:
+`device_id` not 32 hex characters (400), a protocol major version below 2 (426
+`PROTOCOL_TOO_OLD`), an `X-Device-ID` header naming another device than the body
+(400 `DEVICE_MISMATCH`), an empty `account_id` (400 `ACCOUNT_MISSING`), an
+`account_id` other than the server's (403 `ACCOUNT_MISMATCH`). The server then
+takes a snapshot (SNAP-3) and records the caller's account.
+
+`database_id` identifies the database; when a peer sees it change it forgets its
+cursors and exchanges everything again (PROTO-9). `cursor` is the end of the
+feed at handshake time. `supports_audiofiles` is `true` when the account has an
+audio directory configured. `free_bytes` is the free space on the responder's
+disk, 0 when unknown. `server_timestamp` is compared with the caller's clock; a
+difference past one minute is reported (DIAG-3).
 
 #### GET /sync/changes
 
-Pull changes. Two modes:
+Two modes:
 
-**Cursor mode (primary, protocol 1.1):** `?cursor=<n>&limit=<m>` returns every row and authored version whose write-order sequence number is greater than `cursor`, oldest first, at most `limit` (max 10000) changes and about 4 MB of JSON in total, plus `next_cursor` (pass it back to continue) and `is_complete`. Exact, resumable, and independent of clocks. The Rust client only uses this mode and loops until `is_complete`; an initial sync is the same loop from cursor 0.
+**Cursor mode (primary):** `?cursor=<n>&limit=<m>` returns every row and every
+authored or published version whose write-order sequence number is greater than
+`cursor`, oldest first, at most `limit` changes and about 4 MB of JSON in total
+(`FEED_BYTE_BUDGET`; at least one change), plus `next_cursor` (pass it back to
+continue) and `is_complete`. Exact, resumable, and independent of clocks. The
+Rust client uses only this mode and loops until `is_complete`; an initial sync is
+the same loop from cursor 0 (FLOW-1, FLOW-4).
 
-**Timestamp mode (tools, older clients):** `?since=<unix seconds>&limit=<m>` returns changes with any timestamp `>= since`, `limit` *per entity type*. If omitted, returns all changes.
+**Timestamp mode (tools):** `?since=<unix seconds>&limit=<m>` returns changes
+with a timestamp greater than `since`, `limit` per entity type (PROTO-7). If
+`since` is omitted, returns all changes. `is_complete` is `false` when the number
+of changes returned reaches `limit`.
 
-**Query Parameters:**
+**Query Parameters** (`ChangesQuery`):
 - `cursor` (optional): write-order position; takes precedence over `since`.
 - `since` (optional): Unix timestamp (seconds).
-- `limit` (optional): Default 1000, maximum 10000.
+- `limit` (optional): default 1000, maximum 10000.
+- `types` (optional): comma-separated entity types; only those are returned, while the cursor still walks the whole feed (PROTO-13).
 
-**Response:**
+**Response** (`ChangesResponse`):
 ```json
 {
-    "changes": [ /* array of SyncChange objects */ ],
-    "from_timestamp": "2024-01-15 10:30:00",
-    "to_timestamp": "2024-01-15 12:00:00",
-    "device_id": "018d5678efgh9012...",
-    "device_name": "Home Server",
-    "is_complete": true
+    "changes": [ /* array of change objects */ ],
+    "from_timestamp": null,
+    "to_timestamp": 1705320000,
+    "next_cursor": 5321,
+    "database_id": "0193...",
+    "device_id": "0199cccccccc70008000000000000002",
+    "device_name": "Desk",
+    "is_complete": false
 }
 ```
 
-The response also carries `next_cursor` (cursor mode) and `database_id`. If `is_complete` is `false` in cursor mode, continue from `next_cursor`; in timestamp mode at least one entity type hit the limit and a full re-sync is needed.
+`from_timestamp` is the `since` of the request; `to_timestamp` is the latest
+timestamp among the returned changes; `next_cursor` is `null` in timestamp mode.
 
 #### POST /sync/apply
 
-Apply changes from another device.
-
-**Request:**
+**Request** (`ApplyRequest`):
 ```json
 {
-    "device_id": "018d1234abcd5678...",
-    "device_name": "My Android Phone",
-    "changes": [ /* array of SyncChange objects */ ]
+    "device_id": "0199aaaaaaaa70008000000000000001",
+    "device_name": "Phone",
+    "changes": [ /* array of change objects */ ]
 }
 ```
 
-**Response:**
+**Response** (`ApplyResponse`):
 ```json
 {
     "applied": 15,
     "conflicts": 2,
-    "errors": ["Error applying note abc123: validation failed"]
+    "errors": ["Error applying note_tag ...: ..."]
 }
 ```
 
+When the caller declared entity types in its handshake, changes of other types
+are not applied, and a sentence in `errors` says how many (PROTO-13). A
+`device_id` that is not 32 hex characters is refused with 400. The handler
+answers 200 with this body whenever the batch ran; an error that escapes the
+batch is 500. The server records the time of the sync with the caller
+(`update_peer_sync_time`).
+
 #### GET /sync/full
 
-Get complete dataset for initial sync.
-
-**Response:** Same format as `/sync/changes` but includes all data regardless of timestamps.
+The whole dataset as one JSON document, for tools; the Rust client does not use
+it (FLOW-4). Keys: `notes`, `tags`, `note_tags`, `note_attachments`,
+`audio_files`, `transcriptions`, `file_storage_config`, `field_versions`, plus
+`device_id`, `device_name`, `timestamp`, `database_id` and `cursor` (the end of
+the feed when the document was assembled). Its rows carry fewer columns than the
+feed's: no timezone columns, and for audio files `id`, `imported_at`,
+`filename`, `file_created_at`, `duration_seconds`, `summary`, `modified_at`,
+`deleted_at`, `storage_provider`, `storage_key` and `storage_uploaded_at`.
 
 #### GET /sync/status
 
-Health check endpoint.
+Health check; needs no key.
 
-**Response:**
+**Response** (`StatusResponse`):
 ```json
 {
-    "device_id": "018d5678efgh9012...",
-    "device_name": "Home Server",
-    "protocol_version": "1.0",
+    "device_id": "0199cccccccc70008000000000000002",
+    "device_name": "Desk",
+    "protocol_version": "2.0",
     "status": "ok",
     "supports_audiofiles": true
 }
 ```
 
+The status names no account: a single-account listener answers
+`supports_audiofiles` for its one account; a listener that hosts several answers
+`false`, and the handshake of each account answers for that account.
+
+#### POST /sync/audio/missing
+
+**Request** (`MissingFilesRequest`): `{"audio_ids": ["<hex id>", ...]}`, the
+recordings the sender holds.
+
+**Response** (`MissingFilesResponse`): `{"missing": ["<hex id>", ...], "partial": {"<hex id>": <bytes>}}`,
+the ids the receiver lacks and, for those it holds a part of, how many bytes it
+has. An id with no row on the receiver is left out (its sync has not arrived).
+The receiver records that the caller holds every id it named (PROOF-2).
+
+#### GET /sync/audio/<audio_id>/file
+
+Streams the file named by the row's `disk_name` from the audio directory, from
+the byte a `Range: bytes=N-` header names (206 with `Content-Range`, else 200).
+Headers: `Content-Length`, `Accept-Ranges: bytes`, and `X-File-SHA256` with the
+whole file's hex SHA-256 (the row's `content_sha256`, computed and stored once
+when the row has none). A file kept as the bucket holds it by a device without
+the recording key is served as it is, with the hash of those bytes and
+`X-Voice-Encrypted: 1` (ENC-4). 404 when the row or the file is not there; 400
+when no audio directory is configured.
+
+#### POST /sync/audio/<audio_id>/file
+
+Streams the body into `<file>.part`, continuing from the part's length when a
+`Content-Range: bytes N-M/total` header says so; a start other than the part's
+length is 409. At the start of a file the receiver refuses (507) a file that
+would leave less than 64 MB free (`transfer::FREE_SPACE_MARGIN`). When all bytes
+are there, the part is verified against `X-File-SHA256` and renamed (200 `OK`);
+a part of the file that is not the end answers 202 `PART` (FILE-13). The receiver
+states that it holds the file (FILE-22) and that the sender holds it (PROOF-2).
+
+#### POST /pair/claim and POST /pair/grant
+
+Bodies are `PairClaimRequest` / `PairClaimResponse` and `PairGrantRequest` /
+`PairGrantResponse` in `sync_protocol.rs` (see "Pairing" above). A wrong token is
+403 `TOKEN_INVALID` and counts against the address like any other refusal; a
+claim for an account the server does not hold is 404 `ACCOUNT_UNKNOWN`; a
+single-account listener refuses a grant with 409.
+
 ### Entity Types
 
-The sync protocol supports these entity types:
+The feed carries these entity types (`sync_apply::ALL_SYNC_ENTITY_TYPES`,
+PROTO-1); the server test `test_get_changes_since_returns_all_entity_types` fails
+if the feed omits any of them:
 
-| Entity Type | Description | Dependencies |
-|-------------|-------------|--------------|
-| `note` | Note content and metadata | None |
-| `tag` | Tag definitions with hierarchy | None (parent_id is self-referential) |
-| `audio_file` | Audio file metadata (not content) | None |
-| `note_tag` | Note-to-tag associations | Requires note, tag |
-| `note_attachment` | Note-to-attachment associations | Requires note, audio_file |
-| `transcription` | Audio transcription text | Requires audio_file |
-| `file_storage_config` | Single-row cloud storage configuration (provider + credentials), entity_id `default` | None |
+| Entity Type | Description | Apply order |
+|-------------|-------------|-------------|
+| `field_version` | One immutable version of a versioned field (of any entity, including `device` and `setting`) | 0 |
+| `note` | Note row | 1 |
+| `tag` | Tag row | 1 |
+| `audio_file` | Recording metadata (not the file) | 1 |
+| `file_storage_config` | Single-row bucket configuration, entity_id `default` | 1 |
+| `note_tag` | Note-to-tag association, entity_id `<note_id>:<tag_id>` | 2 |
+| `note_attachment` | Note-to-recording association | 2 |
+| `transcription` | Transcription of a recording | 2 |
+| `file_location` | Whether a place holds a recording's file, entity_id `<audio_id>:<place>` | 2 |
+| `purge` | An entity removed for good (PURGE-4) | 3 |
 
-**Dependency Order:** When applying changes, process entities in dependency order:
-1. First: `note`, `tag`, `audio_file` (no dependencies)
-2. Then: `note_tag`, `note_attachment`, `transcription` (depend on entities from step 1)
+Device cards (`device`) and synced settings (`setting`) have no row entity type:
+they travel only as `field_version` changes, and each receiver rewrites its
+`devices` and `synced_settings` tables from the heads.
+
+**Apply order** (`sync_apply::apply_changes`, APPLY-1): queued failures are
+retried first; then the batch sorted by the order above, then by timestamp; then
+one head recompute per touched field. Before applying any change, the receiver
+drops it when it is about a purged entity (PURGE-5).
 
 ### Change Format
 
 ```json
 {
     "entity_type": "note",
-    "entity_id": "018d1234abcd5678901234567890abcd",
-    "operation": "create",
-    "data": {
-        "content": "Meeting notes from today...",
-        "created_at": "2024-01-15 10:30:00",
-        "modified_at": "2024-01-15 10:30:00",
-        "device_id": "018d5678efgh90123456789012345678"
-    },
-    "timestamp": "2024-01-15 10:30:00",
-    "device_id": "018d5678efgh90123456789012345678"
+    "entity_id": "0199dddddddd70008000000000000003",
+    "operation": "update",
+    "data": { /* entity-specific data, see below */ },
+    "timestamp": 1705314900,
+    "device_id": "",
+    "device_name": null
 }
 ```
 
-**Fields:**
-- `entity_type`: One of the entity types listed above
-- `entity_id`: UUID7 hex string (32 characters, no hyphens)
-- `operation`: `create`, `update`, or `delete`
-- `data`: Entity-specific data (see below)
-- `timestamp`: When the change occurred (server's `modified_at`)
-- `device_id`: Device that made the change
+**Fields** (`models::SyncChange`):
+- `entity_type`: one of the entity types listed above
+- `entity_id`: the entity's id as 32 hex characters, or the composite ids shown above
+- `operation`: `create` when `modified_at` is NULL, `update` when set, `delete` when `deleted_at` is set (PROTO-4); a `field_version` is always `create`, a `file_storage_config` and a `file_location` always `update`, a `purge` always `delete`
+- `data`: entity-specific data (see below)
+- `timestamp`: `modified_at`, else `created_at` (`imported_at` for audio files; `deleted_at` before `created_at` for links and attachments); `created_at` of a version; `purged_at` of a purge; `changed_at / 1000` of a file location
+- `device_id`, `device_name`: the server's feed sends them empty (`""`, `null`)
+
+Every timestamp in an entity payload is followed by `<stamp>_offset` and
+`<stamp>_zone` (PROTO-3b); they are left out of the examples below except for
+the first.
 
 ### Entity Data Formats
 
@@ -549,11 +861,14 @@ The sync protocol supports these entity types:
 
 ```json
 {
+    "id": "0199...",
+    "created_at": 1705314600,
+    "created_at_offset": 7200,
+    "created_at_zone": "Asia/Jerusalem",
     "content": "Note text content",
-    "created_at": "2024-01-15 10:30:00",
-    "modified_at": "2024-01-15 10:35:00",
+    "modified_at": 1705314900,
     "deleted_at": null,
-    "device_id": "018d..."
+    "primary_attachment_id": null
 }
 ```
 
@@ -561,12 +876,12 @@ The sync protocol supports these entity types:
 
 ```json
 {
+    "id": "0199...",
     "name": "Work",
     "parent_id": null,
-    "created_at": "2024-01-15 10:30:00",
-    "modified_at": "2024-01-15 10:30:00",
-    "deleted_at": null,
-    "device_id": "018d..."
+    "created_at": 1705314600,
+    "modified_at": null,
+    "deleted_at": null
 }
 ```
 
@@ -574,12 +889,11 @@ The sync protocol supports these entity types:
 
 ```json
 {
-    "note_id": "018d...",
-    "tag_id": "018d...",
-    "created_at": "2024-01-15 10:30:00",
-    "modified_at": "2024-01-15 10:30:00",
-    "deleted_at": null,
-    "device_id": "018d..."
+    "note_id": "0199...",
+    "tag_id": "0199...",
+    "created_at": 1705314600,
+    "modified_at": null,
+    "deleted_at": null
 }
 ```
 
@@ -587,33 +901,59 @@ The sync protocol supports these entity types:
 
 ```json
 {
-    "id": "018d...",
-    "filename": "recording_2024-01-15.m4a",
+    "id": "0199...",
     "imported_at": 1705314600,
+    "filename": "2024_01_15_10_30_00-0000abcd.m4a",
     "file_created_at": 1705314000,
-    "duration_seconds": 60,
     "summary": null,
-    "modified_at": 1705314600,
+    "modified_at": 1705314700,
     "deleted_at": null,
     "storage_provider": "s3",
-    "storage_key": "audio/018d....m4a",
-    "storage_uploaded_at": 1705314700
+    "storage_key": "3f5a...e1.m4a",
+    "storage_uploaded_at": 1705314700,
+    "content_sha256": "3f5a...e1",
+    "storage_encrypted": false,
+    "disk_name": "2024_01_15_10_30_00-0000abcd.m4a",
+    "waveform_levels": "AAECAwQF...",
+    "size_bytes": 482133,
+    "primary_transcription_id": null
 }
 ```
 
-**Note:** Only metadata travels through the sync server. `storage_provider`/`storage_key` are set by the device that uploaded the binary to cloud storage; they are `null` until then. A device that receives a record with a `storage_key` can fetch the binary on demand with the cloud configuration it received through the `file_storage_config` entity. The local file is named by the row's `disk_name` (a recording made by Voice is `YYYY_MM_DD_HH_MM_SS-<last eight of the id>.<ext>`, an imported file keeps its own name), and the bucket object by the file's content hash, `<hash>.<ext>` (`storage_key_for` in `file_storage.rs`); `ext` is from `audio_file_extension()` in `models.rs` (lowercase, `bin` when absent).
+Timezone columns follow `imported_at`, `file_created_at`, `modified_at` and
+`deleted_at`.
+
+Only metadata travels through sync. `storage_provider`, `storage_key` and
+`storage_uploaded_at` are set by the device that uploaded the file to the bucket
+and are `null` until then (FILE-3). The receiver applies every incoming row
+through one upsert that merges per column: the newer row wins a metadata column,
+an older row only writes a column that is NULL, the bucket location is never
+erased by a row without one, and the versioned columns (summary, deletion,
+primary transcription) are never written from a row (FILE-9, DM-4).
+`content_sha256` is never erased by a row without one (FILE-18); `size_bytes` is
+never changed once known (FILE-23); `waveform_levels` is replaced only by a
+newer row that has levels (FILE-20).
+
+The local file is named by the row's `disk_name` (FILE-15): a recording made by
+Voice is `YYYY_MM_DD_HH_MM_SS-<last eight of the id>.<ext>`, an imported file
+keeps its own name, and a collision adds `-<last eight of the id>`. Find a file
+with `audio_local_path()` in `models.rs`, never from the id. The bucket object
+is `<content hash>.<ext>` (FILE-18), with `.enc` added when encrypted (ENC-3) and
+`<id>.<ext>` only while the row has no hash (`storage_key_for` in
+`file_storage.rs`); `ext` is from `audio_file_extension()` in `models.rs`
+(lowercase, last dot wins, `bin` when absent).
 
 #### Note Attachment
 
 ```json
 {
-    "note_id": "018d...",
-    "attachment_id": "018d...",
+    "id": "0199...",
+    "note_id": "0199...",
+    "attachment_id": "0199...",
     "attachment_type": "audio_file",
-    "created_at": "2024-01-15 10:30:00",
-    "modified_at": "2024-01-15 10:30:00",
-    "deleted_at": null,
-    "device_id": "018d..."
+    "created_at": 1705314600,
+    "modified_at": null,
+    "deleted_at": null
 }
 ```
 
@@ -621,79 +961,155 @@ The sync protocol supports these entity types:
 
 ```json
 {
-    "audio_file_id": "018d...",
-    "language": "en",
-    "text": "Transcribed text content...",
-    "provider": "whisper",
-    "model": "large-v3",
-    "segments": "[{\"start\": 0.0, \"end\": 2.5, \"text\": \"Hello\"}]",
+    "id": "0199...",
+    "audio_file_id": "0199...",
+    "content": "Transcribed text content...",
+    "content_segments": "[{\"start\": 0.0, \"end\": 2.5, \"text\": \"שלום\"}]",
+    "service": "whisper",
+    "service_arguments": "{\"language\": \"he\", \"model\": \"small\"}",
+    "service_response": null,
     "state": "original",
-    "created_at": "2024-01-15 10:30:00",
-    "modified_at": "2024-01-15 10:30:00",
-    "device_id": "018d..."
+    "device_id": "0199...",
+    "created_at": 1705314600,
+    "modified_at": null,
+    "deleted_at": null
 }
 ```
 
-### Audio File Transfer
+`state` is a space-separated list of the flags `original`, `verified`,
+`verbatim`, `cleaned` and `polished` (`TECHNICAL-DECISIONS.md` 1.4, 4.3).
 
-Audio binaries do not go through the sync server. `file_storage.rs` uploads them to cloud storage (S3 or S3-compatible, `file_storage_s3.rs`) from the device that holds them, and downloads them on demand elsewhere:
-
-- `upload_pending_audio_files()` runs before every push: records with `storage_provider IS NULL` whose file is on this device are uploaded; the rest are left for their owner. Failures are warnings and retried next sync; after the first remote failure the batch stops.
-- `download_audio_file()` / `download_audio_files_for_note()` are the on-demand paths (CLI, TUI, GUI and Android buttons).
-- `download_missing_audio_files()` fetches everything; only installations with `sync.mirror_audio_files = true` run it during sync.
-- Downloads are streamed to `<file>.part`, size-verified and renamed into place.
-
-The peer-to-peer endpoints `/sync/audio/<id>/file` remain in the server for a future peer-transfer provider but no current client calls them.
-
-### Sync Flow
-
-#### Initial Sync (First Connection)
-
-1. `POST /sync/handshake` - Exchange device identities
-2. `GET /sync/full` - Pull complete dataset from peer (includes `file_storage_config`)
-3. Apply all changes locally (respecting dependency order)
-4. If mirroring is enabled, download missing audio binaries from cloud storage
-5. Upload pending local audio binaries to cloud storage
-6. `POST /sync/apply` - Push local changes to peer
-
-#### Incremental Sync
-
-1. Upload pending local audio binaries to cloud storage (so the pushed metadata carries `storage_key`)
-2. `POST /sync/handshake` - Exchange identities, get `last_sync_timestamp`
-3. `GET /sync/changes?since=<last_sync_timestamp>&limit=10000` - Pull changes
-4. Apply changes locally
-5. If mirroring is enabled, download missing audio binaries from cloud storage
-6. `POST /sync/apply` - Push local changes since last sync
-7. Store the sync time as `last_sync_timestamp` for next sync
-
-### Conflict Handling
-
-Entity rows carry the current values for display; the truth is the
-`field_version` entries in the same feed. A client applies versions first,
-then rows, then recomputes the head of every touched field, which is where
-merging and conflict detection happen. A `field_version` change is
-create-only and idempotent (`INSERT OR IGNORE`), so replaying a feed is safe.
-
-A `field_version` change looks like:
+#### File Storage Config
 
 ```json
 {
-  "entity_type": "field_version",
-  "entity_id": "<version id, hex>",
-  "operation": "create",
-  "timestamp": 1735689600,
-  "data": {
-    "id": "<version id>", "entity_type": "note", "entity_id": "<note id>", "field": "content",
-    "parent_id": "<hex or null>", "merge_parent_id": "<hex or null>",
-    "content": "...", "context": null, "conflict_kind": null,
-    "device_id": "<hex>", "device_name": "Phone", "created_at": 1735689600
-  }
+    "id": "default",
+    "provider": "s3",
+    "config": { "bucket": "voice-...", "region": "eu-central-1", "max_upload_mb": 100, "encrypt": false },
+    "modified_at": 1705314600,
+    "device_id": "0199..."
 }
 ```
 
+`config` is the JSON object stored in the row, or `null`: the provider's
+settings and credentials, the account's upload limit `max_upload_mb` (FILE-23)
+and the encryption switch `encrypt` (ENC-3). The row is applied by newest
+`modified_at` (DM-5). `device_id` is present when the row has one.
+
+#### Purge
+
+```json
+{
+    "entity_type": "note",
+    "entity_id": "0199...",
+    "purged_at": 1705320000,
+    "purged_at_offset": 7200,
+    "purged_at_zone": "Asia/Jerusalem"
+}
+```
+
+#### File Location
+
+```json
+{
+    "audio_file_id": "0199...",
+    "place": "cloud",
+    "present": true,
+    "changed_at": 1705314700123,
+    "changed_by": "0199..."
+}
+```
+
+`place` is a device id or `cloud`; `changed_at` is in milliseconds. The newest
+statement about a place wins, then the larger device id, then presence (FILE-22).
+
+#### Field Version
+
+```json
+{
+    "id": "<version id, hex>",
+    "entity_type": "note",
+    "entity_id": "<note id>",
+    "field": "content",
+    "parent_id": "<hex or null>",
+    "merge_parent_id": "<hex or null>",
+    "content": "...",
+    "context": null,
+    "conflict_kind": null,
+    "device_id": "<hex or null>",
+    "device_name": "Phone",
+    "created_at": 1735689600,
+    "created_at_offset": 7200,
+    "created_at_zone": "Asia/Jerusalem",
+    "published": false
+}
+```
+
+### Recording Files
+
+A sync moves no file. Each of these is an action the user starts
+(`TECHNICAL-DECISIONS.md` 4.5, FLOW-2):
+
+- **Upload** (`file_storage::upload_pending_audio_files`): copies to the bucket
+  every row with no `storage_key`, not deleted, whose file is on this device and
+  within the account's upload limit (FILE-2, FILE-23). Rows whose file is not
+  here are skipped: another device holds them. A file larger than one part (8 MiB)
+  goes up in parts, journalled in `upload_parts` (FILE-19). A pending row whose
+  object is already in the bucket gets its `storage_key` from one request
+  (BUCKET-5). After the first remote failure in a batch the batch stops.
+- **Download** (`download_audio_file`, `download_audio_files_for_note`,
+  `download_missing_audio_files`): copies a file from the bucket to
+  `<file>.part`, verifies it by size and, when the row has one, content hash,
+  then renames it (FILE-7, FILE-18). `download_missing_audio_files` copies every
+  missing file. The core stores the local setting `sync.mirror_audio_files`
+  (`Config::mirror_audio_files`, never synced) for the application that runs this
+  after a sync (FILE-5); `sync_with_peer` itself never calls it.
+- **Send** and **fetch** (`SyncClient::send_to_peer`, `fetch_from_peer`,
+  `transfer.rs`, the file routes above): move a file between two instances of the
+  account, streamed and never held in memory, resumable, verified by SHA-256
+  (FILE-12, FILE-13). A sender first posts `/sync/audio/missing` with the ids it
+  holds, so a thousand recordings cost one round trip.
+- **Deliver** (`SyncClient::deliver`) is sync then send; **exchange**
+  (`SyncClient::exchange`) is sync then send and fetch.
+
+"Cloud storage not configured" is a silent no-op for automatic paths and a clear
+error for the ones the user starts (FILE-10). Recordings in the bucket can be
+encrypted (`crypto.rs`): one recording key per account, chunks of one MiB under
+AES-256-GCM, objects with the suffix `.enc`; a device without the key refuses to
+upload while encryption is on (ENC-1..ENC-4). The bucket key cannot delete: a
+purged recording's object is tagged `voice-purged=1` and the bucket's lifecycle
+rule deletes it a day later (BUCKET-2, BUCKET-4).
+
+### Sync Flow
+
+`SyncClient::sync_with_peer` (FLOW-1):
+
+1. `POST /sync/handshake`: refuse a responder of another account or of protocol 1.x; compare `database_id` with the stored one and restart both cursors from zero when it changed (PROTO-9); report clock skew (DIAG-3)
+2. State this device's own copies of recordings (FILE-22)
+3. Note `local_end = current_seq()`: only what existed before the pull is pushed (FLOW-6)
+4. Take a snapshot (SNAP-3)
+5. Pull: `GET /sync/changes?cursor=<stored>` page by page until `is_complete`, applying each page and saving `next_cursor` after it (DIAG-1)
+6. Push: pages of this device's changes with `last_sent_seq < seq <= local_end` to `POST /sync/apply`, saving the high-water mark after each accepted page
+7. Push the rows of recordings the pull renamed (FILE-15)
+8. Record the peer's sync time and the last operation (PROOF-3)
+9. Add, re-pin or remove peers from the device cards (CARD-3)
+
+`initial_sync` is the same flow from cursor zero in both directions (FLOW-4).
+`pull_from_peer` and `push_to_peer` run one direction (FLOW-3).
+
+### Conflicts
+
+Entity rows carry the current values for display; the truth is the
+`field_version` entries in the same feed. A client applies versions first,
+then rows, then links, then recomputes the head of every touched field, which is
+where merging and conflict detection happen. A `field_version` change is
+create-only and idempotent (`INSERT OR IGNORE`), so replaying a feed is safe
+(PROTO-2).
+
 Version ids are deterministic for roots (hash of entity, field and content),
-merges (hash of both parents and the merged content) and acceptances, so every
-device converges on the same graph and the same conflict ids.
+merges (hash of both parents and the merged content), acceptances and
+resurrections, so every device converges on the same graph and the same conflict
+ids (VER-3, VER-5, VER-11).
 
 Only *authored* versions travel: edits and accepts (they carry a device) and
 roots. Merges and resurrections are *derived*: every device recomputes them
@@ -701,45 +1117,62 @@ from the same authored versions and gets the same ids. A derived version that
 an authored version builds on (an edit made on top of a merge) is marked
 `published` and then travels too, ahead of its child. Heads are always folded
 from the authored leaves, so they do not depend on the order or page size in
-which versions arrived.
+which versions arrived (VER-9, VER-10, HEAD-2).
 
-The `apply` endpoint returns the number of conflicts flagged while recomputing
-heads. A change that cannot be applied (a link whose note has not arrived yet)
-is queued in `sync_failures` and retried on the next batch.
-
-### Timestamp Format
-
-All timestamps in the sync protocol are Unix timestamps in seconds (JSON integers). Display formatting (`YYYY-MM-DD HH:MM:SS`) happens in the UI layers only.
+The `apply` endpoint returns the number of conflicts flagged during the batch
+(APPLY-5). A change that cannot be applied (a link whose note has not arrived
+yet) is queued in `sync_failures` and retried at the start of the next batch
+(APPLY-2, APPLY-3). A batch is one `BEGIN IMMEDIATE` transaction in which a
+failing statement rolls back only itself (APPLY-9).
 
 ### Implementing a New Client
 
-To implement sync in a new client:
+1. **Identity:** a UUID7 `device_id` and a `device_name`; a device key for the account, obtained by pairing (PAIR-3) or made when the device created the account (AUTH-1)
+2. **Headers:** send `X-Account-ID`, `X-Device-ID` and `Authorization: Bearer <key>` on every authenticated request, over HTTPS with the peer's pinned fingerprint
+3. **Handshake:** announce protocol `2.0`, the account, the application and the entity types; refuse a responder of another account or a lower major version
+4. **Sync state:** store `database_id`, the received cursor and the sent high-water mark per peer; save each after every page
+5. **All entity types:** apply every type in `ALL_SYNC_ENTITY_TYPES` in dependency order, versions before rows, and recompute heads afterwards; drop changes about purged entities
+6. **Recording files:** move them only by upload and download (bucket) or send and fetch (peer), as the user asks
+7. **Conflicts:** never pick a winner; merge the version graph and record conflicts for the user to resolve
+8. **Timestamps:** Unix seconds as integers, each user-visible one with its offset and zone
 
-1. **Store device identity:** Generate a UUID7 for `device_id`, store with `device_name`
+## Snapshots and Backups
 
-2. **Track sync state:** Store `last_sync_timestamp` per peer
+- **Snapshots** (SNAP-1..SNAP-4): `Database::snapshot` copies the whole database
+  with SQLite's backup API into `snapshots/` beside the file, named
+  `notes-<UTC time>.db`; the newest five are kept (`SNAPSHOTS_KEPT`). A snapshot
+  is taken before this device applies anything from a peer (on the caller's side
+  before the first pull, on the responder's side at the handshake), before
+  `move_to_account` and before a restore. `restore_snapshot(name)` snapshots the
+  current state first, so a restore can itself be undone. An in-memory database
+  has no snapshots and skips them silently.
+- **Periodic backup** (SNAP-5): `Database::backup_to(dir, keep)` holds the write
+  lock, checkpoints and truncates the write-ahead log, copies the database with
+  the backup API to `dir/notes-<time>.db`, and keeps the newest `keep`. The
+  listener runs it every `backup.interval_hours` for every open account
+  (`sync_server::spawn_periodic_backup`, `backup_open_accounts`); the default
+  directory is `<root>/backups/<account id>/`. `backup_due` says whether an
+  account's backup is due.
 
-3. **Implement change tracking:** Track local changes since last sync (by `modified_at`)
+## Issues
 
-4. **Handle all entity types:** Implement create/update/delete for all entity types, including `field_version` (apply versions before rows, then recompute heads)
-
-5. **Respect dependency order:** Apply changes in correct order
-
-6. **Handle audio files:** Upload local binaries to cloud storage before pushing; download on demand using the synced `file_storage_config`
-
-7. **Handle conflicts:** Never pick a winner; merge the version graph and record conflicts for user resolution
-
-8. **Validate timestamps:** Ensure all timestamps use correct format
+`issues::issues(db, audio_dir, here)` computes, at every call and without
+storing anything (ISSUE-1): recordings not in the bucket, each with its reason
+(no bucket, over the account's upload limit, waiting for the devices that hold
+it, no copy known); transcriptions whose recording row is not there; attachments
+whose note or recording row is not there; recordings no note holds (a note in the
+trash still holds its recordings); tags whose names contain whitespace.
 
 ## Validation Rules
 
 | Field | Rule |
 |-------|------|
-| UUID | 32 hex chars (simple) or 36 chars with hyphens |
-| Datetime | `YYYY-MM-DD HH:MM:SS` format, strict |
-| Tag name | 1-255 characters, no forward slashes |
-| Tag path | Slash-separated tag names |
-| Note content | 1 - 102,400 bytes (100KB max) |
+| UUID | Parsed by `uuid`; hyphens are removed first, so 32 hex characters or the hyphenated form |
+| Datetime text | `validate_datetime`: exactly `YYYY-MM-DD HH:MM:SS`, zero-padded (stored and synced timestamps are integers) |
+| Tag name | Not empty after trimming, at most 100 bytes, no `/` |
+| Tag path | Not empty, at most 500 bytes, at most 50 levels, each name at most 100 bytes |
+| Note content | Not empty after trimming, at most 100,000 bytes |
+| Search query | At most 500 bytes |
 
 ## Dependencies
 
@@ -747,16 +1180,21 @@ To implement sync in a new client:
 
 | Category | Crates | Purpose |
 |----------|--------|---------|
-| Async | `tokio` | Async runtime |
-| Database | `rusqlite` (bundled) | SQLite driver |
+| Async | `tokio`, `futures-util`, `tokio-util` | Async runtime, streams, streamed file bodies |
+| Database | `rusqlite` (bundled, backup) | SQLite driver and backup API |
 | Serialization | `serde`, `serde_json` | JSON encoding |
-| IDs | `uuid` (v7) | UUID7 generation |
-| HTTP | `reqwest`, `axum` | Client and server |
-| TLS | `rustls`, `rcgen` | Pure-Rust TLS |
-| Crypto | `sha2`, `base64` | Hashing and encoding |
-| Errors | `thiserror`, `anyhow` | Error handling |
-| Dates | `chrono` | Datetime operations |
+| IDs | `uuid` (v7, v4) | UUID7 identifiers, random bytes |
+| HTTP | `reqwest`, `axum`, `axum-server`, `tower`, `tower-http` | Client, server, HTTPS listener, gzip |
+| TLS | `rustls`, `rustls-pemfile`, `rcgen` | Pure-Rust TLS (aws-lc on desktop, ring on Android), certificates |
+| Bucket | `rust-s3`, `url` | S3 and S3-compatible storage, signed requests |
+| Crypto | `sha2`, `ring`, `base64` | Hashes, AES-256-GCM, encoding |
+| System | `fs4`, `if-addrs`, `hostname`, `dirs` | Free disk space, listening addresses, host name, configuration directory |
+| Errors | `thiserror`, `anyhow` | Error types |
+| Dates | `chrono` | Date and time |
 | Merging | `diffy`, `similar` | Diff algorithms |
+| Logging | `tracing`, `tracing-subscriber` | Logging |
+| Encoding | `urlencoding` | Setup texts |
+| Bindings | `uniffi` (feature `uniffi`) | Kotlin bindings |
 
 ### Development
 
@@ -768,10 +1206,12 @@ To implement sync in a new client:
 
 ### Python Bindings
 
-VoiceCore is designed for PyO3 integration via the `voice-python` crate:
+The desktop and server use VoiceCore through PyO3, in the `voice-python` crate
+of the `Voice` repository, which depends on the core checked out at
+`Voice/submodules/voicecore`:
 
 ```
-rust/voice-python/
+Voice/rust/voice-python/
 ├── Cargo.toml
 └── src/
     └── lib.rs  # PyO3 bindings
@@ -780,21 +1220,32 @@ rust/voice-python/
 Build with maturin:
 
 ```bash
-cd rust/voice-python
+cd Voice/rust/voice-python
 maturin develop --release
 ```
 
 ### Android
 
-VoiceCore can be compiled for Android targets:
+The Android application uses VoiceCore through UniFFI: `src/android.rs` exposes
+`VoiceClient` (constructed over a data directory with an optional
+`KeystoreWrapper`), records such as `NoteData` and `SyncResultData`, the error
+`VoiceCoreError`, and the callback interfaces `OperationProgress` and
+`KeystoreWrapper`. The scaffolding is generated from the proc-macros
+(`uniffi::setup_scaffolding!()`); `build.rs` generates nothing. Build with the
+`uniffi` feature, generate the Kotlin bindings from the library with the
+`uniffi-bindgen` binary, and build the Android library with cargo-ndk (see
+`VoiceAndroid/CLAUDE.md` for the exact commands):
 
 ```bash
-# Add Android targets
-rustup target add aarch64-linux-android armv7-linux-androideabi
-
-# Build with cargo-ndk
-cargo ndk -t arm64-v8a -t armeabi-v7a build --release
+cargo ndk -t arm64-v8a -o <VoiceAndroid>/app/src/main/jniLibs build --release --features uniffi
 ```
+
+The Kotlin bindings and the native library must be rebuilt together; bindings
+without a matching library crash the phone with `UnsatisfiedLinkError`.
+
+A change to the core is made and committed here, and the checkouts
+`Voice/submodules/voicecore` and `VoiceAndroid/submodules/voicecore` are then
+moved to that commit (`../CLAUDE.md`, "One core, three binding layers").
 
 ## Testing
 
@@ -805,12 +1256,40 @@ cargo test
 # Run with output
 cargo test -- --nocapture
 
-# Run specific test
-cargo test test_create_note
+# Run the tests whose names contain a text
+cargo test purge
 
-# Run tests for a specific module
+# Run the tests of one module
 cargo test database::tests
 ```
+
+Tests use `:memory:` databases and temporary directories, never
+`~/.config/voice` (`TECHNICAL-DECISIONS.md` 7.6).
+
+### Convergence tests
+
+```bash
+cargo test convergence
+```
+
+`src/convergence_tests.rs` runs random multi-device fleets: every entity type,
+pages down to 1, duplicate deliveries, a hub topology, a replaced device, then
+checks that the fleet converges and quiesces (INV-1..INV-5, INV-10). Run them
+after any change to `versions.rs`, `sync_apply.rs`, the row-apply upserts or the
+feed. The same file holds `cursor_feed_is_exact_and_resumable`,
+`cache_rebuilds_and_echoes_do_not_republish`,
+`concurrent_tag_moves_never_form_a_cycle`,
+`feed_pages_are_bounded_in_bytes_and_lose_nothing` and
+`a_batch_is_one_transaction_and_a_bad_change_does_not_abort_it`.
+
+To trace one seed:
+
+```bash
+FLEET_DEBUG=1 FLEET_SEED=<n> cargo test debug_single_seed -- --nocapture
+```
+
+The variables `FLEET_TOPOLOGY` (`hub`), `FLEET_DEVICES`, `FLEET_PAGE`,
+`FLEET_DUP` and `FLEET_STEPS` set the fleet for that run.
 
 ## License
 
@@ -824,4 +1303,4 @@ GPL version 3.0 or above
 ## Related Projects
 
 - [Voice Desktop](https://github.com/dotancohen/voice) - Python desktop application using VoiceCore
-- voice-android (planned) - Android application using VoiceCore
+- VoiceAndroid - Android application using VoiceCore
