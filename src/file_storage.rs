@@ -163,6 +163,140 @@ pub trait FileStorageService: Send + Sync {
         &self,
         storage_key: &str,
     ) -> impl std::future::Future<Output = Result<(), FileStorageError>> + Send;
+
+    /// Upload a large file in parts (Stage 13, FILE-19): the parts the
+    /// journal lists as uploaded are not sent again, each part sent is
+    /// written to the journal before the next, and the object exists only
+    /// once every part is there. A cancel or a failure leaves the journal
+    /// for the next run to continue from.
+    fn upload_in_parts(
+        &self,
+        local_path: &Path,
+        remote_key: &str,
+        journal: &dyn PartJournal,
+    ) -> impl std::future::Future<Output = Result<UploadResult, FileStorageError>>;
+}
+
+/// Bytes per part of an upload in parts (Stage 13). Amazon requires at
+/// least 5 MiB for every part but the last; a file smaller than one part
+/// is uploaded whole.
+pub const PART_SIZE: u64 = 8 * 1024 * 1024;
+
+/// The three requests of an upload in parts, as a bucket answers them:
+/// the seam between the loop, which is tested with a store in memory, and
+/// the signed requests of the S3 service.
+pub trait PartStore {
+    /// Begin an upload of `key`; returns the bucket's upload id.
+    fn begin(&self, key: &str) -> impl std::future::Future<Output = Result<String, FileStorageError>>;
+    /// Send one part; returns the tag the bucket gave it.
+    fn put_part(&self, key: &str, upload_id: &str, part_number: u32, bytes: Vec<u8>) -> impl std::future::Future<Output = Result<String, FileStorageError>>;
+    /// Make the object from the parts, in order.
+    fn complete(&self, key: &str, upload_id: &str, parts: &[(u32, String)]) -> impl std::future::Future<Output = Result<(), FileStorageError>>;
+}
+
+/// Where an upload in parts remembers how far it is (Stage 13): the
+/// database, through `upload_begun` and its siblings; and what it asks
+/// between parts.
+pub trait PartJournal {
+    /// The upload begun earlier, if one is under way.
+    fn begun(&self) -> Result<Option<crate::database::UploadBegun>, FileStorageError>;
+    /// A new upload has begun.
+    fn begin(&self, storage_key: &str, upload_id: &str, part_size: u64) -> Result<(), FileStorageError>;
+    /// One more part is in the bucket.
+    fn part_done(&self, part_number: u32, etag: &str) -> Result<(), FileStorageError>;
+    /// The object is complete; the parts are forgotten.
+    fn finished(&self) -> Result<(), FileStorageError>;
+    /// Whether the person asked to stop; asked before every part.
+    fn cancelled(&self) -> bool {
+        false
+    }
+    /// How many bytes of the file are in the bucket, after each part.
+    fn moved(&self, _done: u64, _total: u64) {}
+}
+
+/// The loop of an upload in parts (Stage 13): continue the upload the
+/// journal remembers when its key and part size still fit, otherwise begin
+/// one; skip the parts already there; send the rest in order; complete.
+pub async fn upload_in_parts<S: PartStore>(store: &S, local_path: &Path, key: &str, journal: &dyn PartJournal, part_size: u64) -> Result<u64, FileStorageError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let total = std::fs::metadata(local_path)
+        .map_err(|e| FileStorageError::LocalFile(format!("Failed to read {}: {}", local_path.display(), e)))?
+        .len();
+    let part_count = u32::try_from(total.div_ceil(part_size).max(1)).map_err(|_| FileStorageError::Upload("too many parts".to_string()))?;
+
+    let (upload_id, mut parts) = match journal.begun()? {
+        Some(begun) if begun.storage_key == key && begun.part_size == part_size => {
+            tracing::info!(key = %key, parts_done = begun.parts.len(), "Continuing an upload in parts");
+            (begun.upload_id, begun.parts)
+        }
+        _ => {
+            let upload_id = store.begin(key).await?;
+            journal.begin(key, &upload_id, part_size)?;
+            (upload_id, Vec::new())
+        }
+    };
+
+    let mut file = std::fs::File::open(local_path)
+        .map_err(|e| FileStorageError::LocalFile(format!("Failed to open {}: {}", local_path.display(), e)))?;
+    for part_number in 1..=part_count {
+        if parts.iter().any(|(n, _)| *n == part_number) {
+            continue;
+        }
+        if journal.cancelled() {
+            return Err(FileStorageError::Upload(crate::sync_client::CANCELLED.to_string()));
+        }
+        let offset = u64::from(part_number - 1) * part_size;
+        let length = (total - offset).min(part_size) as usize;
+        let mut bytes = vec![0u8; length];
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|e| FileStorageError::LocalFile(format!("Failed to read {}: {}", local_path.display(), e)))?;
+        let etag = store.put_part(key, &upload_id, part_number, bytes).await?;
+        journal.part_done(part_number, &etag)?;
+        parts.push((part_number, etag));
+        journal.moved((offset + length as u64).min(total), total);
+    }
+    parts.sort_by_key(|(n, _)| *n);
+    store.complete(key, &upload_id, &parts).await?;
+    journal.finished()?;
+    Ok(total)
+}
+
+/// The database as a journal for one recording's upload (Stage 13).
+pub struct DatabaseJournal<'a> {
+    pub db: &'a Database,
+    pub audio_id: &'a str,
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
+}
+
+impl PartJournal for DatabaseJournal<'_> {
+    fn begun(&self) -> Result<Option<crate::database::UploadBegun>, FileStorageError> {
+        self.db.upload_begun(self.audio_id).map_err(|e| FileStorageError::Config(e.to_string()))
+    }
+    fn begin(&self, storage_key: &str, upload_id: &str, part_size: u64) -> Result<(), FileStorageError> {
+        self.db.upload_begin(self.audio_id, storage_key, upload_id, part_size).map_err(|e| FileStorageError::Config(e.to_string()))
+    }
+    fn part_done(&self, part_number: u32, etag: &str) -> Result<(), FileStorageError> {
+        self.db.upload_part_done(self.audio_id, part_number, etag).map_err(|e| FileStorageError::Config(e.to_string()))
+    }
+    fn finished(&self) -> Result<(), FileStorageError> {
+        self.db.upload_finished(self.audio_id).map_err(|e| FileStorageError::Config(e.to_string()))
+    }
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    fn moved(&self, done: u64, total: u64) {
+        if let Some(sink) = &self.sink {
+            sink.report(crate::sync_client::Progress {
+                stage: "upload".to_string(),
+                done: 0,
+                total: 0,
+                bytes: done,
+                sentence: format!("Uploading {}: {} of {} MiB", self.audio_id, done / (1024 * 1024), total.div_ceil(1024 * 1024)),
+            });
+        }
+    }
 }
 
 /// Generate the storage key for an audio file.
@@ -170,18 +304,28 @@ pub trait FileStorageService: Send + Sync {
 /// Creates a consistent key format: `{prefix}/{audio_file_id}.{extension}`
 /// where the extension is normalised with [`audio_file_extension`].
 pub fn generate_storage_key(prefix: Option<&str>, audio_file_id: &str, filename: &str) -> String {
-    let extension = audio_file_extension(filename);
+    storage_key_for(prefix, audio_file_id, filename, None)
+}
 
+/// The bucket key of a recording (Stage 13): by its content hash when the
+/// row has one, so two devices importing one file share one object; by
+/// its id otherwise.
+pub fn storage_key_for(prefix: Option<&str>, audio_file_id: &str, filename: &str, content_sha256: Option<&str>) -> String {
+    let extension = audio_file_extension(filename);
+    let stem = match content_sha256 {
+        Some(hash) if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) => hash,
+        _ => audio_file_id,
+    };
     match prefix {
         Some(p) => {
             let p = p.trim_end_matches('/');
             if p.is_empty() {
-                format!("{}.{}", audio_file_id, extension)
+                format!("{}.{}", stem, extension)
             } else {
-                format!("{}/{}.{}", p, audio_file_id, extension)
+                format!("{}/{}.{}", p, stem, extension)
             }
         }
-        None => format!("{}.{}", audio_file_id, extension),
+        None => format!("{}.{}", stem, extension),
     }
 }
 
@@ -263,6 +407,18 @@ pub async fn upload_pending_audio_files(
     db: &Database,
     audiofile_directory: &Path,
 ) -> Result<UploadPendingResult, FileStorageError> {
+    upload_pending_audio_files_watched(db, audiofile_directory, None, None).await
+}
+
+/// `upload_pending_audio_files` with a cancel flag, read between parts and
+/// files, and a sink that hears how far a large file is (Stage 13).
+#[cfg(feature = "file-storage")]
+pub async fn upload_pending_audio_files_watched(
+    db: &Database,
+    audiofile_directory: &Path,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
+) -> Result<UploadPendingResult, FileStorageError> {
     let storage = create_storage_service(db)?.ok_or_else(|| {
         FileStorageError::Config(
             "Cloud storage is not enabled. Use 'storage configure-s3' first.".to_string(),
@@ -312,8 +468,19 @@ pub async fn upload_pending_audio_files(
             continue;
         }
 
+        // The hash first (Stage 13): the key is by it, and a fetch verifies by it
+        let hash = match &audio_file.content_sha256 {
+            Some(h) => Some(h.clone()),
+            None => match db.store_content_hash(&audio_file.id, audiofile_directory) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!("Could not hash {}: {}", audio_file.id, e);
+                    None
+                }
+            },
+        };
         // Generate storage key WITHOUT prefix - the storage service adds the prefix.
-        let storage_key = generate_storage_key(None, &audio_file.id, &audio_file.filename);
+        let storage_key = storage_key_for(None, &audio_file.id, &audio_file.filename, hash.as_deref());
 
         // Already there? One request instead of a whole file (Stage 8): a
         // row can say "not uploaded" after a snapshot restore while the
@@ -340,7 +507,20 @@ pub async fn upload_pending_audio_files(
             "Uploading audio file to cloud storage"
         );
 
-        match storage.upload(&local_path, &storage_key).await {
+        if cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            result.errors.push(crate::sync_client::CANCELLED.to_string());
+            result.deferred = total - index;
+            break;
+        }
+        // A large file goes in parts (Stage 13), so a failure loses one part and not the file
+        let large = std::fs::metadata(&local_path).map(|m| m.len() > PART_SIZE).unwrap_or(false);
+        let uploaded = if large {
+            let journal = DatabaseJournal { db, audio_id: &audio_file.id, cancel: cancel.clone(), sink: sink.clone() };
+            storage.upload_in_parts(&local_path, &storage_key, &journal).await
+        } else {
+            storage.upload(&local_path, &storage_key).await
+        };
+        match uploaded {
             Ok(upload) => {
                 match db.update_audio_file_storage(&audio_file.id, &upload.provider, &upload.storage_key) {
                     Ok(_) => {
@@ -366,9 +546,14 @@ pub async fn upload_pending_audio_files(
             Err(e) => {
                 let msg = format!("Failed to upload {}: {}", audio_file.id, e);
                 tracing::error!("{}", msg);
+                let cancelled = e.to_string().ends_with(crate::sync_client::CANCELLED);
                 result.errors.push(msg);
                 result.failed += 1;
 
+                if cancelled {
+                    result.deferred = total - index - 1;
+                    break;
+                }
                 if !e.is_local() {
                     // Probably offline or the service is down: do not burn a
                     // timeout per remaining file. They stay pending and are
@@ -440,9 +625,27 @@ pub async fn download_audio_file(
     );
 
     let bytes = storage.download(&storage_key, &local_path).await?;
+    verify_downloaded(&audio_file, &local_path)?;
 
     tracing::info!(audio_id = %audio_file.id, size_bytes = bytes, "Downloaded audio file");
     Ok(DownloadOutcome::Downloaded(bytes))
+}
+
+/// A downloaded file against the row's content hash (Stage 13): when the
+/// row has one and the bytes differ, the file is removed and the download
+/// reported as failed, so a wrong object never looks like the recording.
+fn verify_downloaded(audio_file: &AudioFileRow, local_path: &Path) -> Result<(), FileStorageError> {
+    let Some(expected) = audio_file.content_sha256.as_deref() else { return Ok(()) };
+    let actual = crate::transfer::file_sha256(local_path)
+        .map_err(|e| FileStorageError::LocalFile(format!("Could not hash {}: {}", local_path.display(), e)))?;
+    if actual != expected {
+        let _ = std::fs::remove_file(local_path);
+        return Err(FileStorageError::Download(format!(
+            "The object for {} is not the recording: its hash {} is not the row's {}",
+            audio_file.id, &actual[..12], &expected[..12]
+        )));
+    }
+    Ok(())
 }
 
 /// Result of downloading a set of audio files from cloud storage.
@@ -492,7 +695,7 @@ async fn download_audio_file_set<S: FileStorageService>(
             "Downloading audio file from cloud storage"
         );
 
-        match storage.download(&storage_key, &local_path).await {
+        match storage.download(&storage_key, &local_path).await.and_then(|bytes| verify_downloaded(&audio_file, &local_path).map(|_| bytes)) {
             Ok(bytes) => {
                 tracing::info!(audio_id = %audio_file.id, size_bytes = bytes, "Downloaded audio file");
                 result.downloaded += 1;
@@ -610,6 +813,14 @@ mod tests {
     }
 
     #[test]
+    fn a_key_is_by_the_content_hash_when_the_row_has_one() {
+        let hash = "a".repeat(64);
+        assert_eq!(storage_key_for(Some("audio"), "019abc123def", "REC.MP3", Some(&hash)), format!("audio/{}.mp3", hash));
+        assert_eq!(storage_key_for(None, "019abc123def", "REC.MP3", Some("not a hash")), "019abc123def.mp3");
+        assert_eq!(storage_key_for(None, "019abc123def", "REC.MP3", None), generate_storage_key(None, "019abc123def", "REC.MP3"));
+    }
+
+    #[test]
     fn test_generate_storage_key_empty_prefix() {
         let key = generate_storage_key(Some(""), "019abc123def", "test.flac");
         assert_eq!(key, "019abc123def.flac");
@@ -690,6 +901,146 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // An upload in parts (Stage 13, FILE-19) against a store in memory.
+    // ------------------------------------------------------------------
+
+    mod parts {
+        use super::super::*;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+
+        /// A bucket in memory: the parts of each upload, and the objects
+        /// completed. `fail_part` makes that part number fail once.
+        #[derive(Default)]
+        struct MemoryStore {
+            uploads: RefCell<HashMap<String, HashMap<u32, Vec<u8>>>>,
+            objects: RefCell<HashMap<String, Vec<u8>>>,
+            fail_part: RefCell<Option<u32>>,
+            puts: RefCell<Vec<u32>>,
+        }
+
+        impl PartStore for MemoryStore {
+            async fn begin(&self, key: &str) -> Result<String, FileStorageError> {
+                let id = format!("upload-of-{}-{}", key, self.uploads.borrow().len() + 1);
+                self.uploads.borrow_mut().insert(id.clone(), HashMap::new());
+                Ok(id)
+            }
+            async fn put_part(&self, _key: &str, upload_id: &str, part_number: u32, bytes: Vec<u8>) -> Result<String, FileStorageError> {
+                if self.fail_part.borrow_mut().take_if(|n| *n == part_number).is_some() {
+                    return Err(FileStorageError::Network("the connection dropped".into()));
+                }
+                self.puts.borrow_mut().push(part_number);
+                let etag = format!("\"{:x}\"", bytes.len() * 7919 + part_number as usize);
+                self.uploads.borrow_mut().get_mut(upload_id).expect("begun").insert(part_number, bytes);
+                Ok(etag)
+            }
+            async fn complete(&self, key: &str, upload_id: &str, parts: &[(u32, String)]) -> Result<(), FileStorageError> {
+                let uploads = self.uploads.borrow();
+                let stored = uploads.get(upload_id).expect("begun");
+                let mut whole = Vec::new();
+                for (n, etag) in parts {
+                    let bytes = stored.get(n).ok_or_else(|| FileStorageError::Upload(format!("part {} missing", n)))?;
+                    assert_eq!(etag, &format!("\"{:x}\"", bytes.len() * 7919 + *n as usize), "the tag of part {} is the one given", n);
+                    whole.extend_from_slice(bytes);
+                }
+                self.objects.borrow_mut().insert(key.to_string(), whole);
+                Ok(())
+            }
+        }
+
+        /// A journal in memory, shaped like the database's.
+        #[derive(Default)]
+        struct MemoryJournal {
+            begun: RefCell<Option<crate::database::UploadBegun>>,
+            cancel: std::sync::atomic::AtomicBool,
+            moved: RefCell<Vec<u64>>,
+        }
+
+        impl PartJournal for MemoryJournal {
+            fn begun(&self) -> Result<Option<crate::database::UploadBegun>, FileStorageError> { Ok(self.begun.borrow().clone()) }
+            fn begin(&self, storage_key: &str, upload_id: &str, part_size: u64) -> Result<(), FileStorageError> {
+                *self.begun.borrow_mut() = Some(crate::database::UploadBegun { storage_key: storage_key.into(), upload_id: upload_id.into(), part_size, parts: vec![] });
+                Ok(())
+            }
+            fn part_done(&self, part_number: u32, etag: &str) -> Result<(), FileStorageError> {
+                self.begun.borrow_mut().as_mut().expect("begun").parts.push((part_number, etag.to_string()));
+                Ok(())
+            }
+            fn finished(&self) -> Result<(), FileStorageError> { *self.begun.borrow_mut() = None; Ok(()) }
+            fn cancelled(&self) -> bool { self.cancel.load(std::sync::atomic::Ordering::Relaxed) }
+            fn moved(&self, done: u64, _total: u64) { self.moved.borrow_mut().push(done); }
+        }
+
+        fn file_of(len: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("הקלטה.ogg");
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            (temp, path)
+        }
+
+        #[tokio::test]
+        async fn a_failed_part_is_the_only_one_sent_again_and_the_object_is_the_whole_file() {
+            let (_temp, path) = file_of(2500);
+            let store = MemoryStore::default();
+            *store.fail_part.borrow_mut() = Some(2);
+            let journal = MemoryJournal::default();
+
+            let failed = upload_in_parts(&store, &path, "audio/x.ogg", &journal, 1000).await;
+            assert!(matches!(failed, Err(FileStorageError::Network(_))), "{:?}", failed.err());
+            assert_eq!(journal.begun.borrow().as_ref().unwrap().parts.len(), 1, "part 1 is remembered");
+            assert!(store.objects.borrow().is_empty(), "no object until every part is there");
+
+            let total = upload_in_parts(&store, &path, "audio/x.ogg", &journal, 1000).await.unwrap();
+            assert_eq!(total, 2500);
+            assert_eq!(*store.puts.borrow(), vec![1, 2, 3], "part 1 was not sent twice");
+            assert_eq!(store.objects.borrow()["audio/x.ogg"], std::fs::read(&path).unwrap());
+            assert!(journal.begun.borrow().is_none(), "the journal is clear once complete");
+            assert_eq!(*journal.moved.borrow(), vec![1000, 2000, 2500]);
+        }
+
+        #[tokio::test]
+        async fn a_cancel_stops_before_the_next_part_and_a_changed_key_or_part_size_begins_again() {
+            let (_temp, path) = file_of(2500);
+            let store = MemoryStore::default();
+            let journal = MemoryJournal::default();
+            journal.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            let stopped = upload_in_parts(&store, &path, "audio/x.ogg", &journal, 1000).await;
+            assert!(stopped.unwrap_err().to_string().ends_with(crate::sync_client::CANCELLED));
+            assert!(store.puts.borrow().is_empty());
+            assert!(journal.begun.borrow().is_some(), "the begun upload is kept for the next run");
+            journal.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+
+            // Another part size: the remembered upload does not fit, a new one begins
+            upload_in_parts(&store, &path, "audio/x.ogg", &journal, 2000).await.unwrap();
+            assert_eq!(*store.puts.borrow(), vec![1, 2]);
+            assert_eq!(store.uploads.borrow().len(), 2, "the first upload was abandoned to the bucket's rule");
+            assert_eq!(store.objects.borrow()["audio/x.ogg"].len(), 2500);
+        }
+
+        #[tokio::test]
+        async fn the_database_journal_remembers_the_parts_of_one_recording() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let db = Database::new(&temp.path().join("j.db")).unwrap();
+            let id = db.create_audio_file("a.ogg", None).unwrap();
+            let other = db.create_audio_file("b.ogg", None).unwrap();
+            let journal = DatabaseJournal { db: &db, audio_id: &id, cancel: None, sink: None };
+            assert!(journal.begun().unwrap().is_none());
+            journal.begin("audio/a.ogg", "upload-1", 8).unwrap();
+            journal.part_done(1, "\"e1\"").unwrap();
+            journal.part_done(2, "\"e2\"").unwrap();
+            let begun = journal.begun().unwrap().unwrap();
+            assert_eq!((begun.storage_key.as_str(), begun.upload_id.as_str(), begun.part_size), ("audio/a.ogg", "upload-1", 8));
+            assert_eq!(begun.parts, vec![(1, "\"e1\"".to_string()), (2, "\"e2\"".to_string())]);
+            assert!(db.upload_begun(&other).unwrap().is_none(), "another recording's journal is its own");
+            journal.begin("audio/a.ogg", "upload-2", 8).unwrap();
+            assert!(journal.begun().unwrap().unwrap().parts.is_empty(), "a new upload forgets the old parts");
+            journal.finished().unwrap();
+            assert!(journal.begun().unwrap().is_none());
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Batch behaviour tests with a fake storage service (no network).
     // ------------------------------------------------------------------
 
@@ -732,6 +1083,9 @@ mod tests {
             fn provider_name(&self) -> &'static str { "fake" }
             fn full_storage_key(&self, remote_key: &str) -> String { remote_key.to_string() }
             async fn tag_purged(&self, _k: &str) -> Result<(), FileStorageError> { Ok(()) }
+            async fn upload_in_parts(&self, local_path: &Path, remote_key: &str, _journal: &dyn PartJournal) -> Result<UploadResult, FileStorageError> {
+                self.upload(local_path, remote_key).await
+            }
         }
 
         fn setup() -> (Database, TempDir) {
@@ -869,6 +1223,37 @@ mod tests {
             let result = download_audio_files_for_note(&db, &dir, &note_id).await.unwrap();
             assert_eq!(result.not_in_cloud, 1);
             assert_eq!(result.downloaded, 0);
+        }
+
+        /// FILE-18: a downloaded object is compared with the row's content
+        /// hash; different bytes are removed and reported, equal bytes kept.
+        #[tokio::test]
+        async fn a_download_is_verified_against_the_rows_content_hash() {
+            let (db, temp) = setup();
+            let dir = temp.path().join("audio");
+            std::fs::create_dir_all(&dir).unwrap();
+            let remote = row(&db, "הקלטה.ogg", true);
+            std::fs::write(audio_local_path(&dir, &remote.local_name), b"the recording").unwrap();
+            let hash = db.store_content_hash(&remote.id, &dir).unwrap();
+            assert_eq!(hash.len(), 64);
+            std::fs::remove_file(audio_local_path(&dir, &remote.local_name)).unwrap();
+            let remote = db.get_audio_file(&remote.id).unwrap().unwrap();
+            assert_eq!(remote.content_sha256.as_deref(), Some(hash.as_str()));
+
+            let mut objects = std::collections::HashMap::new();
+            objects.insert(remote.storage_key.clone().unwrap(), b"something else".to_vec());
+            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None };
+            let result = download_audio_file_set(&storage, &dir, vec![remote.clone()]).await;
+            assert_eq!((result.downloaded, result.failed), (0, 1));
+            assert!(result.errors[0].contains("not the recording"), "{:?}", result.errors);
+            assert!(!dir.join(&remote.local_name).exists(), "a wrong object is not left looking like the recording");
+
+            let mut objects = std::collections::HashMap::new();
+            objects.insert(remote.storage_key.clone().unwrap(), b"the recording".to_vec());
+            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None };
+            let result = download_audio_file_set(&storage, &dir, vec![remote.clone()]).await;
+            assert_eq!((result.downloaded, result.failed), (1, 0), "{:?}", result.errors);
+            assert!(dir.join(&remote.local_name).is_file());
         }
 
         #[tokio::test]

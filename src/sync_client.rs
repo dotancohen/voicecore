@@ -1539,7 +1539,19 @@ impl SyncClient {
             .map_err(|e| VoiceError::Io(std::io::Error::new(e.kind(), format!("Failed to read audio file {}: {}", source_path.display(), e))))?
             .len();
         let from_byte = from_byte.min(total);
-        let hash = crate::transfer::file_sha256(source_path)?;
+        // The row's hash (Stage 13), computed and stored once when it is missing,
+        // instead of hashing the whole file before every send
+        let hash = {
+            let db = self.db.lock().unwrap();
+            match db.get_audio_file(audio_id).ok().flatten().and_then(|r| r.content_sha256) {
+                Some(h) => h,
+                None => {
+                    let h = crate::transfer::file_sha256(source_path)?;
+                    let _ = db.set_content_hash(audio_id, &h);
+                    h
+                }
+            }
+        };
         let mut file = tokio::fs::File::open(source_path).await?;
         if from_byte > 0 {
             file.seek(std::io::SeekFrom::Start(from_byte)).await?;

@@ -51,6 +51,8 @@ pub struct S3Config {
 pub struct S3StorageService {
     bucket: Box<Bucket>,
     prefix: Option<String>,
+    /// The key and the bucket name, for the signed requests of an upload in parts
+    config: S3Config,
 }
 
 impl S3StorageService {
@@ -108,8 +110,38 @@ impl S3StorageService {
 
         Ok(Self {
             bucket,
-            prefix: config.prefix,
+            prefix: config.prefix.clone(),
+            config,
         })
+    }
+
+    fn bucket_key(&self) -> crate::bucket_setup::BucketKey {
+        crate::bucket_setup::BucketKey {
+            access_key_id: self.config.access_key_id.clone(),
+            secret_access_key: self.config.secret_access_key.clone(),
+            region: self.config.region.clone(),
+            endpoint: self.config.endpoint.clone(),
+        }
+    }
+
+    /// The address of an object, or of one of its sub-resources.
+    fn object_url(&self, key: &str, query: &str) -> String {
+        let base = crate::bucket_setup::bucket_url(&self.bucket_key(), &self.config.bucket);
+        let path = crate::bucket_setup::uri_encode(key.trim_start_matches('/'), true);
+        if query.is_empty() {
+            format!("{}/{}", base, path)
+        } else {
+            format!("{}/{}?{}", base, path, query)
+        }
+    }
+
+    fn refused(what: &str, key: &str, status: u16, body: &str) -> FileStorageError {
+        let text = format!("{} of {} failed with HTTP {}: {}", what, key, status, body.trim());
+        match status {
+            401 | 403 => FileStorageError::Auth(text),
+            404 => FileStorageError::NotFound(key.to_string()),
+            _ => FileStorageError::Network(text),
+        }
     }
 
     /// Get the full storage key with prefix applied.
@@ -152,6 +184,51 @@ impl S3StorageService {
             .unwrap_or_default();
         name.push(PARTIAL_SUFFIX);
         local_path.with_file_name(name)
+    }
+}
+
+/// Bytes of one part on the wire; a slow uplink gets long enough.
+const PART_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+impl crate::file_storage::PartStore for S3StorageService {
+    async fn begin(&self, key: &str) -> Result<String, FileStorageError> {
+        let url = self.object_url(key, "uploads");
+        let answer = crate::bucket_setup::send_signed(&self.bucket_key(), "POST", &url, b"", Some("application/octet-stream"), PART_TIMEOUT)
+            .await
+            .map_err(FileStorageError::Network)?;
+        if !(200..300).contains(&answer.status) {
+            return Err(Self::refused("Beginning the upload", key, answer.status, &answer.body));
+        }
+        let upload_id = answer.body.split("<UploadId>").nth(1).and_then(|rest| rest.split("</UploadId>").next()).map(|s| s.trim().to_string());
+        upload_id.filter(|id| !id.is_empty()).ok_or_else(|| FileStorageError::Upload(format!("The bucket gave no upload id for {}: {}", key, answer.body.trim())))
+    }
+
+    async fn put_part(&self, key: &str, upload_id: &str, part_number: u32, bytes: Vec<u8>) -> Result<String, FileStorageError> {
+        let url = self.object_url(key, &format!("partNumber={}&uploadId={}", part_number, crate::bucket_setup::uri_encode(upload_id, false)));
+        let answer = crate::bucket_setup::send_signed(&self.bucket_key(), "PUT", &url, &bytes, Some("application/octet-stream"), PART_TIMEOUT)
+            .await
+            .map_err(FileStorageError::Network)?;
+        if !(200..300).contains(&answer.status) {
+            return Err(Self::refused(&format!("Part {}", part_number), key, answer.status, &answer.body));
+        }
+        answer.etag.ok_or_else(|| FileStorageError::Upload(format!("The bucket gave no tag for part {} of {}", part_number, key)))
+    }
+
+    async fn complete(&self, key: &str, upload_id: &str, parts: &[(u32, String)]) -> Result<(), FileStorageError> {
+        let url = self.object_url(key, &format!("uploadId={}", crate::bucket_setup::uri_encode(upload_id, false)));
+        let mut body = String::from("<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+        for (n, etag) in parts {
+            body.push_str(&format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>", n, etag.replace('"', "&quot;")));
+        }
+        body.push_str("</CompleteMultipartUpload>");
+        let answer = crate::bucket_setup::send_signed(&self.bucket_key(), "POST", &url, body.as_bytes(), Some("application/xml"), PART_TIMEOUT)
+            .await
+            .map_err(FileStorageError::Network)?;
+        // The service can answer 200 and still say <Error> in the body
+        if !(200..300).contains(&answer.status) || answer.body.contains("<Error>") {
+            return Err(Self::refused("Completing the upload", key, answer.status, &answer.body));
+        }
+        Ok(())
     }
 }
 
@@ -214,6 +291,13 @@ impl FileStorageService for S3StorageService {
             provider: "s3".to_string(),
             size_bytes,
         })
+    }
+
+    async fn upload_in_parts(&self, local_path: &Path, remote_key: &str, journal: &dyn crate::file_storage::PartJournal) -> Result<UploadResult, FileStorageError> {
+        let full_key = self.full_key(remote_key);
+        let size_bytes = crate::file_storage::upload_in_parts(self, local_path, &full_key, journal, crate::file_storage::PART_SIZE).await?;
+        tracing::info!(key = %full_key, bucket = %self.bucket.name(), size_bytes = size_bytes, "Uploaded file to S3 in parts");
+        Ok(UploadResult { storage_key: full_key, provider: "s3".to_string(), size_bytes })
     }
 
     async fn download(&self, storage_key: &str, local_path: &Path) -> Result<u64, FileStorageError> {

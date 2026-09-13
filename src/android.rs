@@ -123,6 +123,11 @@ pub struct AudioFileData {
     /// When the file was uploaded to cloud storage; a machine event, so it
     /// carries no timezone of its own and a reader shows it in its own.
     pub storage_uploaded_at: Option<Stamp>,
+    /// The file's name in the audio directory (Stage 13): the recording's
+    /// start, the tail of its id and the extension
+    pub local_name: String,
+    /// The SHA-256 of the file's bytes, lowercase hex, once computed (Stage 13)
+    pub content_sha256: Option<String>,
 }
 
 /// A note-attachment association from the database
@@ -871,6 +876,8 @@ impl VoiceClient {
                 storage_provider: a.storage_provider,
                 storage_key: a.storage_key,
                 storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
+                local_name: a.local_name,
+                content_sha256: a.content_sha256,
             })
             .collect())
     }
@@ -893,7 +900,19 @@ impl VoiceClient {
             storage_provider: a.storage_provider,
             storage_key: a.storage_key,
             storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
+            local_name: a.local_name,
+            content_sha256: a.content_sha256,
         }))
+    }
+
+    /// Compute and store a recording's content hash (Stage 13) from its file
+    /// in the audio directory, after the file is copied there. Returns the hash.
+    pub fn store_content_hash(&self, audio_file_id: String) -> Result<String, VoiceCoreError> {
+        let audiofile_dir = self.get_audiofile_directory().ok_or_else(|| VoiceCoreError::Config {
+            msg: "No audio directory is configured".to_string(),
+        })?;
+        let db = self.db.lock().unwrap();
+        Ok(db.store_content_hash(&audio_file_id, std::path::Path::new(&audiofile_dir))?)
     }
 
     /// Get all audio files in the database (for debugging)
@@ -917,6 +936,8 @@ impl VoiceClient {
                 storage_provider: a.storage_provider,
                 storage_key: a.storage_key,
                 storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
+                local_name: a.local_name,
+                content_sha256: a.content_sha256,
             })
             .collect())
     }
@@ -981,6 +1002,8 @@ impl VoiceClient {
                 storage_provider: a.storage_provider,
                 storage_key: a.storage_key,
                 storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
+                local_name: a.local_name,
+                content_sha256: a.content_sha256,
             })
             .collect())
     }

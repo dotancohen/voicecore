@@ -995,7 +995,18 @@ async fn serve_audio_file(
     if start > total {
         return Err((StatusCode::RANGE_NOT_SATISFIABLE, format!("The file is {} bytes", total)));
     }
-    let hash = crate::transfer::file_sha256(&file_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // The row's hash (Stage 13), computed and stored once when it is missing
+    let hash = {
+        let db = account.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
+        match db.get_audio_file(&audio_id).ok().flatten().and_then(|r| r.content_sha256) {
+            Some(h) => h,
+            None => {
+                let h = crate::transfer::file_sha256(&file_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                let _ = db.set_content_hash(&audio_id, &h);
+                h
+            }
+        }
+    };
     let mut file = tokio::fs::File::open(&file_path).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if start > 0 {
         use tokio::io::AsyncSeekExt;
@@ -3072,6 +3083,25 @@ mod tests {
             task.abort();
         }
 
+        /// FILE-18: a send stores the sender's hash once and the peer receives
+        /// it with the row at the next sync; the fetched bytes match it.
+        #[tokio::test]
+        async fn a_send_stores_the_hash_once_and_the_peer_learns_it_by_sync() {
+            let (a, b, _url, task) = pair();
+            let (id, path) = recording(&a, 1000);
+            assert!(a.db.lock().unwrap().get_audio_file(&id).unwrap().unwrap().content_sha256.is_none());
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let result = client.deliver(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            let expected = crate::transfer::file_sha256(&path).unwrap();
+            assert_eq!(a.db.lock().unwrap().get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(expected.as_str()), "the sender stored its hash");
+            let result = client.deliver(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(b.db.lock().unwrap().get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(expected.as_str()), "the peer received it with the row");
+            assert_eq!(crate::transfer::file_sha256(&path_of(&b, &id)).unwrap(), expected);
+            task.abort();
+        }
+
         #[tokio::test]
         async fn deliver_sends_but_does_not_fetch_and_send_alone_needs_no_sync() {
             let (a, b, _url, task) = pair();
@@ -3767,6 +3797,7 @@ mod tests {
             audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
             None,
             None,
+            None,
         ).unwrap();
 
         // Apply attachment to Instance B
@@ -3881,6 +3912,7 @@ mod tests {
             audio_data.get("storage_provider").and_then(|v| v.as_str()),
             audio_data.get("storage_key").and_then(|v| v.as_str()),
             audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
+            None,
             None,
             None,
         ).unwrap();
@@ -4621,7 +4653,7 @@ mod tests {
         let audio = a.create_audio_file("הקלטה.mp3", None).unwrap();
         a.update_audio_file_storage(&audio, "s3", &format!("audio/{}.mp3", audio)).unwrap();
         // An older copy of the row (from a peer that never saw the upload)
-        a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None, None).unwrap();
+        a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None, None, None).unwrap();
         let row = a.get_audio_file_raw(&audio).unwrap().unwrap();
         assert_eq!(row["storage_key"].as_str().unwrap(), format!("audio/{}.mp3", audio));
         assert_eq!(row["storage_provider"].as_str().unwrap(), "s3");

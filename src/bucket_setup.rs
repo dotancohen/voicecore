@@ -337,7 +337,7 @@ pub fn tls_only_policy(bucket: &str) -> String {
 
 /// Where a bucket's own settings are addressed: virtual-hosted on Amazon,
 /// path style on a custom endpoint.
-fn bucket_url(key: &BucketKey, name: &str) -> String {
+pub(crate) fn bucket_url(key: &BucketKey, name: &str) -> String {
     match &key.endpoint {
         Some(endpoint) => format!("{}/{}", endpoint.trim_end_matches('/'), name),
         None => format!("https://{}.s3.{}.amazonaws.com", name, key.region),
@@ -371,7 +371,7 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
     outer.finalize().to_vec()
 }
 
-fn uri_encode(text: &str, keep_slash: bool) -> String {
+pub(crate) fn uri_encode(text: &str, keep_slash: bool) -> String {
     let mut out = String::new();
     for byte in text.bytes() {
         let c = byte as char;
@@ -444,15 +444,30 @@ pub fn sign_request(
 }
 
 async fn signed(key: &BucketKey, method: &str, url: &str, payload: &[u8], content_type: Option<&str>) -> Result<(u16, String), String> {
+    let answer = send_signed(key, method, url, payload, content_type, Duration::from_secs(30)).await?;
+    Ok((answer.status, answer.body))
+}
+
+/// What a signed request came back with.
+pub(crate) struct SignedAnswer {
+    pub status: u16,
+    pub body: String,
+    /// The object's or part's tag, as the service gave it
+    pub etag: Option<String>,
+}
+
+/// One request signed with the key (SigV4), sent, and read whole.
+pub(crate) async fn send_signed(key: &BucketKey, method: &str, url: &str, payload: &[u8], content_type: Option<&str>, timeout: Duration) -> Result<SignedAnswer, String> {
     let mut extra: Vec<(&str, &str)> = Vec::new();
     if let Some(ct) = content_type {
         extra.push(("content-type", ct));
     }
     let headers = sign_request(method, url, &key.region, &key.access_key_id, &key.secret_access_key, payload, &extra, chrono::Utc::now());
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().map_err(|e| e.to_string())?;
+    let client = reqwest::Client::builder().timeout(timeout).build().map_err(|e| e.to_string())?;
     let mut request = match method {
         "PUT" => client.put(url),
         "GET" => client.get(url),
+        "POST" => client.post(url),
         "DELETE" => client.delete(url),
         _ => client.request(reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?, url),
     };
@@ -461,8 +476,9 @@ async fn signed(key: &BucketKey, method: &str, url: &str, payload: &[u8], conten
     }
     let response = request.body(payload.to_vec()).send().await.map_err(|e| explain_error(&e.to_string()))?;
     let status = response.status().as_u16();
+    let etag = response.headers().get("etag").and_then(|v| v.to_str().ok()).map(|v| v.to_string());
     let body = response.text().await.unwrap_or_default();
-    Ok((status, body))
+    Ok(SignedAnswer { status, body, etag })
 }
 
 fn row(name: &str, passed: bool, detail: impl Into<String>) -> CheckRow {
