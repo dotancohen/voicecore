@@ -174,6 +174,19 @@ pub fn explain_error(text: &str) -> String {
     text.to_string()
 }
 
+/// A refusal explained with the endpoint in mind: over `http://`, a bucket the
+/// wizard hardened refuses every request (its policy allows only TLS), which
+/// otherwise reads exactly like a wrong key. Anything else as [`explain_error`].
+pub fn explain_refusal(key: &BucketKey, text: &str) -> String {
+    let lower = text.to_lowercase();
+    let refused = lower.contains("accessdenied") || lower.contains("http 403") || lower.contains("non 2**");
+    let plain = key.endpoint.as_deref().is_some_and(|e| e.trim().to_lowercase().starts_with("http://"));
+    if refused && plain {
+        return "The service refused the request, and the endpoint is http://: a bucket hardened by the wizard accepts only https:// connections, so use the https:// address. If the address is https:// already, the key may be wrong or lack the policy.".to_string();
+    }
+    explain_error(text)
+}
+
 /// The region the wizard proposes: the one whose S3 endpoint answers a TCP
 /// connection fastest, or None when none answers within two seconds.
 pub async fn nearest_region(regions: &[&str]) -> Option<String> {
@@ -215,6 +228,20 @@ fn bucket_of(key: &BucketKey, name: &str) -> Result<Box<Bucket>, String> {
 /// Amazon's is used as given.
 pub async fn create_bucket(key: &BucketKey, name: &str) -> Result<(), String> {
     bucket_name_allowed(name)?;
+    if key.endpoint.is_some() && key.region.trim() == "us-east-1" {
+        // Amazon's first region takes no location constraint. The library
+        // leaves it out only for the region it knows by name, and a region
+        // behind an endpoint is one it does not know, so it would send
+        // "us-east-1" and be refused: the bucket is made by a signed PUT
+        // with no body instead
+        let url = bucket_url(key, name);
+        let (status, body) = signed(key, "PUT", &url, b"", None).await?;
+        return if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(explain_refusal(key, &format!("HTTP {}: {}", status, body)))
+        };
+    }
     let region = region_of(key)?;
     let credentials = credentials_of(key)?;
     let config = BucketConfiguration::private();
@@ -223,11 +250,11 @@ pub async fn create_bucket(key: &BucketKey, name: &str) -> Result<(), String> {
     } else {
         Bucket::create(name, region, credentials, config).await
     }
-    .map_err(|e| explain_error(&e.to_string()))?;
+    .map_err(|e| explain_refusal(key, &e.to_string()))?;
     if response.success() {
         Ok(())
     } else {
-        Err(explain_error(&format!("HTTP {}: {}", response.response_code, response.response_text)))
+        Err(explain_refusal(key, &format!("HTTP {}: {}", response.response_code, response.response_text)))
     }
 }
 
@@ -240,7 +267,7 @@ pub async fn bucket_exists(key: &BucketKey, name: &str) -> Result<bool, String> 
         (status, _) if (200..300).contains(&status) => Ok(true),
         (404, _) => Ok(false),
         (403, body) if body.contains("AccessDenied") => Err("That bucket name is taken by someone else, or the key may not read it.".to_string()),
-        (status, body) => Err(explain_error(&format!("HTTP {}: {}", status, body))),
+        (status, body) => Err(explain_refusal(key, &format!("HTTP {}: {}", status, body))),
     }
 }
 
@@ -271,8 +298,8 @@ pub fn lifecycle_rules() -> BucketLifecycleConfiguration {
 pub async fn set_lifecycle(key: &BucketKey, name: &str) -> Result<(), String> {
     let bucket = bucket_of(key, name)?;
     let _ = And::new(None, None, None, None); // the type is part of the filter's shape
-    let response = bucket.put_bucket_lifecycle(lifecycle_rules()).await.map_err(|e| explain_error(&e.to_string()))?;
-    answered(&response, "Lifecycle")
+    let response = bucket.put_bucket_lifecycle(lifecycle_rules()).await.map_err(|e| explain_refusal(key, &e.to_string()))?;
+    answered(Some(key), &response, "Lifecycle")
 }
 
 /// Write a small object, read it back, compare, and tag it purged so the
@@ -282,32 +309,34 @@ pub async fn round_trip(key: &BucketKey, name: &str, prefix: Option<&str>) -> Re
     let bucket = bucket_of(key, name)?;
     let object = format!("{}voice-setup-check-{}.txt", prefix.map(|p| p.trim_end_matches('/').to_string() + "/").unwrap_or_default(), chrono::Utc::now().timestamp());
     let content = format!("Voice checked this bucket at {}", chrono::Utc::now().to_rfc3339());
-    let written = bucket.put_object(&object, content.as_bytes()).await.map_err(|e| format!("Write: {}", explain_error(&e.to_string())))?;
-    answered(&written, "Write")?;
-    let read = bucket.get_object(&object).await.map_err(|e| format!("Read back: {}", explain_error(&e.to_string())))?;
-    answered(&read, "Read back")?;
+    let written = bucket.put_object(&object, content.as_bytes()).await.map_err(|e| format!("Write: {}", explain_refusal(key, &e.to_string())))?;
+    answered(Some(key), &written, "Write")?;
+    let read = bucket.get_object(&object).await.map_err(|e| format!("Read back: {}", explain_refusal(key, &e.to_string())))?;
+    answered(Some(key), &read, "Read back")?;
     if read.as_slice() != content.as_bytes() {
         return Err("What was read back is not what was written".to_string());
     }
-    let tagged = bucket.put_object_tagging(&object, &[PURGED_TAG]).await.map_err(|e| format!("Tag: {}", explain_error(&e.to_string())))?;
-    answered(&tagged, "Tag")?;
+    let tagged = bucket.put_object_tagging(&object, &[PURGED_TAG]).await.map_err(|e| format!("Tag: {}", explain_refusal(key, &e.to_string())))?;
+    answered(Some(key), &tagged, "Tag")?;
     Ok(object)
 }
 
-/// A refusal the library hands back as an answer rather than an error.
-fn answered(response: &s3::request::ResponseData, what: &str) -> Result<(), String> {
+/// A refusal the library hands back as an answer rather than an error,
+/// explained with the endpoint in mind when the key is known.
+fn answered(key: Option<&BucketKey>, response: &s3::request::ResponseData, what: &str) -> Result<(), String> {
     let status = response.status_code();
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        Err(format!("{}: {}", what, explain_error(&format!("HTTP {}: {}", status, response.as_str().unwrap_or_default()))))
+        let text = format!("HTTP {}: {}", status, response.as_str().unwrap_or_default());
+        Err(format!("{}: {}", what, key.map_or_else(|| explain_error(&text), |k| explain_refusal(k, &text))))
     }
 }
 
 /// Tag an object purged: the lifecycle rule deletes it a day later.
 pub async fn tag_purged(bucket: &Bucket, key: &str) -> Result<(), String> {
     let response = bucket.put_object_tagging(key, &[PURGED_TAG]).await.map_err(|e| explain_error(&e.to_string()))?;
-    answered(&response, "Tag")
+    answered(None, &response, "Tag")
 }
 
 // ---------------------------------------------------------------------------
@@ -563,11 +592,11 @@ pub async fn harden_bucket(key: &BucketKey, name: &str) -> Vec<CheckRow> {
                 // Verified: read it back
                 match signed(key, "GET", &url, b"", None).await {
                     Ok((200, read)) if read.contains(proof) => rows.push(row(label, true, "Set and verified")),
-                    Ok((status, read)) => rows.push(row(label, false, format!("Set, but reading it back gave HTTP {}: {}", status, explain_error(&read)))),
+                    Ok((status, read)) => rows.push(row(label, false, format!("Set, but reading it back gave HTTP {}: {}", status, explain_refusal(key, &read)))),
                     Err(e) => rows.push(row(label, false, format!("Set, but could not be read back: {}", e))),
                 }
             }
-            Ok((status, text)) => rows.push(row(label, false, format!("HTTP {}: {}", status, explain_error(&text)))),
+            Ok((status, text)) => rows.push(row(label, false, format!("HTTP {}: {}", status, explain_refusal(key, &text)))),
             Err(e) => rows.push(row(label, false, e)),
         }
     }
@@ -605,7 +634,7 @@ pub async fn check_bucket(key: &BucketKey, name: &str, prefix: Option<&str>) -> 
             Ok((200, text)) if text.contains(proof) => rows.push(row(label, true, "In place")),
             Ok((200, _)) => rows.push(row(label, false, "Set, but not as the wizard sets it")),
             Ok((404, _)) => rows.push(row(label, false, "Not set; run the wizard's hardening again")),
-            Ok((status, text)) => rows.push(row(label, false, format!("HTTP {}: {}", status, explain_error(&text)))),
+            Ok((status, text)) => rows.push(row(label, false, format!("HTTP {}: {}", status, explain_refusal(key, &text)))),
             Err(e) => rows.push(row(label, false, e)),
         }
     }
@@ -642,6 +671,22 @@ mod tests {
         assert!(bucket_name_allowed("notes").unwrap_err().contains("voice-"));
         assert!(bucket_name_allowed("voice-Big").unwrap_err().contains("lowercase"));
         assert!(bucket_name_allowed("voice-").unwrap_err().contains("hyphen"));
+    }
+
+    /// Over http://, a refusal names the hardened bucket's TLS-only policy
+    /// before it blames the key; over https:// it is the key as before.
+    #[test]
+    fn a_refusal_over_plain_http_names_the_tls_only_policy() {
+        let plain = BucketKey { access_key_id: "AKIAIOSFODNN7EXAMPLE".into(), secret_access_key: "s".into(), region: "eu-central-1".into(), endpoint: Some("http://127.0.0.1:9000".into()) };
+        let tls = BucketKey { endpoint: Some("https://s3.example.com".into()), ..plain.clone() };
+        let amazon = BucketKey { endpoint: None, ..plain.clone() };
+        let refused = "Got HTTP 403 with content '<Error><Code>AccessDenied</Code></Error>'";
+        assert!(explain_refusal(&plain, refused).contains("accepts only https://"), "{}", explain_refusal(&plain, refused));
+        assert!(explain_refusal(&plain, "HTTP 403: ").contains("https://"));
+        assert_eq!(explain_refusal(&tls, refused), explain_error(refused));
+        assert_eq!(explain_refusal(&amazon, refused), explain_error(refused));
+        assert_eq!(explain_refusal(&plain, "<Code>SignatureDoesNotMatch</Code>"), "The secret is wrong, or has a space on the end.", "a wrong secret is not a refusal by policy");
+        assert_eq!(explain_refusal(&plain, "<Code>NoSuchBucket</Code>"), "There is no bucket of that name in this region.");
     }
 
     #[test]
