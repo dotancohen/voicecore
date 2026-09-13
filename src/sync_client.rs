@@ -1539,15 +1539,6 @@ impl SyncClient {
         peer_url: &str,
         audio_id: &str,
         source_path: &std::path::Path,
-    ) -> VoiceResult<u64> {
-        self.send_audio_file_from(peer_url, audio_id, source_path, 0, 0, 0, 1).await
-    }
-
-    pub async fn send_audio_file_from(
-        &self,
-        peer_url: &str,
-        audio_id: &str,
-        source_path: &std::path::Path,
         from_byte: u64,
         moved_before: u64,
         done: i64,
@@ -1708,7 +1699,7 @@ impl SyncClient {
             let from = missing.partial.get(&audio_id).copied().unwrap_or(0);
             let what = format!("Send of {}", &audio_id[..UUID_SHORT_LEN.min(audio_id.len())]);
             let moved_before = bytes;
-            match self.with_retries(&what, || self.send_audio_file_from(peer_url, &audio_id, &path, from, moved_before, sent, total)).await {
+            match self.with_retries(&what, || self.send_audio_file(peer_url, &audio_id, &path, from, moved_before, sent, total)).await {
                 Ok(n) => {
                     sent += 1;
                     bytes += n;
@@ -2029,7 +2020,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let db = Database::new(&db_path).unwrap();
-        let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         (
             Arc::new(Mutex::new(db)),

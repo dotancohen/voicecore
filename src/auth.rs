@@ -231,7 +231,7 @@ mod tests {
     fn the_own_card_is_made_once_and_updated_on_a_rename() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Database::new(dir.path().join("notes.db")).unwrap();
-        let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
         assert!(config.device_key().is_empty());
 
         let first = ensure_own_device_card(&db, &mut config).unwrap();

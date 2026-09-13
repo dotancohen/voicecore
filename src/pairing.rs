@@ -328,7 +328,7 @@ mod tests {
     fn admitting_by_token_writes_the_card_with_the_key_hash() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Database::new(dir.path().join("notes.db")).unwrap();
-        let config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+        let config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
         let setup = offer(&db, &config, vec!["https://127.0.0.1:1".to_string()]).unwrap();
         assert_eq!(setup.account_id, db.account_id().unwrap());
 

@@ -399,7 +399,7 @@ impl Fleet {
                 let notes = self.alive_notes(d);
                 if let Some(n) = Self::pick(rng, &notes) {
                     let n = n.clone();
-                    let audio = self.dbs[d].create_audio_file(&format!("{}.mp3", rng.word()), None).unwrap();
+                    let audio = self.dbs[d].create_audio_file(&format!("{}.mp3", rng.word()), None, None, crate::models::FileOrigin::Imported, None).unwrap();
                     self.dbs[d].attach_to_note(&n, &audio, "audio_file").unwrap();
                     self.note_effect("attachment");
                 }
@@ -468,7 +468,7 @@ impl Fleet {
                 if let Some(a) = Self::pick(rng, &audios) {
                     let row = self.dbs[d].get_audio_file_raw(a).unwrap().unwrap();
                     if row["storage_key"].is_null() {
-                        self.dbs[d].update_audio_file_storage(a, "s3", &format!("audio/{}.mp3", a)).unwrap();
+                        self.dbs[d].update_audio_file_storage(a, "s3", &format!("audio/{}.mp3", a), false).unwrap();
                     }
                 }
             }

@@ -277,7 +277,7 @@ impl Resolved {
     /// Open the config the way the resolution says.
     pub fn open_config(&self) -> VoiceResult<Config> {
         match self {
-            Resolved::Single { directory } => Config::new(Some(directory.clone())),
+            Resolved::Single { directory } => Config::new(Some(directory.clone()), None),
             Resolved::Account { root, directory, .. } => Config::open_account(root, directory),
         }
     }

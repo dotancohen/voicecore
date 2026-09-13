@@ -293,14 +293,6 @@ impl PartJournal for DatabaseJournal<'_> {
     }
 }
 
-/// Generate the storage key for an audio file.
-///
-/// Creates a consistent key format: `{prefix}/{audio_file_id}.{extension}`
-/// where the extension is normalised with [`audio_file_extension`].
-pub fn generate_storage_key(prefix: Option<&str>, audio_file_id: &str, filename: &str) -> String {
-    storage_key_for(prefix, audio_file_id, filename, None)
-}
-
 /// The bucket key of a recording (Stage 13): by its content hash when the
 /// row has one, so two devices importing one file share one object; by
 /// its id otherwise.
@@ -397,20 +389,12 @@ pub struct UploadPendingResult {
 /// Returns `Err(Config)` when cloud storage is not configured; callers that
 /// run automatically should check [`create_storage_service`] first.
 #[cfg(feature = "file-storage")]
+///
+/// A cancel flag is read between parts and files, and a sink hears how far a
+/// large file is (Stage 13). With encryption on (ENC-3) the recording key is
+/// needed and every upload is encrypted; without it the run refuses before
+/// touching the bucket.
 pub async fn upload_pending_audio_files(
-    db: &Database,
-    audiofile_directory: &Path,
-    recording_key: Option<&crate::crypto::RecordingKey>,
-) -> Result<UploadPendingResult, FileStorageError> {
-    upload_pending_audio_files_watched(db, audiofile_directory, None, None, recording_key).await
-}
-
-/// `upload_pending_audio_files` with a cancel flag, read between parts and
-/// files, and a sink that hears how far a large file is (Stage 13). With
-/// encryption on (ENC-3) the recording key is needed and every upload is
-/// encrypted; without it the run refuses before touching the bucket.
-#[cfg(feature = "file-storage")]
-pub async fn upload_pending_audio_files_watched(
     db: &Database,
     audiofile_directory: &Path,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -510,7 +494,7 @@ pub async fn upload_files_with<S: FileStorageService>(
         // object is in the bucket
         let full_key = storage.full_storage_key(&storage_key);
         if let Ok(true) = storage.exists(&full_key).await {
-            match db.update_audio_file_storage_encrypted(&audio_file.id, storage.provider_name(), &full_key, encrypt) {
+            match db.update_audio_file_storage(&audio_file.id, storage.provider_name(), &full_key, encrypt) {
                 Ok(_) => {
                     tracing::info!(audio_id = %audio_file.id, storage_key = %full_key, "The object was in the bucket already; the row now says so");
                     result.uploaded += 1;
@@ -555,7 +539,7 @@ pub async fn upload_files_with<S: FileStorageService>(
         };
         match uploaded {
             Ok(upload) => {
-                match db.update_audio_file_storage_encrypted(&audio_file.id, &upload.provider, &upload.storage_key, encrypt) {
+                match db.update_audio_file_storage(&audio_file.id, &upload.provider, &upload.storage_key, encrypt) {
                     Ok(_) => {
                         tracing::info!(
                             audio_id = %audio_file.id,
@@ -914,20 +898,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_storage_key_with_prefix() {
-        let key = generate_storage_key(Some("audio"), "019abc123def", "recording.mp3");
+    fn test_storage_key_for_with_prefix() {
+        let key = storage_key_for(Some("audio"), "019abc123def", "recording.mp3", None);
         assert_eq!(key, "audio/019abc123def.mp3");
     }
 
     #[test]
-    fn test_generate_storage_key_with_trailing_slash() {
-        let key = generate_storage_key(Some("audio/"), "019abc123def", "recording.mp3");
+    fn test_storage_key_for_with_trailing_slash() {
+        let key = storage_key_for(Some("audio/"), "019abc123def", "recording.mp3", None);
         assert_eq!(key, "audio/019abc123def.mp3");
     }
 
     #[test]
-    fn test_generate_storage_key_no_prefix() {
-        let key = generate_storage_key(None, "019abc123def", "recording.wav");
+    fn test_storage_key_for_no_prefix() {
+        let key = storage_key_for(None, "019abc123def", "recording.wav", None);
         assert_eq!(key, "019abc123def.wav");
     }
 
@@ -936,36 +920,36 @@ mod tests {
         let hash = "a".repeat(64);
         assert_eq!(storage_key_for(Some("audio"), "019abc123def", "REC.MP3", Some(&hash)), format!("audio/{}.mp3", hash));
         assert_eq!(storage_key_for(None, "019abc123def", "REC.MP3", Some("not a hash")), "019abc123def.mp3");
-        assert_eq!(storage_key_for(None, "019abc123def", "REC.MP3", None), generate_storage_key(None, "019abc123def", "REC.MP3"));
+        assert_eq!(storage_key_for(None, "019abc123def", "REC.MP3", None), storage_key_for(None, "019abc123def", "REC.MP3", None));
     }
 
     #[test]
-    fn test_generate_storage_key_empty_prefix() {
-        let key = generate_storage_key(Some(""), "019abc123def", "test.flac");
+    fn test_storage_key_for_empty_prefix() {
+        let key = storage_key_for(Some(""), "019abc123def", "test.flac", None);
         assert_eq!(key, "019abc123def.flac");
     }
 
     #[test]
-    fn test_generate_storage_key_no_extension() {
-        let key = generate_storage_key(Some("files"), "019abc123def", "noextension");
+    fn test_storage_key_for_no_extension() {
+        let key = storage_key_for(Some("files"), "019abc123def", "noextension", None);
         assert_eq!(key, "files/019abc123def.bin");
     }
 
     #[test]
-    fn test_generate_storage_key_uppercase_extension_is_lowercased() {
-        let key = generate_storage_key(Some("audio"), "019abc123def", "REC.MP3");
+    fn test_storage_key_for_uppercase_extension_is_lowercased() {
+        let key = storage_key_for(Some("audio"), "019abc123def", "REC.MP3", None);
         assert_eq!(key, "audio/019abc123def.mp3");
     }
 
     #[test]
-    fn test_generate_storage_key_multiple_dots() {
-        let key = generate_storage_key(Some("audio"), "019abc123def", "my.recording.mp3");
+    fn test_storage_key_for_multiple_dots() {
+        let key = storage_key_for(Some("audio"), "019abc123def", "my.recording.mp3", None);
         assert_eq!(key, "audio/019abc123def.mp3");
     }
 
     #[test]
-    fn test_generate_storage_key_hebrew_filename() {
-        let key = generate_storage_key(Some("audio"), "019abc123def", "הקלטה של פגישה.OGG");
+    fn test_storage_key_for_hebrew_filename() {
+        let key = storage_key_for(Some("audio"), "019abc123def", "הקלטה של פגישה.OGG", None);
         assert_eq!(key, "audio/019abc123def.ogg");
     }
 
@@ -1141,8 +1125,8 @@ mod tests {
         async fn the_database_journal_remembers_the_parts_of_one_recording() {
             let temp = tempfile::TempDir::new().unwrap();
             let db = Database::new(&temp.path().join("j.db")).unwrap();
-            let id = db.create_audio_file("a.ogg", None).unwrap();
-            let other = db.create_audio_file("b.ogg", None).unwrap();
+            let id = db.create_audio_file("a.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+            let other = db.create_audio_file("b.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
             let journal = DatabaseJournal { db: &db, audio_id: &id, cancel: None, sink: None };
             assert!(journal.begun().unwrap().is_none());
             journal.begin("audio/a.ogg", "upload-1", 8).unwrap();
@@ -1219,10 +1203,10 @@ mod tests {
         }
 
         fn row(db: &Database, filename: &str, in_cloud: bool) -> AudioFileRow {
-            let id = db.create_audio_file(filename, None).unwrap();
+            let id = db.create_audio_file(filename, None, None, crate::models::FileOrigin::Imported, None).unwrap();
             if in_cloud {
-                let key = generate_storage_key(Some("audio"), &id, filename);
-                db.update_audio_file_storage(&id, "fake", &key).unwrap();
+                let key = storage_key_for(Some("audio"), &id, filename, None);
+                db.update_audio_file_storage(&id, "fake", &key, false).unwrap();
             }
             db.get_audio_file(&id).unwrap().unwrap()
         }
@@ -1468,7 +1452,7 @@ mod tests {
             row(&db, "elsewhere.mp3", false);
 
             // Storage not configured -> Config error for the explicit call
-            match upload_pending_audio_files(&db, &dir, None).await {
+            match upload_pending_audio_files(&db, &dir, None, None, None).await {
                 Err(FileStorageError::Config(_)) => {}
                 other => panic!("expected Config error, got {:?}", other.map(|_| ())),
             }
@@ -1480,7 +1464,7 @@ mod tests {
                 "access_key_id": "k", "secret_access_key": "s"
             });
             db.set_file_storage_config("s3", Some(&cfg)).unwrap();
-            let result = upload_pending_audio_files(&db, &dir, None).await.unwrap();
+            let result = upload_pending_audio_files(&db, &dir, None, None, None).await.unwrap();
             assert_eq!(result.skipped, 1);
             assert_eq!(result.uploaded, 0);
             assert_eq!(result.failed, 0);

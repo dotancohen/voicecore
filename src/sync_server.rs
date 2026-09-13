@@ -1575,7 +1575,7 @@ pub async fn start_server(
 /// empty; no default account is made.
 pub async fn start_hosting_server(root: &std::path::Path, host: &str, port: u16, plain_http: bool) -> VoiceResult<()> {
     crate::accounts::AccountIndex::open(root)?;
-    let machine = Arc::new(Mutex::new(Config::new(Some(root.to_path_buf()))?));
+    let machine = Arc::new(Mutex::new(Config::new(Some(root.to_path_buf()), None)?));
     let urls = listen_urls(host, port, plain_http);
     let source: Arc<dyn AccountSource> = Arc::new(IndexedAccounts::new(root, urls));
     start_server_for(source, machine, host, port, plain_http).await
@@ -1762,7 +1762,7 @@ mod tests {
         use crate::sync_client::SyncClient;
 
         fn state_for(db: Database, dir: &TempDir) -> (AppState, AccountHandle) {
-            let config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             let device_id = config.device_id_hex().to_string();
             let account_id = db.account_id().unwrap();
             let handle = AccountHandle { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)) };
@@ -1837,7 +1837,7 @@ mod tests {
             let server_db = Database::new(server_dir.path().join("notes.db")).unwrap();
             server_db.create_note("של השרת").unwrap();
             let server_state_db = Arc::new(Mutex::new(server_db));
-            let server_config = Arc::new(Mutex::new(Config::new(Some(server_dir.path().to_path_buf())).unwrap()));
+            let server_config = Arc::new(Mutex::new(Config::new(Some(server_dir.path().to_path_buf()), None).unwrap()));
             let server_device = server_config.lock().unwrap().device_id_hex().to_string();
             let router = create_router(server_state_db.clone(), server_config);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1850,7 +1850,7 @@ mod tests {
             let client_db = Database::new(client_dir.path().join("notes.db")).unwrap();
             client_db.create_note("של הלקוח").unwrap();
             let client_db = Arc::new(Mutex::new(client_db));
-            let mut client_config = Config::new(Some(client_dir.path().to_path_buf())).unwrap();
+            let mut client_config = Config::new(Some(client_dir.path().to_path_buf()), None).unwrap();
             client_config.add_peer(&server_device, "Server", &url, None, true).unwrap();
             let client = SyncClient::new(client_db.clone(), Arc::new(Mutex::new(client_config))).unwrap();
 
@@ -1887,7 +1887,7 @@ mod tests {
         fn device(name: &str) -> Device {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
-            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             config.set_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
             let id = config.device_id_hex().to_string();
@@ -2111,7 +2111,7 @@ mod tests {
         fn device(name: &str) -> Device {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
-            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             config.set_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
             let id = config.device_id_hex().to_string();
@@ -2280,7 +2280,7 @@ mod tests {
         fn device(name: &str) -> Device {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
-            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             config.set_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
             let id = config.device_id_hex().to_string();
@@ -2293,7 +2293,7 @@ mod tests {
         fn host() -> (TempDir, Arc<IndexedAccounts>, Arc<Mutex<Config>>, String, tokio::task::JoinHandle<()>) {
             let root = TempDir::new().unwrap();
             crate::accounts::AccountIndex::open(root.path()).unwrap();
-            let mut machine = Config::new(Some(root.path().to_path_buf())).unwrap();
+            let mut machine = Config::new(Some(root.path().to_path_buf()), None).unwrap();
             machine.set_device_name("Server").unwrap();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -2468,7 +2468,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
             db.create_note("לגיבוי").unwrap();
-            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             let account = db.account_id().unwrap();
             assert!(backup_due(&config, &account), "nothing copied yet");
             let target = config.backup_directory(&account);
@@ -2494,7 +2494,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
             let account = db.account_id().unwrap();
-            let config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             let handle = AccountHandle { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)) };
             let source: Arc<dyn AccountSource> = Arc::new(SingleAccount { account_id: account.clone(), handle: handle.clone() });
             let task = spawn_periodic_backup(source, Duration::from_millis(60), 3);
@@ -2523,7 +2523,7 @@ mod tests {
         fn device(name: &str) -> Device {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
-            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             config.set_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
             let id = config.device_id_hex().to_string();
@@ -2676,7 +2676,7 @@ mod tests {
         fn device(name: &str) -> Device {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
-            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             config.set_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
             let id = config.device_id_hex().to_string();
@@ -2860,7 +2860,7 @@ mod tests {
         fn device(name: &str) -> Device {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
-            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             config.set_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
             let id = config.device_id_hex().to_string();
@@ -2960,7 +2960,7 @@ mod tests {
         fn device(name: &str) -> Device {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
-            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
             config.set_device_name(name).unwrap();
             let audio = dir.path().join("audio");
             std::fs::create_dir_all(&audio).unwrap();
@@ -3274,7 +3274,7 @@ mod tests {
         async fn a_listener_says_so_on_its_card_stops_when_asked_and_can_start_again() {
             let dir = TempDir::new().unwrap();
             let db = Arc::new(Mutex::new(Database::new(dir.path().join("notes.db")).unwrap()));
-            let config = Arc::new(Mutex::new(Config::new(Some(dir.path().to_path_buf())).unwrap()));
+            let config = Arc::new(Mutex::new(Config::new(Some(dir.path().to_path_buf()), None).unwrap()));
             let device_id = config.lock().unwrap().device_id_hex().to_string();
             let port = free_port();
             let url = format!("http://127.0.0.1:{}", port);
@@ -3804,7 +3804,7 @@ mod tests {
 
         // Create a note and audio file on Instance A
         let note_id = instance_a.create_note("Note with audio").unwrap();
-        let audio_id = instance_a.create_audio_file("recording.mp3", Some(1735732800)).unwrap();
+        let audio_id = instance_a.create_audio_file("recording.mp3", Some(1735732800), None, crate::models::FileOrigin::Imported, None).unwrap();
 
         // Attach audio to note
         let _attachment_id = instance_a.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
@@ -3901,7 +3901,7 @@ mod tests {
 
         // Create note with attachment on Instance A
         let note_id = instance_a.create_note("Note with attachment").unwrap();
-        let audio_id = instance_a.create_audio_file("recording.mp3", None).unwrap();
+        let audio_id = instance_a.create_audio_file("recording.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let attachment_id = instance_a.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
 
         // Initial sync A -> B
@@ -3941,7 +3941,7 @@ mod tests {
         let (instance_b, _temp_b) = create_test_db();
 
         // Create an audio file on Instance A
-        let audio_id = instance_a.create_audio_file("speech.mp3", None).unwrap();
+        let audio_id = instance_a.create_audio_file("speech.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
 
         // Create a transcription for it
         let transcription_id = instance_a.create_transcription(
@@ -4029,7 +4029,7 @@ mod tests {
         let note_id = db.create_note("Test note content").unwrap();
         let tag_id = db.create_tag("TestTag", None).unwrap();
         db.add_tag_to_note(&note_id, &tag_id).unwrap();
-        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+        let audio_id = db.create_audio_file("test.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let _attachment_id = db.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
         let _transcription_id = db.create_transcription(
             &audio_id,
@@ -4100,7 +4100,7 @@ mod tests {
         let (db, _temp) = create_test_db();
 
         // Create audio file and transcription
-        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+        let audio_id = db.create_audio_file("test.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let transcription_id = db.create_transcription(
             &audio_id,
             "Test content",
@@ -4188,8 +4188,8 @@ mod tests {
         let (a, _ta) = create_test_db();
         let (b, _tb) = create_test_db();
         let note_id = a.create_note("פתק עם שתי הקלטות").unwrap();
-        let first = a.create_audio_file("first.ogg", None).unwrap();
-        let second = a.create_audio_file("second.ogg", None).unwrap();
+        let first = a.create_audio_file("first.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+        let second = a.create_audio_file("second.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let first_attachment = a.attach_to_note(&note_id, &first, "audio_file").unwrap();
         let second_attachment = a.attach_to_note(&note_id, &second, "audio_file").unwrap();
         exchange(&a, &b);
@@ -4224,7 +4224,7 @@ mod tests {
         let (db, _t) = create_test_db();
         let mine = db.create_note("הפתק שלי").unwrap();
         let other = db.create_note("פתק אחר").unwrap();
-        let audio = db.create_audio_file("elsewhere.ogg", None).unwrap();
+        let audio = db.create_audio_file("elsewhere.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let attachment = db.attach_to_note(&other, &audio, "audio_file").unwrap();
 
         assert!(db.set_primary_attachment(&mine, Some(&attachment)).is_err());
@@ -4236,7 +4236,7 @@ mod tests {
     fn the_transcription_that_stands_for_a_recording_travels() {
         let (a, _ta) = create_test_db();
         let (b, _tb) = create_test_db();
-        let audio = a.create_audio_file("recording.ogg", None).unwrap();
+        let audio = a.create_audio_file("recording.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let first = a
             .create_transcription(&audio, "תמלול ראשון", None, "local_whisper", None, None, None)
             .unwrap();
@@ -4251,7 +4251,7 @@ mod tests {
         assert_eq!(b.get_primary_transcription(&audio).unwrap().as_deref(), Some(second.as_str()));
 
         // And a transcription of another recording is refused.
-        let elsewhere = a.create_audio_file("other.ogg", None).unwrap();
+        let elsewhere = a.create_audio_file("other.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         assert!(a.set_primary_transcription(&elsewhere, Some(&first)).is_err());
     }
 
@@ -4313,7 +4313,7 @@ mod tests {
     fn purging_a_note_removes_it_and_what_belonged_only_to_it() {
         let (db, _t) = create_test_db();
         let note_id = db.create_note("פתק עם הקלטה").unwrap();
-        let audio_id = db.create_audio_file("recording.ogg", None).unwrap();
+        let audio_id = db.create_audio_file("recording.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         db.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
         let transcription_id = db
             .create_transcription(&audio_id, "תמלול ההקלטה", None, "local_whisper", None, None, None)
@@ -4342,7 +4342,7 @@ mod tests {
         let (db, _t) = create_test_db();
         let keeper = db.create_note("הפתק שנשאר").unwrap();
         let doomed = db.create_note("הפתק שנמחק").unwrap();
-        let audio_id = db.create_audio_file("shared.ogg", None).unwrap();
+        let audio_id = db.create_audio_file("shared.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         db.attach_to_note(&keeper, &audio_id, "audio_file").unwrap();
         db.attach_to_note(&doomed, &audio_id, "audio_file").unwrap();
 
@@ -4361,7 +4361,7 @@ mod tests {
         let (a, _ta) = create_test_db();
         let (b, _tb) = create_test_db();
         let note_id = a.create_note("פתק שיימחק לתמיד").unwrap();
-        let audio_id = a.create_audio_file("gone.ogg", None).unwrap();
+        let audio_id = a.create_audio_file("gone.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         a.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
         exchange(&a, &b);
         assert!(b.get_note(&note_id).unwrap().is_some());
@@ -4609,7 +4609,7 @@ mod tests {
     fn test_versions_transcription_flags_and_text_merge() {
         let (a, _ta) = create_test_db();
         let (b, _tb) = create_test_db();
-        let audio = a.create_audio_file("הקלטה.mp3", None).unwrap();
+        let audio = a.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let tr = a.create_transcription(&audio, "שלום\nעולם\n", None, "whisper", None, None, None).unwrap();
         exchange(&a, &b);
 
@@ -4697,11 +4697,11 @@ mod tests {
         // after the exchange both know the cloud location and the summary.
         let (a, _ta) = create_test_db();
         let (b, _tb) = create_test_db();
-        let audio = a.create_audio_file("הקלטה.mp3", None).unwrap();
+        let audio = a.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         exchange(&a, &b);
         b.update_audio_file_summary(&audio, "סיכום מהטלפון").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        a.update_audio_file_storage(&audio, "s3", &format!("audio/{}.mp3", audio)).unwrap();
+        a.update_audio_file_storage(&audio, "s3", &format!("audio/{}.mp3", audio), false).unwrap();
         exchange(&a, &b);
         exchange(&a, &b);
         for db in [&a, &b] {
@@ -4714,8 +4714,8 @@ mod tests {
     #[test]
     fn test_files_older_audio_row_never_erases_storage_key() {
         let (a, _ta) = create_test_db();
-        let audio = a.create_audio_file("הקלטה.mp3", None).unwrap();
-        a.update_audio_file_storage(&audio, "s3", &format!("audio/{}.mp3", audio)).unwrap();
+        let audio = a.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+        a.update_audio_file_storage(&audio, "s3", &format!("audio/{}.mp3", audio), false).unwrap();
         // An older copy of the row (from a peer that never saw the upload)
         a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None, None, None, None).unwrap();
         let row = a.get_audio_file_raw(&audio).unwrap().unwrap();
@@ -4728,7 +4728,7 @@ mod tests {
         let (a, _ta) = create_test_db();
         let (b, _tb) = create_test_db();
         let note = a.create_note("פתק").unwrap();
-        let audio = a.create_audio_file("הקלטה.mp3", None).unwrap();
+        let audio = a.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         a.attach_to_note(&note, &audio, "audio_file").unwrap();
         let tr = a.create_transcription(&audio, "טקסט", None, "whisper", None, Some("{\"run\":1}"), None).unwrap();
         exchange(&a, &b);
@@ -4747,7 +4747,7 @@ mod tests {
     #[test]
     fn test_transcription_state_toggle_keeps_service_metadata() {
         let (a, _ta) = create_test_db();
-        let audio = a.create_audio_file("הקלטה.mp3", None).unwrap();
+        let audio = a.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let tr = a.create_transcription(&audio, "טקסט", Some("[1,2]"), "whisper", None, Some("{\"ok\":true}"), None).unwrap();
         a.update_transcription(&tr, "טקסט", None, None, Some("original verified")).unwrap();
         let t = a.get_transcription(&tr).unwrap().unwrap();
@@ -4761,7 +4761,7 @@ mod tests {
         let (a, _ta) = create_test_db();
         let n1 = a.create_note("ראשון").unwrap();
         let n2 = a.create_note("שני").unwrap();
-        let audio = a.create_audio_file("הקלטה.mp3", None).unwrap();
+        let audio = a.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let att = a.attach_to_note(&n1, &audio, "audio_file").unwrap();
         let created = a.get_attachment(&att).unwrap().unwrap().created_at;
         // The attachment was moved to n2 (a note merge) at t+100

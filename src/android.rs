@@ -321,8 +321,13 @@ impl crate::sync_client::ProgressSink for ProgressBridge {
     }
 }
 
+#[uniffi::export]
 impl VoiceClient {
-    fn open(data_dir: String, wrapper: Option<Arc<dyn crate::config::SecretWrapper>>) -> Result<Arc<Self>, VoiceCoreError> {
+    /// Create the VoiceClient over a data directory. With the phone's Keystore
+    /// (`wrapper`) the keys are wrapped on disk (AUTH-9); tests pass none.
+    #[uniffi::constructor]
+    pub fn new(data_dir: String, wrapper: Option<Box<dyn KeystoreWrapper>>) -> Result<Arc<Self>, VoiceCoreError> {
+        let wrapper: Option<Arc<dyn crate::config::SecretWrapper>> = wrapper.map(|w| Arc::new(WrapperBridge(w)) as Arc<dyn crate::config::SecretWrapper>);
         let data_path = PathBuf::from(&data_dir);
 
         // Create directory if it doesn't exist
@@ -331,7 +336,7 @@ impl VoiceClient {
         })?;
 
         // Initialize config
-        let mut config = Config::new_wrapped(Some(data_path.clone()), wrapper)?;
+        let mut config = Config::new(Some(data_path.clone()), wrapper)?;
 
         // Initialize database
         let db_path = data_path.join("notes.db");
@@ -345,21 +350,6 @@ impl VoiceClient {
             db: Arc::new(Mutex::new(db)),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }))
-    }
-}
-
-#[uniffi::export]
-impl VoiceClient {
-    /// Create a new VoiceClient with the given data directory
-    #[uniffi::constructor]
-    pub fn new(data_dir: String) -> Result<Arc<Self>, VoiceCoreError> {
-        Self::open(data_dir, None)
-    }
-
-    /// The client with the phone's Keystore wrapping the device key on disk (Stage 14).
-    #[uniffi::constructor]
-    pub fn new_with_keystore(data_dir: String, wrapper: Box<dyn KeystoreWrapper>) -> Result<Arc<Self>, VoiceCoreError> {
-        Self::open(data_dir, Some(Arc::new(WrapperBridge(wrapper))))
     }
 
     /// Tell the core which timezone this phone is in, so every timestamp it
@@ -1062,7 +1052,7 @@ impl VoiceClient {
         storage_key: String,
     ) -> Result<bool, VoiceCoreError> {
         let db = self.db.lock().unwrap();
-        db.update_audio_file_storage(&audio_file_id, &storage_provider, &storage_key)
+        db.update_audio_file_storage(&audio_file_id, &storage_provider, &storage_key, false)
             .map_err(|e| VoiceCoreError::Database {
                 msg: e.to_string(),
             })
@@ -2182,7 +2172,7 @@ impl VoiceClient {
                 .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
             let db = self.db.lock().unwrap();
             let key = self.config.lock().ok().and_then(|c| c.recording_key());
-            let result = rt.block_on(crate::file_storage::upload_pending_audio_files(&db, &dir, key.as_ref()));
+            let result = rt.block_on(crate::file_storage::upload_pending_audio_files(&db, &dir, None, None, key.as_ref()));
             match result {
                 Ok(r) => Ok(UploadResultData {
                     uploaded: r.uploaded as i32,
@@ -2527,7 +2517,7 @@ mod transcription_binding_tests {
     #[test]
     fn create_then_update_transcription_result() {
         let dir = tempfile::tempdir().unwrap();
-        let client = VoiceClient::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let client = VoiceClient::new(dir.path().to_string_lossy().to_string(), None).unwrap();
         let imported = client
             .import_audio_file("Recording 2026-09-08 02-00-00.ogg".into(), Some(1_757_000_000), Some(4))
             .unwrap();
@@ -2579,7 +2569,7 @@ mod transcription_binding_tests {
     #[test]
     fn a_recording_made_in_a_note_joins_that_note() {
         let dir = tempfile::tempdir().unwrap();
-        let client = VoiceClient::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let client = VoiceClient::new(dir.path().to_string_lossy().to_string(), None).unwrap();
         let note_id = client.create_note("הערה עם הקלטה".into()).unwrap();
         let notes_before = client.get_all_notes().unwrap().len();
 
@@ -2612,7 +2602,7 @@ mod transcription_binding_tests {
     #[test]
     fn a_recording_for_a_missing_note_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let client = VoiceClient::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let client = VoiceClient::new(dir.path().to_string_lossy().to_string(), None).unwrap();
         let missing = "00000000000040008000000000000099".to_string();
 
         let result = client.import_audio_file_into_note(missing, "Recording.ogg".into(), None, Some(1));
@@ -2629,7 +2619,7 @@ mod transcription_binding_tests {
     #[test]
     fn a_deleted_transcription_leaves_only_the_good_one() {
         let dir = tempfile::tempdir().unwrap();
-        let client = VoiceClient::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let client = VoiceClient::new(dir.path().to_string_lossy().to_string(), None).unwrap();
         let imported = client
             .import_audio_file("Recording 2026-09-08 03-00-00.ogg".into(), Some(1_757_003_600), Some(9))
             .unwrap();

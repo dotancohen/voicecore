@@ -1774,7 +1774,7 @@ impl Database {
         audio_dir: Option<&Path>,
     ) -> VoiceResult<(String, String)> {
         // 1. Create audio file record; the file keeps its own name (FILE-15)
-        let audio_file_id = self.create_audio_file_with_duration(filename, file_created_at, duration_seconds, crate::models::FileOrigin::Imported, audio_dir)?;
+        let audio_file_id = self.create_audio_file(filename, file_created_at, duration_seconds, crate::models::FileOrigin::Imported, audio_dir)?;
 
         // 2. Create note with file's creation date (empty content)
         let note_id = self.create_note_with_timestamp("", file_created_at)?;
@@ -2280,7 +2280,7 @@ impl Database {
         let resolved_id = self.resolve_note_id(note_id)?;
         // The recorder's file: named by its start and the tail of its id (FILE-15)
         let audio_file_id =
-            self.create_audio_file_with_duration(filename, file_created_at, duration_seconds, crate::models::FileOrigin::Recorded, audio_dir)?;
+            self.create_audio_file(filename, file_created_at, duration_seconds, crate::models::FileOrigin::Recorded, audio_dir)?;
         self.attach_to_note(&resolved_id, &audio_file_id, "audio_file")?;
         Ok(audio_file_id)
     }
@@ -5100,20 +5100,11 @@ impl Database {
     // AudioFile operations
     // ========================================================================
 
-    /// Create a new audio file record
-    pub fn create_audio_file(
-        &self,
-        filename: &str,
-        file_created_at: Option<i64>,
-    ) -> VoiceResult<String> {
-        self.create_audio_file_with_duration(filename, file_created_at, None, crate::models::FileOrigin::Imported, None)
-    }
-
-    /// Create a new audio file record with optional duration. The file's
+    /// Create a new audio file record. The file's
     /// name in the audio folder (FILE-15): a recording's start and the tail
     /// of its id, or an imported file's own name; a name taken in the folder,
     /// by a row or by a file in `audio_dir`, gets ` (2)` and so on.
-    pub fn create_audio_file_with_duration(
+    pub fn create_audio_file(
         &self,
         filename: &str,
         file_created_at: Option<i64>,
@@ -5498,16 +5489,7 @@ impl Database {
         audio_file_id: &str,
         storage_provider: &str,
         storage_key: &str,
-    ) -> VoiceResult<bool> {
-        self.update_audio_file_storage_encrypted(audio_file_id, storage_provider, storage_key, false)
-    }
-
-    /// `update_audio_file_storage`, saying whether the object is encrypted (Stage 15).
-    pub fn update_audio_file_storage_encrypted(
-        &self,
-        audio_file_id: &str,
-        storage_provider: &str,
-        storage_key: &str,
+        // Whether the object is encrypted with the recording key (Stage 15)
         encrypted: bool,
     ) -> VoiceResult<bool> {
         let resolved_id = match self.try_resolve_audio_file_id(audio_file_id)? {
@@ -7131,7 +7113,7 @@ mod tests {
         std::fs::write(dir.join("על הדיסק.ogg"), b"a file no row names").unwrap();
         let db = Database::new(&temp.path().join("n.db")).unwrap();
         let name = |id: &str| db.get_audio_file(id).unwrap().unwrap().local_name;
-        let import = |filename: &str| db.create_audio_file_with_duration(filename, None, None, FileOrigin::Imported, Some(&dir));
+        let import = |filename: &str| db.create_audio_file(filename, None, None, FileOrigin::Imported, Some(&dir));
 
         assert_eq!(name(&import("שיחה.m4a").unwrap()), "שיחה.m4a");
         assert_eq!(name(&import("שיחה.m4a").unwrap()), "שיחה (2).m4a");
@@ -7165,7 +7147,7 @@ mod tests {
         let path = temp.path().join("old.db");
         let id = {
             let db = Database::new(&path).unwrap();
-            let id = db.create_audio_file("הקלטה ישנה.OGG", Some(1735689600)).unwrap();
+            let id = db.create_audio_file("הקלטה ישנה.OGG", Some(1735689600), None, crate::models::FileOrigin::Imported, None).unwrap();
             // The state of a database written before the column existed
             db.conn.execute("UPDATE audio_files SET local_name = NULL", []).unwrap();
             id
@@ -7182,7 +7164,7 @@ mod tests {
         let dir = temp.path().join("audio");
         std::fs::create_dir_all(&dir).unwrap();
         let a = Database::new(&temp.path().join("a.db")).unwrap();
-        let id = a.create_audio_file("שיחה.ogg", Some(1735689600)).unwrap();
+        let id = a.create_audio_file("שיחה.ogg", Some(1735689600), None, crate::models::FileOrigin::Imported, None).unwrap();
         let row = a.get_audio_file(&id).unwrap().unwrap();
         assert!(row.content_sha256.is_none(), "not hashed before the file is there");
         std::fs::write(crate::models::audio_local_path(&dir, &row.local_name), b"bytes of the recording").unwrap();
@@ -7356,8 +7338,8 @@ mod tests {
         // What a transcription queue shows under "Completed": the work that is
         // done, newest first, whichever recording it belongs to.
         let db = Database::new_in_memory().unwrap();
-        let first = db.create_audio_file("הקלטה-1.opus", None).unwrap();
-        let second = db.create_audio_file("הקלטה-2.opus", None).unwrap();
+        let first = db.create_audio_file("הקלטה-1.opus", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+        let second = db.create_audio_file("הקלטה-2.opus", None, None, crate::models::FileOrigin::Imported, None).unwrap();
 
         let older = db
             .create_transcription(&first, "שלום", None, "local_whisper", None, None, None)
@@ -7377,7 +7359,7 @@ mod tests {
     #[test]
     fn test_get_recent_transcriptions_by_service_and_limit() {
         let db = Database::new_in_memory().unwrap();
-        let audio = db.create_audio_file("הקלטה.opus", None).unwrap();
+        let audio = db.create_audio_file("הקלטה.opus", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         db.create_transcription(&audio, "a", None, "local_whisper", None, None, None)
             .unwrap();
         db.create_transcription(&audio, "b", None, "speechtext_ai", None, None, None)
@@ -7396,7 +7378,7 @@ mod tests {
     #[test]
     fn test_get_recent_transcriptions_leaves_out_deleted() {
         let db = Database::new_in_memory().unwrap();
-        let audio = db.create_audio_file("הקלטה.opus", None).unwrap();
+        let audio = db.create_audio_file("הקלטה.opus", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let kept = db
             .create_transcription(&audio, "kept", None, "local_whisper", None, None, None)
             .unwrap();
@@ -7626,7 +7608,7 @@ mod tests {
         let db = Database::new_in_memory().unwrap();
 
         // Create audio file
-        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+        let audio_id = db.create_audio_file("test.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
 
         // Verify storage columns are NULL by default
         let audio = db.get_audio_file(&audio_id).unwrap().unwrap();
@@ -7640,10 +7622,10 @@ mod tests {
         let db = Database::new_in_memory().unwrap();
 
         // Create audio file
-        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
+        let audio_id = db.create_audio_file("test.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
 
         // Update storage info
-        let updated = db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3").unwrap();
+        let updated = db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3", false).unwrap();
         assert!(updated);
 
         // Verify storage info was set
@@ -7659,8 +7641,8 @@ mod tests {
         let db = Database::new_in_memory().unwrap();
 
         // Create audio file and set storage
-        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
-        db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3").unwrap();
+        let audio_id = db.create_audio_file("test.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+        db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3", false).unwrap();
 
         // Verify storage is set
         let audio = db.get_audio_file(&audio_id).unwrap().unwrap();
@@ -7682,12 +7664,12 @@ mod tests {
         let db = Database::new_in_memory().unwrap();
 
         // Create some audio files
-        let audio_id1 = db.create_audio_file("file1.mp3", None).unwrap();
-        let audio_id2 = db.create_audio_file("file2.mp3", None).unwrap();
-        let audio_id3 = db.create_audio_file("file3.mp3", None).unwrap();
+        let audio_id1 = db.create_audio_file("file1.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+        let audio_id2 = db.create_audio_file("file2.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+        let audio_id3 = db.create_audio_file("file3.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
 
         // Upload one of them
-        db.update_audio_file_storage(&audio_id2, "s3", "audio/file2.mp3").unwrap();
+        db.update_audio_file_storage(&audio_id2, "s3", "audio/file2.mp3", false).unwrap();
 
         // Get pending uploads
         let pending = db.get_audio_files_pending_upload().unwrap();
@@ -7737,8 +7719,8 @@ mod tests {
         let db = Database::new_in_memory().unwrap();
 
         // Create audio file with storage info
-        let audio_id = db.create_audio_file("test.mp3", None).unwrap();
-        db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3").unwrap();
+        let audio_id = db.create_audio_file("test.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+        db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3", false).unwrap();
 
         // Get changes
         let (changes, _) = db.get_changes_since(None, 100).unwrap();

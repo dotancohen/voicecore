@@ -413,14 +413,10 @@ impl Config {
     /// Create a new configuration manager
     ///
     /// On mobile platforms (without the `desktop` feature), `config_dir` is required.
-    pub fn new(config_dir: Option<PathBuf>) -> VoiceResult<Self> {
-        Self::new_wrapped(config_dir, None)
-    }
-
-    /// `new`, with the platform's key store wrapping the device key on disk
-    /// (AUTH-9): a wrapped key in the file is unwrapped into memory, a clear
-    /// one is wrapped at the next save.
-    pub fn new_wrapped(config_dir: Option<PathBuf>, wrapper: Option<std::sync::Arc<dyn SecretWrapper>>) -> VoiceResult<Self> {
+    /// With a platform key store (`wrapper`: the phone's Keystore; none on the
+    /// desktop) the keys are wrapped on disk (AUTH-9): a wrapped key in the
+    /// file is unwrapped into memory, a clear one is wrapped at the next save.
+    pub fn new(config_dir: Option<PathBuf>, wrapper: Option<std::sync::Arc<dyn SecretWrapper>>) -> VoiceResult<Self> {
         let config_dir = match config_dir {
             Some(dir) => dir,
             None => {
@@ -504,8 +500,8 @@ impl Config {
     /// the root's `config.json` (made with defaults if missing), and the
     /// certificates live under the root.
     pub fn open_account(root: &Path, account_dir: &Path) -> VoiceResult<Self> {
-        let machine = Self::new(Some(root.to_path_buf()))?;
-        let mut config = Self::new(Some(account_dir.to_path_buf()))?;
+        let machine = Self::new(Some(root.to_path_buf()), None)?;
+        let mut config = Self::new(Some(account_dir.to_path_buf()), None)?;
         config.machine_file = Some(machine.config_file.clone());
         config.certs_root = root.to_path_buf();
         config.data.device_id = machine.data.device_id.clone();
@@ -994,7 +990,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path().to_path_buf();
         let wrapper: std::sync::Arc<dyn SecretWrapper> = std::sync::Arc::new(Flip);
-        let mut config = Config::new_wrapped(Some(dir.clone()), Some(wrapper.clone())).unwrap();
+        let mut config = Config::new(Some(dir.clone()), Some(wrapper.clone())).unwrap();
         config.set_device_key("kEy0123456789abcdefghijklmnopqrstuvwxyzABC").unwrap();
         let file = std::fs::read_to_string(dir.join("config.json")).unwrap();
         assert!(!file.contains("kEy0123456789"), "the clear key is not in the file");
@@ -1002,23 +998,23 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&file).unwrap();
         assert_eq!(json["sync"]["device_key"], "");
 
-        let mut again = Config::new_wrapped(Some(dir.clone()), Some(wrapper.clone())).unwrap();
+        let mut again = Config::new(Some(dir.clone()), Some(wrapper.clone())).unwrap();
         assert_eq!(again.device_key(), "kEy0123456789abcdefghijklmnopqrstuvwxyzABC");
         // The recording key is wrapped the same way (Stage 15)
         let recording = crate::crypto::RecordingKey::generate().to_text();
         again.set_recording_key(&recording).unwrap();
         let file = std::fs::read_to_string(dir.join("config.json")).unwrap();
         assert!(!file.contains(&recording) && file.contains("recording_key_wrapped"));
-        assert_eq!(Config::new_wrapped(Some(dir.clone()), Some(wrapper)).unwrap().recording_key_text(), recording);
-        let without = Config::new(Some(dir.clone())).unwrap();
+        assert_eq!(Config::new(Some(dir.clone()), Some(wrapper)).unwrap().recording_key_text(), recording);
+        let without = Config::new(Some(dir.clone()), None).unwrap();
         assert_eq!(without.device_key(), "", "without the wrapper the key is not readable");
 
         // A file holding a clear key is wrapped as soon as a wrapper opens it
         let other = temp.path().join("other");
-        let mut plain = Config::new(Some(other.clone())).unwrap();
+        let mut plain = Config::new(Some(other.clone()), None).unwrap();
         plain.set_device_key("clearclearclearclearclearclearclearclear123").unwrap();
         assert!(std::fs::read_to_string(other.join("config.json")).unwrap().contains("clearclear"));
-        let wrapped = Config::new_wrapped(Some(other.clone()), Some(std::sync::Arc::new(Flip))).unwrap();
+        let wrapped = Config::new(Some(other.clone()), Some(std::sync::Arc::new(Flip))).unwrap();
         assert_eq!(wrapped.device_key(), "clearclearclearclearclearclearclearclear123");
         assert!(!std::fs::read_to_string(other.join("config.json")).unwrap().contains("clearclear"));
     }
@@ -1033,7 +1029,7 @@ mod tests {
     #[test]
     fn a_forgotten_peer_is_remembered_as_such_until_added_again() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
         let id = "0199aaaaaaaa7000800000000000000a";
         config.add_peer(id, "Desk", "https://desk:8384", None, false).unwrap();
         config.set_last_peer(id).unwrap();
@@ -1042,7 +1038,7 @@ mod tests {
         assert!(config.is_forgotten(id));
         assert!(config.last_peer().is_none(), "the last peer is not a forgotten one");
         assert!(!config.forget_peer(id).unwrap(), "already gone");
-        let again = Config::new(Some(dir.path().to_path_buf())).unwrap();
+        let again = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
         assert!(again.is_forgotten(id), "written to the file");
         config.add_peer(id, "Desk", "https://desk:8384", None, false).unwrap();
         assert!(!config.is_forgotten(id));
@@ -1056,7 +1052,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let temp_dir = TempDir::new().unwrap();
-        let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         assert!(!config.device_id_hex().is_empty());
         assert!(!config.device_name().is_empty());
@@ -1067,7 +1063,7 @@ mod tests {
     #[test]
     fn test_add_peer() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         let peer_id = "0".repeat(32);
         config
@@ -1082,7 +1078,7 @@ mod tests {
     #[test]
     fn test_remove_peer() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         let peer_id = "0".repeat(32);
         config
@@ -1097,7 +1093,7 @@ mod tests {
     #[test]
     fn test_invalid_peer_id() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         let result = config.add_peer("invalid", "Test", "https://example.com", None, false);
         assert!(result.is_err());
@@ -1108,13 +1104,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         {
-            let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             config.set_device_name("Test Device").unwrap();
             config.set_sync_enabled(true).unwrap();
         }
 
         {
-            let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             assert_eq!(config.device_name(), "Test Device");
             assert!(config.is_sync_enabled());
         }
@@ -1123,7 +1119,7 @@ mod tests {
     #[test]
     fn test_audiofile_directory_default_none() {
         let temp_dir = TempDir::new().unwrap();
-        let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         assert!(config.audiofile_directory().is_none());
         assert!(config.audiofile_trash_directory().is_none());
@@ -1132,7 +1128,7 @@ mod tests {
     #[test]
     fn test_set_audiofile_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         config.set_audiofile_directory("/home/user/audiofiles").unwrap();
 
@@ -1148,12 +1144,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         {
-            let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             config.set_audiofile_directory("/path/to/audio").unwrap();
         }
 
         {
-            let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             assert_eq!(config.audiofile_directory(), Some("/path/to/audio"));
         }
     }
@@ -1161,7 +1157,7 @@ mod tests {
     #[test]
     fn test_clear_audiofile_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         config.set_audiofile_directory("/path/to/audio").unwrap();
         assert!(config.audiofile_directory().is_some());
@@ -1173,7 +1169,7 @@ mod tests {
     #[test]
     fn test_audiofile_directory_via_get_set() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         // Initially None
         assert!(config.get("audiofile_directory").is_none());
@@ -1186,7 +1182,7 @@ mod tests {
     #[test]
     fn test_transcription_config_defaults() {
         let temp_dir = TempDir::new().unwrap();
-        let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         // Transcription config is stored as generic JSON
         let transcription = config.transcription_json();
@@ -1205,7 +1201,7 @@ mod tests {
     #[test]
     fn test_set_transcription_json() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         let new_config = serde_json::json!({
             "preferred_languages": ["he", "en"],
@@ -1230,7 +1226,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         {
-            let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             let new_config = serde_json::json!({
                 "preferred_languages": ["ar", "en"],
                 "providers": {
@@ -1243,7 +1239,7 @@ mod tests {
         }
 
         {
-            let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             let transcription = config.transcription_json();
             let languages = transcription.get("preferred_languages").unwrap().as_array().unwrap();
             assert_eq!(languages.len(), 2);
@@ -1263,12 +1259,12 @@ mod tests {
     fn test_mirror_audio_files_default_and_persistence() {
         let temp_dir = TempDir::new().unwrap();
         {
-            let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             assert!(!config.mirror_audio_files());
             config.set_mirror_audio_files(true).unwrap();
         }
         {
-            let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             assert!(config.mirror_audio_files());
         }
     }
@@ -1276,7 +1272,7 @@ mod tests {
     #[test]
     fn test_file_storage_config_default() {
         let temp_dir = TempDir::new().unwrap();
-        let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         assert_eq!(config.file_storage_provider(), "none");
         assert!(!config.is_file_storage_enabled());
@@ -1286,7 +1282,7 @@ mod tests {
     #[test]
     fn test_file_storage_config_s3() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+        let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
         let storage_config = FileStorageConfig::s3(
             "my-bucket",
@@ -1313,7 +1309,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         {
-            let mut config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             let storage_config = FileStorageConfig::s3(
                 "test-bucket",
                 "eu-west-1",
@@ -1326,7 +1322,7 @@ mod tests {
         }
 
         {
-            let config = Config::new(Some(temp_dir.path().to_path_buf())).unwrap();
+            let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
             assert_eq!(config.file_storage_provider(), "s3");
             assert!(config.is_file_storage_enabled());
 

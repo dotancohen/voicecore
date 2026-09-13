@@ -73,7 +73,7 @@ pub use models::{
 // Re-export file storage types when feature is enabled
 #[cfg(feature = "file-storage")]
 pub use file_storage::{
-    generate_storage_key, DownloadUrl, FileStorageError, FileStorageService, UploadResult,
+    storage_key_for, DownloadUrl, FileStorageError, FileStorageService, UploadResult,
 };
 #[cfg(feature = "file-storage")]
 pub use file_storage_s3::S3StorageService;
