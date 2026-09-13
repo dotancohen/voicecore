@@ -43,6 +43,23 @@ use crate::UUID_SHORT_LEN;
 /// by a stop, so a listener can be started again after it stopped.
 static SHUTDOWN_TX: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
 
+/// When the listener last served a request, or started (Stage 6: the idle
+/// stop). Seconds since the Unix epoch; 0 when no listener ran.
+static LAST_ACTIVITY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn note_activity() {
+    LAST_ACTIVITY.store(Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Seconds since the listener last served a request or started; None when
+/// no listener has run in this process.
+pub fn idle_seconds() -> Option<u64> {
+    match LAST_ACTIVITY.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        at => Some(u64::try_from(Utc::now().timestamp() - at).unwrap_or(0)),
+    }
+}
+
 /// The verified device behind a request, for the handlers that record
 /// what it holds (Stage 10).
 #[derive(Clone, Debug)]
@@ -400,6 +417,7 @@ async fn lan_only_gate(
     request: Request,
     next: Next,
 ) -> Response {
+    note_activity();
     if state.lan_only && !source_allowed(addr.ip(), false) {
         tracing::warn!("Refused {} from {}: not a private address and no public URL is configured", request.uri().path(), addr.ip());
         return (
@@ -1596,6 +1614,7 @@ pub async fn start_server_for(
     });
 
     tracing::info!("Starting sync server on {} ({})", addr, if plain_http { "plain http" } else { "https" });
+    note_activity();
 
     let served = match tls {
         Some(server_config) => {
@@ -2972,6 +2991,55 @@ mod tests {
             let again = client.exchange(&b.id).await;
             assert!(again.success);
             assert_eq!((again.sent, again.fetched, again.bytes_moved), (0, 0, 0), "nothing left to move");
+            task.abort();
+        }
+
+        /// Progress reaches the sink, and a cancel from the sink stops the
+        /// transfer at the next chunk, leaves the part, and the next
+        /// operation continues from it.
+        #[tokio::test]
+        async fn progress_is_reported_and_a_cancel_stops_at_the_next_chunk_leaving_a_part_to_continue_from() {
+            struct CancelAfterFirstReport {
+                seen: Mutex<Vec<crate::sync_client::Progress>>,
+                cancel: Arc<std::sync::atomic::AtomicBool>,
+            }
+            impl crate::sync_client::ProgressSink for CancelAfterFirstReport {
+                fn report(&self, progress: crate::sync_client::Progress) {
+                    let mut seen = self.seen.lock().unwrap();
+                    if progress.stage == "send" && progress.bytes > 0 {
+                        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    seen.push(progress);
+                }
+            }
+            let (a, b, _url, task) = pair();
+            let (id_a, _path_a) = recording(&a, 3 * 1024 * 1024 + 7);
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let sink = Arc::new(CancelAfterFirstReport { seen: Mutex::new(Vec::new()), cancel: client.cancel_flag() });
+            client.set_progress_sink(Some(sink.clone()));
+
+            let cut = client.deliver(&b.id).await;
+            assert!(!cut.success);
+            assert!(cut.errors.iter().any(|e| e == crate::sync_client::CANCELLED), "{:?}", cut.errors);
+            assert_eq!(cut.sent, 0);
+            let seen = sink.seen.lock().unwrap().clone();
+            assert!(seen.iter().any(|p| p.stage == "sync"), "the sync reported");
+            assert!(seen.iter().any(|p| p.stage == "send" && p.bytes > 0), "the send reported bytes: {:?}", seen);
+            let on_b = path_of(&b, &id_a);
+            assert!(!on_b.is_file(), "the file did not arrive whole");
+
+            // Without the cancelling sink, the next deliver sends only the
+            // rest: what reached the peer before the cut stays as a part
+            // (the peer finishes writing it after the client gave up, so it
+            // is measured by the second send, not by looking at the disk)
+            client.set_progress_sink(None);
+            let again = client.deliver(&b.id).await;
+            assert!(again.success, "{:?}", again.errors);
+            assert_eq!(again.sent, 1);
+            assert!(again.bytes_moved > 0 && again.bytes_moved < 3 * 1024 * 1024 + 7, "the part was continued from, not resent: {} bytes", again.bytes_moved);
+            assert!(on_b.is_file());
+            assert_eq!(std::fs::metadata(&on_b).unwrap().len(), 3 * 1024 * 1024 + 7, "and the whole arrived");
+            assert!(crate::sync_server::idle_seconds().is_none() || crate::sync_server::idle_seconds().unwrap() < 60);
             task.abort();
         }
 

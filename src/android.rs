@@ -270,6 +270,24 @@ pub fn generate_device_id() -> String {
 pub struct VoiceClient {
     config: Arc<Mutex<Config>>,
     db: Arc<Mutex<Database>>,
+    /// Set by `cancel_operation` from any thread; the operation under way
+    /// stops at its next page, file or chunk (Stage 4)
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Where an operation's progress goes on the phone (Stage 4): the
+/// foreground service's notification.
+#[uniffi::export(callback_interface)]
+pub trait OperationProgress: Send + Sync {
+    fn report(&self, stage: String, done: i64, total: i64, bytes: u64, sentence: String);
+}
+
+struct ProgressBridge(Box<dyn OperationProgress>);
+
+impl crate::sync_client::ProgressSink for ProgressBridge {
+    fn report(&self, progress: crate::sync_client::Progress) {
+        self.0.report(progress.stage, progress.done, progress.total, progress.bytes, progress.sentence);
+    }
 }
 
 #[uniffi::export]
@@ -297,6 +315,7 @@ impl VoiceClient {
         Ok(Arc::new(Self {
             config: Arc::new(Mutex::new(config)),
             db: Arc::new(Mutex::new(db)),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }))
     }
 
@@ -378,6 +397,28 @@ impl VoiceClient {
     pub fn rename_peer(&self, peer_id: String, name: String) -> Result<bool, VoiceCoreError> {
         let mut cfg = self.config.lock().unwrap();
         Ok(cfg.rename_peer(&peer_id, &name)?)
+    }
+
+    /// Cancel the operation under way (Stage 4): it stops at its next page,
+    /// file or chunk; a transfer under way stays resumable.
+    pub fn cancel_operation(&self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Seconds since the listener last served a request or started, or
+    /// None when it has not run; for the idle stop (Stage 6).
+    pub fn listener_idle_seconds(&self) -> Option<u64> {
+        crate::sync_server::idle_seconds()
+    }
+
+    /// Hours of silence after which the listener stops itself; 0 means never.
+    pub fn listener_idle_stop_hours(&self) -> u32 {
+        self.config.lock().unwrap().listener_idle_stop_hours()
+    }
+
+    pub fn set_listener_idle_stop_hours(&self, hours: u32) -> Result<(), VoiceCoreError> {
+        self.config.lock().unwrap().set_listener_idle_stop_hours(hours)?;
+        Ok(())
     }
 
     /// The peer an operation runs with: the one named, else the one of the
@@ -651,9 +692,12 @@ impl VoiceClient {
 
     /// One operation with the configured peer: "sync", "deliver" (sync then
     /// send), "exchange" (sync, send and fetch), "send" or "fetch".
-    pub fn operate(&self, operation: String, peer_id: Option<String>) -> Result<SyncResultData, VoiceCoreError> {
+    pub fn operate(&self, operation: String, peer_id: Option<String>, progress: Option<Box<dyn OperationProgress>>) -> Result<SyncResultData, VoiceCoreError> {
         let peer_id = self.chosen_peer(peer_id)?;
-        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+        let sync_client = SyncClient::with_cancel(self.db.clone(), self.config.clone(), self.cancel.clone())?;
+        if let Some(sink) = progress {
+            sync_client.set_progress_sink(Some(Arc::new(ProgressBridge(sink))));
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

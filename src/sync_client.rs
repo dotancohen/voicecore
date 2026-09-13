@@ -135,7 +135,35 @@ pub struct SyncClient {
     request_id: Mutex<String>,
     /// Changes per page of the feed, [`PULL_LIMIT`] unless lowered
     page_size: Mutex<i64>,
+    /// Set from another thread to stop the operation under way at the next
+    /// page, file or chunk (Stage 4: cancel); cleared when one begins
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Where progress is reported (Stage 4: progress), if anywhere
+    progress: Mutex<Option<Arc<dyn ProgressSink>>>,
 }
+
+/// One step of an operation, as the interfaces show it: the stage ("sync",
+/// "send", "fetch"), how many of how many, the bytes moved so far, and a
+/// sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    pub stage: String,
+    pub done: i64,
+    pub total: i64,
+    pub bytes: u64,
+    pub sentence: String,
+}
+
+/// Where an operation's progress goes: a notification, a label, a log.
+pub trait ProgressSink: Send + Sync {
+    fn report(&self, progress: Progress);
+}
+
+/// The sentence of a cancelled operation; the error carries it.
+pub const CANCELLED: &str = "Cancelled";
+
+/// Bytes between two progress reports of one file.
+const PROGRESS_EVERY_BYTES: u64 = 1024 * 1024;
 
 impl SyncClient {
     /// Give an empty device that cannot reach this one (a server) this
@@ -295,7 +323,44 @@ impl SyncClient {
             device_name,
             request_id: Mutex::new(String::new()),
             page_size: Mutex::new(PULL_LIMIT),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress: Mutex::new(None),
         })
+    }
+
+    /// A client whose cancel flag the interface holds already, so an
+    /// operation started later can be stopped from any thread.
+    pub fn with_cancel(db: Arc<Mutex<Database>>, config: Arc<Mutex<Config>>, cancel: Arc<std::sync::atomic::AtomicBool>) -> VoiceResult<Self> {
+        let mut client = Self::new(db, config)?;
+        client.cancel = cancel;
+        Ok(client)
+    }
+
+    /// The flag that cancels the operation under way when set from
+    /// another thread; shared, so the interface keeps a copy.
+    pub fn cancel_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.cancel.clone()
+    }
+
+    /// Cancel the operation under way: it stops at the next page, file or
+    /// chunk, a transfer under way stays resumable, and the result says so.
+    pub fn cancel(&self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Where progress is reported from now on.
+    pub fn set_progress_sink(&self, sink: Option<Arc<dyn ProgressSink>>) {
+        *self.progress.lock().unwrap() = sink;
+    }
+
+    fn report(&self, stage: &str, done: i64, total: i64, bytes: u64, sentence: impl Into<String>) {
+        if let Some(sink) = self.progress.lock().unwrap().as_ref() {
+            sink.report(Progress { stage: stage.to_string(), done, total, bytes, sentence: sentence.into() });
+        }
     }
 
     /// Lower the page size of the feed, for a test of what a cut mid-sync
@@ -312,6 +377,7 @@ impl SyncClient {
     fn begin_operation(&self) -> String {
         let id = new_request_id();
         *self.request_id.lock().unwrap() = id.clone();
+        self.cancel.store(false, std::sync::atomic::Ordering::SeqCst);
         id
     }
 
@@ -943,6 +1009,10 @@ impl SyncClient {
     async fn pull_all(&self, peer_url: &str, peer_id: &str, peer_name: &str, mut cursor: i64) -> PullOutcome {
         let mut outcome = PullOutcome { applied: 0, conflicts: 0, changes: Vec::new(), errors: Vec::new(), warnings: Vec::new() };
         for page in 0..MAX_PAGES {
+            if self.cancelled() {
+                outcome.errors.push(CANCELLED.to_string());
+                break;
+            }
             match self.pull_page(peer_url, peer_id, peer_name, cursor).await {
                 Ok((pull, next_cursor, complete)) => {
                     outcome.applied += pull.applied;
@@ -951,6 +1021,7 @@ impl SyncClient {
                     outcome.errors.extend(pull.errors);
                     outcome.warnings.extend(pull.warnings);
                     cursor = next_cursor;
+                    self.report("sync", outcome.applied, 0, 0, format!("Received {} changes from {}", outcome.applied, peer_name));
                     if let Err(e) = self.save_peer_cursors(peer_id, Some(cursor), None, None) {
                         outcome.errors.push(format!("Failed to save cursor: {}", e));
                         break;
@@ -989,6 +1060,10 @@ impl SyncClient {
         let mut warnings = Vec::new();
         let mut server_queued = false;
         for _ in 0..MAX_PAGES {
+            if self.cancelled() {
+                errors.push(CANCELLED.to_string());
+                break;
+            }
             let (changes, next, complete) = {
                 let db = self.db.lock().unwrap();
                 match db.get_changes_after_seq_as_sync_changes(sent, Some(upto), self.page_size()) {
@@ -1365,6 +1440,9 @@ impl SyncClient {
         peer_url: &str,
         audio_id: &str,
         dest_path: &std::path::Path,
+        moved_before: u64,
+        done: i64,
+        total_files: i64,
     ) -> VoiceResult<u64> {
         use futures_util::StreamExt;
         use tokio::io::AsyncWriteExt;
@@ -1409,10 +1487,20 @@ impl SyncClient {
         };
         let mut stream = response.bytes_stream();
         let mut received = 0u64;
+        let mut reported_at = 0u64;
         while let Some(chunk) = stream.next().await {
+            if self.cancelled() {
+                // The part stays; the next fetch continues from it
+                out.flush().await?;
+                return Err(VoiceError::Sync(CANCELLED.to_string()));
+            }
             let chunk = chunk.map_err(|e| VoiceError::Network(format!("The fetch of {} stopped: {}", audio_id, describe(&e))))?;
             out.write_all(&chunk).await?;
             received += chunk.len() as u64;
+            if received - reported_at >= PROGRESS_EVERY_BYTES {
+                reported_at = received;
+                self.report("fetch", done, total_files, moved_before + received, format!("Fetching recording {} of {}: {} MB", done + 1, total_files, (moved_before + received) / (1024 * 1024)));
+            }
         }
         out.flush().await?;
         drop(out);
@@ -1430,7 +1518,7 @@ impl SyncClient {
         audio_id: &str,
         source_path: &std::path::Path,
     ) -> VoiceResult<u64> {
-        self.send_audio_file_from(peer_url, audio_id, source_path, 0).await
+        self.send_audio_file_from(peer_url, audio_id, source_path, 0, 0, 0, 1).await
     }
 
     pub async fn send_audio_file_from(
@@ -1439,7 +1527,11 @@ impl SyncClient {
         audio_id: &str,
         source_path: &std::path::Path,
         from_byte: u64,
+        moved_before: u64,
+        done: i64,
+        total_files: i64,
     ) -> VoiceResult<u64> {
+        use futures_util::StreamExt;
         use tokio::io::AsyncSeekExt;
 
         let url = format!("{}/sync/audio/{}/file", peer_url, audio_id);
@@ -1452,7 +1544,27 @@ impl SyncClient {
         if from_byte > 0 {
             file.seek(std::io::SeekFrom::Start(from_byte)).await?;
         }
-        let stream = tokio_util::io::ReaderStream::with_capacity(file, crate::transfer::CHUNK);
+        // Counted and cancellable chunk by chunk: a cancel ends the body
+        // early, the peer keeps the part, and the next send continues from it
+        let cancel = self.cancel.clone();
+        let progress = self.progress.lock().unwrap().clone();
+        let counted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = counted.clone();
+        let stream = tokio_util::io::ReaderStream::with_capacity(file, crate::transfer::CHUNK)
+            .take_while(move |_| {
+                let go = !cancel.load(std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(go)
+            })
+            .inspect(move |chunk| {
+                if let Ok(chunk) = chunk {
+                    let sent_so_far = counter.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::SeqCst) + chunk.len() as u64;
+                    if sent_so_far / PROGRESS_EVERY_BYTES != (sent_so_far - chunk.len() as u64) / PROGRESS_EVERY_BYTES {
+                        if let Some(sink) = &progress {
+                            sink.report(Progress { stage: "send".to_string(), done, total: total_files, bytes: moved_before + sent_so_far, sentence: format!("Sending recording {} of {}: {} MB", done + 1, total_files, (moved_before + sent_so_far) / (1024 * 1024)) });
+                        }
+                    }
+                }
+            });
         let mut request = self
             .authed(self.file_client_for(peer_url)?.post(&url))
             .header("Content-Type", "application/octet-stream")
@@ -1461,12 +1573,16 @@ impl SyncClient {
         if from_byte > 0 {
             request = request.header("Content-Range", format!("bytes {}-{}/{}", from_byte, total.saturating_sub(1), total));
         }
-        let response = request
-            .body(reqwest::Body::wrap_stream(stream))
-            .send()
-            .await
-            .map_err(|e| VoiceError::Network(format!("Failed to send audio {}: {}", audio_id, describe(&e))))?;
+        let response = match request.body(reqwest::Body::wrap_stream(stream)).send().await {
+            Ok(response) => response,
+            // A body ended early by a cancel is reported as a cancel, not a network failure
+            Err(_) if self.cancelled() => return Err(VoiceError::Sync(CANCELLED.to_string())),
+            Err(e) => return Err(VoiceError::Network(format!("Failed to send audio {}: {}", audio_id, describe(&e)))),
+        };
 
+        if self.cancelled() && counted.load(std::sync::atomic::Ordering::SeqCst) < total - from_byte {
+            return Err(VoiceError::Sync(CANCELLED.to_string()));
+        }
         if !response.status().is_success() {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_default();
@@ -1509,7 +1625,7 @@ impl SyncClient {
                 Ok(n) => return Ok(n),
                 Err(e) => {
                     let text = e.to_string();
-                    let refused = text.contains("HTTP 4");
+                    let refused = text.contains("HTTP 4") || text.ends_with(CANCELLED);
                     tracing::warn!("{} failed: {}{}", what, text, if tries_left > 0 && !refused { "; trying again" } else { "" });
                     last = Some(e);
                     if refused || tries_left == 0 {
@@ -1547,14 +1663,27 @@ impl SyncClient {
         };
         let mut sent = 0i64;
         let mut bytes = 0u64;
-        for (audio_id, path) in local.into_iter().filter(|(id, _)| missing.missing.contains(id)) {
+        let to_send: Vec<_> = local.into_iter().filter(|(id, _)| missing.missing.contains(id)).collect();
+        let total = to_send.len() as i64;
+        for (audio_id, path) in to_send {
+            if self.cancelled() {
+                errors.push(CANCELLED.to_string());
+                break;
+            }
+            self.report("send", sent, total, bytes, format!("Sending recording {} of {}", sent + 1, total));
             let from = missing.partial.get(&audio_id).copied().unwrap_or(0);
             let what = format!("Send of {}", &audio_id[..UUID_SHORT_LEN.min(audio_id.len())]);
-            match self.with_retries(&what, || self.send_audio_file_from(peer_url, &audio_id, &path, from)).await {
+            let moved_before = bytes;
+            match self.with_retries(&what, || self.send_audio_file_from(peer_url, &audio_id, &path, from, moved_before, sent, total)).await {
                 Ok(n) => {
                     sent += 1;
                     bytes += n;
                     self.note_copy(&audio_id, peer_id);
+                    self.report("send", sent, total, bytes, format!("Sent recording {} of {}", sent, total));
+                }
+                Err(e) if e.to_string().ends_with(CANCELLED) => {
+                    errors.push(CANCELLED.to_string());
+                    break;
                 }
                 Err(e) => errors.push(e.to_string()),
             }
@@ -1573,17 +1702,30 @@ impl SyncClient {
         };
         let mut fetched = 0i64;
         let mut bytes = 0u64;
-        for row in rows.into_iter().filter(|r| r.deleted_at.is_none()) {
-            let path = audio_local_path(audiofile_directory, &row.local_name);
-            if path.is_file() {
-                continue;
+        let wanted: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.deleted_at.is_none() && !audio_local_path(audiofile_directory, &r.local_name).is_file())
+            .collect();
+        let total = wanted.len() as i64;
+        for row in wanted {
+            if self.cancelled() {
+                errors.push(CANCELLED.to_string());
+                break;
             }
+            let path = audio_local_path(audiofile_directory, &row.local_name);
+            self.report("fetch", fetched, total, bytes, format!("Fetching recording {} of {}", fetched + 1, total));
             let what = format!("Fetch of {}", &row.id[..UUID_SHORT_LEN.min(row.id.len())]);
-            match self.with_retries(&what, || self.fetch_audio_file(peer_url, &row.id, &path)).await {
+            let moved_before = bytes;
+            match self.with_retries(&what, || self.fetch_audio_file(peer_url, &row.id, &path, moved_before, fetched, total)).await {
                 Ok(n) => {
                     fetched += 1;
                     bytes += n;
                     self.note_copy(&row.id, peer_id);
+                    self.report("fetch", fetched, total, bytes, format!("Fetched recording {} of {}", fetched, total));
+                }
+                Err(e) if e.to_string().ends_with(CANCELLED) => {
+                    errors.push(CANCELLED.to_string());
+                    break;
                 }
                 Err(e) if e.to_string().contains("HTTP 404") => {}
                 Err(e) => errors.push(e.to_string()),

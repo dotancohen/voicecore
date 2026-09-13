@@ -108,6 +108,11 @@ pub struct SyncConfig {
     /// them back to the list until the user adds them again. Local.
     #[serde(default)]
     pub forgotten_peers: Vec<String>,
+    /// Hours of silence after which the listener stops itself (Stage 6);
+    /// 0, the default, means never. Stopping, not starting: it only saves
+    /// the battery of a user who forgets.
+    #[serde(default)]
+    pub listener_idle_stop_hours: u32,
 }
 
 fn default_server_port() -> u16 {
@@ -129,6 +134,7 @@ impl Default for SyncConfig {
             device_key: String::new(),
             last_peer_id: String::new(),
             forgotten_peers: Vec::new(),
+            listener_idle_stop_hours: 0,
         }
     }
 }
@@ -694,6 +700,16 @@ impl Config {
         } else {
             Ok(false)
         }
+    }
+
+    /// Hours of silence after which the listener stops itself; 0 means never.
+    pub fn listener_idle_stop_hours(&self) -> u32 {
+        self.data.sync.listener_idle_stop_hours
+    }
+
+    pub fn set_listener_idle_stop_hours(&mut self, hours: u32) -> VoiceResult<()> {
+        self.data.sync.listener_idle_stop_hours = hours;
+        self.save()
     }
 
     /// The peer of the last operation (Stage 5), if it is still in the list.
