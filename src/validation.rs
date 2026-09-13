@@ -259,11 +259,6 @@ pub fn validate_tag_id(tag_id: &str) -> VoiceResult<Uuid> {
     validate_entity_id(tag_id, "tag_id")
 }
 
-/// Validate a device ID.
-pub fn validate_device_id(device_id: &str) -> VoiceResult<Uuid> {
-    validate_entity_id(device_id, "device_id")
-}
-
 /// Validate an audio file ID.
 pub fn validate_audio_file_id(audio_file_id: &str) -> VoiceResult<Uuid> {
     validate_entity_id(audio_file_id, "audio_file_id")

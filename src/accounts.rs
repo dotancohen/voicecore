@@ -243,10 +243,6 @@ impl AccountIndex {
         Ok(None)
     }
 
-    /// The hosted accounts (Stage 3).
-    pub fn hosted(&self) -> VoiceResult<Vec<AccountEntry>> {
-        Ok(self.list()?.into_iter().filter(|a| a.hosted).collect())
-    }
 }
 
 /// What an installation opens (ACCT-6).

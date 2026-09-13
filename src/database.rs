@@ -3794,14 +3794,14 @@ impl Database {
         Ok(if taken { crate::models::suffixed_name(name, audio_id, true) } else { short })
     }
 
-    /// Whether a name collided once already (FILE-15): a recording that is
-    /// not deleted holds it with its own suffix.
+    /// Whether a name collided once already (FILE-15): a recording, deleted
+    /// or not, holds it with its own suffix.
     fn name_retired(&self, name: &str, audio_id: &str) -> VoiceResult<bool> {
         let (stem, _) = crate::models::split_file_name(name);
         let from = format!("{}-", stem);
         let to = format!("{}.", stem);
         let mut stmt = self.conn.prepare(
-            "SELECT lower(hex(id)), disk_name FROM audio_files WHERE deleted_at IS NULL AND id != ? AND disk_name >= ? AND disk_name < ?",
+            "SELECT lower(hex(id)), disk_name FROM audio_files WHERE id != ? AND disk_name >= ? AND disk_name < ?",
         )?;
         let rows = stmt.query_map(params![audio_id_bytes(audio_id)?, from, to], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
@@ -3814,9 +3814,9 @@ impl Database {
     }
 
     /// Resolve a collision of this recording's name (FILE-15). Two recordings
-    /// that are not deleted with identical names both take their suffix; a
-    /// name that collided once gives this one its suffix too; a deleted
-    /// recording holding the name takes its suffix and leaves the name.
+    /// that are not deleted with identical names both take their suffix. A
+    /// deleted recording's name is set in stone: when it holds this name, or
+    /// the name collided once before, only this recording takes a suffix.
     /// `file_may_be_here`: whether this recording's file can already be on
     /// this device under its present name.
     pub fn resolve_name_collision(&self, audio_id: &str, file_may_be_here: bool) -> VoiceResult<()> {
@@ -3834,13 +3834,16 @@ impl Database {
             let rows = stmt.query_map(params![name, id], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let mut shared_by_a_live_recording = false;
+        let mut held = false;
         for (other, deleted) in &holders {
-            let suffixed = self.suffix_for(other, &name)?;
-            self.set_disk_name(other, &suffixed, true)?;
-            shared_by_a_live_recording |= !deleted;
+            held = true;
+            // A deleted recording's name and file are never touched
+            if !deleted {
+                let suffixed = self.suffix_for(other, &name)?;
+                self.set_disk_name(other, &suffixed, true)?;
+            }
         }
-        if shared_by_a_live_recording || self.name_retired(&name, audio_id)? {
+        if held || self.name_retired(&name, audio_id)? {
             let suffixed = self.suffix_for(audio_id, &name)?;
             self.set_disk_name(audio_id, &suffixed, file_may_be_here)?;
         }
@@ -3866,9 +3869,9 @@ impl Database {
     /// Make room on disk for this recording's file under its name (FILE-15).
     /// A file already there that is not its own moves aside: a recording's
     /// file under a name that differs only in case, on storage that does not
-    /// tell case apart, is a collision and both take their suffix; a deleted
-    /// recording's file takes that recording's suffix; a file no row names
-    /// takes a random suffix. `occupant_is_not_ours`: the caller knows this
+    /// tell case apart, is a collision and both take their suffix; a file no row names
+    /// takes a random suffix. A deleted recording's file is never moved: this
+    /// recording takes its suffix instead. `occupant_is_not_ours`: the caller knows this
     /// recording's file is not the one there; otherwise a file whose hash is
     /// this recording's, or that cannot be told apart, is left as its own.
     pub fn make_room_on_disk(&self, audio_id: &str, audio_dir: &Path, occupant_is_not_ours: bool) -> VoiceResult<()> {
@@ -3913,8 +3916,13 @@ impl Database {
             tracing::info!(name = %row.disk_name, aside = %aside, "A file no recording names moved aside for the recording that has its name");
             return Ok(());
         }
-        let mut live = false;
+        let mut takes_suffix = false;
         for (other, other_name, deleted) in owners {
+            takes_suffix = true;
+            // A deleted recording's name and file are never touched
+            if deleted {
+                continue;
+            }
             let suffixed = self.suffix_for(&other, &other_name)?;
             if let Some(old) = self.set_disk_name(&other, &suffixed, false)? {
                 let from = audio_dir.join(&old);
@@ -3922,9 +3930,8 @@ impl Database {
                     std::fs::rename(&from, audio_dir.join(&suffixed))?;
                 }
             }
-            live |= !deleted;
         }
-        if live {
+        if takes_suffix {
             let suffixed = self.suffix_for(audio_id, &row.disk_name)?;
             self.set_disk_name(audio_id, &suffixed, false)?;
         }
@@ -7460,11 +7467,12 @@ mod tests {
         assert!(name(&recorded).ends_with(&format!("-{}.ogg", &recorded[24..])), "{}", name(&recorded));
     }
 
-    /// FILE-15: a deleted recording holds no name: when a new file takes its
-    /// name, the deleted recording's file and row take its suffix and the new
-    /// file keeps the name. A file on disk that no row names moves aside.
+    /// FILE-15: a deleted recording's name is set in stone. A new file with
+    /// that name, or with a name deleted recordings took in an old collision,
+    /// takes its own suffix; the deleted recording's row and file are never
+    /// touched. A file on disk that no row names moves aside.
     #[test]
-    fn a_deleted_recording_and_a_file_no_row_names_leave_the_name_to_the_new_file() {
+    fn a_deleted_recordings_name_is_set_in_stone_and_only_the_new_file_takes_a_suffix() {
         use crate::models::{suffixed_name, FileOrigin};
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path().join("audio");
@@ -7477,10 +7485,17 @@ mod tests {
         std::fs::write(dir.join("שיר.ogg"), b"a deleted song").unwrap();
         db.delete_audio_file(&old).unwrap();
         let new = import("שיר.ogg").unwrap();
-        assert_eq!(name(&new), "שיר.ogg");
-        assert_eq!(name(&old), suffixed_name("שיר.ogg", &old, false));
-        assert_eq!(std::fs::read(dir.join(name(&old))).unwrap(), b"a deleted song");
-        assert!(!dir.join("שיר.ogg").exists(), "the name is free for the new file");
+        assert_eq!(name(&old), "שיר.ogg", "a deleted recording's name is set in stone");
+        assert_eq!(std::fs::read(dir.join("שיר.ogg")).unwrap(), b"a deleted song", "and its file stays where it is");
+        assert_eq!(name(&new), suffixed_name("שיר.ogg", &new, false), "only the new file takes a suffix");
+
+        let first = import("בית.jpg").unwrap();
+        let second = import("בית.jpg").unwrap();
+        db.delete_audio_file(&first).unwrap();
+        db.delete_audio_file(&second).unwrap();
+        let later = import("בית.jpg").unwrap();
+        assert_eq!(name(&first), suffixed_name("בית.jpg", &first, false));
+        assert_eq!(name(&later), suffixed_name("בית.jpg", &later, false), "a name deleted recordings took in a collision never returns bare");
 
         std::fs::write(dir.join("stray.ogg"), b"no row names me").unwrap();
         let taker = import("stray.ogg").unwrap();
