@@ -3001,7 +3001,7 @@ mod tests {
             let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let source = d._dir.path().join("source.ogg");
             std::fs::write(&source, &content).unwrap();
-            let (_note_id, audio_id) = d.db.lock().unwrap().import_audio_file("source.ogg", None, None).unwrap();
+            let (_note_id, audio_id) = d.db.lock().unwrap().import_audio_file("source.ogg", None, None, None).unwrap();
             let path = path_of(d, &audio_id);
             std::fs::rename(&source, &path).unwrap();
             (audio_id, path)

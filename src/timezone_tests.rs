@@ -266,7 +266,7 @@ fn every_time_an_import_records_is_stamped() {
     set_local_timezone(INDIA, Some("Asia/Kolkata".to_string()));
     let db = Database::new_in_memory().unwrap();
     let (note, audio) = db
-        .import_audio_file("הקלטה 2026-09-08 14-53-14.ogg", Some(NOON), Some(42))
+        .import_audio_file("הקלטה 2026-09-08 14-53-14.ogg", Some(NOON), Some(42), None)
         .unwrap();
 
     assert_eq!(zone_of(&db, "notes", &note, "created_at").0, Some(INDIA as i64));
@@ -597,7 +597,7 @@ fn a_transcription_keeps_the_clock_of_the_device_that_made_it() {
     let _guard = lock();
     set_local_timezone(NEPAL, Some("Asia/Kathmandu".to_string()));
     let phone = Database::new_in_memory().unwrap();
-    let (_note, audio) = phone.import_audio_file("הקלטה.ogg", Some(NOON), Some(9)).unwrap();
+    let (_note, audio) = phone.import_audio_file("הקלטה.ogg", Some(NOON), Some(9), None).unwrap();
     let transcription = phone
         .create_transcription(&audio, "זהו תמלול", None, "local_whisper", None, None, None)
         .unwrap();

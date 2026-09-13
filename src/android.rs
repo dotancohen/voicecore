@@ -1914,6 +1914,9 @@ impl VoiceClient {
     /// * `file_created_at` - Unix timestamp of when the file was created (optional)
     /// * `duration_seconds` - Duration of the audio file in seconds (optional)
     ///
+    /// The file keeps its own name in the audio folder; a name already taken
+    /// there gets ` (2)` and so on (FILE-15).
+    ///
     /// # Returns
     /// ImportAudioResultData with note_id and audio_file_id
     pub fn import_audio_file(
@@ -1922,9 +1925,10 @@ impl VoiceClient {
         file_created_at: Option<i64>,
         duration_seconds: Option<i64>,
     ) -> Result<ImportAudioResultData, VoiceCoreError> {
+        let dir = self.get_audiofile_directory();
         let db = self.db.lock().unwrap();
         let (note_id, audio_file_id) = db
-            .import_audio_file(&filename, file_created_at, duration_seconds)
+            .import_audio_file(&filename, file_created_at, duration_seconds, dir.as_deref().map(std::path::Path::new))
             .map_err(|e| VoiceCoreError::Database {
                 msg: e.to_string(),
             })?;
@@ -2012,8 +2016,8 @@ impl VoiceClient {
     ///
     /// The phone records inside the note now, so the note is there before
     /// the recording is: pressing Save attaches the file to that note rather
-    /// than making a second one. Returns the new audio file id, which is
-    /// also the name the file is stored under.
+    /// than making a second one. Returns the new audio file id; the file's
+    /// name, its start and the tail of its id, is on the row (FILE-15).
     pub fn import_audio_file_into_note(
         &self,
         note_id: String,
@@ -2021,8 +2025,9 @@ impl VoiceClient {
         file_created_at: Option<i64>,
         duration_seconds: Option<i64>,
     ) -> Result<String, VoiceCoreError> {
+        let dir = self.get_audiofile_directory();
         let db = self.db.lock().unwrap();
-        db.import_audio_file_into_note(&note_id, &filename, file_created_at, duration_seconds)
+        db.import_audio_file_into_note(&note_id, &filename, file_created_at, duration_seconds, dir.as_deref().map(std::path::Path::new))
             .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
     }
 

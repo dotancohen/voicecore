@@ -1771,9 +1771,10 @@ impl Database {
         filename: &str,
         file_created_at: Option<i64>,
         duration_seconds: Option<i64>,
+        audio_dir: Option<&Path>,
     ) -> VoiceResult<(String, String)> {
-        // 1. Create audio file record
-        let audio_file_id = self.create_audio_file_with_duration(filename, file_created_at, duration_seconds)?;
+        // 1. Create audio file record; the file keeps its own name (FILE-15)
+        let audio_file_id = self.create_audio_file_with_duration(filename, file_created_at, duration_seconds, crate::models::FileOrigin::Imported, audio_dir)?;
 
         // 2. Create note with file's creation date (empty content)
         let note_id = self.create_note_with_timestamp("", file_created_at)?;
@@ -2272,12 +2273,14 @@ impl Database {
         filename: &str,
         file_created_at: Option<i64>,
         duration_seconds: Option<i64>,
+        audio_dir: Option<&Path>,
     ) -> VoiceResult<String> {
         // Resolve first: attaching a recording to a note that is not there
         // would leave the file with no way back to the user.
         let resolved_id = self.resolve_note_id(note_id)?;
+        // The recorder's file: named by its start and the tail of its id (FILE-15)
         let audio_file_id =
-            self.create_audio_file_with_duration(filename, file_created_at, duration_seconds)?;
+            self.create_audio_file_with_duration(filename, file_created_at, duration_seconds, crate::models::FileOrigin::Recorded, audio_dir)?;
         self.attach_to_note(&resolved_id, &audio_file_id, "audio_file")?;
         Ok(audio_file_id)
     }
@@ -5103,16 +5106,24 @@ impl Database {
         filename: &str,
         file_created_at: Option<i64>,
     ) -> VoiceResult<String> {
-        self.create_audio_file_with_duration(filename, file_created_at, None)
+        self.create_audio_file_with_duration(filename, file_created_at, None, crate::models::FileOrigin::Imported, None)
     }
 
-    /// Create a new audio file record with optional duration
+    /// Create a new audio file record with optional duration. The file's
+    /// name in the audio folder (FILE-15): a recording's start and the tail
+    /// of its id, or an imported file's own name; a name taken in the folder,
+    /// by a row or by a file in `audio_dir`, gets ` (2)` and so on.
     pub fn create_audio_file_with_duration(
         &self,
         filename: &str,
         file_created_at: Option<i64>,
         duration_seconds: Option<i64>,
+        origin: crate::models::FileOrigin,
+        audio_dir: Option<&Path>,
     ) -> VoiceResult<String> {
+        if origin == crate::models::FileOrigin::Imported && !crate::models::valid_file_name(filename) {
+            return Err(VoiceError::validation("filename", format!("{:?} is not a file name", filename)));
+        }
         let audio_file_id = Uuid::now_v7();
         let uuid_bytes = audio_file_id.as_bytes().to_vec();
         let device_id = get_local_device_id();
@@ -5139,9 +5150,23 @@ impl Database {
             // carries no zone of its own.
             let _ = self.stamp_local_zone("audio_files", &id_hex, "file_created_at");
         }
-        // The file's name on this device (Stage 13), at this device's offset
-        let moment = file_created_at.unwrap_or_else(|| Utc::now().timestamp());
-        let local_name = crate::models::recording_file_name(&id_hex, filename, moment, crate::timezone::stamp_offset());
+        // The file's name on this device (FILE-15)
+        let wanted = match origin {
+            crate::models::FileOrigin::Recorded => {
+                let moment = file_created_at.unwrap_or_else(|| Utc::now().timestamp());
+                crate::models::recording_file_name(&id_hex, filename, moment, crate::timezone::stamp_offset())
+            }
+            crate::models::FileOrigin::Imported => filename.to_string(),
+        };
+        let taken_by_rows: std::collections::HashSet<String> = {
+            let mut stmt = self.conn.prepare("SELECT local_name FROM audio_files WHERE local_name IS NOT NULL AND local_name != '' AND id != ?")?;
+            let rows = stmt.query_map([&uuid_bytes], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?.into_iter().map(|n| n.to_lowercase()).collect()
+        };
+        // Compared without regard to case: the phone's shared storage does not tell "A" from "a"
+        let local_name = crate::models::free_file_name(&wanted, |candidate| {
+            taken_by_rows.contains(&candidate.to_lowercase()) || audio_dir.is_some_and(|dir| dir.join(candidate).exists())
+        });
         self.conn.execute("UPDATE audio_files SET local_name = ? WHERE id = ?", params![local_name, uuid_bytes])?;
         Ok(id_hex)
     }
@@ -7092,6 +7117,63 @@ impl Database {
 mod tests {
     use super::*;
 
+    /// FILE-15: an imported file keeps its own name, any POSIX name; a name
+    /// taken by a row (without regard to case) or by a file in the folder
+    /// gets ` (2)`, ` (3)` before its extension; a recording is named by its
+    /// start and the tail of its id; a name that is no file name is refused
+    /// before any row is made.
+    #[test]
+    fn an_imported_file_keeps_its_name_and_a_taken_name_gets_a_numbered_suffix() {
+        use crate::models::FileOrigin;
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("audio");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("על הדיסק.ogg"), b"a file no row names").unwrap();
+        let db = Database::new(&temp.path().join("n.db")).unwrap();
+        let name = |id: &str| db.get_audio_file(id).unwrap().unwrap().local_name;
+        let import = |filename: &str| db.create_audio_file_with_duration(filename, None, None, FileOrigin::Imported, Some(&dir));
+
+        assert_eq!(name(&import("שיחה.m4a").unwrap()), "שיחה.m4a");
+        assert_eq!(name(&import("שיחה.m4a").unwrap()), "שיחה (2).m4a");
+        assert_eq!(name(&import("Memo.M4A").unwrap()), "Memo.M4A", "the name is kept as it is, case and all");
+        assert_eq!(name(&import("memo.m4a").unwrap()), "memo (2).m4a", "names differing only in case are one name on the phone's storage");
+        assert_eq!(name(&import("על הדיסק.ogg").unwrap()), "על הדיסק (2).ogg", "a file already in the folder takes its name too");
+        assert_eq!(name(&import(".hidden").unwrap()), ".hidden");
+        assert_eq!(name(&import("no extension").unwrap()), "no extension");
+        assert_eq!(name(&import("no extension").unwrap()), "no extension (2)");
+        assert_eq!(name(&import("a.tar.gz").unwrap()), "a.tar.gz");
+        assert_eq!(name(&import("a.tar.gz").unwrap()), "a.tar (2).gz");
+
+        let before = db.get_all_audio_files().unwrap().len();
+        for bad in ["", ".", "..", "a/b.ogg", "nul\0.ogg"] {
+            assert!(import(bad).is_err(), "{:?} is not a file name", bad);
+        }
+        assert_eq!(db.get_all_audio_files().unwrap().len(), before, "no row is made for a refused name");
+
+        let note = db.create_note("").unwrap();
+        let recorded = db.import_audio_file_into_note(&note, "Recording 2026-09-13 10-00-00.ogg", Some(1757746800), Some(3), Some(&dir)).unwrap();
+        let recorded_name = name(&recorded);
+        assert!(recorded_name.ends_with(&format!("-{}.ogg", &recorded[recorded.len() - 8..])), "{}", recorded_name);
+        assert_eq!(recorded_name.len(), "2026_09_13_10_00_00-".len() + 8 + ".ogg".len(), "{}", recorded_name);
+    }
+
+    /// FILE-15: a row from before the name column keeps the name its file
+    /// has, `<id>.<ext>`; the migration invents no other.
+    #[test]
+    fn a_row_from_before_the_name_column_keeps_the_name_its_file_has() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("old.db");
+        let id = {
+            let db = Database::new(&path).unwrap();
+            let id = db.create_audio_file("הקלטה ישנה.OGG", Some(1735689600)).unwrap();
+            // The state of a database written before the column existed
+            db.conn.execute("UPDATE audio_files SET local_name = NULL", []).unwrap();
+            id
+        };
+        let db = Database::new(&path).unwrap();
+        assert_eq!(db.get_audio_file(&id).unwrap().unwrap().local_name, format!("{}.ogg", id));
+    }
+
     /// FILE-18: the content hash is computed from the file the row names,
     /// travels in the feed, and a row without one never erases it.
     #[test]
@@ -7443,7 +7525,7 @@ mod tests {
         let file_created_at = Some(1700000000); // Nov 14, 2023
         let duration_seconds = Some(120); // 2 minutes
         let (note_id, audio_file_id) = db
-            .import_audio_file("recording.m4a", file_created_at, duration_seconds)
+            .import_audio_file("recording.m4a", file_created_at, duration_seconds, None)
             .unwrap();
 
         // Verify the note was created
@@ -7469,7 +7551,7 @@ mod tests {
 
         // Import without file creation date or duration
         let (note_id, audio_file_id) = db
-            .import_audio_file("voice_memo.mp3", None, None)
+            .import_audio_file("voice_memo.mp3", None, None, None)
             .unwrap();
 
         // Verify the note was created with current timestamp
@@ -7490,7 +7572,7 @@ mod tests {
         let db = Database::new_in_memory().unwrap();
         // The older note is the one with a recording on it
         let (older, audio) = db
-            .import_audio_file("הקלטה.ogg", Some(1_700_000_000), Some(5))
+            .import_audio_file("הקלטה.ogg", Some(1_700_000_000), Some(5), None)
             .unwrap();
         db.update_note(&older, "הפגישה הראשונה").unwrap();
         let newer = db.create_note("הערה שנייה").unwrap();
@@ -7514,7 +7596,7 @@ mod tests {
     fn merging_the_other_way_round_keeps_the_same_note() {
         let db = Database::new_in_memory().unwrap();
         let (older, _) = db
-            .import_audio_file("הקלטה.ogg", Some(1_700_000_000), Some(5))
+            .import_audio_file("הקלטה.ogg", Some(1_700_000_000), Some(5), None)
             .unwrap();
         let newer = db.create_note("הערה שנייה").unwrap();
 
@@ -7848,8 +7930,7 @@ impl Database {
             );
             "#,
         )?;
-        // The recording's file name a person can read (Stage 13): local, never
-        // synced, written once; rows from before are named the same way
+        // The recording's file name on disk (FILE-15): local, never synced
         if !self.column_exists("audio_files", "local_name")? {
             self.conn.execute("ALTER TABLE audio_files ADD COLUMN local_name TEXT", [])?;
         }
@@ -7862,14 +7943,18 @@ impl Database {
             self.conn.execute("ALTER TABLE audio_files ADD COLUMN storage_encrypted INTEGER NOT NULL DEFAULT 0", [])?;
         }
         {
-            let unnamed: Vec<(Vec<u8>, String, i64, Option<i64>, Option<i64>)> = {
-                let mut stmt = self.conn.prepare("SELECT id, filename, imported_at, file_created_at, file_created_at_offset FROM audio_files WHERE local_name IS NULL OR local_name = ''")?;
-                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+            // A row from before this column names no file, but its file is
+            // where the code of that time put it, `<id>.<ext>`. That name is
+            // written down as it is: a migration never changes a name that
+            // refers to a file outside the database (FILE-15).
+            let unnamed: Vec<(Vec<u8>, String)> = {
+                let mut stmt = self.conn.prepare("SELECT id, filename FROM audio_files WHERE local_name IS NULL OR local_name = ''")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
-            for (id, filename, imported_at, file_created_at, offset) in unnamed {
+            for (id, filename) in unnamed {
                 let id_hex = uuid_bytes_to_hex(&id).unwrap_or_default();
-                let name = crate::models::recording_file_name(&id_hex, &filename, file_created_at.unwrap_or(imported_at), offset.and_then(|o| i32::try_from(o).ok()));
+                let name = format!("{}.{}", id_hex, crate::models::audio_file_extension(&filename));
                 self.conn.execute("UPDATE audio_files SET local_name = ? WHERE id = ?", params![name, id])?;
             }
         }

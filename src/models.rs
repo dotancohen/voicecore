@@ -49,6 +49,40 @@ pub fn recording_file_name(audio_id: &str, filename: &str, moment: i64, offset_s
     format!("{}-{}.{}", when.format("%Y_%m_%d_%H_%M_%S"), &audio_id[tail_start..], audio_file_extension(filename))
 }
 
+/// Whether this application recorded a file or took it from elsewhere
+/// (FILE-15): a recording is named by its start and the tail of its id, an
+/// imported file keeps its own name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOrigin {
+    Recorded,
+    Imported,
+}
+
+/// Whether a name can be a file's name in the audio folder: any POSIX name,
+/// which is anything but empty, `.`, `..`, or a name holding `/` or NUL.
+pub fn valid_file_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
+/// The name itself when it is free; otherwise ` (2)`, ` (3)` and so on
+/// before its extension, the first that `taken` does not claim (FILE-15).
+pub fn free_file_name(wanted: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(wanted) {
+        return wanted.to_string();
+    }
+    let (stem, extension) = match wanted.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
+        _ => (wanted, None),
+    };
+    (2u64..)
+        .map(|n| match extension {
+            Some(extension) => format!("{} ({}).{}", stem, n, extension),
+            None => format!("{} ({})", stem, n),
+        })
+        .find(|candidate| !taken(candidate))
+        .expect("some number is free")
+}
+
 /// Full local path of a recording: the audio directory and the row's
 /// `local_name`.
 pub fn audio_local_path(audiofile_directory: &std::path::Path, local_name: &str) -> std::path::PathBuf {
@@ -630,6 +664,19 @@ mod tests {
         assert_eq!(audio_file_extension("trailingdot."), "bin");
         assert_eq!(audio_file_extension(".hidden"), "bin");
         assert_eq!(audio_file_extension(""), "bin");
+    }
+
+    /// FILE-15: a taken name gets a number before its extension; any POSIX name is a name.
+    #[test]
+    fn a_taken_name_gets_a_number_before_its_extension() {
+        let taken = ["x.ogg", "x (2).ogg"];
+        assert_eq!(free_file_name("x.ogg", |n| taken.contains(&n)), "x (3).ogg");
+        assert_eq!(free_file_name("y.ogg", |n| taken.contains(&n)), "y.ogg");
+        assert_eq!(free_file_name("בלי סיומת", |n| n == "בלי סיומת"), "בלי סיומת (2)");
+        assert_eq!(free_file_name(".hidden", |n| n == ".hidden"), ".hidden (2)");
+        assert_eq!(free_file_name("a.tar.gz", |n| n == "a.tar.gz"), "a.tar (2).gz");
+        assert!(valid_file_name("שם עם רווחים.ogg") && valid_file_name(".hidden") && valid_file_name("a\nb") && valid_file_name("no extension"));
+        assert!(!valid_file_name("") && !valid_file_name(".") && !valid_file_name("..") && !valid_file_name("a/b") && !valid_file_name("a\0b"));
     }
 
     #[test]

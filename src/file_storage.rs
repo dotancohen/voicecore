@@ -1249,7 +1249,7 @@ mod tests {
             assert_eq!(result.failed, 0);
             assert!(result.errors.is_empty());
             // Downloaded to the path the row names (Stage 13)
-            assert!(remote.local_name.ends_with(".wav") && remote.local_name.contains('-'), "{}", remote.local_name);
+            assert_eq!(remote.local_name, "בענן.WAV", "an imported file keeps its own name (FILE-15)");
             assert!(dir.join(&remote.local_name).is_file());
         }
 
