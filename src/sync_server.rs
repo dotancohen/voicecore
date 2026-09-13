@@ -282,6 +282,9 @@ struct AppState {
     accounts: Arc<dyn AccountSource>,
     device_id: String,
     device_name: String,
+    /// Whether only private addresses may call (LISTEN-3): true unless the
+    /// machine has a public URL configured
+    lan_only: bool,
     /// Refusals per source address, for the delay that slows a guesser
     /// (AUTH-5): count and the time of the last one.
     failures: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
@@ -370,6 +373,45 @@ async fn pair_grant(
         key_hash: own.key_hash,
     })
     .into_response()
+}
+
+/// Whether a caller at `ip` may be served (LISTEN-3): from a private
+/// network, link-local or this machine itself always; from anywhere else
+/// only when the machine has a public URL configured.
+pub fn source_allowed(ip: IpAddr, has_public_url: bool) -> bool {
+    if has_public_url {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.to_ipv4_mapped().map(|v4| v4.is_private() || v4.is_loopback() || v4.is_link_local()).unwrap_or(false)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// The gate of LISTEN-3, before any route.
+async fn lan_only_gate(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.lan_only && !source_allowed(addr.ip(), false) {
+        tracing::warn!("Refused {} from {}: not a private address and no public URL is configured", request.uri().path(), addr.ip());
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::with_code(
+                format!("This device serves its own network only; it has no public address ({})", codes::NOT_ON_LAN),
+                codes::NOT_ON_LAN,
+            )),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Count a refusal from an address and say how long to wait before
@@ -1334,10 +1376,12 @@ pub fn create_router_for(accounts: Arc<dyn AccountSource>, machine: Arc<Mutex<Co
         )
     };
 
+    let lan_only = machine.lock().unwrap().public_url().trim().is_empty();
     let state = AppState {
         accounts,
         device_id,
         device_name,
+        lan_only,
         failures: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -1362,6 +1406,9 @@ pub fn create_router_for(accounts: Arc<dyn AccountSource>, machine: Arc<Mutex<Co
         .route("/sync/status", get(status))
         .route("/pair/claim", post(pair_claim))
         .route("/pair/grant", post(pair_grant))
+        // Every route, the open ones too: a phone on hotel wifi is not a
+        // server for the hotel (LISTEN-3)
+        .route_layer(middleware::from_fn_with_state(state.clone(), lan_only_gate))
         .merge(authenticated)
         // The limit applies to the JSON routes; a recording streams past it
         // (FILE-12) because the file route reads its body as a stream
@@ -1566,6 +1613,7 @@ mod tests {
                 accounts: Arc::new(SingleAccount { account_id, handle: handle.clone() }),
                 device_id,
                 device_name: "Server".to_string(),
+                lan_only: true,
                 failures: Arc::new(Mutex::new(HashMap::new())),
             };
             (state, handle)
@@ -2185,6 +2233,21 @@ mod tests {
             let response = reqwest::Client::new().post(format!("{}/pair/grant", url)).json(&grant).send().await.unwrap();
             assert_eq!(response.status(), 403, "no token was ever offered");
             task.abort();
+        }
+    }
+
+    mod lan_only {
+        use super::*;
+
+        #[test]
+        fn private_link_local_and_loopback_callers_are_served_and_others_only_with_a_public_url() {
+            for ip in ["127.0.0.1", "10.0.0.5", "172.16.4.4", "192.168.1.7", "169.254.1.1", "::1", "fe80::1", "fd12::1", "::ffff:192.168.1.7"] {
+                assert!(source_allowed(ip.parse().unwrap(), false), "{}", ip);
+            }
+            for ip in ["8.8.8.8", "203.0.113.9", "2001:db8::1", "::ffff:8.8.8.8"] {
+                assert!(!source_allowed(ip.parse().unwrap(), false), "{}", ip);
+                assert!(source_allowed(ip.parse().unwrap(), true), "{} with a public URL", ip);
+            }
         }
     }
 

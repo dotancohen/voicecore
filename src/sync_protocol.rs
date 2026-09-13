@@ -43,6 +43,8 @@ pub mod codes {
     pub const SETUP_TEXT_INVALID: &str = "SETUP_TEXT_INVALID";
     /// This device holds notes of another account and will not be paired over them.
     pub const DEVICE_HOLDS_NOTES: &str = "DEVICE_HOLDS_NOTES";
+    /// The caller is not on a private network and this listener has no public address (LISTEN-3)
+    pub const NOT_ON_LAN: &str = "NOT_ON_LAN";
 }
 
 /// `POST /sync/handshake` request body.
