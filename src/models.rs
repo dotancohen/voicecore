@@ -9,7 +9,16 @@ use std::fmt;
 use uuid::Uuid;
 
 /// Supported audio file formats for import.
-pub const AUDIO_FILE_FORMATS: &[&str] = &["mp3", "wav", "flac", "ogg", "opus", "m4a"];
+/// Every common audio format a recording may be imported in, by extension
+/// (the owner's decision, 2026-09-13: support all common formats; a file whose
+/// format is not here is skipped). The one list: the desktop and the phone read
+/// it through their bindings. What each device can play is its player's
+/// business; which formats it cannot play is reported, not guessed here.
+pub const AUDIO_FILE_FORMATS: &[&str] = &[
+    "3g2", "3ga", "3gp", "aac", "ac3", "aif", "aifc", "aiff", "amr", "ape", "au", "awb", "caf", "flac", "gsm",
+    "m4a", "m4b", "mka", "mp2", "mp3", "mp4", "mpga", "oga", "ogg", "opus", "qcp", "snd", "spx", "wav", "wave",
+    "weba", "webm", "wma", "wv",
+];
 
 /// Extension used on disk and in cloud storage when a filename has no extension.
 pub const AUDIO_FILE_DEFAULT_EXTENSION: &str = "bin";
@@ -696,6 +705,9 @@ mod tests {
         assert!(AUDIO_FILE_FORMATS.contains(&"ogg"));
         assert!(AUDIO_FILE_FORMATS.contains(&"opus"));
         assert!(AUDIO_FILE_FORMATS.contains(&"m4a"));
+        for common in ["3gp", "amr", "aac", "wma", "aiff", "awb", "webm", "mp4"] {
+            assert!(AUDIO_FILE_FORMATS.contains(&common), "{}", common);
+        }
         assert!(!AUDIO_FILE_FORMATS.contains(&"txt"));
     }
 

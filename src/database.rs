@@ -3985,6 +3985,35 @@ impl Database {
         Ok(crate::models::audio_local_path(audio_dir, &row.disk_name))
     }
 
+    /// Keep the levels a recording's waveform is drawn from (FILE-20), as the
+    /// device that decoded it found them; they travel with the recording.
+    pub fn set_waveform_levels(&self, audio_id: &str, levels: &[u8]) -> VoiceResult<()> {
+        let text = crate::waveform::encode_levels(levels).ok_or_else(|| {
+            VoiceError::validation("levels", format!("a waveform keeps 1 to {} levels, not {}", crate::waveform::LEVELS_MAX, levels.len()))
+        })?;
+        self.conn.execute(
+            "UPDATE audio_files SET waveform_levels = ?, modified_at = COALESCE(modified_at, imported_at) WHERE id = ? AND (waveform_levels IS NULL OR waveform_levels != ?)",
+            params![text, audio_id_bytes(audio_id)?, text],
+        )?;
+        Ok(())
+    }
+
+    /// The levels a recording's waveform is drawn from, when a device kept them.
+    pub fn waveform_levels(&self, audio_id: &str) -> VoiceResult<Option<Vec<u8>>> {
+        let text: Option<String> = self
+            .conn
+            .query_row("SELECT waveform_levels FROM audio_files WHERE id = ?", [audio_id_bytes(audio_id)?], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(text.and_then(|t| crate::waveform::decode_levels(&t)))
+    }
+
+    /// The bars of a recording's waveform from its kept levels, without
+    /// reading the audio (FILE-20); None when no device kept levels yet.
+    pub fn waveform_bars(&self, audio_id: &str, bar_count: usize) -> VoiceResult<Option<Vec<f32>>> {
+        Ok(self.waveform_levels(audio_id)?.map(|levels| crate::waveform::bars_from_levels(&levels, bar_count)))
+    }
+
     /// Store a recording's content hash (Stage 13), computed from its file
     /// in the audio directory; the row is published again so it travels.
     /// Returns the hash.
@@ -4423,16 +4452,16 @@ impl Database {
 
         // Audio files
         {
-            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64, String);
+            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64, String, Option<String>);
             let rows: Vec<AudioRow> = self.feed_query(
-                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted, disk_name", "audio_files",
+                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted, disk_name, waveform_levels", "audio_files",
                 "sync_received_at >= ?1 OR modified_at >= ?1 OR imported_at >= ?1",
                 "COALESCE(sync_received_at, modified_at, imported_at)", "COALESCE(modified_at, imported_at)",
                 filter, limit,
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(22)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), row.get::<_, Option<String>>(21)?.unwrap_or_default())),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(23)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), row.get::<_, Option<String>>(21)?.unwrap_or_default(), row.get::<_, Option<String>>(22)?)),
             )?;
             saturated |= rows.len() as i64 >= limit;
-            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted, disk_name) in rows {
+            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted, disk_name, waveform_levels) in rows {
                 let timestamp = modified_at.unwrap_or(imported_at);
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
                 let mut data = serde_json::Map::new();
@@ -4449,6 +4478,7 @@ impl Database {
                 data.insert("content_sha256".to_string(), str_val(content_sha256));
                 data.insert("storage_encrypted".to_string(), serde_json::Value::Bool(storage_encrypted != 0));
                 data.insert("disk_name".to_string(), serde_json::Value::String(disk_name));
+                data.insert("waveform_levels".to_string(), str_val(waveform_levels));
                 data.insert(
                     "primary_transcription_id".to_string(),
                     str_val(primary_transcription.and_then(|b| uuid_bytes_to_hex(&b))),
@@ -4801,7 +4831,7 @@ impl Database {
         // Get all audio_files
         let mut stmt = self.conn.prepare(
             r#"SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
-                      storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name FROM audio_files"#
+                      storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name, waveform_levels FROM audio_files"#
         )?;
         let af_rows = stmt.query_map([], |row| {
             Ok((
@@ -4820,12 +4850,13 @@ impl Database {
                 row.get::<_, Option<String>>(12)?,
                 row.get::<_, Option<i64>>(13)?.unwrap_or(0),
                 row.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(15)?,
             ))
         })?;
 
         let mut audio_files = Vec::new();
         for row in af_rows {
-            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name) = row?;
+            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name, waveform_levels) = row?;
             let mut af = HashMap::new();
             af.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
             af.insert("imported_at".to_string(), serde_json::json!(imported_at));
@@ -4842,6 +4873,7 @@ impl Database {
             af.insert("content_sha256".to_string(), content_sha256.map_or(serde_json::Value::Null, serde_json::Value::String));
             af.insert("storage_encrypted".to_string(), serde_json::Value::Bool(storage_encrypted != 0));
             af.insert("disk_name".to_string(), serde_json::Value::String(disk_name));
+            af.insert("waveform_levels".to_string(), waveform_levels.map_or(serde_json::Value::Null, serde_json::Value::String));
             audio_files.push(af);
         }
         result.insert("audio_files".to_string(), audio_files);
@@ -6114,7 +6146,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at,
-                   storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name
+                   storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name, waveform_levels
             FROM audio_files
             WHERE id = ?
             "#,
@@ -6135,6 +6167,7 @@ impl Database {
             let content_sha256: Option<String> = row.get(11)?;
             let storage_encrypted: Option<i64> = row.get(12)?;
             let disk_name: Option<String> = row.get(13)?;
+            let waveform_levels: Option<String> = row.get(14)?;
 
             Ok(serde_json::json!({
                 "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -6151,6 +6184,7 @@ impl Database {
                 "content_sha256": content_sha256,
                 "storage_encrypted": storage_encrypted.unwrap_or(0) != 0,
                 "disk_name": disk_name,
+                "waveform_levels": waveform_levels,
             }))
         });
 
@@ -6185,6 +6219,8 @@ impl Database {
         storage_encrypted: Option<bool>,
         // The file's name on disk, the same on every device (FILE-15)
         disk_name: Option<&str>,
+        // The levels a waveform is drawn from (FILE-20); never erased by a row without them
+        waveform_levels: Option<&str>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
@@ -6210,13 +6246,16 @@ impl Database {
 
         self.conn.execute(
             r#"
-            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at, disk_name, content_sha256, storage_encrypted)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at, disk_name, content_sha256, storage_encrypted, waveform_levels)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 storage_encrypted = CASE WHEN excluded.storage_key IS NOT NULL
                                            AND (audio_files.storage_key IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
                                          THEN excluded.storage_encrypted ELSE audio_files.storage_encrypted END,
                 disk_name = excluded.disk_name,
+                waveform_levels = CASE WHEN excluded.waveform_levels IS NOT NULL
+                                         AND (audio_files.waveform_levels IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
+                                       THEN excluded.waveform_levels ELSE audio_files.waveform_levels END,
                 content_sha256 = CASE WHEN excluded.content_sha256 IS NOT NULL
                                         AND (audio_files.content_sha256 IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
                                       THEN excluded.content_sha256 ELSE audio_files.content_sha256 END,
@@ -6267,6 +6306,7 @@ impl Database {
                 disk_name,
                 content_sha256,
                 storage_encrypted.unwrap_or(false) as i64,
+                waveform_levels.filter(|l| crate::waveform::decode_levels(l).is_some()),
             ],
         )?;
 
@@ -7403,6 +7443,41 @@ impl Database {
 mod tests {
     use super::*;
 
+    /// FILE-20: the levels a waveform is drawn from are kept with the
+    /// recording, travel in the feed, give bars without the audio, are never
+    /// erased by a row without them, and a newer row's replace an older's.
+    #[test]
+    fn waveform_levels_are_kept_synced_and_drawn_without_the_audio() {
+        use crate::models::FileOrigin;
+        let temp = tempfile::TempDir::new().unwrap();
+        let a = Database::new(&temp.path().join("a.db")).unwrap();
+        let id = a.create_audio_file("הרצאה.amr", None, None, FileOrigin::Imported, None).unwrap();
+        assert!(a.waveform_bars(&id, 150).unwrap().is_none(), "no levels before a device decodes it");
+        let levels: Vec<u8> = (0..1200).map(|i| (i % 200) as u8 + if i == 30 { 55 } else { 0 }).collect();
+        a.set_waveform_levels(&id, &levels).unwrap();
+        assert_eq!(a.waveform_levels(&id).unwrap().unwrap(), levels);
+        let bars = a.waveform_bars(&id, 150).unwrap().unwrap();
+        assert_eq!(bars, crate::waveform::bars_from_levels(&levels, 150));
+        assert!(a.set_waveform_levels(&id, &[]).is_err());
+        assert!(a.set_waveform_levels(&id, &vec![9u8; crate::waveform::LEVELS_MAX + 1]).is_err());
+
+        let (changes, _, _) = a.get_changes_after_seq_as_sync_changes(0, None, 100).unwrap();
+        let row = changes.iter().find(|c| c.entity_type == "audio_file" && c.entity_id == id).unwrap();
+        let text = row.data["waveform_levels"].as_str().unwrap().to_string();
+        assert_eq!(crate::waveform::decode_levels(&text).unwrap(), levels, "the levels travel with the recording");
+
+        let b = Database::new(&temp.path().join("b.db")).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "הרצאה.amr", None, None, None, Some(1735689601), None, Some(1735689602), None, None, None, None, None, None, Some("הרצאה.amr"), Some(&text)).unwrap();
+        assert_eq!(b.waveform_bars(&id, 150).unwrap().unwrap(), bars, "the phone draws the desktop's waveform without decoding");
+        b.apply_sync_audio_file(&id, 1735689600, "הרצאה.amr", None, None, None, Some(1735689700), None, Some(1735689701), None, None, None, None, None, None, Some("הרצאה.amr"), None).unwrap();
+        assert_eq!(b.waveform_levels(&id).unwrap().unwrap(), levels, "never erased by a row without levels");
+        let newer = crate::waveform::encode_levels(&[1, 2, 3]).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "הרצאה.amr", None, None, None, Some(1735689800), None, Some(1735689801), None, None, None, None, None, None, Some("הרצאה.amr"), Some(&newer)).unwrap();
+        assert_eq!(b.waveform_levels(&id).unwrap().unwrap(), vec![1, 2, 3], "a newer row's levels replace an older's");
+        b.apply_sync_audio_file(&id, 1735689600, "הרצאה.amr", None, None, None, Some(1735689900), None, Some(1735689901), None, None, None, None, None, None, Some("הרצאה.amr"), Some("not levels!")).unwrap();
+        assert_eq!(b.waveform_levels(&id).unwrap().unwrap(), vec![1, 2, 3], "text that is not levels is ignored");
+    }
+
     /// Several processes open one database at once (a command-line run
     /// beside the window and its listener): every open succeeds, and an
     /// up-to-date database is not rebuilt by any of them.
@@ -7573,16 +7648,16 @@ mod tests {
         assert_eq!(a.get_audio_file_raw(&id).unwrap().unwrap()["content_sha256"].as_str(), Some(hash.as_str()));
 
         let b = Database::new(&temp.path().join("b.db")).unwrap();
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689601), None, Some(1735689602), None, None, None, None, Some(&hash), None, None).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689601), None, Some(1735689602), None, None, None, None, Some(&hash), None, None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()));
         // A newer row without a hash: the hash stays
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689700), None, Some(1735689701), None, None, None, None, None, None, None).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689700), None, Some(1735689701), None, None, None, None, None, None, None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()), "never erased");
         // An older row with another hash: ignored; a newer one: taken
         let other = "b".repeat(64);
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689650), None, Some(1735689702), None, None, None, None, Some(&other), None, None).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689650), None, Some(1735689702), None, None, None, None, Some(&other), None, None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()), "an older row does not replace it");
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689800), None, Some(1735689703), None, None, None, None, Some(&other), None, None).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689800), None, Some(1735689703), None, None, None, None, Some(&other), None, None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(other.as_str()), "a newer row does");
         assert!(b.get_full_dataset().unwrap()["audio_files"][0]["content_sha256"].is_string());
     }
@@ -8100,6 +8175,7 @@ mod tests {
             None,
             None,
             None,
+            None,        // waveform_levels
         ).unwrap();
 
         // Verify storage info was applied
@@ -8324,6 +8400,10 @@ impl Database {
         if !self.column_exists("audio_files", "storage_encrypted")? {
             self.conn.execute("ALTER TABLE audio_files ADD COLUMN storage_encrypted INTEGER NOT NULL DEFAULT 0", [])?;
         }
+        // The levels a waveform is drawn from (FILE-20): synced, kept by the first device that decodes
+        if !self.column_exists("audio_files", "waveform_levels")? {
+            self.conn.execute("ALTER TABLE audio_files ADD COLUMN waveform_levels TEXT", [])?;
+        }
         {
             // A row from before this column names no file, but its file is
             // where the code of that time put it, `<id>.<ext>`. That name is
@@ -8418,7 +8498,7 @@ impl Database {
             ("tags", &["name", "parent_id", "modified_at", "deleted_at"]),
             ("note_tags", &["modified_at", "deleted_at"]),
             ("note_attachments", &["modified_at", "deleted_at"]),
-            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256", "storage_encrypted", "disk_name"]),
+            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256", "storage_encrypted", "disk_name", "waveform_levels"]),
             ("transcriptions", &["content", "content_segments", "service_response", "state", "modified_at", "deleted_at"]),
             ("file_storage_config", &["provider", "config", "modified_at"]),
             // A purge is written once and never changed, so it only needs

@@ -795,7 +795,7 @@ mod tests {
     fn test_validate_audio_extension_invalid() {
         assert!(validate_audio_extension("document.pdf").is_err());
         assert!(validate_audio_extension("image.png").is_err());
-        assert!(validate_audio_extension("video.mp4").is_err());
+        assert!(validate_audio_extension("archive.zip").is_err());
         assert!(validate_audio_extension("text.txt").is_err());
     }
 

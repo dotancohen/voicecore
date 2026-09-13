@@ -3883,7 +3883,7 @@ mod tests {
 
         // Apply audio file to Instance B
         let audio_data = audio_change.unwrap().get("data").unwrap();
-        instance_b.apply_sync_audio_file(&audio_id, audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0), audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""), audio_data.get("file_created_at").and_then(|v| v.as_i64()), audio_data.get("duration_seconds").and_then(|v| v.as_i64()), audio_data.get("summary").and_then(|v| v.as_str()), audio_data.get("modified_at").and_then(|v| v.as_i64()), audio_data.get("deleted_at").and_then(|v| v.as_i64()), None, audio_data.get("storage_provider").and_then(|v| v.as_str()), audio_data.get("storage_key").and_then(|v| v.as_str()), audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()), None, None, None, None).unwrap();
+        instance_b.apply_sync_audio_file(&audio_id, audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0), audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""), audio_data.get("file_created_at").and_then(|v| v.as_i64()), audio_data.get("duration_seconds").and_then(|v| v.as_i64()), audio_data.get("summary").and_then(|v| v.as_str()), audio_data.get("modified_at").and_then(|v| v.as_i64()), audio_data.get("deleted_at").and_then(|v| v.as_i64()), None, audio_data.get("storage_provider").and_then(|v| v.as_str()), audio_data.get("storage_key").and_then(|v| v.as_str()), audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()), None, None, None, None, None).unwrap();
 
         // Apply attachment to Instance B
         let att_data = attachment_change.unwrap().get("data").unwrap();
@@ -3984,7 +3984,7 @@ mod tests {
             c.get("entity_type").and_then(|v| v.as_str()) == Some("audio_file")
         }).unwrap();
         let audio_data = audio_change.get("data").unwrap();
-        instance_b.apply_sync_audio_file(&audio_id, audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0), audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""), audio_data.get("file_created_at").and_then(|v| v.as_i64()), audio_data.get("duration_seconds").and_then(|v| v.as_i64()), audio_data.get("summary").and_then(|v| v.as_str()), audio_data.get("modified_at").and_then(|v| v.as_i64()), audio_data.get("deleted_at").and_then(|v| v.as_i64()), None, audio_data.get("storage_provider").and_then(|v| v.as_str()), audio_data.get("storage_key").and_then(|v| v.as_str()), audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()), None, None, None, None).unwrap();
+        instance_b.apply_sync_audio_file(&audio_id, audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0), audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""), audio_data.get("file_created_at").and_then(|v| v.as_i64()), audio_data.get("duration_seconds").and_then(|v| v.as_i64()), audio_data.get("summary").and_then(|v| v.as_str()), audio_data.get("modified_at").and_then(|v| v.as_i64()), audio_data.get("deleted_at").and_then(|v| v.as_i64()), None, audio_data.get("storage_provider").and_then(|v| v.as_str()), audio_data.get("storage_key").and_then(|v| v.as_str()), audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()), None, None, None, None, None).unwrap();
 
         // Find and apply transcription
         let trans_change = changes.iter().find(|c| {
@@ -4722,7 +4722,7 @@ mod tests {
         let audio = a.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         a.update_audio_file_storage(&audio, "s3", &format!("audio/{}.mp3", audio), false).unwrap();
         // An older copy of the row (from a peer that never saw the upload)
-        a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None, None, None, None).unwrap();
+        a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None, None, None, None, None).unwrap();
         let row = a.get_audio_file_raw(&audio).unwrap().unwrap();
         assert_eq!(row["storage_key"].as_str().unwrap(), format!("audio/{}.mp3", audio));
         assert_eq!(row["storage_provider"].as_str().unwrap(), "s3");

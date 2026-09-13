@@ -356,6 +356,7 @@ pub fn apply_one(
                 data["content_sha256"].as_str(),
                 data["storage_encrypted"].as_bool(),
                 data["disk_name"].as_str(),
+                data["waveform_levels"].as_str(),
             )?;
             db.apply_zones_by_id(
                 "audio_files",

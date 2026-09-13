@@ -939,6 +939,20 @@ impl VoiceClient {
         }))
     }
 
+    /// Keep the levels a recording's waveform is drawn from (FILE-20), after
+    /// this phone decoded it; they reach every device with the recording.
+    pub fn set_waveform_levels(&self, audio_file_id: String, levels: Vec<u8>) -> Result<(), VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db.set_waveform_levels(&audio_file_id, &levels)?)
+    }
+
+    /// The bars of a recording's waveform from the levels a device kept, so
+    /// the phone draws it without decoding (FILE-20); None when none did yet.
+    pub fn waveform_bars(&self, audio_file_id: String, bar_count: u32) -> Result<Option<Vec<f32>>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db.waveform_bars(&audio_file_id, bar_count as usize)?)
+    }
+
     /// Compute and store a recording's content hash (Stage 13) from its file
     /// in the audio directory, after the file is copied there. Returns the hash.
     pub fn store_content_hash(&self, audio_file_id: String) -> Result<String, VoiceCoreError> {
@@ -2461,6 +2475,13 @@ pub struct SnapshotData {
     pub size_bytes: u64,
     /// Notes in the snapshot that are not in the trash
     pub note_count: i64,
+}
+
+/// Every audio format a recording may be imported in, by extension: the one
+/// list, kept in the core.
+#[uniffi::export]
+pub fn audio_file_formats() -> Vec<String> {
+    crate::models::AUDIO_FILE_FORMATS.iter().map(|f| f.to_string()).collect()
 }
 
 /// Where encryption of recordings stands on this device (Stage 15)

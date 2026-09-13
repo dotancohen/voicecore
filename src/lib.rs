@@ -43,6 +43,7 @@ pub mod sync_server;
 pub mod tls;
 pub mod transfer;
 pub mod validation;
+pub mod waveform;
 pub mod versions;
 
 #[cfg(test)]
