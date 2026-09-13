@@ -224,6 +224,70 @@ pub struct CopyData {
     pub at: i64,
 }
 
+/// One statement about where a recording's copy is (FILE-22)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FileLocationData {
+    /// "cloud", or a device id
+    pub place: String,
+    pub present: bool,
+    /// Milliseconds
+    pub changed_at: i64,
+    pub changed_by: String,
+}
+
+/// A recording that is not in the bucket, and why (ISSUE-1)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RecordingNotInCloudData {
+    pub audio_id: String,
+    pub filename: String,
+    pub size_bytes: Option<i64>,
+    /// no_bucket, too_large, waiting_for_upload or no_copy_known
+    pub reason: String,
+    pub held_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OrphanedTranscriptionData {
+    pub transcription_id: String,
+    pub audio_file_id: String,
+    pub content_start: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OrphanedAttachmentData {
+    pub attachment_id: String,
+    pub note_id: String,
+    pub target_id: String,
+    pub attachment_type: String,
+    pub note_missing: bool,
+    pub target_missing: bool,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OrphanedRecordingData {
+    pub audio_id: String,
+    pub filename: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TagWithWhitespaceData {
+    pub tag_id: String,
+    pub name: String,
+    pub path: String,
+}
+
+/// What the user should know about (ISSUE-1)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IssuesData {
+    pub recordings_not_in_cloud: Vec<RecordingNotInCloudData>,
+    pub max_upload_bytes: u64,
+    pub orphaned_transcriptions: Vec<OrphanedTranscriptionData>,
+    pub orphaned_attachments: Vec<OrphanedAttachmentData>,
+    pub orphaned_recordings: Vec<OrphanedRecordingData>,
+    pub tags_with_whitespace: Vec<TagWithWhitespaceData>,
+    pub count: u32,
+}
+
 /// A peer as remembered: when it was last reached and by which operation
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PeerSummaryData {
@@ -1289,6 +1353,84 @@ impl VoiceClient {
         Ok(db.copies_of(&audio_id, &here)?.into_iter().map(|c| CopyData { peer_id: c.peer_id, at: c.at }).collect())
     }
 
+    /// Every statement about where a recording's copies are (FILE-22), the
+    /// bucket first.
+    pub fn file_locations(&self, audio_id: String) -> Result<Vec<FileLocationData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .file_locations(&audio_id)?
+            .into_iter()
+            .map(|l| FileLocationData { place: l.place, present: l.present, changed_at: l.changed_at, changed_by: l.changed_by })
+            .collect())
+    }
+
+    /// Compare this phone's audio folder with what it has stated about its
+    /// copies (FILE-22). Returns how many files are here now and how many
+    /// are gone, in that order.
+    pub fn check_files_here(&self) -> Result<Vec<u32>, VoiceCoreError> {
+        let (dir, here) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
+        };
+        let Some(dir) = dir else { return Ok(vec![0, 0]) };
+        let (arrived, gone) = self.db.lock().unwrap().check_files_here(&dir, &here)?;
+        Ok(vec![arrived as u32, gone as u32])
+    }
+
+    /// Remove this phone's copy of a recording to save space; the recording
+    /// stays. Refused when no other place holds the file (FILE-22).
+    pub fn remove_local_copy(&self, audio_id: String) -> Result<(), VoiceCoreError> {
+        let (dir, here) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
+        };
+        let dir = dir.ok_or_else(|| VoiceCoreError::Config { msg: "The audio folder is not set".to_string() })?;
+        Ok(self.db.lock().unwrap().remove_local_copy(&audio_id, &dir, &here)?)
+    }
+
+    /// The account's upload limit in megabytes (FILE-23), the same on every device.
+    pub fn get_max_upload_mb(&self) -> Result<u64, VoiceCoreError> {
+        Ok(self.db.lock().unwrap().max_upload_bytes()? / (1024 * 1024))
+    }
+
+    /// Set the account's upload limit in megabytes (FILE-23).
+    pub fn set_max_upload_mb(&self, megabytes: u64) -> Result<(), VoiceCoreError> {
+        Ok(self.db.lock().unwrap().set_max_upload_mb(megabytes)?)
+    }
+
+    /// What the user should know about (ISSUE-1); this phone's folder is
+    /// compared first.
+    pub fn issues(&self) -> Result<IssuesData, VoiceCoreError> {
+        let (dir, here) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
+        };
+        let db = self.db.lock().unwrap();
+        let found = crate::issues::issues(&db, dir.as_deref(), &here)?;
+        let count = found.count() as u32;
+        Ok(IssuesData {
+            recordings_not_in_cloud: found
+                .recordings_not_in_cloud
+                .into_iter()
+                .map(|r| RecordingNotInCloudData { audio_id: r.audio_id, filename: r.filename, size_bytes: r.size_bytes, reason: r.reason.as_str().to_string(), held_by: r.held_by })
+                .collect(),
+            max_upload_bytes: found.max_upload_bytes,
+            orphaned_transcriptions: found
+                .orphaned_transcriptions
+                .into_iter()
+                .map(|o| OrphanedTranscriptionData { transcription_id: o.transcription_id, audio_file_id: o.audio_file_id, content_start: o.content_start })
+                .collect(),
+            orphaned_attachments: found
+                .orphaned_attachments
+                .into_iter()
+                .map(|o| OrphanedAttachmentData { attachment_id: o.attachment_id, note_id: o.note_id, target_id: o.target_id, attachment_type: o.attachment_type, note_missing: o.note_missing, target_missing: o.target_missing })
+                .collect(),
+            orphaned_recordings: found.orphaned_recordings.into_iter().map(|o| OrphanedRecordingData { audio_id: o.audio_id, filename: o.filename }).collect(),
+            tags_with_whitespace: found.tags_with_whitespace.into_iter().map(|t| TagWithWhitespaceData { tag_id: t.tag_id, name: t.name, path: t.path }).collect(),
+            count,
+        })
+    }
+
     /// Every peer dealt with: when it was last reached and by what.
     pub fn peer_summaries(&self) -> Result<Vec<PeerSummaryData>, VoiceCoreError> {
         let db = self.db.lock().unwrap();
@@ -1696,20 +1838,6 @@ impl VoiceClient {
     // Sync configuration methods
     // =========================================================================
 
-    /// Get the maximum sync file size in MB
-    pub fn get_max_sync_file_size_mb(&self) -> Result<u32, VoiceCoreError> {
-        let cfg = self.config.lock().unwrap();
-        Ok(cfg.max_sync_file_size_mb())
-    }
-
-    /// Set the maximum sync file size in MB
-    pub fn set_max_sync_file_size_mb(&self, size_mb: u32) -> Result<(), VoiceCoreError> {
-        let mut cfg = self.config.lock().unwrap();
-        cfg.set_max_sync_file_size_mb(size_mb)
-            .map_err(|e| VoiceCoreError::Config {
-                msg: e.to_string(),
-            })
-    }
 
     /// Rebuild the list pane display cache for a single note
     ///
@@ -2164,7 +2292,7 @@ impl VoiceClient {
             let db = self.db.lock().unwrap();
             let result = rt.block_on(crate::file_storage::reupload_encrypted(&db, &dir, Some(self.cancel.clone()), sink, key.as_ref()));
             match result {
-                Ok(r) => Ok(UploadResultData { uploaded: r.uploaded as i32, skipped: r.skipped as i32, failed: r.failed as i32, deferred: r.deferred as i32, errors: r.errors }),
+                Ok(r) => Ok(UploadResultData { uploaded: r.uploaded as i32, skipped: r.skipped as i32, failed: r.failed as i32, deferred: r.deferred as i32, too_large: r.too_large as i32, errors: r.errors }),
                 Err(e) => Err(VoiceCoreError::Sync { msg: e.to_string() }),
             }
         }
@@ -2200,6 +2328,7 @@ impl VoiceClient {
                     skipped: r.skipped as i32,
                     failed: r.failed as i32,
                     deferred: r.deferred as i32,
+                    too_large: r.too_large as i32,
                     errors: r.errors,
                 }),
                 Err(e) => Err(VoiceCoreError::Sync { msg: e.to_string() }),
@@ -2504,6 +2633,8 @@ pub struct UploadResultData {
     pub failed: i32,
     /// Files not attempted because an earlier failure stopped the batch
     pub deferred: i32,
+    /// Files larger than the account's upload limit, left where they are (FILE-23)
+    pub too_large: i32,
     /// One message per failure
     pub errors: Vec<String>,
 }
