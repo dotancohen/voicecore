@@ -43,6 +43,11 @@ use crate::UUID_SHORT_LEN;
 /// by a stop, so a listener can be started again after it stopped.
 static SHUTDOWN_TX: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
 
+/// The verified device behind a request, for the handlers that record
+/// what it holds (Stage 10).
+#[derive(Clone, Debug)]
+pub struct CallerDevice(pub String);
+
 /// One account as the server holds it open: its database and its config.
 #[derive(Clone)]
 pub struct AccountHandle {
@@ -497,6 +502,7 @@ async fn require_device(
             let mut request = request;
             let handle = handle.expect("verified requests have an account");
             request.extensions_mut().insert(handle.clone());
+            request.extensions_mut().insert(CallerDevice(device.clone().unwrap_or_default()));
             let response = next.run(request).instrument(span).await;
             audit_request(&state, Some(&handle), &request_id, device.as_deref(), &method, &path, bytes_in, &response, "");
             response
@@ -910,6 +916,7 @@ async fn serve_audio_file(
 /// `X-File-SHA256` header before the rename (FILE-13).
 async fn receive_audio_file(
     Extension(account): Extension<AccountHandle>,
+    Extension(caller): Extension<CallerDevice>,
     Path(audio_id): Path<String>,
     headers: HeaderMap,
     request: Request,
@@ -957,6 +964,7 @@ async fn receive_audio_file(
         if total == 0 {
             crate::transfer::complete(&file_path, now_have, expected_hash.as_deref())
                 .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            note_copy(&account, &audio_id, &caller.0);
             return Ok((StatusCode::OK, "OK"));
         }
         return Ok((StatusCode::ACCEPTED, "PART"));
@@ -964,13 +972,25 @@ async fn receive_audio_file(
     crate::transfer::complete(&file_path, total, expected_hash.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tracing::info!("Received audio file {} ({} bytes)", short(&audio_id), total);
+    note_copy(&account, &audio_id, &caller.0);
     Ok((StatusCode::OK, "OK"))
+}
+
+/// The sender of a whole file holds it (Stage 10).
+fn note_copy(account: &AccountHandle, audio_id: &str, device_id: &str) {
+    if device_id.is_empty() {
+        return;
+    }
+    if let Err(e) = account.db.lock().unwrap().record_copy(audio_id, device_id) {
+        tracing::warn!("Could not record that {} holds {}: {}", short(device_id), short(audio_id), e);
+    }
 }
 
 /// `POST /sync/audio/missing` (FILE-12): of the ids a sender holds, which
 /// this device lacks, and how many bytes of each it already has in a part.
 async fn missing_audio_files(
     Extension(account): Extension<AccountHandle>,
+    Extension(caller): Extension<CallerDevice>,
     Json(request): Json<MissingFilesRequest>,
 ) -> Result<Json<MissingFilesResponse>, (StatusCode, String)> {
     let mut missing = Vec::new();
@@ -984,6 +1004,8 @@ async fn missing_audio_files(
             }
             Err(e) => return Err(e),
         };
+        // The sender said it holds this one (Stage 10)
+        note_copy(&account, &audio_id, &caller.0);
         if path.is_file() {
             continue;
         }
@@ -2428,9 +2450,51 @@ mod tests {
             assert_eq!(std::fs::read(&on_a).unwrap(), std::fs::read(&path_b).unwrap(), "B's recording arrived on A whole");
             assert!(!crate::transfer::part_path(&on_a).exists());
 
+            // Both sides now know where the copies are (Stage 10)
+            let a_knows = |id: &str| a.db.lock().unwrap().copies_of(id).unwrap().iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>();
+            let b_knows = |id: &str| b.db.lock().unwrap().copies_of(id).unwrap().iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>();
+            assert_eq!(a_knows(&id_a), vec![b.id.clone()], "A sent its recording to B");
+            assert_eq!(a_knows(&id_b), vec![b.id.clone()], "A fetched B's, so B holds it");
+            assert_eq!(b_knows(&id_a), vec![a.id.clone()], "B received A's, so A holds it");
+            assert_eq!(b_knows(&id_b), vec![a.id.clone()], "B served its own to A");
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 }, "everything of A's is somewhere else too");
+            let peers = a.db.lock().unwrap().peer_summaries().unwrap();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].last_operation.as_deref(), Some("exchange"));
+            assert!(peers[0].last_reached_at.is_some());
+
             let again = client.exchange(&b.id).await;
             assert!(again.success);
             assert_eq!((again.sent, again.fetched, again.bytes_moved), (0, 0, 0), "nothing left to move");
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn what_is_on_this_device_only_is_counted_until_it_is_elsewhere() {
+            let (a, b, _url, task) = pair();
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 });
+            a.db.lock().unwrap().create_note("רק כאן").unwrap();
+            let (_id, _path) = recording(&a, 1000);
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 1, recordings: 1 }, "a note and a recording, on this device only");
+            assert_eq!(a.db.lock().unwrap().not_duplicated(None).unwrap(), crate::database::NotDuplicated { notes: 1, recordings: 0 }, "without an audio directory no recording is counted");
+
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let synced = client.sync_with_peer(&b.id).await;
+            assert!(synced.success, "{:?}", synced.errors);
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 1 }, "the note was sent; the file was not");
+
+            let delivered = client.deliver(&b.id).await;
+            assert!(delivered.success, "{:?}", delivered.errors);
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 });
+
+            // A note that came from B is not "on this device only"; an edit of it here is, until sent
+            b.db.lock().unwrap().create_note("מ-B").unwrap();
+            let synced = client.sync_with_peer(&b.id).await;
+            assert!(synced.success);
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap().notes, 0);
+            let from_b = a.db.lock().unwrap().get_all_notes().unwrap().into_iter().find(|n| n.content == "מ-B").unwrap();
+            a.db.lock().unwrap().update_note(&from_b.id, "מ-B, ערוך כאן").unwrap();
+            assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio)).unwrap().notes, 1);
             task.abort();
         }
 

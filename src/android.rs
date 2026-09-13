@@ -205,6 +205,29 @@ pub struct SyncResultData {
     pub clock_skew_seconds: i64,
 }
 
+/// What is on this phone only (Stage 10)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NotDuplicatedData {
+    pub notes: i64,
+    pub recordings: i64,
+}
+
+/// A peer known to hold a copy of a recording (Stage 10)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CopyData {
+    pub peer_id: String,
+    pub at: i64,
+}
+
+/// A peer as remembered: when it was last reached and by which operation
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PeerSummaryData {
+    pub peer_id: String,
+    pub peer_name: String,
+    pub last_reached_at: Option<i64>,
+    pub last_operation: String,
+}
+
 /// One row of a connection check (Stage 12)
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct CheckRowData {
@@ -1137,34 +1160,31 @@ impl VoiceClient {
             })
     }
 
-    /// Check if there are local changes that haven't been synced
-    pub fn has_unsynced_changes(&self) -> Result<bool, VoiceCoreError> {
+    /// What is on this phone only (Stage 10): the line at the top of the
+    /// sync screen. Nowhere else.
+    pub fn not_duplicated(&self) -> Result<NotDuplicatedData, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         let cfg = self.config.lock().unwrap();
+        let dir = cfg.audiofile_directory().map(std::path::PathBuf::from);
+        let counts = db.not_duplicated(dir.as_deref())?;
+        Ok(NotDuplicatedData { notes: counts.notes, recordings: counts.recordings })
+    }
 
-        // If sync is not enabled or no peers configured, no unsynced changes to report
-        if !cfg.is_sync_enabled() || cfg.peers().is_empty() {
-            return Ok(false);
-        }
+    /// Where the copies of a recording are (Stage 10): the peers known to
+    /// hold it; the bucket is `storage_key` on the row, this phone the file.
+    pub fn copies_of(&self, audio_id: String) -> Result<Vec<CopyData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db.copies_of(&audio_id)?.into_iter().map(|c| CopyData { peer_id: c.peer_id, at: c.at }).collect())
+    }
 
-        // Get peer's last sync time
-        let peer_id = cfg.peers().first().map(|p| p.peer_id.as_str());
-        let last_sync: Option<i64> = match peer_id {
-            Some(id) => db.get_peer_last_sync(id).ok().flatten(),
-            None => return Ok(false),
-        };
-
-        // If we've never synced with this peer, no baseline to compare against
-        let last_sync = match last_sync {
-            Some(ts) => ts,
-            None => return Ok(false),
-        };
-
-        // Check if there are changes since last sync
-        let (changes, _) = db.get_changes_since(Some(last_sync), 1)
-            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })?;
-
-        Ok(!changes.is_empty())
+    /// Every peer dealt with: when it was last reached and by what.
+    pub fn peer_summaries(&self) -> Result<Vec<PeerSummaryData>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .peer_summaries()?
+            .into_iter()
+            .map(|p| PeerSummaryData { peer_id: p.peer_id, peer_name: p.peer_name.unwrap_or_default(), last_reached_at: p.last_reached_at, last_operation: p.last_operation.unwrap_or_default() })
+            .collect())
     }
 
     /// Debug method to see sync state details

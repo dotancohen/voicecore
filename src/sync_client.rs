@@ -448,7 +448,7 @@ impl SyncClient {
     }
 
     /// Sync with a peer: exchange database changes both ways. Files never
-    /// move here; see `fetch_audio_files_after_sync` and `send_audio_files_after_sync`.
+    /// move here; see `deliver` and `exchange`.
     /// One operation, one request id.
     pub async fn sync_with_peer(&self, peer_id: &str) -> SyncResult {
         self.begin_operation();
@@ -1210,30 +1210,11 @@ impl SyncClient {
     }
 
     fn update_peer_sync_time(&self, peer_id: &str) -> VoiceResult<()> {
-        let peer_uuid = Uuid::parse_str(peer_id)?;
-        let peer_bytes = peer_uuid.as_bytes().to_vec();
-
-        let db = self.db.lock().unwrap();
-        let conn = db.connection();
-
-        // Try to update existing record (use Unix timestamp)
-        let updated = conn.execute(
-            "UPDATE sync_peers SET last_sync_at = strftime('%s', 'now') WHERE peer_id = ?",
-            [&peer_bytes],
-        )?;
-
-        if updated == 0 {
-            // Insert new record (use Unix timestamp)
+        let (name, url) = {
             let config = self.config.lock().unwrap();
-            if let Some(peer) = config.get_peer(peer_id) {
-                conn.execute(
-                    "INSERT INTO sync_peers (peer_id, peer_name, peer_url, last_sync_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
-                    rusqlite::params![peer_bytes, peer.peer_name, peer.peer_url],
-                )?;
-            }
-        }
-
-        Ok(())
+            config.get_peer(peer_id).map(|p| (p.peer_name.clone(), p.peer_url.clone())).unwrap_or_default()
+        };
+        self.db.lock().unwrap().set_peer_last_operation(peer_id, Some(&name), Some(&url), "sync")
     }
 
     /// Push pre-fetched changes to peer (used by initial_sync)
@@ -1481,7 +1462,7 @@ impl SyncClient {
     /// **Send** (terms): every recording this device holds that the peer
     /// lacks, in one question and as many transfers. Returns (files, bytes,
     /// errors).
-    pub async fn send_missing_to_peer(&self, peer_url: &str, audiofile_directory: &std::path::Path) -> (i64, u64, Vec<String>) {
+    pub async fn send_missing_to_peer(&self, peer_id: &str, peer_url: &str, audiofile_directory: &std::path::Path) -> (i64, u64, Vec<String>) {
         let mut errors = Vec::new();
         let rows = match self.db.lock().unwrap().get_all_audio_files() {
             Ok(rows) => rows,
@@ -1509,6 +1490,7 @@ impl SyncClient {
                 Ok(n) => {
                     sent += 1;
                     bytes += n;
+                    self.note_copy(&audio_id, peer_id);
                 }
                 Err(e) => errors.push(e.to_string()),
             }
@@ -1519,7 +1501,7 @@ impl SyncClient {
     /// **Fetch** (terms): every recording the peer holds that this device
     /// lacks. The rows say what exists; the peer answers 404 for a file it
     /// does not hold, which is not an error. Returns (files, bytes, errors).
-    pub async fn fetch_missing_from_peer(&self, peer_url: &str, audiofile_directory: &std::path::Path) -> (i64, u64, Vec<String>) {
+    pub async fn fetch_missing_from_peer(&self, peer_id: &str, peer_url: &str, audiofile_directory: &std::path::Path) -> (i64, u64, Vec<String>) {
         let mut errors = Vec::new();
         let rows = match self.db.lock().unwrap().get_all_audio_files() {
             Ok(rows) => rows,
@@ -1537,9 +1519,27 @@ impl SyncClient {
                 Ok(n) => {
                     fetched += 1;
                     bytes += n;
+                    self.note_copy(&row.id, peer_id);
                 }
                 Err(e) if e.to_string().contains("HTTP 404") => {}
                 Err(e) => errors.push(e.to_string()),
+            }
+        }
+        // The peer learns what this device holds now (Stage 10): one
+        // missing-list request, whose answer is not needed
+        if fetched > 0 {
+            let held: Vec<String> = match self.db.lock().unwrap().get_all_audio_files() {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter(|r| r.deleted_at.is_none() && audio_local_path(audiofile_directory, &r.id, &r.filename).is_file())
+                    .map(|r| r.id)
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            if !held.is_empty() {
+                if let Err(e) = self.missing_on_peer(peer_url, held).await {
+                    tracing::debug!("The peer was not told what this device holds: {}", e);
+                }
             }
         }
         (fetched, bytes, errors)
@@ -1561,6 +1561,7 @@ impl SyncClient {
             return result;
         }
         self.move_files(peer_id, &mut result, true, false).await;
+        self.record_operation(peer_id, "deliver");
         result
     }
 
@@ -1571,6 +1572,7 @@ impl SyncClient {
             return result;
         }
         self.move_files(peer_id, &mut result, true, true).await;
+        self.record_operation(peer_id, "exchange");
         result
     }
 
@@ -1579,6 +1581,9 @@ impl SyncClient {
         self.begin_operation();
         let mut result = SyncResult::success();
         self.move_files(peer_id, &mut result, true, false).await;
+        if result.success {
+            self.record_operation(peer_id, "send");
+        }
         result
     }
 
@@ -1586,7 +1591,28 @@ impl SyncClient {
         self.begin_operation();
         let mut result = SyncResult::success();
         self.move_files(peer_id, &mut result, false, true).await;
+        if result.success {
+            self.record_operation(peer_id, "fetch");
+        }
         result
+    }
+
+    /// A peer holds a copy of a recording now (Stage 10).
+    fn note_copy(&self, audio_id: &str, peer_id: &str) {
+        if let Err(e) = self.db.lock().unwrap().record_copy(audio_id, peer_id) {
+            tracing::warn!("Could not record that {} holds {}: {}", short_id(peer_id), short_id(audio_id), e);
+        }
+    }
+
+    /// The peer's row remembers when it was last reached and by what.
+    fn record_operation(&self, peer_id: &str, operation: &str) {
+        let (name, url) = {
+            let config = self.config.lock().unwrap();
+            config.get_peer(peer_id).map(|p| (p.peer_name.clone(), p.peer_url.clone())).unwrap_or_default()
+        };
+        if let Err(e) = self.db.lock().unwrap().set_peer_last_operation(peer_id, Some(&name), Some(&url), operation) {
+            tracing::warn!("Could not record the {} with {}: {}", operation, short_id(peer_id), e);
+        }
     }
 
     async fn move_files(&self, peer_id: &str, result: &mut SyncResult, send: bool, fetch: bool) {
@@ -1602,245 +1628,18 @@ impl SyncClient {
             return;
         };
         if send {
-            let (n, bytes, errors) = self.send_missing_to_peer(&peer_url, &dir).await;
+            let (n, bytes, errors) = self.send_missing_to_peer(peer_id, &peer_url, &dir).await;
             result.sent += n;
             result.bytes_moved += bytes;
             result.errors.extend(errors);
         }
         if fetch {
-            let (n, bytes, errors) = self.fetch_missing_from_peer(&peer_url, &dir).await;
+            let (n, bytes, errors) = self.fetch_missing_from_peer(peer_id, &peer_url, &dir).await;
             result.fetched += n;
             result.bytes_moved += bytes;
             result.errors.extend(errors);
         }
         result.success = result.errors.is_empty();
-    }
-
-    /// Fetch the files of the recordings whose rows arrived in a sync.
-    ///
-    /// Args:
-    ///     peer_url: Base URL of the peer sync server
-    ///     pulled_changes: List of changes that were pulled
-    ///     audiofile_directory: Directory to save audio files
-    ///
-    /// Returns:
-    ///     List of error messages (empty if all succeeded)
-    pub async fn fetch_audio_files_after_sync(
-        &self,
-        peer_url: &str,
-        pulled_changes: &[SyncChange],
-        audiofile_directory: &std::path::Path,
-    ) -> Vec<String> {
-        let mut errors = Vec::new();
-
-        for change in pulled_changes {
-            // Only process audio_file creates/updates (not deletes)
-            if change.entity_type != "audio_file" {
-                continue;
-            }
-            if change.operation == "delete" {
-                continue;
-            }
-
-            let audio_id = &change.entity_id;
-
-            // Get filename from change data to determine extension
-            let filename = change
-                .data
-                .get("filename")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown.bin");
-
-            let dest_path = audio_local_path(audiofile_directory, audio_id, filename);
-
-            // Skip if file already exists
-            if dest_path.exists() {
-                continue;
-            }
-
-            match self.fetch_audio_file(peer_url, audio_id, &dest_path).await {
-                Ok(bytes) => {
-                    tracing::info!("Downloaded audio file {} ({} bytes)", audio_id, bytes);
-                }
-                Err(e) => {
-                    errors.push(format!("Failed to download audio {}: {}", audio_id, e));
-                }
-            }
-        }
-
-        errors
-    }
-
-    /// Download any audio files that exist in the database but are missing locally.
-    ///
-    /// This handles the case where audio file metadata was synced successfully but
-    /// the binary download failed (e.g., due to permission issues). On subsequent
-    /// syncs, this function will retry downloading missing files.
-    ///
-    /// Args:
-    ///     peer_url: Base URL of the peer sync server
-    ///     audiofile_directory: Directory to save audio files
-    ///
-    /// Returns:
-    ///     List of error messages (empty if all succeeded)
-    pub async fn fetch_missing_audio_files(
-        &self,
-        peer_url: &str,
-        audiofile_directory: &std::path::Path,
-    ) -> Vec<String> {
-        let mut errors = Vec::new();
-
-        // Get all audio files from the database
-        let audio_files = {
-            let db = self.db.lock().unwrap();
-            match db.get_all_audio_files() {
-                Ok(files) => files,
-                Err(e) => {
-                    errors.push(format!("Failed to get audio files from database: {}", e));
-                    return errors;
-                }
-            }
-        };
-
-        for audio_file in audio_files {
-            // Skip deleted audio files
-            if audio_file.deleted_at.is_some() {
-                continue;
-            }
-
-            let audio_id = &audio_file.id;
-
-            let dest_path = audio_local_path(audiofile_directory, audio_id, &audio_file.filename);
-
-            // Skip if file already exists
-            if dest_path.exists() {
-                continue;
-            }
-
-            tracing::info!("Downloading missing audio file: {}", audio_id);
-            match self.fetch_audio_file(peer_url, audio_id, &dest_path).await {
-                Ok(bytes) => {
-                    tracing::info!("Downloaded missing audio file {} ({} bytes)", audio_id, bytes);
-                }
-                Err(e) => {
-                    errors.push(format!("Failed to download missing audio {}: {}", audio_id, e));
-                }
-            }
-        }
-
-        errors
-    }
-
-    /// Upload binary files for audio_files that were pushed during sync.
-    ///
-    /// Args:
-    ///     peer_url: Base URL of the peer sync server
-    ///     pushed_changes: List of changes that were pushed
-    ///     audiofile_directory: Directory where audio files are stored
-    ///
-    /// Returns:
-    ///     List of error messages (empty if all succeeded)
-    pub async fn send_audio_files_after_sync(
-        &self,
-        peer_url: &str,
-        pushed_changes: &[SyncChange],
-        audiofile_directory: &std::path::Path,
-    ) -> Vec<String> {
-        let mut errors = Vec::new();
-
-        // Get max file size from config
-        let max_file_size = {
-            let cfg = self.config.lock().unwrap();
-            cfg.max_sync_file_size_bytes()
-        };
-
-        for change in pushed_changes {
-            // Only process audio_file creates/updates (not deletes)
-            if change.entity_type != "audio_file" {
-                continue;
-            }
-            if change.operation == "delete" {
-                continue;
-            }
-
-            let audio_id = &change.entity_id;
-
-            // Get filename from change data to determine extension
-            let filename = change
-                .data
-                .get("filename")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown.bin");
-
-            let source_path = audio_local_path(audiofile_directory, audio_id, filename);
-
-            // Skip if local file doesn't exist
-            if !source_path.exists() {
-                tracing::warn!(
-                    "Audio file {} not found locally at {}, skipping upload",
-                    audio_id,
-                    source_path.display()
-                );
-                continue;
-            }
-
-            // Check file size
-            let file_size = match std::fs::metadata(&source_path) {
-                Ok(meta) => meta.len(),
-                Err(e) => {
-                    errors.push(format!("Failed to get file size for {}: {}", audio_id, e));
-                    continue;
-                }
-            };
-
-            // If file is too big, tag attached notes and skip upload
-            if file_size > max_file_size {
-                tracing::warn!(
-                    "Audio file {} is too large ({} bytes > {} max), tagging notes as _too-big",
-                    audio_id,
-                    file_size,
-                    max_file_size
-                );
-
-                // Tag all notes that have this audio file attached
-                if let Ok(db) = self.db.lock() {
-                    if let Ok(note_ids) = db.get_notes_for_audio_file(audio_id) {
-                        for note_id in note_ids {
-                            if let Err(e) = db.tag_note_too_big(&note_id) {
-                                tracing::error!(
-                                    "Failed to tag note {} as too-big: {}",
-                                    note_id,
-                                    e
-                                );
-                            } else {
-                                tracing::info!(
-                                    "Tagged note {} as _too-big due to large audio file {}",
-                                    note_id,
-                                    audio_id
-                                );
-                            }
-                        }
-                    }
-                }
-
-                errors.push(format!(
-                    "Audio file {} is too large to sync ({} MB > {} MB limit)",
-                    audio_id,
-                    file_size / 1024 / 1024,
-                    max_file_size / 1024 / 1024
-                ));
-                continue;
-            }
-
-            match self.send_audio_file(peer_url, audio_id, &source_path).await {
-                Ok(_) => {}
-                Err(e) => {
-                    errors.push(format!("Failed to upload audio {}: {}", audio_id, e));
-                }
-            }
-        }
-
-        errors
     }
 
     /// Download every non-deleted audio file that is in cloud storage but not

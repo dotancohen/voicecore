@@ -16,6 +16,30 @@ use uuid::Uuid;
 
 use crate::error::{VoiceError, VoiceResult};
 use crate::models::SyncChange;
+
+/// A peer known to hold a copy of a recording (Stage 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyRow {
+    pub peer_id: String,
+    pub at: i64,
+}
+
+/// What exists on this device only (Stage 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NotDuplicated {
+    pub notes: i64,
+    pub recordings: i64,
+}
+
+/// A peer as `sync_peers` remembers it: when it was last reached, and by
+/// which operation (Stage 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSummary {
+    pub peer_id: String,
+    pub peer_name: Option<String>,
+    pub last_reached_at: Option<i64>,
+    pub last_operation: Option<String>,
+}
 use crate::versions::{
     note_tag_entity_id, ENTITY_AUDIO_FILE, ENTITY_NOTE, ENTITY_NOTE_ATTACHMENT, ENTITY_NOTE_TAG,
     ENTITY_TAG, ENTITY_TRANSCRIPTION, FIELD_ACTIVE, FIELD_CONTENT, FIELD_DELETED, FIELD_NAME,
@@ -3522,6 +3546,103 @@ impl Database {
             .optional()?;
         let (c, s, d) = row.unwrap_or((None, None, None));
         Ok((c.unwrap_or(0), s.unwrap_or(0), d))
+    }
+
+    /// A peer holds a copy of a recording (Stage 10).
+    pub fn record_copy(&self, audio_id: &str, peer_id: &str) -> VoiceResult<()> {
+        let audio = Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
+        let peer = Uuid::parse_str(peer_id).map_err(|e| VoiceError::validation("peer_id", e.to_string()))?;
+        self.conn.execute(
+            "INSERT INTO audio_file_copies (audio_id, peer_id, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(audio_id, peer_id) DO UPDATE SET at = ?3",
+            params![audio.as_bytes().to_vec(), peer.as_bytes().to_vec(), Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// The peers known to hold a copy of a recording, and when that was
+    /// learnt; the bucket is `storage_key` on the row, this device the file.
+    pub fn copies_of(&self, audio_id: &str) -> VoiceResult<Vec<CopyRow>> {
+        let audio = Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
+        let mut stmt = self.conn.prepare("SELECT peer_id, at FROM audio_file_copies WHERE audio_id = ? ORDER BY at")?;
+        let rows = stmt.query_map(params![audio.as_bytes().to_vec()], |r| {
+            let peer: Vec<u8> = r.get(0)?;
+            Ok(CopyRow { peer_id: Uuid::from_slice(&peer).map(|u| u.simple().to_string()).unwrap_or_default(), at: r.get(1)? })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// What is on this device only (Stage 10): notes whose head version was
+    /// written here and never sent to any peer, and recordings whose file
+    /// is here, not in the bucket, and on no peer that this device knows of.
+    /// A note's head content version is here only when it was not received
+    /// by sync, it is either authored (it has a device) or a root made for a
+    /// note row that was itself written here, and its `seq` is above every
+    /// peer's sent cursor. `audio_dir` is where the files are, and without
+    /// it no recording counts.
+    pub fn not_duplicated(&self, audio_dir: Option<&Path>) -> VoiceResult<NotDuplicated> {
+        let max_sent: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(MAX(last_sent_seq), 0) FROM sync_peers", [], |r| r.get(0))?;
+        let notes: i64 = self.conn.query_row(
+            r#"SELECT COUNT(*) FROM notes n
+               JOIN field_heads h ON h.entity_type = 'note' AND h.entity_id = lower(hex(n.id)) AND h.field = 'content'
+               JOIN field_versions v ON v.id = h.head_id
+               WHERE n.deleted_at IS NULL
+                 AND v.sync_received_at IS NULL
+                 AND (v.device_id IS NOT NULL OR n.sync_received_at IS NULL)
+                 AND COALESCE(v.seq, 0) > ?1"#,
+            params![max_sent],
+            |r| r.get(0),
+        )?;
+        let mut recordings = 0i64;
+        if let Some(dir) = audio_dir {
+            let mut stmt = self.conn.prepare(
+                r#"SELECT lower(hex(a.id)), a.filename FROM audio_files a
+                   WHERE a.deleted_at IS NULL AND a.storage_key IS NULL
+                     AND NOT EXISTS (SELECT 1 FROM audio_file_copies c WHERE c.audio_id = a.id)"#,
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (id, filename) = row?;
+                if crate::models::audio_local_path(dir, &id, &filename).is_file() {
+                    recordings += 1;
+                }
+            }
+        }
+        Ok(NotDuplicated { notes, recordings })
+    }
+
+    /// Record that an operation with a peer ran now (Stage 10): the peer's
+    /// row gets the time and the operation's name.
+    pub fn set_peer_last_operation(&self, peer_device_id: &str, peer_name: Option<&str>, peer_url: Option<&str>, operation: &str) -> VoiceResult<()> {
+        let peer_uuid = Uuid::parse_str(peer_device_id).map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+        let peer_bytes = peer_uuid.as_bytes().to_vec();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, ?)",
+            params![peer_bytes, peer_name, peer_url.unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "UPDATE sync_peers SET last_sync_at = ?, last_operation = ?, peer_name = COALESCE(?, peer_name) WHERE peer_id = ?",
+            params![Utc::now().timestamp(), operation, peer_name, peer_bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Every peer this device has dealt with: when it was last reached and
+    /// what the last operation was (Stage 10).
+    pub fn peer_summaries(&self) -> VoiceResult<Vec<PeerSummary>> {
+        let mut stmt = self.conn.prepare("SELECT peer_id, peer_name, last_sync_at, last_operation FROM sync_peers ORDER BY last_sync_at DESC")?;
+        let rows = stmt.query_map([], |r| {
+            let peer: Vec<u8> = r.get(0)?;
+            Ok(PeerSummary {
+                peer_id: Uuid::from_slice(&peer).map(|u| u.simple().to_string()).unwrap_or_default(),
+                peer_name: r.get(1)?,
+                last_reached_at: r.get(2)?,
+                last_operation: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Store cursor state for a peer (any `None` leaves that value alone).
@@ -7357,7 +7478,20 @@ impl Database {
             );
             "#,
         )?;
-        for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT", "peer_account_id TEXT"] {
+        // Which peers hold a copy of which recording (Stage 10): written by a
+        // send, by a fetch, by a receive, and by a peer's missing-list
+        // request. Local, never synced; it answers "is this one safe".
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS audio_file_copies (
+                audio_id BLOB NOT NULL,
+                peer_id BLOB NOT NULL,
+                at INTEGER NOT NULL,
+                PRIMARY KEY (audio_id, peer_id)
+            );
+            "#,
+        )?;
+        for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT", "peer_account_id TEXT", "last_operation TEXT"] {
             let name = col.split(' ').next().unwrap_or_default();
             if !self.column_exists("sync_peers", name)? {
                 self.conn.execute(&format!("ALTER TABLE sync_peers ADD COLUMN {}", col), [])?;
