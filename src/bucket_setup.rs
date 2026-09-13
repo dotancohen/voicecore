@@ -314,8 +314,14 @@ pub async fn round_trip(key: &BucketKey, name: &str, prefix: Option<&str>) -> Re
     let bucket = bucket_of(key, name)?;
     let object = format!("{}voice-setup-check-{}.txt", prefix.map(|p| p.trim_end_matches('/').to_string() + "/").unwrap_or_default(), chrono::Utc::now().timestamp());
     let content = format!("Voice checked this bucket at {}", chrono::Utc::now().to_rfc3339());
-    let written = bucket.put_object(&object, content.as_bytes()).await.map_err(|e| format!("Write: {}", explain_refusal(key, &e.to_string())))?;
-    answered(Some(key), &written, "Write")?;
+    // The write is the core's own signed request, which reads the whole
+    // answer: the library keeps no body of a refused upload, and without the
+    // service's code a wrong secret cannot be told from a refusal by policy
+    let object_url = format!("{}/{}", bucket_url(key, name), uri_encode(&object, true));
+    let (status, body) = signed(key, "PUT", &object_url, content.as_bytes(), Some("text/plain")).await.map_err(|e| format!("Write: {}", e))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("Write: {}", explain_refusal(key, &format!("HTTP {}: {}", status, body))));
+    }
     let read = bucket.get_object(&object).await.map_err(|e| format!("Read back: {}", explain_refusal(key, &e.to_string())))?;
     answered(Some(key), &read, "Read back")?;
     if read.as_slice() != content.as_bytes() {
