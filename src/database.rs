@@ -7396,6 +7396,26 @@ impl Database {
 mod tests {
     use super::*;
 
+    /// Several processes open one database at once (a command-line run
+    /// beside the window and its listener): every open succeeds, and an
+    /// up-to-date database is not rebuilt by any of them.
+    #[test]
+    fn many_opens_of_one_database_at_once_all_succeed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("shared.db");
+        drop(Database::new(&path).unwrap());
+        for _ in 0..5 {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    std::thread::spawn(move || Database::new(&path).map(|_| ()).map_err(|e| e.to_string()))
+                })
+                .collect();
+            let failures: Vec<String> = handles.into_iter().filter_map(|h| h.join().unwrap().err()).collect();
+            assert!(failures.is_empty(), "{:?}", failures);
+        }
+    }
+
     /// FILE-15: two recordings with one name both take the suffix of their
     /// own id, the file already on disk moving with its row; a later file with
     /// a name that collided takes its suffix too; any POSIX name is kept; a
@@ -8432,15 +8452,43 @@ impl Database {
                     .map(|c| format!("NEW.{c} IS NOT OLD.{c}", c = c))
                     .collect::<Vec<_>>()
                     .join(" OR ");
-                // Rebuilt at every open: a database made before a column joined
-                // this list would otherwise keep a trigger that never publishes it
-                self.conn.execute_batch(&format!(
-                    "DROP TRIGGER IF EXISTS trg_{t}_seq_update; CREATE TRIGGER trg_{t}_seq_update AFTER UPDATE OF {of} ON {t} WHEN {when} BEGIN {bump} END;",
-                    t = table, of = of, when = when, bump = bump
-                ))?;
+                // A database made before a column joined this list keeps a
+                // trigger that never publishes that column: rebuilt then, and
+                // only then, inside a write transaction that checks again, so
+                // several processes opening one database never race to rebuild it
+                let name = format!("trg_{}_seq_update", table);
+                let current = format!("AFTER UPDATE OF {} ON {}", of, table);
+                if !self.trigger_mentions(&name, &current)? {
+                    self.conn.execute_batch("BEGIN IMMEDIATE")?;
+                    let rebuilt = (|| -> VoiceResult<()> {
+                        if !self.trigger_mentions(&name, &current)? {
+                            self.conn.execute_batch(&format!(
+                                "DROP TRIGGER IF EXISTS {name}; CREATE TRIGGER IF NOT EXISTS {name} AFTER UPDATE OF {of} ON {t} WHEN {when} BEGIN {bump} END;",
+                                name = name, t = table, of = of, when = when, bump = bump
+                            ))?;
+                        }
+                        Ok(())
+                    })();
+                    match rebuilt {
+                        Ok(()) => self.conn.execute_batch("COMMIT")?,
+                        Err(e) => {
+                            let _ = self.conn.execute_batch("ROLLBACK");
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Whether a trigger exists and its definition holds `text`.
+    fn trigger_mentions(&self, name: &str, text: &str) -> VoiceResult<bool> {
+        let sql: Option<String> = self
+            .conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", [name], |r| r.get(0))
+            .optional()?;
+        Ok(sql.is_some_and(|sql| sql.contains(text)))
     }
 
     fn column_exists(&self, table: &str, column: &str) -> VoiceResult<bool> {
