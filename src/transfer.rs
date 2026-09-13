@@ -127,8 +127,11 @@ pub fn parse_content_range(header: &str) -> Option<(u64, u64)> {
 pub const SEND_STALL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The other side verifies a whole file before it answers; this long after
-/// the last byte without an answer, the upload is over.
-pub const ANSWER_AFTER_LAST_BYTE: std::time::Duration = std::time::Duration::from_secs(120);
+/// the last byte without an answer, the upload is over. A phone hashes two
+/// gigabytes in well under a minute. On a dead link the last byte "goes" long
+/// before it arrives, into the socket buffers, so this wait is what a frozen
+/// send costs per try.
+pub const ANSWER_AFTER_LAST_BYTE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Watch an upload's body as it is taken by the connection, and return why
 /// it stalled: nothing moved for [`SEND_STALL`] before the last byte, or no

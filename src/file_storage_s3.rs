@@ -238,59 +238,30 @@ impl FileStorageService for S3StorageService {
         local_path: &Path,
         remote_key: &str,
     ) -> Result<UploadResult, FileStorageError> {
-        let metadata = tokio::fs::metadata(local_path)
+        // A file of at most one part (FILE-19), sent whole in one signed PUT
+        // whose body is watched as it goes: a bucket that stops answering ends
+        // the upload instead of holding it for the request's whole deadline
+        let bytes = tokio::fs::read(local_path)
             .await
             .map_err(|e| FileStorageError::LocalFile(format!("Failed to read {}: {}", local_path.display(), e)))?;
-        let size_bytes = metadata.len();
+        let size_bytes = bytes.len() as u64;
         let full_key = self.full_key(remote_key);
+        tracing::debug!(key = %full_key, bucket = %self.bucket.name(), size_bytes = size_bytes, "Uploading to S3");
 
-        tracing::debug!(
-            key = %full_key,
-            bucket = %self.bucket.name(),
-            size_bytes = size_bytes,
-            "Uploading to S3"
-        );
-
-        // Stream from disk instead of reading the whole file into memory; the
-        // library switches to multipart upload for large files.
-        let mut file = tokio::fs::File::open(local_path)
+        let url = self.object_url(&full_key, "");
+        let answer = crate::bucket_setup::send_signed_watched(&self.bucket_key(), "PUT", &url, bytes, Some("application/octet-stream"), REQUEST_TIMEOUT)
             .await
-            .map_err(|e| FileStorageError::LocalFile(format!("Failed to open {}: {}", local_path.display(), e)))?;
-
-        let response = self
-            .bucket
-            .put_object_stream(&mut file, &full_key)
-            .await
-            .map_err(|e| {
-                let err = Self::map_error(e, "Upload", &full_key);
-                tracing::error!(error = %err, key = %full_key, "S3 upload failed");
-                match err {
-                    // Anything the service refused counts as an upload failure
-                    FileStorageError::Network(msg) => FileStorageError::Upload(msg),
-                    other => other,
-                }
-            })?;
-
-        let status = response.status_code();
-        if !(200..300).contains(&status) {
-            return Err(FileStorageError::Upload(format!(
-                "S3 upload of {} failed with status {}",
-                full_key, status
-            )));
+            .map_err(|e| FileStorageError::Upload(format!("Upload of {}: {}", full_key, e)))?;
+        if !(200..300).contains(&answer.status) {
+            return Err(match Self::refused("Upload", &full_key, answer.status, &answer.body) {
+                // Anything the service refused counts as an upload failure
+                FileStorageError::Network(msg) => FileStorageError::Upload(msg),
+                other => other,
+            });
         }
 
-        tracing::info!(
-            key = %full_key,
-            bucket = %self.bucket.name(),
-            size_bytes = size_bytes,
-            "Uploaded file to S3"
-        );
-
-        Ok(UploadResult {
-            storage_key: full_key,
-            provider: "s3".to_string(),
-            size_bytes,
-        })
+        tracing::info!(key = %full_key, bucket = %self.bucket.name(), size_bytes = size_bytes, "Uploaded file to S3");
+        Ok(UploadResult { storage_key: full_key, provider: "s3".to_string(), size_bytes })
     }
 
     async fn upload_in_parts(&self, source: &mut dyn crate::crypto::ByteSource, remote_key: &str, journal: &dyn crate::file_storage::PartJournal) -> Result<UploadResult, FileStorageError> {
