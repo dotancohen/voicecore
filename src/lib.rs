@@ -44,6 +44,7 @@ pub mod tls;
 pub mod transfer;
 pub mod validation;
 pub mod waveform;
+pub mod issues;
 pub mod versions;
 
 #[cfg(test)]
