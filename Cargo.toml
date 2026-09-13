@@ -22,7 +22,7 @@ uniffi = ["dep:uniffi"]
 # Cloud file storage (S3 and S3-compatible services)
 # rust-s3 0.37+ uses reqwest with bundled webpki roots, so the same
 # implementation works on desktop and Android.
-file-storage = ["dep:rust-s3"]
+file-storage = ["dep:rust-s3", "dep:tokio-util"]
 
 [dependencies]
 # Async runtime - use lighter features for mobile

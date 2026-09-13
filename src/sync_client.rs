@@ -281,9 +281,11 @@ fn connect_timeout_for(peer_url: &str) -> Duration {
 }
 
 fn build_client(pin: &str, peer_url: &str) -> VoiceResult<Client> {
-    // A page can be a few megabytes over a slow link
+    // A page can be a few megabytes over a slow link; a link that stops
+    // moving for thirty seconds is dead, however long the page (FILE-14)
     let builder = Client::builder()
         .connect_timeout(connect_timeout_for(peer_url))
+        .read_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(180));
     let builder = if pin.is_empty() {
         builder
@@ -1472,6 +1474,28 @@ impl SyncClient {
         Ok(client)
     }
 
+    /// The client a recording's bytes are sent with: no overall timeout and no
+    /// read timeout, because the connection reads nothing while a body goes
+    /// out; [`crate::transfer::stall_of_upload`] ends a send that stops moving.
+    fn send_client_for(&self, peer_url: &str) -> VoiceResult<Client> {
+        check_scheme(peer_url)?;
+        let pin = self.pin_for(peer_url);
+        let cache_key = format!("send\n{}\n{}", peer_url, pin);
+        if let Some(client) = self.clients.lock().unwrap().get(&cache_key) {
+            return Ok(client.clone());
+        }
+        let builder = Client::builder()
+            .connect_timeout(connect_timeout_for(peer_url));
+        let builder = if pin.is_empty() {
+            builder
+        } else {
+            builder.use_preconfigured_tls(crate::tls::pinned_client_config(&pin)?)
+        };
+        let client = builder.build().map_err(|e| VoiceError::Network(e.to_string()))?;
+        self.clients.lock().unwrap().insert(cache_key, client.clone());
+        Ok(client)
+    }
+
     fn pin_for(&self, peer_url: &str) -> String {
         let config = self.config.lock().unwrap();
         config
@@ -1546,7 +1570,14 @@ impl SyncClient {
                 out.flush().await?;
                 return Err(VoiceError::Sync(CANCELLED.to_string()));
             }
-            let chunk = chunk.map_err(|e| VoiceError::Network(format!("The fetch of {} stopped: {}", audio_id, describe(&e))))?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    // What arrived stays in the part, for the next try to continue from
+                    let _ = out.flush().await;
+                    return Err(VoiceError::Network(format!("The fetch of {} stopped: {}", audio_id, describe(&e))));
+                }
+            };
             out.write_all(&chunk).await?;
             received += chunk.len() as u64;
             if received - reported_at >= PROGRESS_EVERY_BYTES {
@@ -1638,14 +1669,19 @@ impl SyncClient {
                 }
             });
         let mut request = self
-            .authed(self.file_client_for(peer_url)?.post(&url))
+            .authed(self.send_client_for(peer_url)?.post(&url))
             .header("Content-Type", "application/octet-stream")
             .header("Content-Length", (total - from_byte).to_string())
             .header(crate::sync_protocol::HEADER_FILE_SHA256, &hash);
         if from_byte > 0 {
             request = request.header("Content-Range", format!("bytes {}-{}/{}", from_byte, total.saturating_sub(1), total));
         }
-        let response = match request.body(reqwest::Body::wrap_stream(stream)).send().await {
+        let stalled = crate::transfer::stall_of_upload(counted.clone(), total - from_byte);
+        let sent = tokio::select! {
+            sent = request.body(reqwest::Body::wrap_stream(stream)).send() => sent,
+            why = stalled => return Err(VoiceError::Network(format!("Failed to send audio {}: {}", audio_id, why))),
+        };
+        let response = match sent {
             Ok(response) => response,
             // A body ended early by a cancel is reported as a cancel, not a network failure
             Err(_) if self.cancelled() => return Err(VoiceError::Sync(CANCELLED.to_string())),
@@ -1746,7 +1782,28 @@ impl SyncClient {
             let from = missing.partial.get(&audio_id).copied().unwrap_or(0);
             let what = format!("Send of {}", &audio_id[..UUID_SHORT_LEN.min(audio_id.len())]);
             let moved_before = bytes;
-            match self.with_retries(&what, || self.send_audio_file(peer_url, &audio_id, &path, from, moved_before, sent, total)).await {
+            // A try after a broken one continues from what the peer holds now:
+            // the offset asked before the first try is stale once bytes arrived (FILE-13)
+            let first_try = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let attempt = || {
+                let first_try = first_try.clone();
+                let audio_id = audio_id.clone();
+                let path = path.clone();
+                async move {
+                    let from = if first_try.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        from
+                    } else {
+                        let now = self.missing_on_peer(peer_url, vec![audio_id.clone()]).await?;
+                        if !now.missing.contains(&audio_id) {
+                            // The broken try arrived whole after all
+                            return Ok(0);
+                        }
+                        now.partial.get(&audio_id).copied().unwrap_or(0)
+                    };
+                    self.send_audio_file(peer_url, &audio_id, &path, from, moved_before, sent, total).await
+                }
+            };
+            match self.with_retries(&what, attempt).await {
                 Ok(n) => {
                     sent += 1;
                     bytes += n;

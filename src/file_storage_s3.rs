@@ -205,7 +205,7 @@ impl crate::file_storage::PartStore for S3StorageService {
 
     async fn put_part(&self, key: &str, upload_id: &str, part_number: u32, bytes: Vec<u8>) -> Result<String, FileStorageError> {
         let url = self.object_url(key, &format!("partNumber={}&uploadId={}", part_number, crate::bucket_setup::uri_encode(upload_id, false)));
-        let answer = crate::bucket_setup::send_signed(&self.bucket_key(), "PUT", &url, &bytes, Some("application/octet-stream"), PART_TIMEOUT)
+        let answer = crate::bucket_setup::send_signed_watched(&self.bucket_key(), "PUT", &url, bytes, Some("application/octet-stream"), PART_TIMEOUT)
             .await
             .map_err(FileStorageError::Network)?;
         if !(200..300).contains(&answer.status) {
@@ -301,50 +301,38 @@ impl FileStorageService for S3StorageService {
     }
 
     async fn download(&self, storage_key: &str, local_path: &Path) -> Result<u64, FileStorageError> {
-        // 1. Ask for the object metadata first: a clear NotFound/Auth error,
-        //    and the expected size for verification afterwards.
-        let (head, status) = self
-            .bucket
-            .head_object(storage_key)
-            .await
-            .map_err(|e| Self::map_error(e, "Download", storage_key))?;
-        if status == 404 {
-            return Err(FileStorageError::NotFound(storage_key.to_string()));
-        }
-        if !(200..300).contains(&status) {
-            return Err(FileStorageError::Download(format!(
-                "HEAD {} returned status {}",
-                storage_key, status
-            )));
-        }
-        let expected_len = head.content_length.and_then(|n| u64::try_from(n).ok());
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
 
-        // 2. Stream into a temporary file next to the destination.
+        // 1. One signed GET, read as it arrives; a link that stops moving
+        //    ends it (FILE-14) instead of holding the download for minutes
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 FileStorageError::LocalFile(format!("Failed to create {}: {}", parent.display(), e))
             })?;
         }
-        let partial = Self::partial_path(local_path);
+        let url = self.object_url(storage_key, "");
+        let response = crate::bucket_setup::get_signed_stream(&self.bucket_key(), &url)
+            .await
+            .map_err(|e| FileStorageError::Network(format!("Download of {}: {}", storage_key, e)))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::refused("Download", storage_key, status, &body));
+        }
+        let expected_len = response.content_length();
 
+        // 2. Into a temporary file next to the destination
+        let partial = Self::partial_path(local_path);
         let result = async {
             let mut file = tokio::fs::File::create(&partial).await.map_err(|e| {
                 FileStorageError::LocalFile(format!("Failed to create {}: {}", partial.display(), e))
             })?;
-
-            let status = self
-                .bucket
-                .get_object_to_writer(storage_key, &mut file)
-                .await
-                .map_err(|e| Self::map_error(e, "Download", storage_key))?;
-            if !(200..300).contains(&status) {
-                return Err(FileStorageError::Download(format!(
-                    "GET {} returned status {}",
-                    storage_key, status
-                )));
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| FileStorageError::Network(format!("The download of {} stopped: {}", storage_key, e)))?;
+                file.write_all(&chunk).await?;
             }
-
-            use tokio::io::AsyncWriteExt;
             file.flush().await?;
             file.sync_all().await?;
             let written = file.metadata().await?.len();
@@ -416,12 +404,16 @@ impl FileStorageService for S3StorageService {
     }
 
     async fn exists(&self, storage_key: &str) -> Result<bool, FileStorageError> {
-        match self.bucket.head_object(storage_key).await {
-            Ok((_, code)) => Ok(code == 200),
-            Err(e) => match Self::map_error(e, "Exists check", storage_key) {
-                FileStorageError::NotFound(_) => Ok(false),
-                other => Err(other),
-            },
+        // A signed HEAD with a short deadline: a bucket that never answers
+        // ends the upload run instead of holding it (FILE-14)
+        let url = self.object_url(storage_key, "");
+        let answer = crate::bucket_setup::send_signed(&self.bucket_key(), "HEAD", &url, b"", None, crate::bucket_setup::STALL_TIMEOUT)
+            .await
+            .map_err(|e| FileStorageError::Network(format!("Exists check of {}: {}", storage_key, e)))?;
+        match answer.status {
+            200..=299 => Ok(true),
+            404 => Ok(false),
+            status => Err(Self::refused("Exists check", storage_key, status, &answer.body)),
         }
     }
 

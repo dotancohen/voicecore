@@ -448,6 +448,66 @@ async fn signed(key: &BucketKey, method: &str, url: &str, payload: &[u8], conten
     Ok((answer.status, answer.body))
 }
 
+/// A link that moves no byte for this long is dead (FILE-14): the same
+/// thirty seconds as a transfer between devices.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A signed GET whose body is read as it arrives: no overall timeout, because
+/// a long recording over a slow link takes as long as it takes, but a
+/// connection that moves nothing for [`STALL_TIMEOUT`] ends the download.
+pub(crate) async fn get_signed_stream(key: &BucketKey, url: &str) -> Result<reqwest::Response, String> {
+    let headers = sign_request("GET", url, &key.region, &key.access_key_id, &key.secret_access_key, b"", &[], chrono::Utc::now());
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(STALL_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut request = client.get(url);
+    for (k, v) in headers {
+        request = request.header(k, v);
+    }
+    request.send().await.map_err(|e| explain_error(&e.to_string()))
+}
+
+/// A signed request whose body is counted as the connection takes it, ended
+/// by [`crate::transfer::stall_of_upload`] when it stops moving, and by
+/// `backstop` in any case: a part over a slow uplink is not a dead link.
+pub(crate) async fn send_signed_watched(key: &BucketKey, method: &str, url: &str, payload: Vec<u8>, content_type: Option<&str>, backstop: Duration) -> Result<SignedAnswer, String> {
+    use futures_util::StreamExt;
+    let mut extra: Vec<(&str, &str)> = Vec::new();
+    if let Some(ct) = content_type {
+        extra.push(("content-type", ct));
+    }
+    let headers = sign_request(method, url, &key.region, &key.access_key_id, &key.secret_access_key, &payload, &extra, chrono::Utc::now());
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(backstop)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let length = payload.len() as u64;
+    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    let mut request = client.request(method, url).header("content-length", length.to_string());
+    for (k, v) in headers {
+        request = request.header(k, v);
+    }
+    let moved = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = moved.clone();
+    let body = tokio_util::io::ReaderStream::with_capacity(std::io::Cursor::new(payload), 64 * 1024).inspect(move |chunk| {
+        if let Ok(chunk) = chunk {
+            counter.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let stalled = crate::transfer::stall_of_upload(moved, length);
+    let response = tokio::select! {
+        sent = request.body(reqwest::Body::wrap_stream(body)).send() => sent.map_err(|e| explain_error(&e.to_string()))?,
+        why = stalled => return Err(why),
+    };
+    let status = response.status().as_u16();
+    let etag = response.headers().get("etag").and_then(|v| v.to_str().ok()).map(|v| v.to_string());
+    let body = response.text().await.unwrap_or_default();
+    Ok(SignedAnswer { status, body, etag })
+}
+
 /// What a signed request came back with.
 pub(crate) struct SignedAnswer {
     pub status: u16,

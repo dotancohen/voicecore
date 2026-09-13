@@ -1093,7 +1093,14 @@ async fn receive_audio_file(
     let mut stream = request.into_body().into_data_stream();
     let mut written = 0u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| (StatusCode::BAD_REQUEST, format!("The transfer stopped: {}", e)))?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                // What arrived stays in the part, for the sender's next try to continue from
+                let _ = out.flush().await;
+                return Err((StatusCode::BAD_REQUEST, format!("The transfer stopped: {}", e)));
+            }
+        };
         out.write_all(&chunk).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)))?;
         written += chunk.len() as u64;
     }

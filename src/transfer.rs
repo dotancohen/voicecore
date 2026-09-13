@@ -123,6 +123,42 @@ pub fn parse_content_range(header: &str) -> Option<(u64, u64)> {
     Some((start.trim().parse().ok()?, total.trim().parse().ok()?))
 }
 
+/// An upload is over when no byte of its body has moved for this long (FILE-14).
+pub const SEND_STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The other side verifies a whole file before it answers; this long after
+/// the last byte without an answer, the upload is over.
+pub const ANSWER_AFTER_LAST_BYTE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Watch an upload's body as it is taken by the connection, and return why
+/// it stalled: nothing moved for [`SEND_STALL`] before the last byte, or no
+/// answer for [`ANSWER_AFTER_LAST_BYTE`] after it. Never returns while bytes
+/// keep moving, however slowly: a read timeout cannot tell a slow upload from
+/// a dead one, because the connection reads nothing while the body goes out.
+pub async fn stall_of_upload(moved: std::sync::Arc<std::sync::atomic::AtomicU64>, body_len: u64) -> String {
+    use std::sync::atomic::Ordering;
+    let mut last = moved.load(Ordering::SeqCst);
+    let mut since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let now = moved.load(Ordering::SeqCst);
+        if now != last {
+            last = now;
+            since = tokio::time::Instant::now();
+            continue;
+        }
+        let all_sent = now >= body_len;
+        let limit = if all_sent { ANSWER_AFTER_LAST_BYTE } else { SEND_STALL };
+        if since.elapsed() >= limit {
+            return if all_sent {
+                format!("no answer for {} seconds after the last byte", limit.as_secs())
+            } else {
+                format!("nothing moved for {} seconds after {} of {} bytes", limit.as_secs(), now, body_len)
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
