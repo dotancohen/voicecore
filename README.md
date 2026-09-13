@@ -395,8 +395,8 @@ VoiceCore uses a bidirectional sync protocol where any device can act as both cl
 | `POST` | `/sync/apply` | Apply remote changes to local database |
 | `GET` | `/sync/full` | Full dataset for initial sync |
 | `GET` | `/sync/status` | Health check and server info |
-| `GET` | `/sync/audio/<audio_id>/file` | Legacy: download audio binary from a peer (not used by current clients) |
-| `POST` | `/sync/audio/<audio_id>/file` | Legacy: upload audio binary to a peer (not used by current clients) |
+| `GET` | `/sync/audio/<audio_id>/file` | Fetch a recording's file from this peer, resumable with `Range` (FILE-12, FILE-13) |
+| `POST` | `/sync/audio/<audio_id>/file` | Send a recording's file to this peer, resumable with `Content-Range` (FILE-12, FILE-13) |
 
 ### Endpoint Details
 
@@ -601,7 +601,7 @@ The sync protocol supports these entity types:
 }
 ```
 
-**Note:** Only metadata travels through the sync server. `storage_provider`/`storage_key` are set by the device that uploaded the binary to cloud storage; they are `null` until then. A device that receives a record with a `storage_key` can fetch the binary on demand with the cloud configuration it received through the `file_storage_config` entity. The local file name is always `{id}.{ext}` with `ext` from `audio_file_extension()` in `models.rs` (lowercase, `bin` when absent).
+**Note:** Only metadata travels through the sync server. `storage_provider`/`storage_key` are set by the device that uploaded the binary to cloud storage; they are `null` until then. A device that receives a record with a `storage_key` can fetch the binary on demand with the cloud configuration it received through the `file_storage_config` entity. The local file is named by the row's `disk_name` (a recording made by Voice is `YYYY_MM_DD_HH_MM_SS-<last eight of the id>.<ext>`, an imported file keeps its own name), and the bucket object by the file's content hash, `<hash>.<ext>` (`storage_key_for` in `file_storage.rs`); `ext` is from `audio_file_extension()` in `models.rs` (lowercase, `bin` when absent).
 
 #### Note Attachment
 
