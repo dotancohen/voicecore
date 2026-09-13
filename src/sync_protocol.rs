@@ -9,8 +9,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::SyncChange;
 
-/// The protocol version both sides announce in the handshake and the status.
-pub const PROTOCOL_VERSION: &str = "1.1";
+/// The protocol version both sides announce in the handshake and the status
+/// (Stage 16): the headers, the device cards, pairing and the new entity
+/// types changed the exchange, so a peer that announces `1.x` is refused
+/// with `PROTOCOL_TOO_OLD`. Everything starts afresh; nothing negotiates
+/// with version 1.
+pub const PROTOCOL_VERSION: &str = "2.0";
+
+/// The major version this build speaks; a peer below it is refused.
+pub const PROTOCOL_MAJOR: u32 = 2;
+
+/// The major number of a version text ("2.0" → 2), or None for nonsense.
+pub fn protocol_major(version: &str) -> Option<u32> {
+    version.trim().split('.').next().and_then(|m| m.parse().ok())
+}
 
 /// The codes a refusal carries, so a sentence on a screen and a line in a
 /// log can be matched to the rule that produced them.
@@ -43,6 +55,8 @@ pub mod codes {
     pub const SETUP_TEXT_INVALID: &str = "SETUP_TEXT_INVALID";
     /// This device holds notes of another account and will not be paired over them.
     pub const DEVICE_HOLDS_NOTES: &str = "DEVICE_HOLDS_NOTES";
+    /// The peer speaks a protocol version below this build's (Stage 16)
+    pub const PROTOCOL_TOO_OLD: &str = "PROTOCOL_TOO_OLD";
     /// The caller is not on a private network and this listener has no public address (LISTEN-3)
     pub const NOT_ON_LAN: &str = "NOT_ON_LAN";
 }
@@ -57,6 +71,14 @@ pub struct HandshakeRequest {
     /// which is refused.
     #[serde(default)]
     pub account_id: String,
+    /// Which application calls (Stage 16): "voice", later "images".
+    #[serde(default)]
+    pub application: String,
+    /// The entity types the caller wants and understands (Stage 16). Empty
+    /// means every type; an image application declares `["tag"]` and
+    /// receives and sends tags and nothing else.
+    #[serde(default)]
+    pub entity_types: Vec<String>,
 }
 
 /// `POST /sync/handshake` response body.
@@ -69,6 +91,9 @@ pub struct HandshakeResponse {
     /// reached the account it meant to.
     #[serde(default)]
     pub account_id: String,
+    /// Which application answers (Stage 16)
+    #[serde(default)]
+    pub application: String,
     pub last_sync_timestamp: Option<i64>,
     #[serde(default)]
     pub server_timestamp: i64,
@@ -95,6 +120,8 @@ pub struct ChangesQuery {
     /// Timestamp filter (kept for tools and older clients).
     pub since: Option<i64>,
     pub limit: Option<i64>,
+    /// Only these entity types, comma-separated (Stage 16); absent means every type.
+    pub types: Option<String>,
 }
 
 /// `GET /sync/changes` response body: one page of the feed.

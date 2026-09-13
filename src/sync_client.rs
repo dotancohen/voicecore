@@ -591,6 +591,10 @@ impl SyncClient {
         // 2. Account and key: the handshake, which is refused with a code
         match self.handshake(&peer.peer_url).await {
             Ok(handshake) => {
+                match Self::check_protocol(&peer.peer_name, &handshake) {
+                    Ok(()) => rows.push(row("Protocol", true, format!("Version {}", handshake.protocol_version), "")),
+                    Err(sentence) => rows.push(row("Protocol", false, sentence, codes::PROTOCOL_TOO_OLD)),
+                }
                 let own = self.account_id();
                 if handshake.account_id == own {
                     rows.push(row("Account", true, format!("The peer holds account {}", short_id(&own)), ""));
@@ -618,6 +622,7 @@ impl SyncClient {
                     .find(|c| sentence.contains(c));
                 match code {
                     Some(code) => rows.push(row("Account", false, sentence, code)),
+                    None if sentence.contains(codes::PROTOCOL_TOO_OLD) => rows.push(row("Protocol", false, sentence, codes::PROTOCOL_TOO_OLD)),
                     None => {
                         let code = [codes::DEVICE_UNKNOWN, codes::DEVICE_REVOKED, codes::KEY_WRONG, codes::KEY_MISSING, codes::DEVICE_MISMATCH]
                             .into_iter()
@@ -803,7 +808,18 @@ impl SyncClient {
     /// The account check on the caller's side (ACCT-3): the peer must hold
     /// the same account as this database, or nothing is exchanged. Returns
     /// the sentence to refuse with. Never adopts.
+    /// A responder of an older protocol is refused, in words (Stage 16).
+    fn check_protocol(peer_name: &str, handshake: &HandshakeResponse) -> Result<(), String> {
+        if crate::sync_protocol::protocol_major(&handshake.protocol_version).unwrap_or(0) < crate::sync_protocol::PROTOCOL_MAJOR {
+            return Err(format!("Update Voice on {} ({})", peer_name, codes::PROTOCOL_TOO_OLD));
+        }
+        Ok(())
+    }
+
     fn check_account(&self, peer_id: &str, handshake: &HandshakeResponse) -> Result<(), String> {
+        if let Err(sentence) = Self::check_protocol(&self.config.lock().map(|c| c.get_peer(peer_id).map(|p| p.peer_name.clone()).unwrap_or_default()).unwrap_or_default(), handshake) {
+            return Err(sentence);
+        }
         let own = self.account_id();
         if handshake.account_id.is_empty() {
             return Err(format!("The peer named no account ({})", codes::ACCOUNT_MISSING));
@@ -1120,6 +1136,9 @@ impl SyncClient {
             device_name: self.device_name.clone(),
             protocol_version: PROTOCOL_VERSION.to_string(),
             account_id: self.account_id(),
+            application: crate::auth::APPLICATION_VOICE.to_string(),
+            // Voice wants every type; an image application would declare ["tag"]
+            entity_types: Vec::new(),
         };
 
         let response = self

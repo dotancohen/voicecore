@@ -598,6 +598,19 @@ async fn handshake(
             .into_response();
     }
 
+    // A peer of an older protocol is refused, in words (Stage 16)
+    if crate::sync_protocol::protocol_major(&request.protocol_version).unwrap_or(0) < crate::sync_protocol::PROTOCOL_MAJOR {
+        tracing::warn!("Refused device {}: protocol {} is older than {}", short(&request.device_id), request.protocol_version, PROTOCOL_VERSION);
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(ErrorResponse::with_code(
+                format!("Update Voice on {} ({})", request.device_name, codes::PROTOCOL_TOO_OLD),
+                codes::PROTOCOL_TOO_OLD,
+            )),
+        )
+            .into_response();
+    }
+
     // The body and the headers must agree about who is calling, or a device
     // could act under another's name with its own key.
     if let Some(named) = header(&headers, auth::HEADER_DEVICE) {
@@ -680,11 +693,19 @@ async fn handshake(
         (db.database_id().unwrap_or_default(), db.current_seq().unwrap_or(0))
     };
 
+    // What the peer wants and understands (Stage 16): apply accepts only that
+    if let Ok(db) = account.db.lock() {
+        if let Err(e) = db.set_peer_entity_types(&request.device_id, Some(&request.device_name), &request.entity_types) {
+            tracing::warn!("Could not remember the entity types of {}: {}", short(&request.device_id), e);
+        }
+    }
+
     let response = HandshakeResponse {
         device_id: state.device_id.clone(),
         device_name: state.device_name.clone(),
         protocol_version: PROTOCOL_VERSION.to_string(),
         account_id: own_account,
+        application: auth::APPLICATION_VOICE.to_string(),
         last_sync_timestamp: last_sync,
         server_timestamp: Utc::now().timestamp(),
         supports_audiofiles,
@@ -732,6 +753,13 @@ async fn get_changes(
         }
     };
 
+    // Only the types the caller asked for (Stage 16); the cursor still
+    // walks the whole feed, so nothing is skipped for good
+    let changes = match query.types.as_deref().map(|t| t.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect::<Vec<_>>()) {
+        Some(wanted) if !wanted.is_empty() => changes.into_iter().filter(|c| wanted.iter().any(|w| w == &c.entity_type)).collect(),
+        _ => changes,
+    };
+
     tracing::debug!(
         "Returning {} changes, to_timestamp={:?}",
         changes.len(),
@@ -770,6 +798,19 @@ async fn apply_changes(
         &request.device_id[..UUID_SHORT_LEN.min(request.device_id.len())],
         request.changes.len()
     );
+
+    // Only the types the peer declared in its handshake (Stage 16)
+    let declared = account.db.lock().ok().and_then(|db| db.peer_entity_types(&request.device_id).ok()).unwrap_or_default();
+    let mut request = request;
+    let mut undeclared = 0usize;
+    if !declared.is_empty() {
+        let before = request.changes.len();
+        request.changes.retain(|c| declared.iter().any(|d| d == &c.entity_type));
+        undeclared = before - request.changes.len();
+        if undeclared > 0 {
+            tracing::warn!("{} change(s) of types {} did not declare were not applied", undeclared, short(&request.device_id));
+        }
+    }
     for change in &request.changes {
         tracing::trace!(
             "  Incoming: {} {} {}",
@@ -823,6 +864,10 @@ async fn apply_changes(
         let _ = db.update_peer_sync_time(&request.device_id, Some(&request.device_name));
     }
 
+    let mut errors = errors;
+    if undeclared > 0 {
+        errors.push(format!("{} change(s) of entity types this device did not declare in its handshake were not applied", undeclared));
+    }
     let response = ApplyResponse {
         applied,
         conflicts,
@@ -1625,6 +1670,8 @@ mod tests {
                 device_name: "Phone".to_string(),
                 protocol_version: PROTOCOL_VERSION.to_string(),
                 account_id: account_id.to_string(),
+                application: String::new(),
+                entity_types: Vec::new(),
             }
         }
 
@@ -1882,6 +1929,8 @@ mod tests {
                     device_name: "Someone else".to_string(),
                     protocol_version: PROTOCOL_VERSION.to_string(),
                     account_id: account.clone(),
+                    application: String::new(),
+                    entity_types: Vec::new(),
                 })
                 .send()
                 .await
@@ -2232,6 +2281,143 @@ mod tests {
             };
             let response = reqwest::Client::new().post(format!("{}/pair/grant", url)).json(&grant).send().await.unwrap();
             assert_eq!(response.status(), 403, "no token was ever offered");
+            task.abort();
+        }
+    }
+
+    mod version_two {
+        use super::*;
+        use crate::auth;
+        use crate::config::Config;
+        use crate::sync_client::SyncClient;
+        use crate::sync_protocol::{codes, HandshakeRequest};
+
+        struct Device {
+            db: Arc<Mutex<Database>>,
+            config: Arc<Mutex<Config>>,
+            id: String,
+            _dir: TempDir,
+        }
+
+        fn device(name: &str) -> Device {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new(dir.path().join("notes.db")).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            config.set_device_name(name).unwrap();
+            auth::ensure_own_device_card(&db, &mut config).unwrap();
+            let id = config.device_id_hex().to_string();
+            Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
+        }
+
+        /// A and B of one account, B served plain http; A's raw client with its headers.
+        async fn pair() -> (Device, Device, String, reqwest::Client, Vec<(String, String)>, tokio::task::JoinHandle<()>) {
+            let a = device("A");
+            let b = device("B");
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            b.db.lock().unwrap().move_to_account(&account).unwrap();
+            let card_a = a.db.lock().unwrap().get_device_card(&a.id).unwrap().unwrap();
+            let card_b = b.db.lock().unwrap().get_device_card(&b.id).unwrap().unwrap();
+            a.db.lock().unwrap().admit_device_card(&card_b).unwrap();
+            b.db.lock().unwrap().admit_device_card(&card_a).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let router = create_router(b.db.clone(), b.config.clone()).into_make_service_with_connect_info::<SocketAddr>();
+            let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
+            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            let key = a.config.lock().unwrap().device_key().to_string();
+            let headers = vec![
+                (auth::HEADER_ACCOUNT.to_string(), account),
+                (auth::HEADER_DEVICE.to_string(), a.id.clone()),
+                ("authorization".to_string(), format!("Bearer {}", key)),
+            ];
+            (a, b, url, reqwest::Client::new(), headers, task)
+        }
+
+        fn with_headers(mut request: reqwest::RequestBuilder, headers: &[(String, String)]) -> reqwest::RequestBuilder {
+            for (k, v) in headers {
+                request = request.header(k, v);
+            }
+            request
+        }
+
+        #[tokio::test]
+        async fn a_peer_of_version_one_is_refused_in_words_and_version_two_is_let_in() {
+            let (a, _b, url, http, headers, task) = pair().await;
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            let mut request = HandshakeRequest {
+                device_id: a.id.clone(),
+                device_name: "Old phone".to_string(),
+                protocol_version: "1.1".to_string(),
+                account_id: account.clone(),
+                application: "voice".to_string(),
+                entity_types: Vec::new(),
+            };
+            let response = with_headers(http.post(format!("{}/sync/handshake", url)), &headers).json(&request).send().await.unwrap();
+            assert_eq!(response.status(), 426);
+            let body: ErrorResponse = response.json().await.unwrap();
+            assert_eq!(body.code, codes::PROTOCOL_TOO_OLD);
+            assert_eq!(body.error, "Update Voice on Old phone (PROTOCOL_TOO_OLD)");
+
+            request.protocol_version = "2.0".to_string();
+            let response = with_headers(http.post(format!("{}/sync/handshake", url)), &headers).json(&request).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            let body: HandshakeResponse = response.json().await.unwrap();
+            assert_eq!(body.protocol_version, "2.0");
+            assert_eq!(body.application, "voice");
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn the_feed_narrows_to_the_types_asked_for_and_apply_refuses_undeclared_ones() {
+            let (a, b, url, http, headers, task) = pair().await;
+            {
+                let db = b.db.lock().unwrap();
+                db.create_note("פתק").unwrap();
+                db.create_tag("תגית", None).unwrap();
+            }
+            let response = with_headers(http.get(format!("{}/sync/changes?cursor=0&limit=1000&types=tag", url)), &headers).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            let page: ChangesResponse = response.json().await.unwrap();
+            assert!(!page.changes.is_empty());
+            assert!(page.changes.iter().all(|c| c.entity_type == "tag"), "{:?}", page.changes.iter().map(|c| c.entity_type.clone()).collect::<Vec<_>>());
+            assert!(page.next_cursor.unwrap_or(0) > 0, "the cursor walks the whole feed");
+
+            // An application that declared tags only: a note it sends is not applied
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            let handshake = HandshakeRequest {
+                device_id: a.id.clone(),
+                device_name: "Images".to_string(),
+                protocol_version: PROTOCOL_VERSION.to_string(),
+                account_id: account,
+                application: "images".to_string(),
+                entity_types: vec!["tag".to_string()],
+            };
+            let response = with_headers(http.post(format!("{}/sync/handshake", url)), &headers).json(&handshake).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            let (note_change, tag_change) = {
+                let db = a.db.lock().unwrap();
+                db.create_note("מהתמונות").unwrap();
+                db.create_tag("צילומים", None).unwrap();
+                let (changes, _, _) = db.get_changes_after_seq_as_sync_changes(0, None, 1000).unwrap();
+                (
+                    changes.iter().find(|c| c.entity_type == "note").cloned().unwrap(),
+                    changes.iter().find(|c| c.entity_type == "tag").cloned().unwrap(),
+                )
+            };
+            let apply = ApplyRequest { device_id: a.id.clone(), device_name: "Images".to_string(), changes: vec![note_change, tag_change] };
+            let response = with_headers(http.post(format!("{}/sync/apply", url)), &headers).json(&apply).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            let body: ApplyResponse = response.json().await.unwrap();
+            assert_eq!(body.applied, 1, "the tag");
+            assert!(body.errors.iter().any(|e| e.contains("did not declare")), "{:?}", body.errors);
+            assert!(b.db.lock().unwrap().get_all_notes().unwrap().iter().all(|n| n.content != "מהתמונות"));
+
+            // Voice, declaring nothing, gets everything as before
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let result = client.sync_with_peer(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert!(b.db.lock().unwrap().get_all_notes().unwrap().iter().any(|n| n.content == "מהתמונות"));
             task.abort();
         }
     }

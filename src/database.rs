@@ -3566,6 +3566,32 @@ impl Database {
         Ok((c.unwrap_or(0), s.unwrap_or(0), d))
     }
 
+    /// The entity types a peer declared in its handshake (Stage 16): apply
+    /// accepts only those. Empty means every type.
+    pub fn set_peer_entity_types(&self, peer_device_id: &str, peer_name: Option<&str>, types: &[String]) -> VoiceResult<()> {
+        let peer_uuid = Uuid::parse_str(peer_device_id).map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+        let peer_bytes = peer_uuid.as_bytes().to_vec();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, '')",
+            params![peer_bytes, peer_name],
+        )?;
+        self.conn.execute(
+            "UPDATE sync_peers SET peer_entity_types = ? WHERE peer_id = ?",
+            params![serde_json::to_string(types).unwrap_or_default(), peer_bytes],
+        )?;
+        Ok(())
+    }
+
+    /// The entity types a peer declared, or empty for every type.
+    pub fn peer_entity_types(&self, peer_device_id: &str) -> VoiceResult<Vec<String>> {
+        let peer_uuid = Uuid::parse_str(peer_device_id).map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+        let text: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT peer_entity_types FROM sync_peers WHERE peer_id = ?", params![peer_uuid.as_bytes().to_vec()], |r| r.get(0))
+            .optional()?;
+        Ok(text.flatten().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default())
+    }
+
     /// The bucket objects of purged recordings not yet tagged (Stage 14).
     pub fn purged_objects(&self) -> VoiceResult<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT storage_key FROM purged_objects ORDER BY at")?;
@@ -7556,7 +7582,7 @@ impl Database {
             );
             "#,
         )?;
-        for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT", "peer_account_id TEXT", "last_operation TEXT"] {
+        for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT", "peer_account_id TEXT", "last_operation TEXT", "peer_entity_types TEXT"] {
             let name = col.split(' ').next().unwrap_or_default();
             if !self.column_exists("sync_peers", name)? {
                 self.conn.execute(&format!("ALTER TABLE sync_peers ADD COLUMN {}", col), [])?;
