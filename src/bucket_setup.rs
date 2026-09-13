@@ -179,7 +179,12 @@ pub fn explain_error(text: &str) -> String {
 /// otherwise reads exactly like a wrong key. Anything else as [`explain_error`].
 pub fn explain_refusal(key: &BucketKey, text: &str) -> String {
     let lower = text.to_lowercase();
-    let refused = lower.contains("accessdenied") || lower.contains("http 403") || lower.contains("non 2**");
+    // A cause the service names (a wrong secret, an unknown key id, no such
+    // bucket, another region, a taken name) is that cause, over any address
+    let named = ["signaturedoesnotmatch", "invalidaccesskeyid", "nosuchbucket", "permanentredirect", "authorizationheadermalformed", "bucketalreadyexists", "bucketalreadyownedbyyou"]
+        .iter()
+        .any(|code| lower.contains(code));
+    let refused = !named && (lower.contains("accessdenied") || lower.contains("http 403") || lower.contains("non 2**"));
     let plain = key.endpoint.as_deref().is_some_and(|e| e.trim().to_lowercase().starts_with("http://"));
     if refused && plain {
         return "The service refused the request, and the endpoint is http://: a bucket hardened by the wizard accepts only https:// connections, so use the https:// address. If the address is https:// already, the key may be wrong or lack the policy.".to_string();
@@ -685,8 +690,10 @@ mod tests {
         assert!(explain_refusal(&plain, "HTTP 403: ").contains("https://"));
         assert_eq!(explain_refusal(&tls, refused), explain_error(refused));
         assert_eq!(explain_refusal(&amazon, refused), explain_error(refused));
-        assert_eq!(explain_refusal(&plain, "<Code>SignatureDoesNotMatch</Code>"), "The secret is wrong, or has a space on the end.", "a wrong secret is not a refusal by policy");
-        assert_eq!(explain_refusal(&plain, "<Code>NoSuchBucket</Code>"), "There is no bucket of that name in this region.");
+        // As the service sends them: the status, then the code that names the cause
+        assert_eq!(explain_refusal(&plain, "HTTP 403: <Error><Code>SignatureDoesNotMatch</Code></Error>"), "The secret is wrong, or has a space on the end.", "a wrong secret is not a refusal by policy");
+        assert_eq!(explain_refusal(&plain, "Got HTTP 403 with content '<Code>InvalidAccessKeyId</Code>'"), "The key id is wrong; it starts with AKIA and is 20 characters.");
+        assert_eq!(explain_refusal(&plain, "HTTP 404: <Code>NoSuchBucket</Code>"), "There is no bucket of that name in this region.");
     }
 
     #[test]
