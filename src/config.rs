@@ -100,6 +100,14 @@ pub struct SyncConfig {
     /// held in clear only here, hashed on every other device's card.
     #[serde(default)]
     pub device_key: String,
+    /// The peer of the last operation (Stage 5): the one visible button
+    /// names it. Local.
+    #[serde(default)]
+    pub last_peer_id: String,
+    /// Peers forgotten on this device (Stage 5): their cards do not bring
+    /// them back to the list until the user adds them again. Local.
+    #[serde(default)]
+    pub forgotten_peers: Vec<String>,
 }
 
 fn default_server_port() -> u16 {
@@ -119,6 +127,8 @@ impl Default for SyncConfig {
             max_sync_file_size_mb: default_max_sync_file_size_mb(),
             mirror_audio_files: false,
             device_key: String::new(),
+            last_peer_id: String::new(),
+            forgotten_peers: Vec::new(),
         }
     }
 }
@@ -292,9 +302,11 @@ fn generate_device_id() -> String {
 fn get_default_device_name() -> String {
     #[cfg(feature = "desktop")]
     {
+        // The hostname alone (Stage 5): a card should read "desk", not
+        // "Voice on desk"
         match hostname::get() {
-            Ok(name) => format!("Voice on {}", name.to_string_lossy()),
-            Err(_) => "Voice Device".to_string(),
+            Ok(name) if !name.is_empty() => name.to_string_lossy().to_string(),
+            _ => "Voice Device".to_string(),
         }
     }
     #[cfg(not(feature = "desktop"))]
@@ -601,6 +613,9 @@ impl Config {
             return Err(VoiceError::validation("peer_id", "must be 32 hex characters"));
         }
 
+        // Added by hand or by pairing: no longer forgotten (Stage 5)
+        self.data.sync.forgotten_peers.retain(|p| p != peer_id);
+
         // Check if peer already exists
         if let Some(existing) = self.data.sync.peers.iter_mut().find(|p| p.peer_id == peer_id) {
             if !allow_update {
@@ -632,6 +647,54 @@ impl Config {
             self.save()?;
         }
         Ok(removed)
+    }
+
+    /// Forget a peer on this device (Stage 5): it leaves the list, and its
+    /// card does not bring it back until it is added again by hand or by
+    /// pairing. Returns whether it was in the list.
+    pub fn forget_peer(&mut self, peer_id: &str) -> VoiceResult<bool> {
+        let removed = self.remove_peer(peer_id)?;
+        if !self.data.sync.forgotten_peers.iter().any(|p| p == peer_id) {
+            self.data.sync.forgotten_peers.push(peer_id.to_string());
+        }
+        if self.data.sync.last_peer_id == peer_id {
+            self.data.sync.last_peer_id.clear();
+        }
+        self.save()?;
+        Ok(removed)
+    }
+
+    /// Whether a peer was forgotten here (Stage 5).
+    pub fn is_forgotten(&self, peer_id: &str) -> bool {
+        self.data.sync.forgotten_peers.iter().any(|p| p == peer_id)
+    }
+
+    /// The local name of a peer (Stage 5), shown in place of its card's.
+    pub fn rename_peer(&mut self, peer_id: &str, name: &str) -> VoiceResult<bool> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(VoiceError::validation("name", "A peer's name cannot be empty"));
+        }
+        if let Some(peer) = self.data.sync.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+            peer.peer_name = name.to_string();
+            self.save()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The peer of the last operation (Stage 5), if it is still in the list.
+    pub fn last_peer(&self) -> Option<&PeerConfig> {
+        self.get_peer(&self.data.sync.last_peer_id.clone())
+    }
+
+    pub fn set_last_peer(&mut self, peer_id: &str) -> VoiceResult<()> {
+        if self.data.sync.last_peer_id != peer_id {
+            self.data.sync.last_peer_id = peer_id.to_string();
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// Get a specific peer by ID
@@ -779,6 +842,35 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_device_name_is_the_hostname_alone() {
+        let name = get_default_device_name();
+        assert!(!name.starts_with("Voice on"), "{}", name);
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn a_forgotten_peer_is_remembered_as_such_until_added_again() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+        let id = "0199aaaaaaaa7000800000000000000a";
+        config.add_peer(id, "Desk", "https://desk:8384", None, false).unwrap();
+        config.set_last_peer(id).unwrap();
+        assert_eq!(config.last_peer().unwrap().peer_id, id);
+        assert!(config.forget_peer(id).unwrap());
+        assert!(config.is_forgotten(id));
+        assert!(config.last_peer().is_none(), "the last peer is not a forgotten one");
+        assert!(!config.forget_peer(id).unwrap(), "already gone");
+        let again = Config::new(Some(dir.path().to_path_buf())).unwrap();
+        assert!(again.is_forgotten(id), "written to the file");
+        config.add_peer(id, "Desk", "https://desk:8384", None, false).unwrap();
+        assert!(!config.is_forgotten(id));
+        assert!(config.rename_peer(id, "Study").unwrap());
+        assert_eq!(config.get_peer(id).unwrap().peer_name, "Study");
+        assert!(config.rename_peer(id, "  ").is_err());
+        assert!(!config.rename_peer("0199aaaaaaaa7000800000000000000b", "x").unwrap());
+    }
     use tempfile::TempDir;
 
     #[test]

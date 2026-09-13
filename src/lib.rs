@@ -77,6 +77,6 @@ pub use file_storage_s3::S3StorageService;
 // Re-export Android types when uniffi feature is enabled
 #[cfg(feature = "uniffi")]
 pub use android::{
-    generate_device_id, ImportAudioResultData, NoteData, SyncResultData, SyncServerConfig,
+    generate_device_id, ImportAudioResultData, NoteData, SyncResultData,
     VoiceClient, VoiceCoreError,
 };

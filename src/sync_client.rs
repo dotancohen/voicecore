@@ -512,6 +512,13 @@ impl SyncClient {
         if let Err(e) = self.update_peer_sync_time(peer_id) {
             result.errors.push(format!("Failed to update sync time: {}", e));
         }
+        if let Err(e) = self.config.lock().unwrap().set_last_peer(peer_id) {
+            result.warnings.push(format!("Could not remember the last peer: {}", e));
+        }
+        // The cards that arrived are peers now (Stage 5)
+        if let Err(e) = self.adopt_peers_from_cards() {
+            result.warnings.push(format!("The peer list could not be read from the cards: {}", e));
+        }
 
         result.success = result.errors.is_empty();
         result
@@ -1604,7 +1611,8 @@ impl SyncClient {
         }
     }
 
-    /// The peer's row remembers when it was last reached and by what.
+    /// The peer's row remembers when it was last reached and by what, and
+    /// the peer becomes the one the visible button names (Stage 5).
     fn record_operation(&self, peer_id: &str, operation: &str) {
         let (name, url) = {
             let config = self.config.lock().unwrap();
@@ -1613,6 +1621,54 @@ impl SyncClient {
         if let Err(e) = self.db.lock().unwrap().set_peer_last_operation(peer_id, Some(&name), Some(&url), operation) {
             tracing::warn!("Could not record the {} with {}: {}", operation, short_id(peer_id), e);
         }
+        if let Err(e) = self.config.lock().unwrap().set_last_peer(peer_id) {
+            tracing::warn!("Could not remember {} as the last peer: {}", short_id(peer_id), e);
+        }
+    }
+
+    /// After a sync every card of the account is a peer (Stage 5): a card
+    /// without an entry gets one, with the card's name, its first address
+    /// and its fingerprint; an entry re-pins its fingerprint from the card
+    /// (which arrived over an authenticated connection); a revoked card's
+    /// entry goes; a forgotten peer stays forgotten. The remembered address
+    /// is never replaced by the card's.
+    pub fn adopt_peers_from_cards(&self) -> VoiceResult<usize> {
+        let cards = self.db.lock().unwrap().list_device_cards()?;
+        let mut config = self.config.lock().unwrap();
+        let own = config.device_id_hex().to_string();
+        let mut changed = 0;
+        for card in cards {
+            if card.device_id == own || config.is_forgotten(&card.device_id) {
+                continue;
+            }
+            if card.revoked == "1" {
+                if config.remove_peer(&card.device_id)? {
+                    changed += 1;
+                }
+                continue;
+            }
+            let first_address = serde_json::from_str::<Vec<String>>(&card.addresses).ok().and_then(|a| a.into_iter().next()).unwrap_or_default();
+            let fingerprint = if card.certificate_fingerprint.is_empty() { None } else { Some(card.certificate_fingerprint.as_str()) };
+            match config.get_peer(&card.device_id).cloned() {
+                None => {
+                    let name = if card.name.is_empty() { short_id(&card.device_id).to_string() } else { card.name.clone() };
+                    config.add_peer(&card.device_id, &name, &first_address, fingerprint, false)?;
+                    changed += 1;
+                }
+                Some(existing) => {
+                    let url = if existing.peer_url.is_empty() { first_address } else { existing.peer_url.clone() };
+                    let pin_changed = fingerprint.is_some() && existing.certificate_fingerprint.as_deref() != fingerprint;
+                    if url != existing.peer_url || pin_changed {
+                        config.add_peer(&card.device_id, &existing.peer_name, &url, fingerprint, true)?;
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        if changed > 0 {
+            self.clients.lock().unwrap().clear();
+        }
+        Ok(changed)
     }
 
     async fn move_files(&self, peer_id: &str, result: &mut SyncResult, send: bool, fetch: bool) {

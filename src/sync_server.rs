@@ -2374,6 +2374,105 @@ mod tests {
         }
     }
 
+    mod peers_from_cards {
+        use super::*;
+        use crate::auth;
+        use crate::config::Config;
+        use crate::sync_client::SyncClient;
+
+        struct Device {
+            db: Arc<Mutex<Database>>,
+            config: Arc<Mutex<Config>>,
+            id: String,
+            _dir: TempDir,
+        }
+
+        fn device(name: &str) -> Device {
+            let dir = TempDir::new().unwrap();
+            let db = Database::new(dir.path().join("notes.db")).unwrap();
+            let mut config = Config::new(Some(dir.path().to_path_buf())).unwrap();
+            config.set_device_name(name).unwrap();
+            auth::ensure_own_device_card(&db, &mut config).unwrap();
+            let id = config.device_id_hex().to_string();
+            Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
+        }
+
+        fn card_of(d: &Device) -> crate::versions::DeviceCard {
+            d.db.lock().unwrap().get_device_card(&d.id).unwrap().unwrap()
+        }
+
+        #[tokio::test]
+        async fn after_a_sync_every_card_is_a_peer_a_revoked_one_goes_and_a_forgotten_one_stays_away() {
+            let a = device("A");
+            let b = device("B");
+            let c = device("C");
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            for d in [&b, &c] {
+                d.db.lock().unwrap().move_to_account(&account).unwrap();
+            }
+            // B knows A and C; C listens somewhere and says so on its card
+            {
+                let db = c.db.lock().unwrap();
+                let mut cfg = c.config.lock().unwrap();
+                record_listening(&db, &mut cfg, &["https://192.168.1.7:8384".to_string()], true).unwrap();
+            }
+            b.db.lock().unwrap().admit_device_card(&card_of(&a)).unwrap();
+            b.db.lock().unwrap().admit_device_card(&card_of(&c)).unwrap();
+            a.db.lock().unwrap().admit_device_card(&card_of(&b)).unwrap();
+            // B's card on B carries the listening address and the fingerprint once it serves
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            {
+                let db = b.db.lock().unwrap();
+                let mut cfg = b.config.lock().unwrap();
+                record_listening(&db, &mut cfg, &[url.clone()], true).unwrap();
+            }
+            let router = create_router(b.db.clone(), b.config.clone()).into_make_service_with_connect_info::<SocketAddr>();
+            let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
+            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+
+            // C's card, with its address, reaches B when C syncs; a card
+            // admitted by hand carries no address (the owner's fields travel)
+            c.db.lock().unwrap().admit_device_card(&card_of(&b)).unwrap();
+            c.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            let from_c = SyncClient::new(c.db.clone(), c.config.clone()).unwrap().sync_with_peer(&b.id).await;
+            assert!(from_c.success, "{:?}", from_c.errors);
+
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let result = client.sync_with_peer(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+
+            let peers = a.config.lock().unwrap().peers().to_vec();
+            assert_eq!(peers.len(), 2, "B, and C from its card: {:?}", peers);
+            let c_peer = peers.iter().find(|p| p.peer_id == c.id).expect("C is a peer now");
+            assert_eq!(c_peer.peer_name, "C");
+            assert_eq!(c_peer.peer_url, "https://192.168.1.7:8384", "the card's first address");
+            assert_eq!(a.config.lock().unwrap().last_peer().map(|p| p.peer_id.clone()), Some(b.id.clone()), "the last peer is B");
+            assert!(!peers.iter().any(|p| p.peer_id == a.id), "never itself");
+
+            // Forgotten on A: gone, and the next sync does not bring it back
+            assert!(a.config.lock().unwrap().forget_peer(&c.id).unwrap());
+            let result = client.sync_with_peer(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert!(!a.config.lock().unwrap().peers().iter().any(|p| p.peer_id == c.id), "forgotten stays forgotten");
+            // Added again by hand: no longer forgotten
+            a.config.lock().unwrap().add_peer(&c.id, "C again", "https://192.168.1.7:8384", None, true).unwrap();
+            assert!(!a.config.lock().unwrap().is_forgotten(&c.id));
+            assert!(a.config.lock().unwrap().rename_peer(&c.id, "Meirav's phone").unwrap());
+            let result = client.sync_with_peer(&b.id).await;
+            assert!(result.success);
+            assert_eq!(a.config.lock().unwrap().get_peer(&c.id).unwrap().peer_name, "Meirav's phone", "the local name stays over the card's");
+
+            // Revoked on B: after the next sync it is no peer of A's
+            b.db.lock().unwrap().revoke_device(&c.id).unwrap();
+            let result = client.sync_with_peer(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert!(!a.config.lock().unwrap().peers().iter().any(|p| p.peer_id == c.id), "a revoked card's peer goes");
+            task.abort();
+        }
+    }
+
     mod files_between_instances {
         use super::*;
         use crate::auth;

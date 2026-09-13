@@ -237,13 +237,17 @@ pub struct CheckRowData {
     pub code: String,
 }
 
-/// Configuration for sync server connection
+/// A peer of this phone (Stage 5)
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct SyncServerConfig {
-    pub server_url: String,
-    pub server_peer_id: String,
-    pub device_id: String,
-    pub device_name: String,
+pub struct PeerData {
+    pub peer_id: String,
+    pub name: String,
+    pub url: String,
+    pub certificate_fingerprint: String,
+    pub last_reached_at: Option<i64>,
+    pub last_operation: String,
+    /// The one the visible button names
+    pub is_last: bool,
 }
 
 /// Result of importing an audio file
@@ -328,78 +332,81 @@ impl VoiceClient {
         Ok(notes.len() as i32)
     }
 
-    /// Configure sync settings
-    pub fn configure_sync(&self, sync_config: SyncServerConfig) -> Result<(), VoiceCoreError> {
+    /// Every peer of this phone (Stage 5): the card's name or the local
+    /// one, the remembered address, when it was last reached and by what,
+    /// and whether it is the one the visible button names.
+    pub fn list_peers(&self) -> Result<Vec<PeerData>, VoiceCoreError> {
+        let cfg = self.config.lock().unwrap();
+        let db = self.db.lock().unwrap();
+        let summaries = db.peer_summaries()?;
+        let last = cfg.last_peer().map(|p| p.peer_id.clone()).unwrap_or_default();
+        Ok(cfg
+            .peers()
+            .iter()
+            .map(|p| {
+                let summary = summaries.iter().find(|s| s.peer_id == p.peer_id);
+                PeerData {
+                    peer_id: p.peer_id.clone(),
+                    name: p.peer_name.clone(),
+                    url: p.peer_url.clone(),
+                    certificate_fingerprint: p.certificate_fingerprint.clone().unwrap_or_default(),
+                    last_reached_at: summary.and_then(|s| s.last_reached_at),
+                    last_operation: summary.and_then(|s| s.last_operation.clone()).unwrap_or_default(),
+                    is_last: p.peer_id == last,
+                }
+            })
+            .collect())
+    }
+
+    /// Add a peer typed by hand (Stage 7, the third way): its device id,
+    /// a name and where it listens. Pairing adds peers by itself.
+    pub fn add_peer(&self, peer_id: String, name: String, url: String) -> Result<(), VoiceCoreError> {
         let mut cfg = self.config.lock().unwrap();
-
-        // Update device name
-        cfg.set_device_name(&sync_config.device_name)?;
-
-        // Add or update the peer
-        cfg.add_peer(
-            &sync_config.server_peer_id,
-            "Sync Server",
-            &sync_config.server_url,
-            None,
-            true, // allow_update
-        )?;
-
-        // Enable sync
+        cfg.add_peer(&peer_id, name.trim(), url.trim(), None, true)?;
         cfg.set_sync_enabled(true)?;
-
         Ok(())
     }
 
-    /// Check if sync is configured
-    pub fn is_sync_configured(&self) -> bool {
-        let cfg = self.config.lock().unwrap();
-        cfg.is_sync_enabled() && !cfg.peers().is_empty()
+    /// Forget a peer on this phone (Stage 5): its card does not bring it
+    /// back until it is added again.
+    pub fn forget_peer(&self, peer_id: String) -> Result<bool, VoiceCoreError> {
+        let mut cfg = self.config.lock().unwrap();
+        Ok(cfg.forget_peer(&peer_id)?)
     }
 
-    /// Get current sync configuration
-    pub fn get_sync_config(&self) -> Option<SyncServerConfig> {
-        let cfg = self.config.lock().unwrap();
-
-        if !cfg.is_sync_enabled() {
-            return None;
-        }
-
-        let peers = cfg.peers();
-        if peers.is_empty() {
-            return None;
-        }
-
-        let peer = &peers[0];
-        Some(SyncServerConfig {
-            server_url: peer.peer_url.clone(),
-            server_peer_id: peer.peer_id.clone(),
-            device_id: cfg.device_id_hex().to_string(),
-            device_name: cfg.device_name().to_string(),
-        })
+    /// A local name for a peer (Stage 5), shown in place of its card's.
+    pub fn rename_peer(&self, peer_id: String, name: String) -> Result<bool, VoiceCoreError> {
+        let mut cfg = self.config.lock().unwrap();
+        Ok(cfg.rename_peer(&peer_id, &name)?)
     }
 
-    /// Sync with the configured server: database changes both ways, no files.
+    /// The peer an operation runs with: the one named, else the one of the
+    /// last operation, else the only one. With several and none named, the
+    /// caller must choose.
+    fn chosen_peer(&self, peer_id: Option<String>) -> Result<String, VoiceCoreError> {
+        let cfg = self.config.lock().unwrap();
+        if let Some(id) = peer_id.filter(|id| !id.is_empty()) {
+            return match cfg.get_peer(&id) {
+                Some(p) => Ok(p.peer_id.clone()),
+                None => Err(VoiceCoreError::Sync { msg: format!("No peer {} on this phone", &id[..UUID_SHORT_LEN.min(id.len())]) }),
+            };
+        }
+        if cfg.peers().is_empty() {
+            return Err(VoiceCoreError::Sync { msg: "No peer yet: read a code shown by another device, or add one by its address".to_string() });
+        }
+        if let Some(last) = cfg.last_peer() {
+            return Ok(last.peer_id.clone());
+        }
+        if cfg.peers().len() == 1 {
+            return Ok(cfg.peers()[0].peer_id.clone());
+        }
+        Err(VoiceCoreError::Sync { msg: "Several peers and none used yet: choose one".to_string() })
+    }
+
+    /// Sync with the last peer, or the only one: database changes both
+    /// ways, no files. `operate` names a peer.
     pub fn sync(&self) -> Result<SyncResultData, VoiceCoreError> {
-        // Check if sync is configured
-        {
-            let cfg = self.config.lock().unwrap();
-            if !cfg.is_sync_enabled() {
-                return Err(VoiceCoreError::Sync {
-                    msg: "Sync is not enabled".to_string(),
-                });
-            }
-            if cfg.peers().is_empty() {
-                return Err(VoiceCoreError::Sync {
-                    msg: "No sync peers configured".to_string(),
-                });
-            }
-        }
-
-        // Get peer ID
-        let peer_id = {
-            let cfg = self.config.lock().unwrap();
-            cfg.peers()[0].peer_id.clone()
-        };
+        let peer_id = self.chosen_peer(None)?;
 
         // Create sync client
         let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
@@ -626,14 +633,8 @@ impl VoiceClient {
 
     /// One operation with the configured peer: "sync", "deliver" (sync then
     /// send), "exchange" (sync, send and fetch), "send" or "fetch".
-    pub fn operate(&self, operation: String) -> Result<SyncResultData, VoiceCoreError> {
-        let peer_id = {
-            let cfg = self.config.lock().unwrap();
-            if !cfg.is_sync_enabled() || cfg.peers().is_empty() {
-                return Err(VoiceCoreError::Sync { msg: "No sync peers configured".to_string() });
-            }
-            cfg.peers()[0].peer_id.clone()
-        };
+    pub fn operate(&self, operation: String, peer_id: Option<String>) -> Result<SyncResultData, VoiceCoreError> {
+        let peer_id = self.chosen_peer(peer_id)?;
         let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -687,27 +688,8 @@ impl VoiceClient {
     ///
     /// Unlike sync(), this ignores timestamps and fetches all data.
     /// Use this for first-time sync or to re-fetch everything.
-    pub fn initial_sync(&self) -> Result<SyncResultData, VoiceCoreError> {
-        // Check if sync is configured
-        {
-            let cfg = self.config.lock().unwrap();
-            if !cfg.is_sync_enabled() {
-                return Err(VoiceCoreError::Sync {
-                    msg: "Sync is not enabled".to_string(),
-                });
-            }
-            if cfg.peers().is_empty() {
-                return Err(VoiceCoreError::Sync {
-                    msg: "No sync peers configured".to_string(),
-                });
-            }
-        }
-
-        // Get peer ID
-        let peer_id = {
-            let cfg = self.config.lock().unwrap();
-            cfg.peers()[0].peer_id.clone()
-        };
+    pub fn initial_sync(&self, peer_id: Option<String>) -> Result<SyncResultData, VoiceCoreError> {
+        let peer_id = self.chosen_peer(peer_id)?;
 
         // Create sync client
         let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
@@ -1197,7 +1179,7 @@ impl VoiceClient {
         info.push_str(&format!("Sync enabled: {}\n", cfg.is_sync_enabled()));
         info.push_str(&format!("Peers count: {}\n", cfg.peers().len()));
 
-        if let Some(peer) = cfg.peers().first() {
+        if let Some(peer) = cfg.last_peer().or_else(|| cfg.peers().first()) {
             info.push_str(&format!("Peer ID: {}...\n", &peer.peer_id[..UUID_SHORT_LEN.min(peer.peer_id.len())]));
 
             if let Ok(Some(last_sync)) = db.get_peer_last_sync(&peer.peer_id) {
