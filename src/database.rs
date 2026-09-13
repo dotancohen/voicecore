@@ -2037,6 +2037,22 @@ impl Database {
             }
         }
 
+        // The bucket objects of the recordings that go: tagged purged at the
+        // next upload run, and deleted by the lifecycle rule a day later
+        // (Stage 14). Remembered before the rows go.
+        for audio_id in &audio_ids {
+            let key: Option<Option<String>> = self
+                .conn
+                .query_row("SELECT storage_key FROM audio_files WHERE id = ? AND storage_key IS NOT NULL", params![audio_id], |r| r.get(0))
+                .optional()?;
+            if let Some(Some(key)) = key {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO purged_objects (storage_key, at) VALUES (?, ?)",
+                    params![key, Utc::now().timestamp()],
+                )?;
+            }
+        }
+
         let purged_at = Utc::now().timestamp();
         for (entity_type, entity_id) in &victims {
             self.purge_entity(entity_type, entity_id, purged_at)?;
@@ -3546,6 +3562,19 @@ impl Database {
             .optional()?;
         let (c, s, d) = row.unwrap_or((None, None, None));
         Ok((c.unwrap_or(0), s.unwrap_or(0), d))
+    }
+
+    /// The bucket objects of purged recordings not yet tagged (Stage 14).
+    pub fn purged_objects(&self) -> VoiceResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT storage_key FROM purged_objects ORDER BY at")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// A purged object was tagged in the bucket; forget it.
+    pub fn forget_purged_object(&self, storage_key: &str) -> VoiceResult<()> {
+        self.conn.execute("DELETE FROM purged_objects WHERE storage_key = ?", params![storage_key])?;
+        Ok(())
     }
 
     /// A peer holds a copy of a recording (Stage 10).
@@ -7483,6 +7512,10 @@ impl Database {
         // request. Local, never synced; it answers "is this one safe".
         self.conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS purged_objects (
+                storage_key TEXT PRIMARY KEY,
+                at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS audio_file_copies (
                 audio_id BLOB NOT NULL,
                 peer_id BLOB NOT NULL,

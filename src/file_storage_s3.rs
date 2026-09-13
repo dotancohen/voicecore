@@ -341,6 +341,23 @@ impl FileStorageService for S3StorageService {
         }
     }
 
+    fn full_storage_key(&self, remote_key: &str) -> String {
+        self.full_key(remote_key)
+    }
+
+    async fn tag_purged(&self, storage_key: &str) -> Result<(), FileStorageError> {
+        let response = self
+            .bucket
+            .put_object_tagging(storage_key, &[crate::bucket_setup::PURGED_TAG])
+            .await
+            .map_err(|e| Self::map_error(e, "Tag", storage_key))?;
+        match response.status_code() {
+            status if (200..300).contains(&status) => Ok(()),
+            404 => Err(FileStorageError::NotFound(storage_key.to_string())),
+            status => Err(FileStorageError::Network(format!("Tag of {} failed with HTTP {}: {}", storage_key, status, response.as_str().unwrap_or_default().trim()))),
+        }
+    }
+
     fn provider_name(&self) -> &'static str {
         "s3"
     }

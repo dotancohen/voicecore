@@ -24,6 +24,9 @@ pub mod error;
 pub mod file_storage;
 #[cfg(feature = "file-storage")]
 pub mod file_storage_s3;
+/// The bucket, made and hardened (Stage 8, Stage 14)
+#[cfg(feature = "file-storage")]
+pub mod bucket_setup;
 pub mod merge;
 pub mod models;
 pub mod search;

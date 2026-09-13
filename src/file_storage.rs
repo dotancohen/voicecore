@@ -153,6 +153,16 @@ pub trait FileStorageService: Send + Sync {
 
     /// Provider name stored in `audio_files.storage_provider`.
     fn provider_name(&self) -> &'static str;
+
+    /// The full storage key (prefix applied) an upload of `remote_key` would use.
+    fn full_storage_key(&self, remote_key: &str) -> String;
+
+    /// Tag an object purged (Stage 14): the bucket's lifecycle rule deletes
+    /// it a day later. The key cannot delete.
+    fn tag_purged(
+        &self,
+        storage_key: &str,
+    ) -> impl std::future::Future<Output = Result<(), FileStorageError>> + Send;
 }
 
 /// Generate the storage key for an audio file.
@@ -268,6 +278,27 @@ pub async fn upload_pending_audio_files(
     let mut result = UploadPendingResult::default();
     let total = pending_files.len();
 
+    // The objects of purged recordings are tagged first (Stage 14): a purge
+    // reaches the bucket at the next upload run, and the tag costs one request
+    match db.purged_objects() {
+        Ok(keys) => {
+            for key in keys {
+                match storage.tag_purged(&key).await {
+                    Ok(()) | Err(FileStorageError::NotFound(_)) => {
+                        if let Err(e) = db.forget_purged_object(&key) {
+                            tracing::warn!("Could not forget the purged object {}: {}", key, e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("The purged object {} was not tagged: {}", key, e);
+                        result.errors.push(format!("Purged recording {} not yet tagged in the bucket: {}", key, e));
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("Could not list purged objects: {}", e),
+    }
+
     for (index, audio_file) in pending_files.into_iter().enumerate() {
         let local_path = audio_local_path(audiofile_directory, &audio_file.id, &audio_file.filename);
 
@@ -283,6 +314,24 @@ pub async fn upload_pending_audio_files(
 
         // Generate storage key WITHOUT prefix - the storage service adds the prefix.
         let storage_key = generate_storage_key(None, &audio_file.id, &audio_file.filename);
+
+        // Already there? One request instead of a whole file (Stage 8): a
+        // row can say "not uploaded" after a snapshot restore while the
+        // object is in the bucket
+        let full_key = storage.full_storage_key(&storage_key);
+        if let Ok(true) = storage.exists(&full_key).await {
+            match db.update_audio_file_storage(&audio_file.id, storage.provider_name(), &full_key) {
+                Ok(_) => {
+                    tracing::info!(audio_id = %audio_file.id, storage_key = %full_key, "The object was in the bucket already; the row now says so");
+                    result.uploaded += 1;
+                }
+                Err(e) => {
+                    result.errors.push(format!("{} is in the bucket but the row could not be updated: {}", audio_file.id, e));
+                    result.failed += 1;
+                }
+            }
+            continue;
+        }
 
         tracing::info!(
             audio_id = %audio_file.id,
@@ -681,6 +730,8 @@ mod tests {
             async fn delete(&self, _k: &str) -> Result<(), FileStorageError> { Ok(()) }
             async fn exists(&self, k: &str) -> Result<bool, FileStorageError> { Ok(self.objects.contains_key(k)) }
             fn provider_name(&self) -> &'static str { "fake" }
+            fn full_storage_key(&self, remote_key: &str) -> String { remote_key.to_string() }
+            async fn tag_purged(&self, _k: &str) -> Result<(), FileStorageError> { Ok(()) }
         }
 
         fn setup() -> (Database, TempDir) {
