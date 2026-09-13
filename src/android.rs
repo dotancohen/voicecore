@@ -287,6 +287,32 @@ pub trait OperationProgress: Send + Sync {
     fn report(&self, stage: String, done: i64, total: i64, bytes: u64, sentence: String);
 }
 
+/// The phone's Keystore (Stage 14): wraps a secret before the core writes
+/// it and unwraps it after the core reads it. The clear bytes live in memory only.
+#[uniffi::export(callback_interface)]
+pub trait KeystoreWrapper: Send + Sync {
+    fn wrap(&self, clear: Vec<u8>) -> Vec<u8>;
+    fn unwrap(&self, wrapped: Vec<u8>) -> Vec<u8>;
+}
+
+struct WrapperBridge(Box<dyn KeystoreWrapper>);
+
+impl std::fmt::Debug for WrapperBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeystoreWrapper")
+    }
+}
+
+impl crate::config::SecretWrapper for WrapperBridge {
+    fn wrap(&self, clear: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(self.0.wrap(clear.to_vec()))
+    }
+    fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>, String> {
+        let clear = self.0.unwrap(wrapped.to_vec());
+        if clear.is_empty() { Err("the Keystore did not unwrap the secret".to_string()) } else { Ok(clear) }
+    }
+}
+
 struct ProgressBridge(Box<dyn OperationProgress>);
 
 impl crate::sync_client::ProgressSink for ProgressBridge {
@@ -295,11 +321,8 @@ impl crate::sync_client::ProgressSink for ProgressBridge {
     }
 }
 
-#[uniffi::export]
 impl VoiceClient {
-    /// Create a new VoiceClient with the given data directory
-    #[uniffi::constructor]
-    pub fn new(data_dir: String) -> Result<Arc<Self>, VoiceCoreError> {
+    fn open(data_dir: String, wrapper: Option<Arc<dyn crate::config::SecretWrapper>>) -> Result<Arc<Self>, VoiceCoreError> {
         let data_path = PathBuf::from(&data_dir);
 
         // Create directory if it doesn't exist
@@ -308,7 +331,7 @@ impl VoiceClient {
         })?;
 
         // Initialize config
-        let mut config = Config::new(Some(data_path.clone()))?;
+        let mut config = Config::new_wrapped(Some(data_path.clone()), wrapper)?;
 
         // Initialize database
         let db_path = data_path.join("notes.db");
@@ -322,6 +345,21 @@ impl VoiceClient {
             db: Arc::new(Mutex::new(db)),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }))
+    }
+}
+
+#[uniffi::export]
+impl VoiceClient {
+    /// Create a new VoiceClient with the given data directory
+    #[uniffi::constructor]
+    pub fn new(data_dir: String) -> Result<Arc<Self>, VoiceCoreError> {
+        Self::open(data_dir, None)
+    }
+
+    /// The client with the phone's Keystore wrapping the device key on disk (Stage 14).
+    #[uniffi::constructor]
+    pub fn new_with_keystore(data_dir: String, wrapper: Box<dyn KeystoreWrapper>) -> Result<Arc<Self>, VoiceCoreError> {
+        Self::open(data_dir, Some(Arc::new(WrapperBridge(wrapper))))
     }
 
     /// Tell the core which timezone this phone is in, so every timestamp it

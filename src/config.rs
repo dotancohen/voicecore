@@ -97,9 +97,14 @@ pub struct SyncConfig {
     #[serde(default)]
     pub mirror_audio_files: bool,
     /// This device's key for the account (AUTH-1): 43 base64url characters,
-    /// held in clear only here, hashed on every other device's card.
+    /// held in clear only here, hashed on every other device's card. Empty
+    /// in the file when a wrapper keeps it in `device_key_wrapped` (AUTH-9).
     #[serde(default)]
     pub device_key: String,
+    /// The device key wrapped by the platform's key store (AUTH-9), base64url;
+    /// only the phone writes it. The clear key is in memory alone.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device_key_wrapped: String,
     /// The peer of the last operation (Stage 5): the one visible button
     /// names it. Local.
     #[serde(default)]
@@ -132,6 +137,7 @@ impl Default for SyncConfig {
             max_sync_file_size_mb: default_max_sync_file_size_mb(),
             mirror_audio_files: false,
             device_key: String::new(),
+            device_key_wrapped: String::new(),
             last_peer_id: String::new(),
             forgotten_peers: Vec::new(),
             listener_idle_stop_hours: 0,
@@ -358,6 +364,15 @@ pub struct Config {
     /// Where `certs/` lives: the root
     certs_root: PathBuf,
     data: ConfigData,
+    /// The platform's key store wrapping the device key on disk (AUTH-9); none on the desktop
+    wrapper: Option<std::sync::Arc<dyn SecretWrapper>>,
+}
+
+/// A platform key store that wraps a secret before it is written and
+/// unwraps it after it is read (AUTH-9): the Android Keystore on the phone.
+pub trait SecretWrapper: Send + Sync + std::fmt::Debug {
+    fn wrap(&self, clear: &[u8]) -> Result<Vec<u8>, String>;
+    fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>, String>;
 }
 
 impl Config {
@@ -365,6 +380,13 @@ impl Config {
     ///
     /// On mobile platforms (without the `desktop` feature), `config_dir` is required.
     pub fn new(config_dir: Option<PathBuf>) -> VoiceResult<Self> {
+        Self::new_wrapped(config_dir, None)
+    }
+
+    /// `new`, with the platform's key store wrapping the device key on disk
+    /// (AUTH-9): a wrapped key in the file is unwrapped into memory, a clear
+    /// one is wrapped at the next save.
+    pub fn new_wrapped(config_dir: Option<PathBuf>, wrapper: Option<std::sync::Arc<dyn SecretWrapper>>) -> VoiceResult<Self> {
         let config_dir = match config_dir {
             Some(dir) => dir,
             None => {
@@ -410,16 +432,28 @@ impl Config {
             data.database_file = config_dir.join("notes.db").to_string_lossy().to_string();
         }
 
+        if let Some(wrapper) = &wrapper {
+            if data.sync.device_key.is_empty() && !data.sync.device_key_wrapped.is_empty() {
+                use base64::Engine;
+                let wrapped = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&data.sync.device_key_wrapped)
+                    .map_err(|e| VoiceError::Config(format!("The wrapped device key is not base64: {}", e)))?;
+                let clear = wrapper.unwrap(&wrapped).map_err(|e| VoiceError::Config(format!("The device key could not be unwrapped: {}", e)))?;
+                data.sync.device_key = String::from_utf8(clear).map_err(|_| VoiceError::Config("The unwrapped device key is not text".to_string()))?;
+            }
+        }
+
         let config = Self {
             certs_root: config_dir.clone(),
             config_dir,
             config_file,
             machine_file: None,
             data,
+            wrapper,
         };
 
-        // Save default config if it doesn't exist
-        if !config.config_file.exists() {
+        // Save default config if it doesn't exist, or the key is still in clear under a wrapper
+        if !config.config_file.exists() || (config.wrapper.is_some() && !config.data.sync.device_key.is_empty() && config.data.sync.device_key_wrapped.is_empty()) {
             config.save()?;
         }
 
@@ -496,7 +530,18 @@ impl Config {
     /// Save configuration to file. The machine-level fields go to the
     /// machine's file as well when that is a different file.
     pub fn save(&self) -> VoiceResult<()> {
-        let content = serde_json::to_string_pretty(&self.data)?;
+        let content = match &self.wrapper {
+            // The device key leaves memory wrapped only (AUTH-9)
+            Some(wrapper) if !self.data.sync.device_key.is_empty() => {
+                use base64::Engine;
+                let wrapped = wrapper.wrap(self.data.sync.device_key.as_bytes()).map_err(|e| VoiceError::Config(format!("The device key could not be wrapped: {}", e)))?;
+                let mut on_disk = self.data.clone();
+                on_disk.sync.device_key_wrapped = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wrapped);
+                on_disk.sync.device_key = String::new();
+                serde_json::to_string_pretty(&on_disk)?
+            }
+            _ => serde_json::to_string_pretty(&self.data)?,
+        };
         fs::write(&self.config_file, content)?;
         if let Some(machine_file) = &self.machine_file {
             let mut machine: ConfigData = fs::read_to_string(machine_file)
@@ -870,6 +915,45 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wrapper for the test: every byte flipped, so the file plainly does
+    /// not hold the key and the unwrap plainly needs the wrapper.
+    #[derive(Debug)]
+    struct Flip;
+    impl SecretWrapper for Flip {
+        fn wrap(&self, clear: &[u8]) -> Result<Vec<u8>, String> { Ok(clear.iter().map(|b| !b).collect()) }
+        fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>, String> { Ok(wrapped.iter().map(|b| !b).collect()) }
+    }
+
+    /// AUTH-9: under a wrapper the device key is on disk wrapped only, and
+    /// comes back through the wrapper; without one, as before.
+    #[test]
+    fn the_device_key_is_written_wrapped_and_read_back_through_the_wrapper() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let wrapper: std::sync::Arc<dyn SecretWrapper> = std::sync::Arc::new(Flip);
+        let mut config = Config::new_wrapped(Some(dir.clone()), Some(wrapper.clone())).unwrap();
+        config.set_device_key("kEy0123456789abcdefghijklmnopqrstuvwxyzABC").unwrap();
+        let file = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(!file.contains("kEy0123456789"), "the clear key is not in the file");
+        assert!(file.contains("device_key_wrapped"));
+        let json: serde_json::Value = serde_json::from_str(&file).unwrap();
+        assert_eq!(json["sync"]["device_key"], "");
+
+        let again = Config::new_wrapped(Some(dir.clone()), Some(wrapper)).unwrap();
+        assert_eq!(again.device_key(), "kEy0123456789abcdefghijklmnopqrstuvwxyzABC");
+        let without = Config::new(Some(dir.clone())).unwrap();
+        assert_eq!(without.device_key(), "", "without the wrapper the key is not readable");
+
+        // A file holding a clear key is wrapped as soon as a wrapper opens it
+        let other = temp.path().join("other");
+        let mut plain = Config::new(Some(other.clone())).unwrap();
+        plain.set_device_key("clearclearclearclearclearclearclearclear123").unwrap();
+        assert!(std::fs::read_to_string(other.join("config.json")).unwrap().contains("clearclear"));
+        let wrapped = Config::new_wrapped(Some(other.clone()), Some(std::sync::Arc::new(Flip))).unwrap();
+        assert_eq!(wrapped.device_key(), "clearclearclearclearclearclearclearclear123");
+        assert!(!std::fs::read_to_string(other.join("config.json")).unwrap().contains("clearclear"));
+    }
 
     #[test]
     fn the_default_device_name_is_the_hostname_alone() {
