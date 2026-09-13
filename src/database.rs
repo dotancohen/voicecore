@@ -15,6 +15,28 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{VoiceError, VoiceResult};
+
+/// A recording id as the bytes the database keys by.
+fn audio_id_bytes(audio_id: &str) -> VoiceResult<Vec<u8>> {
+    Ok(Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?.as_bytes().to_vec())
+}
+
+/// Whether two paths name one file: on storage that does not tell upper
+/// from lower case, two spellings of a name do.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        a == b
+    }
+}
 use crate::models::SyncChange;
 
 /// A peer known to hold a copy of a recording (Stage 10).
@@ -177,6 +199,9 @@ pub enum FeedFilter {
     Since(Option<i64>),
     /// Write-order feed: `seq > cursor` and, when given, `seq <= upto`
     AfterSeq { cursor: i64, upto: Option<i64> },
+    /// The recordings with these ids, whatever their `seq`: the ones a
+    /// collision renamed while a sync was pulling (FILE-15)
+    Ids(Vec<Vec<u8>>),
 }
 
 /// A page of the change feed.
@@ -262,8 +287,9 @@ pub struct AudioFileRow {
     pub modified_at_zone: Option<String>,
     pub deleted_at_offset: Option<i32>,
     pub deleted_at_zone: Option<String>,
-    /// The file's name in the audio directory (Stage 13): local, never synced
-    pub local_name: String,
+    /// The file's name on disk, the same on every device (FILE-15): synced;
+    /// a device holding the file renames it when the name changes
+    pub disk_name: String,
     /// The SHA-256 of the file's bytes, lowercase hex (Stage 13): synced
     /// metadata, written by import and by recording; the bucket object is
     /// keyed by it and a fetched file is verified by it
@@ -335,6 +361,10 @@ pub struct Database {
     /// Where the file is, so a snapshot can be written beside it. None for
     /// an in-memory database.
     path: Option<PathBuf>,
+    /// Recordings renamed by a collision since the sync client last asked
+    /// (FILE-15): a sync pushes them after pulling, because their new `seq`
+    /// is past the window it fixed before the pull
+    renamed_recordings: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 /// How many snapshots are kept beside a database (SNAP-2).
@@ -371,7 +401,7 @@ impl Database {
         // from other connections that may have written and closed
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
 
-        let mut db = Self { conn, path: Some(path) };
+        let mut db = Self { conn, path: Some(path), renamed_recordings: Default::default() };
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
         db.migrate_timestamps_to_unix()?;
@@ -388,7 +418,7 @@ impl Database {
     /// Create an in-memory database (for testing)
     pub fn new_in_memory() -> VoiceResult<Self> {
         let conn = Connection::open_in_memory()?;
-        let mut db = Self { conn, path: None };
+        let mut db = Self { conn, path: None, renamed_recordings: Default::default() };
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
         db.migrate_timestamps_to_unix()?;
@@ -3716,12 +3746,244 @@ impl Database {
         Ok(text.flatten().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default())
     }
 
+    /// Rename a recording (FILE-15). The name is published with a newer
+    /// `modified_at`, so every device takes it. When the file may be on this
+    /// device under the old name, its rename waits in `pending_file_renames`
+    /// for a caller that knows the folder. Returns the old name when it changed.
+    fn set_disk_name(&self, audio_id: &str, new_name: &str, file_may_be_here: bool) -> VoiceResult<Option<String>> {
+        let id = audio_id_bytes(audio_id)?;
+        let old: Option<String> = self.conn.query_row("SELECT disk_name FROM audio_files WHERE id = ?", [&id], |r| r.get(0)).optional()?.flatten();
+        let Some(old) = old else { return Ok(None) };
+        if old == new_name {
+            return Ok(None);
+        }
+        self.conn.execute(
+            "UPDATE audio_files SET disk_name = ?, modified_at = MAX(COALESCE(modified_at, 0) + 1, CAST(strftime('%s', 'now') AS INTEGER)) WHERE id = ?",
+            params![new_name, id],
+        )?;
+        if file_may_be_here {
+            self.conn.execute("INSERT OR IGNORE INTO pending_file_renames (audio_id, from_name) VALUES (?, ?)", params![id, old])?;
+        }
+        self.renamed_recordings.borrow_mut().insert(Uuid::from_slice(&id).map(|u| u.simple().to_string()).unwrap_or_default());
+        Ok(Some(old))
+    }
+
+    /// The recordings renamed by a collision since the last call, forgotten
+    /// as they are returned (FILE-15).
+    pub fn take_renamed_recordings(&self) -> Vec<String> {
+        std::mem::take(&mut *self.renamed_recordings.borrow_mut()).into_iter().collect()
+    }
+
+    /// The feed changes of these recordings as they are now, for a sync that
+    /// pushes what a collision renamed during its pull (FILE-15).
+    pub fn get_changes_for_recordings(&self, audio_ids: &[String]) -> VoiceResult<Vec<SyncChange>> {
+        let ids: Vec<Vec<u8>> = audio_ids.iter().filter_map(|i| Uuid::parse_str(i).ok()).map(|u| u.as_bytes().to_vec()).collect();
+        let feed = self.collect_changes(&FeedFilter::Ids(ids), 10_000)?;
+        Ok(Self::feed_to_sync_changes(feed.changes))
+    }
+
+    /// The name a recording takes when its name collides: the last eight
+    /// characters of its own id, or the whole id when that name is taken too.
+    fn suffix_for(&self, audio_id: &str, name: &str) -> VoiceResult<String> {
+        let short = crate::models::suffixed_name(name, audio_id, false);
+        let taken: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM audio_files WHERE disk_name = ? AND id != ?)",
+            params![short, audio_id_bytes(audio_id)?],
+            |r| r.get(0),
+        )?;
+        Ok(if taken { crate::models::suffixed_name(name, audio_id, true) } else { short })
+    }
+
+    /// Whether a name collided once already (FILE-15): a recording that is
+    /// not deleted holds it with its own suffix.
+    fn name_retired(&self, name: &str, audio_id: &str) -> VoiceResult<bool> {
+        let (stem, _) = crate::models::split_file_name(name);
+        let from = format!("{}-", stem);
+        let to = format!("{}.", stem);
+        let mut stmt = self.conn.prepare(
+            "SELECT lower(hex(id)), disk_name FROM audio_files WHERE deleted_at IS NULL AND id != ? AND disk_name >= ? AND disk_name < ?",
+        )?;
+        let rows = stmt.query_map(params![audio_id_bytes(audio_id)?, from, to], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (other, other_name) = row?;
+            if other_name == crate::models::suffixed_name(name, &other, false) || other_name == crate::models::suffixed_name(name, &other, true) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Resolve a collision of this recording's name (FILE-15). Two recordings
+    /// that are not deleted with identical names both take their suffix; a
+    /// name that collided once gives this one its suffix too; a deleted
+    /// recording holding the name takes its suffix and leaves the name.
+    /// `file_may_be_here`: whether this recording's file can already be on
+    /// this device under its present name.
+    pub fn resolve_name_collision(&self, audio_id: &str, file_may_be_here: bool) -> VoiceResult<()> {
+        let id = audio_id_bytes(audio_id)?;
+        let row: Option<(Option<String>, Option<i64>)> = self
+            .conn
+            .query_row("SELECT disk_name, deleted_at FROM audio_files WHERE id = ?", [&id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((Some(name), None)) = row else { return Ok(()) };
+        if name.is_empty() {
+            return Ok(());
+        }
+        let holders: Vec<(String, bool)> = {
+            let mut stmt = self.conn.prepare("SELECT lower(hex(id)), deleted_at IS NOT NULL FROM audio_files WHERE disk_name = ? AND id != ?")?;
+            let rows = stmt.query_map(params![name, id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut shared_by_a_live_recording = false;
+        for (other, deleted) in &holders {
+            let suffixed = self.suffix_for(other, &name)?;
+            self.set_disk_name(other, &suffixed, true)?;
+            shared_by_a_live_recording |= !deleted;
+        }
+        if shared_by_a_live_recording || self.name_retired(&name, audio_id)? {
+            let suffixed = self.suffix_for(audio_id, &name)?;
+            self.set_disk_name(audio_id, &suffixed, file_may_be_here)?;
+        }
+        Ok(())
+    }
+
+    /// Every name two recordings that are not deleted still share, resolved
+    /// (FILE-15): a recording brought back from the trash under a name taken since.
+    pub fn resolve_all_name_collisions(&self) -> VoiceResult<()> {
+        let shared: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT lower(hex(MIN(id))) FROM audio_files WHERE deleted_at IS NULL AND disk_name IS NOT NULL AND disk_name != '' GROUP BY disk_name HAVING COUNT(*) > 1",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for id in shared {
+            self.resolve_name_collision(&id, true)?;
+        }
+        Ok(())
+    }
+
+    /// Make room on disk for this recording's file under its name (FILE-15).
+    /// A file already there that is not its own moves aside: a recording's
+    /// file under a name that differs only in case, on storage that does not
+    /// tell case apart, is a collision and both take their suffix; a deleted
+    /// recording's file takes that recording's suffix; a file no row names
+    /// takes a random suffix. `occupant_is_not_ours`: the caller knows this
+    /// recording's file is not the one there; otherwise a file whose hash is
+    /// this recording's, or that cannot be told apart, is left as its own.
+    pub fn make_room_on_disk(&self, audio_id: &str, audio_dir: &Path, occupant_is_not_ours: bool) -> VoiceResult<()> {
+        let Some(row) = self.get_audio_file(audio_id)? else { return Ok(()) };
+        if row.disk_name.is_empty() {
+            return Ok(());
+        }
+        let target = crate::models::audio_local_path(audio_dir, &row.disk_name);
+        if !target.exists() {
+            return Ok(());
+        }
+        let owners: Vec<(String, String, bool)> = {
+            let mut stmt = self.conn.prepare("SELECT lower(hex(id)), disk_name, deleted_at IS NOT NULL FROM audio_files WHERE id != ? AND lower(disk_name) = lower(?)")?;
+            let rows = stmt.query_map(params![audio_id_bytes(audio_id)?, row.disk_name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let owners: Vec<_> = owners
+            .into_iter()
+            .filter(|(_, other_name, _)| other_name == &row.disk_name || same_file(&target, &audio_dir.join(other_name)))
+            .collect();
+        if owners.is_empty() {
+            let ours = !occupant_is_not_ours
+                && match &row.content_sha256 {
+                    Some(expected) => crate::transfer::file_sha256(&target).map(|h| &h == expected).unwrap_or(true),
+                    None => true,
+                };
+            if ours {
+                return Ok(());
+            }
+            let (stem, extension) = crate::models::split_file_name(&row.disk_name);
+            let aside = loop {
+                let random = Uuid::new_v4().simple().to_string();
+                let candidate = match extension {
+                    Some(extension) => format!("{}-{}.{}", stem, &random[..8], extension),
+                    None => format!("{}-{}", stem, &random[..8]),
+                };
+                if !audio_dir.join(&candidate).exists() {
+                    break candidate;
+                }
+            };
+            std::fs::rename(&target, audio_dir.join(&aside))?;
+            tracing::info!(name = %row.disk_name, aside = %aside, "A file no recording names moved aside for the recording that has its name");
+            return Ok(());
+        }
+        let mut live = false;
+        for (other, other_name, deleted) in owners {
+            let suffixed = self.suffix_for(&other, &other_name)?;
+            if let Some(old) = self.set_disk_name(&other, &suffixed, false)? {
+                let from = audio_dir.join(&old);
+                if from.exists() {
+                    std::fs::rename(&from, audio_dir.join(&suffixed))?;
+                }
+            }
+            live |= !deleted;
+        }
+        if live {
+            let suffixed = self.suffix_for(audio_id, &row.disk_name)?;
+            self.set_disk_name(audio_id, &suffixed, false)?;
+        }
+        Ok(())
+    }
+
+    /// Rename on disk the files of recordings renamed while no caller knew
+    /// the folder (FILE-15). A file that is not on this device is nothing to
+    /// rename. Returns how many files were renamed.
+    pub fn apply_pending_file_renames(&self, audio_dir: &Path) -> VoiceResult<usize> {
+        let pending: Vec<(Vec<u8>, String)> = {
+            let mut stmt = self.conn.prepare("SELECT audio_id, from_name FROM pending_file_renames")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut renamed = 0usize;
+        for (id, from) in pending {
+            let id_hex = uuid_bytes_to_hex(&id).unwrap_or_default();
+            let source = audio_dir.join(&from);
+            let to = self.get_audio_file(&id_hex)?.map(|r| r.disk_name).filter(|to| to != &from && !to.is_empty());
+            if let (Some(to), true) = (to, source.is_file()) {
+                let destination = audio_dir.join(&to);
+                if destination.exists() && !same_file(&source, &destination) {
+                    self.make_room_on_disk(&id_hex, audio_dir, true)?;
+                }
+                let to = self.get_audio_file(&id_hex)?.map(|r| r.disk_name).unwrap_or(to);
+                std::fs::rename(&source, audio_dir.join(&to))?;
+                renamed += 1;
+            }
+            self.conn.execute("DELETE FROM pending_file_renames WHERE audio_id = ?", [&id])?;
+        }
+        if renamed > 0 {
+            tracing::info!(renamed, "Recordings renamed by a collision or by another device were renamed on disk");
+        }
+        Ok(renamed)
+    }
+
+    /// Names two recordings still share resolved, and pending renames made
+    /// on disk (FILE-15): at start, and after a sync.
+    pub fn settle_file_names(&self, audio_dir: &Path) -> VoiceResult<usize> {
+        self.resolve_all_name_collisions()?;
+        self.apply_pending_file_renames(audio_dir)
+    }
+
+    /// The path this recording's file is written to (FILE-15): pending
+    /// renames made and room made on disk first.
+    pub fn disk_path_for_writing(&self, audio_id: &str, audio_dir: &Path) -> VoiceResult<PathBuf> {
+        self.apply_pending_file_renames(audio_dir)?;
+        self.make_room_on_disk(audio_id, audio_dir, false)?;
+        let row = self.get_audio_file(audio_id)?.ok_or_else(|| VoiceError::NotFound(audio_id.to_string()))?;
+        Ok(crate::models::audio_local_path(audio_dir, &row.disk_name))
+    }
+
     /// Store a recording's content hash (Stage 13), computed from its file
     /// in the audio directory; the row is published again so it travels.
     /// Returns the hash.
     pub fn store_content_hash(&self, audio_id: &str, audio_dir: &Path) -> VoiceResult<String> {
         let row = self.get_audio_file(audio_id)?.ok_or_else(|| VoiceError::NotFound(audio_id.to_string()))?;
-        let path = crate::models::audio_local_path(audio_dir, &row.local_name);
+        let path = crate::models::audio_local_path(audio_dir, &row.disk_name);
         let hash = crate::transfer::file_sha256(&path)?;
         self.set_content_hash(audio_id, &hash)?;
         Ok(hash)
@@ -3885,14 +4147,14 @@ impl Database {
         let mut recordings = 0i64;
         if let Some(dir) = audio_dir {
             let mut stmt = self.conn.prepare(
-                r#"SELECT COALESCE(a.local_name, '') FROM audio_files a
+                r#"SELECT COALESCE(a.disk_name, '') FROM audio_files a
                    WHERE a.deleted_at IS NULL AND a.storage_key IS NULL
                      AND NOT EXISTS (SELECT 1 FROM audio_file_copies c WHERE c.audio_id = a.id)"#,
             )?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             for row in rows {
-                let local_name = row?;
-                if !local_name.is_empty() && crate::models::audio_local_path(dir, &local_name).is_file() {
+                let disk_name = row?;
+                if !disk_name.is_empty() && crate::models::audio_local_path(dir, &disk_name).is_file() {
                     recordings += 1;
                 }
             }
@@ -3968,7 +4230,7 @@ impl Database {
     fn collect_changes(&self, filter: &FeedFilter, limit: i64) -> VoiceResult<ChangeFeed> {
         let mut out = ChangeFeed { changes: Vec::new(), latest_timestamp: None, next_cursor: 0, is_complete: true };
         match filter {
-            FeedFilter::Since(_) => {
+            FeedFilter::Since(_) | FeedFilter::Ids(_) => {
                 let (items, saturated) = self.collect_items(filter, limit)?;
                 // Historical behaviour: per-type order, per-type limits.
                 for (_, timestamp, c) in items {
@@ -4154,16 +4416,16 @@ impl Database {
 
         // Audio files
         {
-            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64);
+            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64, String);
             let rows: Vec<AudioRow> = self.feed_query(
-                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted", "audio_files",
+                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted, disk_name", "audio_files",
                 "sync_received_at >= ?1 OR modified_at >= ?1 OR imported_at >= ?1",
                 "COALESCE(sync_received_at, modified_at, imported_at)", "COALESCE(modified_at, imported_at)",
                 filter, limit,
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(21)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0))),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(22)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), row.get::<_, Option<String>>(21)?.unwrap_or_default())),
             )?;
             saturated |= rows.len() as i64 >= limit;
-            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted) in rows {
+            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted, disk_name) in rows {
                 let timestamp = modified_at.unwrap_or(imported_at);
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
                 let mut data = serde_json::Map::new();
@@ -4179,6 +4441,7 @@ impl Database {
                 data.insert("storage_uploaded_at".to_string(), ts_val(storage_uploaded_at));
                 data.insert("content_sha256".to_string(), str_val(content_sha256));
                 data.insert("storage_encrypted".to_string(), serde_json::Value::Bool(storage_encrypted != 0));
+                data.insert("disk_name".to_string(), serde_json::Value::String(disk_name));
                 data.insert(
                     "primary_transcription_id".to_string(),
                     str_val(primary_transcription.and_then(|b| uuid_bytes_to_hex(&b))),
@@ -4280,6 +4543,7 @@ impl Database {
             let versions = match filter {
                 FeedFilter::Since(since) => self.get_versions_since(*since, limit)?.into_iter().map(|v| (0i64, v)).collect::<Vec<_>>(),
                 FeedFilter::AfterSeq { cursor, upto } => self.get_versions_after_seq(*cursor, *upto, limit)?,
+                FeedFilter::Ids(_) => Vec::new(),
             };
             saturated |= versions.len() as i64 >= limit;
             for (seq, v) in versions {
@@ -4363,6 +4627,15 @@ impl Database {
                 format!("SELECT {}, seq FROM {} WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3", cols, table),
                 vec![(*cursor).into(), upto.unwrap_or(i64::MAX).into(), limit.into()],
             ),
+            FeedFilter::Ids(ids) => {
+                if table != "audio_files" || ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let marks = vec!["?"; ids.len()].join(", ");
+                let mut values: Vec<rusqlite::types::Value> = ids.iter().map(|id| rusqlite::types::Value::Blob(id.clone())).collect();
+                values.push(limit.into());
+                (format!("SELECT {}, seq FROM {} WHERE id IN ({}) ORDER BY seq LIMIT ?", cols, table, marks), values)
+            }
         };
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| map(row))?;
@@ -4521,7 +4794,7 @@ impl Database {
         // Get all audio_files
         let mut stmt = self.conn.prepare(
             r#"SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
-                      storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted FROM audio_files"#
+                      storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name FROM audio_files"#
         )?;
         let af_rows = stmt.query_map([], |row| {
             Ok((
@@ -4539,12 +4812,13 @@ impl Database {
                 row.get::<_, Option<i64>>(11)?,
                 row.get::<_, Option<String>>(12)?,
                 row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                row.get::<_, Option<String>>(14)?.unwrap_or_default(),
             ))
         })?;
 
         let mut audio_files = Vec::new();
         for row in af_rows {
-            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted) = row?;
+            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name) = row?;
             let mut af = HashMap::new();
             af.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
             af.insert("imported_at".to_string(), serde_json::json!(imported_at));
@@ -4560,6 +4834,7 @@ impl Database {
             af.insert("storage_uploaded_at".to_string(), storage_uploaded_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             af.insert("content_sha256".to_string(), content_sha256.map_or(serde_json::Value::Null, serde_json::Value::String));
             af.insert("storage_encrypted".to_string(), serde_json::Value::Bool(storage_encrypted != 0));
+            af.insert("disk_name".to_string(), serde_json::Value::String(disk_name));
             audio_files.push(af);
         }
         result.insert("audio_files".to_string(), audio_files);
@@ -5141,7 +5416,7 @@ impl Database {
             // carries no zone of its own.
             let _ = self.stamp_local_zone("audio_files", &id_hex, "file_created_at");
         }
-        // The file's name on this device (FILE-15)
+        // The file's name on disk (FILE-15)
         let wanted = match origin {
             crate::models::FileOrigin::Recorded => {
                 let moment = file_created_at.unwrap_or_else(|| Utc::now().timestamp());
@@ -5149,16 +5424,14 @@ impl Database {
             }
             crate::models::FileOrigin::Imported => filename.to_string(),
         };
-        let taken_by_rows: std::collections::HashSet<String> = {
-            let mut stmt = self.conn.prepare("SELECT local_name FROM audio_files WHERE local_name IS NOT NULL AND local_name != '' AND id != ?")?;
-            let rows = stmt.query_map([&uuid_bytes], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?.into_iter().map(|n| n.to_lowercase()).collect()
-        };
-        // Compared without regard to case: the phone's shared storage does not tell "A" from "a"
-        let local_name = crate::models::free_file_name(&wanted, |candidate| {
-            taken_by_rows.contains(&candidate.to_lowercase()) || audio_dir.is_some_and(|dir| dir.join(candidate).exists())
-        });
-        self.conn.execute("UPDATE audio_files SET local_name = ? WHERE id = ?", params![local_name, uuid_bytes])?;
+        self.conn.execute("UPDATE audio_files SET disk_name = ? WHERE id = ?", params![wanted, uuid_bytes])?;
+        // Two recordings with identical names both take their suffix; the new
+        // one has no file yet, so only the other's file waits to be renamed
+        self.resolve_name_collision(&id_hex, false)?;
+        if let Some(dir) = audio_dir {
+            self.apply_pending_file_renames(dir)?;
+            self.make_room_on_disk(&id_hex, dir, true)?;
+        }
         Ok(id_hex)
     }
 
@@ -5178,7 +5451,7 @@ impl Database {
             SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256, storage_encrypted
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted
             FROM audio_files
             WHERE id = ?
             "#,
@@ -5209,7 +5482,7 @@ impl Database {
                    af.summary, af.device_id, af.modified_at, af.deleted_at,
                    af.storage_provider, af.storage_key, af.storage_uploaded_at,
                    af.imported_at_offset, af.imported_at_zone, af.file_created_at_offset, af.file_created_at_zone,
-                   af.modified_at_offset, af.modified_at_zone, af.deleted_at_offset, af.deleted_at_zone, af.local_name, af.content_sha256, af.storage_encrypted
+                   af.modified_at_offset, af.modified_at_zone, af.deleted_at_offset, af.deleted_at_zone, af.disk_name, af.content_sha256, af.storage_encrypted
             FROM audio_files af
             INNER JOIN note_attachments na ON af.id = na.attachment_id
             WHERE na.note_id = ?
@@ -5271,7 +5544,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256, storage_encrypted
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted
             FROM audio_files
             ORDER BY imported_at DESC
             "#,
@@ -5395,7 +5668,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256, storage_encrypted
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted
             FROM audio_files
             WHERE duration_seconds IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -5445,7 +5718,7 @@ impl Database {
             modified_at_zone: row.get(17)?,
             deleted_at_offset: row.get::<_, Option<i64>>(18)?.and_then(|o| i32::try_from(o).ok()),
             deleted_at_zone: row.get(19)?,
-            local_name: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
+            disk_name: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
             content_sha256: row.get(21)?,
             storage_encrypted: row.get::<_, Option<i64>>(22)?.unwrap_or(0) != 0,
         })
@@ -5466,7 +5739,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256, storage_encrypted
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted
             FROM audio_files
             WHERE storage_provider IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -5834,7 +6107,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at,
-                   storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted
+                   storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name
             FROM audio_files
             WHERE id = ?
             "#,
@@ -5854,6 +6127,7 @@ impl Database {
             let storage_uploaded_at: Option<i64> = row.get(10)?;
             let content_sha256: Option<String> = row.get(11)?;
             let storage_encrypted: Option<i64> = row.get(12)?;
+            let disk_name: Option<String> = row.get(13)?;
 
             Ok(serde_json::json!({
                 "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -5869,6 +6143,7 @@ impl Database {
                 "storage_uploaded_at": storage_uploaded_at,
                 "content_sha256": content_sha256,
                 "storage_encrypted": storage_encrypted.unwrap_or(0) != 0,
+                "disk_name": disk_name,
             }))
         });
 
@@ -5897,28 +6172,44 @@ impl Database {
         // Which transcription stands for this recording, when the sender
         // named one. A hint like every other row value (VER-4).
         primary_transcription_id: Option<&str>,
-        // The offset the recording was made in, for its file name (Stage 13)
-        file_created_at_offset: Option<i32>,
         // The content hash the sender knows (Stage 13); never erased by a row without one
         content_sha256: Option<&str>,
         // Whether the object is encrypted (Stage 15); travels with the storage key
         storage_encrypted: Option<bool>,
+        // The file's name on disk, the same on every device (FILE-15)
+        disk_name: Option<&str>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
         let device_id = get_local_device_id();
-        // Named on arrival at the recording's own offset (Stage 13); kept once written
-        let local_name = crate::models::recording_file_name(id, filename, file_created_at.unwrap_or(imported_at), file_created_at_offset);
+        // The name: the newer row's, as for the other metadata; a row that names
+        // no file keeps the name here, or is named by its own file name
+        let here: Option<(Option<String>, Option<i64>)> = self
+            .conn
+            .query_row("SELECT disk_name, modified_at FROM audio_files WHERE id = ?", [id_uuid.as_bytes().to_vec()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let incoming = disk_name.filter(|n| crate::models::valid_file_name(n));
+        let name_here = here.as_ref().and_then(|(n, _)| n.clone()).filter(|n| !n.is_empty());
+        let disk_name = match (&incoming, &name_here) {
+            (Some(incoming), Some(name_here)) => {
+                let here_modified = here.as_ref().and_then(|(_, m)| *m).unwrap_or(0);
+                if modified_at.unwrap_or(0) >= here_modified { incoming.to_string() } else { name_here.clone() }
+            }
+            (Some(incoming), None) => incoming.to_string(),
+            (None, Some(name_here)) => name_here.clone(),
+            (None, None) if crate::models::valid_file_name(filename) => filename.to_string(),
+            (None, None) => format!("{}.{}", id_uuid.simple(), crate::models::audio_file_extension(filename)),
+        };
 
         self.conn.execute(
             r#"
-            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at, local_name, content_sha256, storage_encrypted)
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at, disk_name, content_sha256, storage_encrypted)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 storage_encrypted = CASE WHEN excluded.storage_key IS NOT NULL
                                            AND (audio_files.storage_key IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
                                          THEN excluded.storage_encrypted ELSE audio_files.storage_encrypted END,
-                local_name = COALESCE(NULLIF(audio_files.local_name, ''), excluded.local_name),
+                disk_name = excluded.disk_name,
                 content_sha256 = CASE WHEN excluded.content_sha256 IS NOT NULL
                                         AND (audio_files.content_sha256 IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
                                       THEN excluded.content_sha256 ELSE audio_files.content_sha256 END,
@@ -5966,7 +6257,7 @@ impl Database {
                 storage_provider,
                 storage_key,
                 storage_uploaded_at,
-                local_name,
+                disk_name,
                 content_sha256,
                 storage_encrypted.unwrap_or(false) as i64,
             ],
@@ -5983,6 +6274,12 @@ impl Database {
             self.ensure_root_version(ENTITY_AUDIO_FILE, id, FIELD_DELETED, "1", d)?;
         }
         self.reapply_entity_heads(ENTITY_AUDIO_FILE, id)?;
+
+        // A name changed by the sender: the file here, if any, follows (FILE-15)
+        if let Some(name_here) = name_here.filter(|n| n != &disk_name) {
+            self.conn.execute("INSERT OR IGNORE INTO pending_file_renames (audio_id, from_name) VALUES (?, ?)", params![id_uuid.as_bytes().to_vec(), name_here])?;
+        }
+        self.resolve_name_collision(id, here.is_some())?;
 
         Ok(())
     }
@@ -7099,32 +7396,38 @@ impl Database {
 mod tests {
     use super::*;
 
-    /// FILE-15: an imported file keeps its own name, any POSIX name; a name
-    /// taken by a row (without regard to case) or by a file in the folder
-    /// gets ` (2)`, ` (3)` before its extension; a recording is named by its
-    /// start and the tail of its id; a name that is no file name is refused
-    /// before any row is made.
+    /// FILE-15: two recordings with one name both take the suffix of their
+    /// own id, the file already on disk moving with its row; a later file with
+    /// a name that collided takes its suffix too; any POSIX name is kept; a
+    /// name that is no file name is refused before a row is made; a recording
+    /// is named by its start and the tail of its id.
     #[test]
-    fn an_imported_file_keeps_its_name_and_a_taken_name_gets_a_numbered_suffix() {
-        use crate::models::FileOrigin;
+    fn two_recordings_with_one_name_both_take_their_suffix_and_the_name_stays_retired() {
+        use crate::models::{suffixed_name, FileOrigin};
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path().join("audio");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("על הדיסק.ogg"), b"a file no row names").unwrap();
         let db = Database::new(&temp.path().join("n.db")).unwrap();
-        let name = |id: &str| db.get_audio_file(id).unwrap().unwrap().local_name;
+        let name = |id: &str| db.get_audio_file(id).unwrap().unwrap().disk_name;
         let import = |filename: &str| db.create_audio_file(filename, None, None, FileOrigin::Imported, Some(&dir));
 
-        assert_eq!(name(&import("שיחה.m4a").unwrap()), "שיחה.m4a");
-        assert_eq!(name(&import("שיחה.m4a").unwrap()), "שיחה (2).m4a");
-        assert_eq!(name(&import("Memo.M4A").unwrap()), "Memo.M4A", "the name is kept as it is, case and all");
-        assert_eq!(name(&import("memo.m4a").unwrap()), "memo (2).m4a", "names differing only in case are one name on the phone's storage");
-        assert_eq!(name(&import("על הדיסק.ogg").unwrap()), "על הדיסק (2).ogg", "a file already in the folder takes its name too");
+        let first = import("הבית שלי.jpg").unwrap();
+        assert_eq!(name(&first), "הבית שלי.jpg");
+        std::fs::write(dir.join("הבית שלי.jpg"), b"the first house").unwrap();
+        let second = import("הבית שלי.jpg").unwrap();
+        assert_eq!(name(&first), suffixed_name("הבית שלי.jpg", &first, false));
+        assert_eq!(name(&second), suffixed_name("הבית שלי.jpg", &second, false));
+        assert!(name(&first).ends_with(&format!("-{}.jpg", &first[24..])), "{}", name(&first));
+        assert_eq!(std::fs::read(dir.join(name(&first))).unwrap(), b"the first house", "the file moved with its row");
+        assert!(!dir.join("הבית שלי.jpg").exists(), "no file keeps the name that collided");
+
+        let third = import("הבית שלי.jpg").unwrap();
+        assert_eq!(name(&third), suffixed_name("הבית שלי.jpg", &third, false), "a name that collided once never returns without a suffix");
+        assert_eq!(name(&first), suffixed_name("הבית שלי.jpg", &first, false), "the others keep theirs");
+
         assert_eq!(name(&import(".hidden").unwrap()), ".hidden");
         assert_eq!(name(&import("no extension").unwrap()), "no extension");
-        assert_eq!(name(&import("no extension").unwrap()), "no extension (2)");
-        assert_eq!(name(&import("a.tar.gz").unwrap()), "a.tar.gz");
-        assert_eq!(name(&import("a.tar.gz").unwrap()), "a.tar (2).gz");
+        assert_eq!(name(&import("Memo.M4A").unwrap()), "Memo.M4A");
 
         let before = db.get_all_audio_files().unwrap().len();
         for bad in ["", ".", "..", "a/b.ogg", "nul\0.ogg"] {
@@ -7134,9 +7437,66 @@ mod tests {
 
         let note = db.create_note("").unwrap();
         let recorded = db.import_audio_file_into_note(&note, "Recording 2026-09-13 10-00-00.ogg", Some(1757746800), Some(3), Some(&dir)).unwrap();
-        let recorded_name = name(&recorded);
-        assert!(recorded_name.ends_with(&format!("-{}.ogg", &recorded[recorded.len() - 8..])), "{}", recorded_name);
-        assert_eq!(recorded_name.len(), "2026_09_13_10_00_00-".len() + 8 + ".ogg".len(), "{}", recorded_name);
+        assert!(name(&recorded).ends_with(&format!("-{}.ogg", &recorded[24..])), "{}", name(&recorded));
+    }
+
+    /// FILE-15: a deleted recording holds no name: when a new file takes its
+    /// name, the deleted recording's file and row take its suffix and the new
+    /// file keeps the name. A file on disk that no row names moves aside.
+    #[test]
+    fn a_deleted_recording_and_a_file_no_row_names_leave_the_name_to_the_new_file() {
+        use crate::models::{suffixed_name, FileOrigin};
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("audio");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::new(&temp.path().join("n.db")).unwrap();
+        let name = |id: &str| db.get_audio_file(id).unwrap().unwrap().disk_name;
+        let import = |filename: &str| db.create_audio_file(filename, None, None, FileOrigin::Imported, Some(&dir));
+
+        let old = import("שיר.ogg").unwrap();
+        std::fs::write(dir.join("שיר.ogg"), b"a deleted song").unwrap();
+        db.delete_audio_file(&old).unwrap();
+        let new = import("שיר.ogg").unwrap();
+        assert_eq!(name(&new), "שיר.ogg");
+        assert_eq!(name(&old), suffixed_name("שיר.ogg", &old, false));
+        assert_eq!(std::fs::read(dir.join(name(&old))).unwrap(), b"a deleted song");
+        assert!(!dir.join("שיר.ogg").exists(), "the name is free for the new file");
+
+        std::fs::write(dir.join("stray.ogg"), b"no row names me").unwrap();
+        let taker = import("stray.ogg").unwrap();
+        assert_eq!(name(&taker), "stray.ogg");
+        let aside: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n.starts_with("stray-") && n.ends_with(".ogg")).collect();
+        assert_eq!(aside.len(), 1, "{:?}", aside);
+        assert_eq!(std::fs::read(dir.join(&aside[0])).unwrap(), b"no row names me");
+    }
+
+    /// FILE-15 and the change feed: a database from before the rename keeps
+    /// its names under `disk_name`, and a trigger built before a column
+    /// joined the synced list is rebuilt, so a change to that column publishes.
+    #[test]
+    fn an_older_database_keeps_its_names_and_publishes_every_synced_column() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("older.db");
+        let id = {
+            let db = Database::new(&path).unwrap();
+            let id = db.create_audio_file("ישן.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+            // The state of a database written before these changes
+            db.conn.execute_batch(
+                "ALTER TABLE audio_files RENAME COLUMN disk_name TO local_name;
+                 DROP TRIGGER IF EXISTS trg_audio_files_seq_update;
+                 CREATE TRIGGER trg_audio_files_seq_update AFTER UPDATE OF filename, modified_at ON audio_files
+                 WHEN NEW.filename IS NOT OLD.filename OR NEW.modified_at IS NOT OLD.modified_at
+                 BEGIN UPDATE sync_sequence SET value = value + 1 WHERE id = 1;
+                       UPDATE audio_files SET seq = (SELECT value FROM sync_sequence WHERE id = 1) WHERE rowid = NEW.rowid; END;",
+            ).unwrap();
+            id
+        };
+        let db = Database::new(&path).unwrap();
+        assert_eq!(db.get_audio_file(&id).unwrap().unwrap().disk_name, "ישן.ogg");
+        let seq = |db: &Database| -> i64 { db.conn.query_row("SELECT seq FROM audio_files", [], |r| r.get(0)).unwrap() };
+        let before = seq(&db);
+        db.conn.execute("UPDATE audio_files SET content_sha256 = 'aa'", []).unwrap();
+        assert!(seq(&db) > before, "a change to the content hash alone is published");
     }
 
     /// FILE-15: a row from before the name column keeps the name its file
@@ -7149,11 +7509,11 @@ mod tests {
             let db = Database::new(&path).unwrap();
             let id = db.create_audio_file("הקלטה ישנה.OGG", Some(1735689600), None, crate::models::FileOrigin::Imported, None).unwrap();
             // The state of a database written before the column existed
-            db.conn.execute("UPDATE audio_files SET local_name = NULL", []).unwrap();
+            db.conn.execute("UPDATE audio_files SET disk_name = NULL", []).unwrap();
             id
         };
         let db = Database::new(&path).unwrap();
-        assert_eq!(db.get_audio_file(&id).unwrap().unwrap().local_name, format!("{}.ogg", id));
+        assert_eq!(db.get_audio_file(&id).unwrap().unwrap().disk_name, format!("{}.ogg", id));
     }
 
     /// FILE-18: the content hash is computed from the file the row names,
@@ -7167,9 +7527,9 @@ mod tests {
         let id = a.create_audio_file("שיחה.ogg", Some(1735689600), None, crate::models::FileOrigin::Imported, None).unwrap();
         let row = a.get_audio_file(&id).unwrap().unwrap();
         assert!(row.content_sha256.is_none(), "not hashed before the file is there");
-        std::fs::write(crate::models::audio_local_path(&dir, &row.local_name), b"bytes of the recording").unwrap();
+        std::fs::write(crate::models::audio_local_path(&dir, &row.disk_name), b"bytes of the recording").unwrap();
         let hash = a.store_content_hash(&id, &dir).unwrap();
-        assert_eq!(hash, crate::transfer::file_sha256(&crate::models::audio_local_path(&dir, &row.local_name)).unwrap());
+        assert_eq!(hash, crate::transfer::file_sha256(&crate::models::audio_local_path(&dir, &row.disk_name)).unwrap());
         assert_eq!(a.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()));
 
         let (changes, _, _) = a.get_changes_after_seq_as_sync_changes(0, None, 100).unwrap();
@@ -7178,16 +7538,16 @@ mod tests {
         assert_eq!(a.get_audio_file_raw(&id).unwrap().unwrap()["content_sha256"].as_str(), Some(hash.as_str()));
 
         let b = Database::new(&temp.path().join("b.db")).unwrap();
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689601), None, Some(1735689602), None, None, None, None, None, Some(&hash), None).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689601), None, Some(1735689602), None, None, None, None, Some(&hash), None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()));
         // A newer row without a hash: the hash stays
         b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689700), None, Some(1735689701), None, None, None, None, None, None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()), "never erased");
         // An older row with another hash: ignored; a newer one: taken
         let other = "b".repeat(64);
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689650), None, Some(1735689702), None, None, None, None, None, Some(&other), None).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689650), None, Some(1735689702), None, None, None, None, Some(&other), None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()), "an older row does not replace it");
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689800), None, Some(1735689703), None, None, None, None, None, Some(&other), None).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689800), None, Some(1735689703), None, None, None, None, Some(&other), None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(other.as_str()), "a newer row does");
         assert!(b.get_full_dataset().unwrap()["audio_files"][0]["content_sha256"].is_string());
     }
@@ -7912,10 +8272,15 @@ impl Database {
             );
             "#,
         )?;
-        // The recording's file name on disk (FILE-15): local, never synced
-        if !self.column_exists("audio_files", "local_name")? {
-            self.conn.execute("ALTER TABLE audio_files ADD COLUMN local_name TEXT", [])?;
+        // The recording's file name on disk (FILE-15): synced, the same on every device
+        if !self.column_exists("audio_files", "disk_name")? {
+            if self.column_exists("audio_files", "local_name")? {
+                self.conn.execute("ALTER TABLE audio_files RENAME COLUMN local_name TO disk_name", [])?;
+            } else {
+                self.conn.execute("ALTER TABLE audio_files ADD COLUMN disk_name TEXT", [])?;
+            }
         }
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_audio_files_disk_name ON audio_files(disk_name)", [])?;
         // The content hash (Stage 13): synced metadata, merged per column
         if !self.column_exists("audio_files", "content_sha256")? {
             self.conn.execute("ALTER TABLE audio_files ADD COLUMN content_sha256 TEXT", [])?;
@@ -7930,14 +8295,14 @@ impl Database {
             // written down as it is: a migration never changes a name that
             // refers to a file outside the database (FILE-15).
             let unnamed: Vec<(Vec<u8>, String)> = {
-                let mut stmt = self.conn.prepare("SELECT id, filename FROM audio_files WHERE local_name IS NULL OR local_name = ''")?;
+                let mut stmt = self.conn.prepare("SELECT id, filename FROM audio_files WHERE disk_name IS NULL OR disk_name = ''")?;
                 let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
             for (id, filename) in unnamed {
                 let id_hex = uuid_bytes_to_hex(&id).unwrap_or_default();
                 let name = format!("{}.{}", id_hex, crate::models::audio_file_extension(&filename));
-                self.conn.execute("UPDATE audio_files SET local_name = ? WHERE id = ?", params![name, id])?;
+                self.conn.execute("UPDATE audio_files SET disk_name = ? WHERE id = ?", params![name, id])?;
             }
         }
 
@@ -7949,6 +8314,10 @@ impl Database {
             CREATE TABLE IF NOT EXISTS purged_objects (
                 storage_key TEXT PRIMARY KEY,
                 at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_file_renames (
+                audio_id BLOB PRIMARY KEY,
+                from_name TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS upload_parts (
                 audio_id BLOB NOT NULL,
@@ -8014,7 +8383,7 @@ impl Database {
             ("tags", &["name", "parent_id", "modified_at", "deleted_at"]),
             ("note_tags", &["modified_at", "deleted_at"]),
             ("note_attachments", &["modified_at", "deleted_at"]),
-            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256", "storage_encrypted"]),
+            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256", "storage_encrypted", "disk_name"]),
             ("transcriptions", &["content", "content_segments", "service_response", "state", "modified_at", "deleted_at"]),
             ("file_storage_config", &["provider", "config", "modified_at"]),
             // A purge is written once and never changed, so it only needs
@@ -8063,8 +8432,10 @@ impl Database {
                     .map(|c| format!("NEW.{c} IS NOT OLD.{c}", c = c))
                     .collect::<Vec<_>>()
                     .join(" OR ");
+                // Rebuilt at every open: a database made before a column joined
+                // this list would otherwise keep a trigger that never publishes it
                 self.conn.execute_batch(&format!(
-                    "CREATE TRIGGER IF NOT EXISTS trg_{t}_seq_update AFTER UPDATE OF {of} ON {t} WHEN {when} BEGIN {bump} END;",
+                    "DROP TRIGGER IF EXISTS trg_{t}_seq_update; CREATE TRIGGER trg_{t}_seq_update AFTER UPDATE OF {of} ON {t} WHEN {when} BEGIN {bump} END;",
                     t = table, of = of, when = when, bump = bump
                 ))?;
             }

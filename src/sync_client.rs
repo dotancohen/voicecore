@@ -600,6 +600,11 @@ impl SyncClient {
         // Everything written locally up to here is what this sync pushes;
         // whatever the pull writes is the peer's own data coming back.
         let local_end = self.local_seq();
+        // Renames a collision brought by this pull makes here are this device's
+        // own changes (FILE-15): forget any recorded before, push these after
+        if let Ok(db) = self.db.lock() {
+            db.take_renamed_recordings();
+        }
 
         // Step 2: Pull, page by page, saving the cursor after every page
         self.snapshot_before("sync", &mut result);
@@ -615,6 +620,31 @@ impl SyncClient {
         result.conflicts += conflicts;
         result.errors.extend(errors);
         result.warnings.extend(warnings);
+
+        // Recordings the pull renamed: their rows are past the window above,
+        // and the peer needs them now to take the same names (FILE-15)
+        let renamed = self.db.lock().map(|db| db.take_renamed_recordings()).unwrap_or_default();
+        if !renamed.is_empty() {
+            let changes = {
+                let db = self.db.lock().unwrap();
+                db.get_changes_for_recordings(&renamed)
+            };
+            match changes {
+                Ok(changes) if !changes.is_empty() => {
+                    let changes = self.stamp_origin(changes);
+                    match self.push_changes_with_data(peer_url, &changes).await {
+                        Ok((applied, page_conflicts, server_errors)) => {
+                            result.pushed += applied;
+                            result.conflicts += page_conflicts;
+                            result.warnings.extend(server_errors.into_iter().map(|e| format!("Server queued for retry: {}", e)));
+                        }
+                        Err(e) => result.errors.push(format!("Push of renamed recordings failed: {}", e)),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => result.errors.push(format!("Failed to read renamed recordings: {}", e)),
+            }
+        }
 
         // Update last sync time
         if let Err(e) = self.update_peer_sync_time(peer_id) {
@@ -1346,6 +1376,12 @@ impl SyncClient {
         let db = self.db.lock().unwrap();
         let sync_received_at = Utc::now().timestamp();
         let outcome = crate::sync_apply::apply_changes(&db, changes, peer_id, peer_name, sync_received_at)?;
+        // Names changed by the peer, or by a collision it brought, reach the disk (FILE-15)
+        if let Some(dir) = self.config.lock().ok().and_then(|c| c.audiofile_directory().map(std::path::PathBuf::from)) {
+            if let Err(e) = db.apply_pending_file_renames(&dir) {
+                tracing::warn!("Recording names were not all settled on disk: {}", e);
+            }
+        }
         if outcome.retried_ok > 0 {
             tracing::info!("Applied {} previously failed changes", outcome.retried_ok);
         }
@@ -1676,7 +1712,7 @@ impl SyncClient {
         let local: Vec<_> = rows
             .into_iter()
             .filter(|r| r.deleted_at.is_none())
-            .map(|r| (r.id.clone(), audio_local_path(audiofile_directory, &r.local_name)))
+            .map(|r| (r.id.clone(), audio_local_path(audiofile_directory, &r.disk_name)))
             .filter(|(_, path)| path.is_file())
             .collect();
         if local.is_empty() {
@@ -1729,7 +1765,7 @@ impl SyncClient {
         let mut bytes = 0u64;
         let wanted: Vec<_> = rows
             .into_iter()
-            .filter(|r| r.deleted_at.is_none() && !audio_local_path(audiofile_directory, &r.local_name).is_file())
+            .filter(|r| r.deleted_at.is_none() && !audio_local_path(audiofile_directory, &r.disk_name).is_file())
             .collect();
         let total = wanted.len() as i64;
         for row in wanted {
@@ -1737,7 +1773,17 @@ impl SyncClient {
                 errors.push(CANCELLED.to_string());
                 break;
             }
-            let path = audio_local_path(audiofile_directory, &row.local_name);
+            // Room on disk for the file under its name (FILE-15)
+            let path = match self.db.lock().unwrap().disk_path_for_writing(&row.id, audiofile_directory) {
+                Ok(path) => path,
+                Err(e) => {
+                    errors.push(format!("No room for {}: {}", &row.id[..UUID_SHORT_LEN.min(row.id.len())], e));
+                    continue;
+                }
+            };
+            if path.is_file() {
+                continue;
+            }
             self.report("fetch", fetched, total, bytes, format!("Fetching recording {} of {}", fetched + 1, total));
             let what = format!("Fetch of {}", &row.id[..UUID_SHORT_LEN.min(row.id.len())]);
             let moved_before = bytes;
@@ -1762,7 +1808,7 @@ impl SyncClient {
             let held: Vec<String> = match self.db.lock().unwrap().get_all_audio_files() {
                 Ok(rows) => rows
                     .into_iter()
-                    .filter(|r| r.deleted_at.is_none() && audio_local_path(audiofile_directory, &r.local_name).is_file())
+                    .filter(|r| r.deleted_at.is_none() && audio_local_path(audiofile_directory, &r.disk_name).is_file())
                     .map(|r| r.id)
                     .collect(),
                 Err(_) => Vec::new(),

@@ -968,21 +968,29 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Where a recording's file is, from its row, or None if the row does not
 /// exist or no audio directory is configured.
-fn audio_path_for(account: &AccountHandle, audio_id: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+fn audio_path_for(account: &AccountHandle, audio_id: &str, for_writing: bool) -> Result<std::path::PathBuf, (StatusCode, String)> {
     Uuid::parse_str(audio_id).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
     let audiofile_dir = {
         let config = account.config.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Config lock error".to_string()))?;
         config.audiofile_directory().map(|s| s.to_string())
     }
     .ok_or_else(|| (StatusCode::BAD_REQUEST, "audiofile_directory not configured".to_string()))?;
-    let local_name = {
-        let db = account.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
+    let dir = std::path::Path::new(&audiofile_dir);
+    let db = account.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
+    let found = |db: &Database| {
         db.get_audio_file(audio_id)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Audio file record not found: {}", audio_id)))?
-            .local_name
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Audio file record not found: {}", audio_id)))
     };
-    Ok(audio_local_path(std::path::Path::new(&audiofile_dir), &local_name))
+    found(&db)?;
+    // Names changed by a sync reach the disk before the file is read or written (FILE-15)
+    if for_writing {
+        return db.disk_path_for_writing(audio_id, dir).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
+    if let Err(e) = db.apply_pending_file_renames(dir) {
+        tracing::warn!("Recording names were not all settled on disk: {}", e);
+    }
+    Ok(audio_local_path(dir, &found(&db)?.disk_name))
 }
 
 /// `GET /sync/audio/:id/file`: stream one recording to a fetching peer
@@ -994,7 +1002,7 @@ async fn serve_audio_file(
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     tracing::debug!("GET /sync/audio/{}/file", short(&audio_id));
-    let file_path = audio_path_for(&account, &audio_id)?;
+    let file_path = audio_path_for(&account, &audio_id, false)?;
     if !file_path.is_file() {
         return Err((StatusCode::NOT_FOUND, format!("Audio file not found: {}", audio_id)));
     }
@@ -1056,7 +1064,7 @@ async fn receive_audio_file(
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
-    let file_path = audio_path_for(&account, &audio_id)?;
+    let file_path = audio_path_for(&account, &audio_id, true)?;
     let content_length: Option<u64> = header(&headers, "content-length").and_then(|v| v.parse().ok());
     let (start, total) = match header(&headers, "content-range").and_then(crate::transfer::parse_content_range) {
         Some((start, total)) => (start, total),
@@ -1128,7 +1136,7 @@ async fn missing_audio_files(
     let mut missing = Vec::new();
     let mut partial = std::collections::HashMap::new();
     for audio_id in request.audio_ids {
-        let path = match audio_path_for(&account, &audio_id) {
+        let path = match audio_path_for(&account, &audio_id, false) {
             Ok(p) => p,
             Err((StatusCode::NOT_FOUND, _)) => {
                 // No row yet: the sender's sync has not reached us; ask for it next time
@@ -2992,16 +3000,20 @@ mod tests {
 
         /// Where a recording's file is on `d`: what its row says (Stage 13).
         fn path_of(d: &Device, audio_id: &str) -> std::path::PathBuf {
-            let local_name = d.db.lock().unwrap().get_audio_file(audio_id).unwrap().unwrap().local_name;
-            audio_local_path(&d.audio, &local_name)
+            let disk_name = d.db.lock().unwrap().get_audio_file(audio_id).unwrap().unwrap().disk_name;
+            audio_local_path(&d.audio, &disk_name)
         }
 
-        /// A note with one recording of `size` bytes on `d`.
+        /// A note with one recording of `size` bytes on `d`, under a name no
+        /// other recording has: these tests move files, and two recordings
+        /// with one name would collide (FILE-15), which the collision tests cover.
         fn recording(d: &Device, size: usize) -> (String, std::path::PathBuf) {
+            static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let name = format!("recording {}.ogg", MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
             let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-            let source = d._dir.path().join("source.ogg");
+            let source = d._dir.path().join(&name);
             std::fs::write(&source, &content).unwrap();
-            let (_note_id, audio_id) = d.db.lock().unwrap().import_audio_file("source.ogg", None, None, None).unwrap();
+            let (_note_id, audio_id) = d.db.lock().unwrap().import_audio_file(&name, None, None, Some(d.audio.as_path())).unwrap();
             let path = path_of(d, &audio_id);
             std::fs::rename(&source, &path).unwrap();
             (audio_id, path)
@@ -3028,6 +3040,33 @@ mod tests {
             assert_eq!(std::fs::read(path_of(&a, &id)).unwrap(), plain, "opened on arrival with the key");
             assert!(!crate::transfer::part_path(&path_of(&a, &id)).exists());
             assert!(crate::crypto::file_is_encrypted(&path_b), "B still keeps it as it came");
+            task.abort();
+        }
+
+        /// FILE-15: two devices that each imported a file with one name reach
+        /// the same two suffixed names after an exchange, and every copy on
+        /// disk carries its row's name.
+        #[tokio::test]
+        async fn two_devices_that_imported_one_name_reach_the_same_suffixed_names() {
+            let (a, b, _url, task) = pair();
+            let import = |d: &Device, bytes: &[u8]| {
+                let id = d.db.lock().unwrap().create_audio_file("MyHouse.jpg", None, None, crate::models::FileOrigin::Imported, Some(d.audio.as_path())).unwrap();
+                std::fs::write(path_of(d, &id), bytes).unwrap();
+                id
+            };
+            let on_a = import(&a, b"the house photographed on A");
+            let on_b = import(&b, b"the house photographed on B");
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let result = client.exchange(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            let name = |d: &Device, id: &str| d.db.lock().unwrap().get_audio_file(id).unwrap().unwrap().disk_name;
+            for d in [&a, &b] {
+                assert_eq!(name(d, &on_a), crate::models::suffixed_name("MyHouse.jpg", &on_a, false));
+                assert_eq!(name(d, &on_b), crate::models::suffixed_name("MyHouse.jpg", &on_b, false));
+                assert!(!d.audio.join("MyHouse.jpg").exists(), "no file keeps the name that collided");
+                assert_eq!(std::fs::read(path_of(d, &on_a)).unwrap(), b"the house photographed on A");
+                assert_eq!(std::fs::read(path_of(d, &on_b)).unwrap(), b"the house photographed on B");
+            }
             task.abort();
         }
 
@@ -3844,24 +3883,7 @@ mod tests {
 
         // Apply audio file to Instance B
         let audio_data = audio_change.unwrap().get("data").unwrap();
-        instance_b.apply_sync_audio_file(
-            &audio_id,
-            audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0),
-            audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
-            audio_data.get("file_created_at").and_then(|v| v.as_i64()),
-            audio_data.get("duration_seconds").and_then(|v| v.as_i64()),
-            audio_data.get("summary").and_then(|v| v.as_str()),
-            audio_data.get("modified_at").and_then(|v| v.as_i64()),
-            audio_data.get("deleted_at").and_then(|v| v.as_i64()),
-            None,
-            audio_data.get("storage_provider").and_then(|v| v.as_str()),
-            audio_data.get("storage_key").and_then(|v| v.as_str()),
-            audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        instance_b.apply_sync_audio_file(&audio_id, audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0), audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""), audio_data.get("file_created_at").and_then(|v| v.as_i64()), audio_data.get("duration_seconds").and_then(|v| v.as_i64()), audio_data.get("summary").and_then(|v| v.as_str()), audio_data.get("modified_at").and_then(|v| v.as_i64()), audio_data.get("deleted_at").and_then(|v| v.as_i64()), None, audio_data.get("storage_provider").and_then(|v| v.as_str()), audio_data.get("storage_key").and_then(|v| v.as_str()), audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()), None, None, None, None).unwrap();
 
         // Apply attachment to Instance B
         let att_data = attachment_change.unwrap().get("data").unwrap();
@@ -3962,24 +3984,7 @@ mod tests {
             c.get("entity_type").and_then(|v| v.as_str()) == Some("audio_file")
         }).unwrap();
         let audio_data = audio_change.get("data").unwrap();
-        instance_b.apply_sync_audio_file(
-            &audio_id,
-            audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0),
-            audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
-            audio_data.get("file_created_at").and_then(|v| v.as_i64()),
-            audio_data.get("duration_seconds").and_then(|v| v.as_i64()),
-            audio_data.get("summary").and_then(|v| v.as_str()),
-            audio_data.get("modified_at").and_then(|v| v.as_i64()),
-            audio_data.get("deleted_at").and_then(|v| v.as_i64()),
-            None,
-            audio_data.get("storage_provider").and_then(|v| v.as_str()),
-            audio_data.get("storage_key").and_then(|v| v.as_str()),
-            audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        instance_b.apply_sync_audio_file(&audio_id, audio_data.get("imported_at").and_then(|v| v.as_i64()).unwrap_or(0), audio_data.get("filename").and_then(|v| v.as_str()).unwrap_or(""), audio_data.get("file_created_at").and_then(|v| v.as_i64()), audio_data.get("duration_seconds").and_then(|v| v.as_i64()), audio_data.get("summary").and_then(|v| v.as_str()), audio_data.get("modified_at").and_then(|v| v.as_i64()), audio_data.get("deleted_at").and_then(|v| v.as_i64()), None, audio_data.get("storage_provider").and_then(|v| v.as_str()), audio_data.get("storage_key").and_then(|v| v.as_str()), audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()), None, None, None, None).unwrap();
 
         // Find and apply transcription
         let trans_change = changes.iter().find(|c| {

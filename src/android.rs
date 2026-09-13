@@ -123,9 +123,9 @@ pub struct AudioFileData {
     /// When the file was uploaded to cloud storage; a machine event, so it
     /// carries no timezone of its own and a reader shows it in its own.
     pub storage_uploaded_at: Option<Stamp>,
-    /// The file's name in the audio directory (Stage 13): the recording's
-    /// start, the tail of its id and the extension
-    pub local_name: String,
+    /// The file's name on disk, the same on every device (FILE-15): a
+    /// recording's start and the tail of its id, or an imported file's own name
+    pub disk_name: String,
     /// The SHA-256 of the file's bytes, lowercase hex, once computed (Stage 13)
     pub content_sha256: Option<String>,
 }
@@ -852,8 +852,14 @@ impl VoiceClient {
 
     /// Set the audio file directory for storing downloaded audio files
     pub fn set_audiofile_directory(&self, path: String) -> Result<(), VoiceCoreError> {
-        let mut cfg = self.config.lock().unwrap();
-        cfg.set_audiofile_directory(&path)?;
+        {
+            let mut cfg = self.config.lock().unwrap();
+            cfg.set_audiofile_directory(&path)?;
+        }
+        // Names two recordings share, and renames that came by sync, reach the disk (FILE-15)
+        if let Err(e) = self.db.lock().unwrap().settle_file_names(std::path::Path::new(&path)) {
+            tracing::warn!("Recording names were not all settled on disk: {}", e);
+        }
         Ok(())
     }
 
@@ -904,7 +910,7 @@ impl VoiceClient {
                 storage_provider: a.storage_provider,
                 storage_key: a.storage_key,
                 storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
-                local_name: a.local_name,
+                disk_name: a.disk_name,
                 content_sha256: a.content_sha256,
             })
             .collect())
@@ -928,7 +934,7 @@ impl VoiceClient {
             storage_provider: a.storage_provider,
             storage_key: a.storage_key,
             storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
-            local_name: a.local_name,
+            disk_name: a.disk_name,
             content_sha256: a.content_sha256,
         }))
     }
@@ -964,7 +970,7 @@ impl VoiceClient {
                 storage_provider: a.storage_provider,
                 storage_key: a.storage_key,
                 storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
-                local_name: a.local_name,
+                disk_name: a.disk_name,
                 content_sha256: a.content_sha256,
             })
             .collect())
@@ -994,7 +1000,7 @@ impl VoiceClient {
             None => return Ok(None),
         };
 
-        let path = crate::models::audio_local_path(std::path::Path::new(&audiofile_dir), &audio_file.local_name);
+        let path = crate::models::audio_local_path(std::path::Path::new(&audiofile_dir), &audio_file.disk_name);
 
         // Only return path if file exists
         if path.is_file() {
@@ -1030,7 +1036,7 @@ impl VoiceClient {
                 storage_provider: a.storage_provider,
                 storage_key: a.storage_key,
                 storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
-                local_name: a.local_name,
+                disk_name: a.disk_name,
                 content_sha256: a.content_sha256,
             })
             .collect())
@@ -2243,7 +2249,7 @@ impl VoiceClient {
             None => return Ok(false),
         };
 
-        let path = crate::models::audio_local_path(std::path::Path::new(&audiofile_dir), &audio_file.local_name);
+        let path = crate::models::audio_local_path(std::path::Path::new(&audiofile_dir), &audio_file.disk_name);
         Ok(path.is_file())
     }
 

@@ -39,7 +39,7 @@ pub const RECORDING_ID_TAIL: usize = 8;
 /// `file_created_at`, at the offset it was recorded in; the import time
 /// when the file carries no date), a hyphen, the last eight characters of
 /// its id, and the extension of the original name. Written once to
-/// `audio_files.local_name`, which is local and the only way a file is
+/// `audio_files.disk_name`, which is local and the only way a file is
 /// found.
 pub fn recording_file_name(audio_id: &str, filename: &str, moment: i64, offset_seconds: Option<i32>) -> String {
     use chrono::{FixedOffset, Local, TimeZone};
@@ -64,29 +64,29 @@ pub fn valid_file_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
-/// The name itself when it is free; otherwise ` (2)`, ` (3)` and so on
-/// before its extension, the first that `taken` does not claim (FILE-15).
-pub fn free_file_name(wanted: &str, taken: impl Fn(&str) -> bool) -> String {
-    if !taken(wanted) {
-        return wanted.to_string();
-    }
-    let (stem, extension) = match wanted.rsplit_once('.') {
+/// A file name split at its extension: `("a.tar", Some("gz"))`, `("memo", None)`,
+/// `(".hidden", None)`.
+pub fn split_file_name(name: &str) -> (&str, Option<&str>) {
+    match name.rsplit_once('.') {
         Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
-        _ => (wanted, None),
-    };
-    (2u64..)
-        .map(|n| match extension {
-            Some(extension) => format!("{} ({}).{}", stem, n, extension),
-            None => format!("{} ({})", stem, n),
-        })
-        .find(|candidate| !taken(candidate))
-        .expect("some number is free")
+        _ => (name, None),
+    }
+}
+
+/// A colliding name with a recording's suffix (FILE-15): a hyphen and the
+/// last eight characters of its id before the extension, or the whole id.
+pub fn suffixed_name(name: &str, audio_id: &str, whole_id: bool) -> String {
+    let tail = if whole_id { audio_id } else { &audio_id[audio_id.len().saturating_sub(RECORDING_ID_TAIL)..] };
+    match split_file_name(name) {
+        (stem, Some(extension)) => format!("{}-{}.{}", stem, tail, extension),
+        (stem, None) => format!("{}-{}", stem, tail),
+    }
 }
 
 /// Full local path of a recording: the audio directory and the row's
-/// `local_name`.
-pub fn audio_local_path(audiofile_directory: &std::path::Path, local_name: &str) -> std::path::PathBuf {
-    audiofile_directory.join(local_name)
+/// `disk_name`.
+pub fn audio_local_path(audiofile_directory: &std::path::Path, disk_name: &str) -> std::path::PathBuf {
+    audiofile_directory.join(disk_name)
 }
 
 /// Represents a note in the system.
@@ -666,15 +666,14 @@ mod tests {
         assert_eq!(audio_file_extension(""), "bin");
     }
 
-    /// FILE-15: a taken name gets a number before its extension; any POSIX name is a name.
+    /// FILE-15: a suffix goes before the extension and names no sequence; any POSIX name is a name.
     #[test]
-    fn a_taken_name_gets_a_number_before_its_extension() {
-        let taken = ["x.ogg", "x (2).ogg"];
-        assert_eq!(free_file_name("x.ogg", |n| taken.contains(&n)), "x (3).ogg");
-        assert_eq!(free_file_name("y.ogg", |n| taken.contains(&n)), "y.ogg");
-        assert_eq!(free_file_name("בלי סיומת", |n| n == "בלי סיומת"), "בלי סיומת (2)");
-        assert_eq!(free_file_name(".hidden", |n| n == ".hidden"), ".hidden (2)");
-        assert_eq!(free_file_name("a.tar.gz", |n| n == "a.tar.gz"), "a.tar (2).gz");
+    fn a_suffix_is_the_tail_of_the_id_before_the_extension() {
+        let id = "0199aaaabbbbccccdddd0000ffff1234";
+        assert_eq!(suffixed_name("הבית שלי.jpg", id, false), "הבית שלי-ffff1234.jpg");
+        assert_eq!(suffixed_name("a.tar.gz", id, false), "a.tar-ffff1234.gz");
+        assert_eq!(suffixed_name("בלי סיומת", id, false), "בלי סיומת-ffff1234");
+        assert_eq!(suffixed_name(".hidden", id, true), format!(".hidden-{}", id));
         assert!(valid_file_name("שם עם רווחים.ogg") && valid_file_name(".hidden") && valid_file_name("a\nb") && valid_file_name("no extension"));
         assert!(!valid_file_name("") && !valid_file_name(".") && !valid_file_name("..") && !valid_file_name("a/b") && !valid_file_name("a\0b"));
     }

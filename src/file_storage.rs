@@ -459,7 +459,7 @@ pub async fn upload_files_with<S: FileStorageService>(
     }
 
     for (index, audio_file) in pending_files.into_iter().enumerate() {
-        let local_path = audio_local_path(audiofile_directory, &audio_file.local_name);
+        let local_path = audio_local_path(audiofile_directory, &audio_file.disk_name);
 
         if !local_path.is_file() {
             tracing::debug!(
@@ -661,12 +661,23 @@ pub async fn download_audio_file(
     audio_file_id: &str,
     recording_key: Option<&crate::crypto::RecordingKey>,
 ) -> Result<DownloadOutcome, FileStorageError> {
+    // Names changed by a sync or a collision reach the disk first (FILE-15)
+    if let Err(e) = db.apply_pending_file_renames(audiofile_directory) {
+        tracing::warn!("Recording names were not all settled on disk: {}", e);
+    }
     let audio_file = db
         .get_audio_file(audio_file_id)
         .map_err(|e| FileStorageError::Config(format!("Failed to read audio file record: {}", e)))?
         .ok_or_else(|| FileStorageError::NotFound(format!("Audio file record {} not found", audio_file_id)))?;
 
-    let local_path = audio_local_path(audiofile_directory, &audio_file.local_name);
+    let local_path = audio_local_path(audiofile_directory, &audio_file.disk_name);
+    if local_path.is_file() {
+        return Ok(DownloadOutcome::AlreadyLocal);
+    }
+    // Room on disk for the file under its name (FILE-15)
+    let local_path = db
+        .disk_path_for_writing(&audio_file.id, audiofile_directory)
+        .map_err(|e| FileStorageError::LocalFile(e.to_string()))?;
     if local_path.is_file() {
         return Ok(DownloadOutcome::AlreadyLocal);
     }
@@ -769,7 +780,7 @@ async fn download_audio_file_set<S: FileStorageService>(
     let total = audio_files.len();
 
     for (index, audio_file) in audio_files.into_iter().enumerate() {
-        let local_path = audio_local_path(audiofile_directory, &audio_file.local_name);
+        let local_path = audio_local_path(audiofile_directory, &audio_file.disk_name);
         if local_path.is_file() {
             result.already_local += 1;
             continue;
@@ -833,12 +844,16 @@ pub async fn download_audio_files_for_note(
     note_id: &str,
     recording_key: Option<&crate::crypto::RecordingKey>,
 ) -> Result<DownloadMissingResult, FileStorageError> {
+    // Names changed by a sync or a collision reach the disk first (FILE-15)
+    if let Err(e) = db.apply_pending_file_renames(audiofile_directory) {
+        tracing::warn!("Recording names were not all settled on disk: {}", e);
+    }
     let audio_files = db
         .get_audio_files_for_note(note_id)
         .map_err(|e| FileStorageError::Config(format!("Failed to read audio files for note: {}", e)))?;
 
     let needs_cloud = audio_files.iter().any(|af| {
-        !audio_local_path(audiofile_directory, &af.local_name).is_file()
+        !audio_local_path(audiofile_directory, &af.disk_name).is_file()
             && af.storage_key.is_some()
     });
 
@@ -846,7 +861,7 @@ pub async fn download_audio_files_for_note(
         // Nothing to fetch: report counts without touching the network.
         let mut result = DownloadMissingResult::default();
         for af in &audio_files {
-            if audio_local_path(audiofile_directory, &af.local_name).is_file() {
+            if audio_local_path(audiofile_directory, &af.disk_name).is_file() {
                 result.already_local += 1;
             } else {
                 result.not_in_cloud += 1;
@@ -875,6 +890,10 @@ pub async fn download_missing_audio_files(
     audiofile_directory: &Path,
     recording_key: Option<&crate::crypto::RecordingKey>,
 ) -> Result<DownloadMissingResult, FileStorageError> {
+    // Names changed by a sync or a collision reach the disk first (FILE-15)
+    if let Err(e) = db.apply_pending_file_renames(audiofile_directory) {
+        tracing::warn!("Recording names were not all settled on disk: {}", e);
+    }
     let storage = match create_storage_service(db)? {
         Some(s) => s,
         None => {
@@ -1218,7 +1237,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
 
             let local = row(&db, "מקומי.MP3", true);
-            std::fs::write(audio_local_path(&dir, &local.local_name), b"x").unwrap();
+            std::fs::write(audio_local_path(&dir, &local.disk_name), b"x").unwrap();
             let not_uploaded = row(&db, "not-yet.ogg", false);
             let remote = row(&db, "בענן.WAV", true);
 
@@ -1233,8 +1252,8 @@ mod tests {
             assert_eq!(result.failed, 0);
             assert!(result.errors.is_empty());
             // Downloaded to the path the row names (Stage 13)
-            assert_eq!(remote.local_name, "בענן.WAV", "an imported file keeps its own name (FILE-15)");
-            assert!(dir.join(&remote.local_name).is_file());
+            assert_eq!(remote.disk_name, "בענן.WAV", "an imported file keeps its own name (FILE-15)");
+            assert!(dir.join(&remote.disk_name).is_file());
         }
 
         #[tokio::test]
@@ -1298,7 +1317,7 @@ mod tests {
             );
 
             let local = row(&db, "local.mp3", true);
-            std::fs::write(audio_local_path(&dir, &local.local_name), b"x").unwrap();
+            std::fs::write(audio_local_path(&dir, &local.disk_name), b"x").unwrap();
             assert_eq!(
                 download_audio_file(&db, &dir, &local.id, None).await.unwrap(),
                 DownloadOutcome::AlreadyLocal
@@ -1341,10 +1360,10 @@ mod tests {
             let dir = temp.path().join("audio");
             std::fs::create_dir_all(&dir).unwrap();
             let remote = row(&db, "הקלטה.ogg", true);
-            std::fs::write(audio_local_path(&dir, &remote.local_name), b"the recording").unwrap();
+            std::fs::write(audio_local_path(&dir, &remote.disk_name), b"the recording").unwrap();
             let hash = db.store_content_hash(&remote.id, &dir).unwrap();
             assert_eq!(hash.len(), 64);
-            std::fs::remove_file(audio_local_path(&dir, &remote.local_name)).unwrap();
+            std::fs::remove_file(audio_local_path(&dir, &remote.disk_name)).unwrap();
             let remote = db.get_audio_file(&remote.id).unwrap().unwrap();
             assert_eq!(remote.content_sha256.as_deref(), Some(hash.as_str()));
 
@@ -1354,14 +1373,14 @@ mod tests {
             let result = download_audio_file_set(&storage, &dir, vec![remote.clone()], None).await;
             assert_eq!((result.downloaded, result.failed), (0, 1));
             assert!(result.errors[0].contains("not the recording"), "{:?}", result.errors);
-            assert!(!dir.join(&remote.local_name).exists(), "a wrong object is not left looking like the recording");
+            assert!(!dir.join(&remote.disk_name).exists(), "a wrong object is not left looking like the recording");
 
             let mut objects = std::collections::HashMap::new();
             objects.insert(remote.storage_key.clone().unwrap(), b"the recording".to_vec());
             let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
             let result = download_audio_file_set(&storage, &dir, vec![remote.clone()], None).await;
             assert_eq!((result.downloaded, result.failed), (1, 0), "{:?}", result.errors);
-            assert!(dir.join(&remote.local_name).is_file());
+            assert!(dir.join(&remote.disk_name).is_file());
         }
 
         /// ENC-3, ENC-4: with encryption on, the object is `.enc` and opens
@@ -1378,7 +1397,7 @@ mod tests {
             assert!(db.encryption_on().unwrap());
             let row = row(&db, "שיר.ogg", false);
             let plain: Vec<u8> = (0..(crate::crypto::CHUNK_PLAIN + 777)).map(|i| (i % 253) as u8).collect();
-            std::fs::write(audio_local_path(&dir, &row.local_name), &plain).unwrap();
+            std::fs::write(audio_local_path(&dir, &row.disk_name), &plain).unwrap();
             let hash = db.store_content_hash(&row.id, &dir).unwrap();
             let key = crate::crypto::RecordingKey::generate();
             let storage = FakeStorage { objects: Default::default(), downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
@@ -1399,23 +1418,23 @@ mod tests {
             assert_eq!(opened, plain);
 
             // A download with the key: the plain file, verified by its hash; without: kept as it is
-            std::fs::remove_file(audio_local_path(&dir, &after.local_name)).unwrap();
+            std::fs::remove_file(audio_local_path(&dir, &after.disk_name)).unwrap();
             let mut objects = std::collections::HashMap::new();
             objects.insert(object_key.clone(), object.clone());
             let bucket = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
             let result = download_audio_file_set(&bucket, &dir, vec![after.clone()], Some(&key)).await;
             assert_eq!((result.downloaded, result.failed), (1, 0), "{:?}", result.errors);
-            assert_eq!(std::fs::read(audio_local_path(&dir, &after.local_name)).unwrap(), plain);
-            std::fs::remove_file(audio_local_path(&dir, &after.local_name)).unwrap();
+            assert_eq!(std::fs::read(audio_local_path(&dir, &after.disk_name)).unwrap(), plain);
+            std::fs::remove_file(audio_local_path(&dir, &after.disk_name)).unwrap();
             let result = download_audio_file_set(&bucket, &dir, vec![after.clone()], None).await;
             assert_eq!((result.downloaded, result.failed), (1, 0), "{:?}", result.errors);
-            assert!(crate::crypto::file_is_encrypted(&audio_local_path(&dir, &after.local_name)), "a keyless device keeps the object as it is");
+            assert!(crate::crypto::file_is_encrypted(&audio_local_path(&dir, &after.disk_name)), "a keyless device keeps the object as it is");
             let result = download_audio_file_set(&bucket, &dir, vec![after.clone()], Some(&crate::crypto::RecordingKey::generate())).await;
             assert_eq!(result.already_local, 1, "the file is there, encrypted or not");
-            std::fs::remove_file(audio_local_path(&dir, &after.local_name)).unwrap();
+            std::fs::remove_file(audio_local_path(&dir, &after.disk_name)).unwrap();
             let result = download_audio_file_set(&bucket, &dir, vec![after.clone()], Some(&crate::crypto::RecordingKey::generate())).await;
             assert_eq!((result.downloaded, result.failed), (0, 1), "the wrong key does not open it");
-            assert!(!audio_local_path(&dir, &after.local_name).exists());
+            assert!(!audio_local_path(&dir, &after.disk_name).exists());
         }
 
         /// ENC-3: "Re-upload existing recordings encrypted" sends the plain
@@ -1428,7 +1447,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             db.set_file_storage_config("s3", Some(&serde_json::json!({"bucket": "b", "region": "us-east-1", "access_key_id": "k", "secret_access_key": "s"}))).unwrap();
             let plain_here = row(&db, "here.ogg", true);
-            std::fs::write(audio_local_path(&dir, &plain_here.local_name), b"plain bytes here").unwrap();
+            std::fs::write(audio_local_path(&dir, &plain_here.disk_name), b"plain bytes here").unwrap();
             let plain_elsewhere = row(&db, "elsewhere.ogg", true);
             let key = crate::crypto::RecordingKey::generate();
             let storage = FakeStorage { objects: Default::default(), downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
