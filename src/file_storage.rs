@@ -171,7 +171,7 @@ pub trait FileStorageService: Send + Sync {
     /// for the next run to continue from.
     fn upload_in_parts(
         &self,
-        local_path: &Path,
+        source: &mut dyn crate::crypto::ByteSource,
         remote_key: &str,
         journal: &dyn PartJournal,
     ) -> impl std::future::Future<Output = Result<UploadResult, FileStorageError>>;
@@ -217,11 +217,8 @@ pub trait PartJournal {
 /// The loop of an upload in parts (Stage 13): continue the upload the
 /// journal remembers when its key and part size still fit, otherwise begin
 /// one; skip the parts already there; send the rest in order; complete.
-pub async fn upload_in_parts<S: PartStore>(store: &S, local_path: &Path, key: &str, journal: &dyn PartJournal, part_size: u64) -> Result<u64, FileStorageError> {
-    use std::io::{Read, Seek, SeekFrom};
-    let total = std::fs::metadata(local_path)
-        .map_err(|e| FileStorageError::LocalFile(format!("Failed to read {}: {}", local_path.display(), e)))?
-        .len();
+pub async fn upload_in_parts<S: PartStore>(store: &S, source: &mut dyn crate::crypto::ByteSource, key: &str, journal: &dyn PartJournal, part_size: u64) -> Result<u64, FileStorageError> {
+    let total = source.len();
     let part_count = u32::try_from(total.div_ceil(part_size).max(1)).map_err(|_| FileStorageError::Upload("too many parts".to_string()))?;
 
     let (upload_id, mut parts) = match journal.begun()? {
@@ -236,8 +233,6 @@ pub async fn upload_in_parts<S: PartStore>(store: &S, local_path: &Path, key: &s
         }
     };
 
-    let mut file = std::fs::File::open(local_path)
-        .map_err(|e| FileStorageError::LocalFile(format!("Failed to open {}: {}", local_path.display(), e)))?;
     for part_number in 1..=part_count {
         if parts.iter().any(|(n, _)| *n == part_number) {
             continue;
@@ -248,9 +243,8 @@ pub async fn upload_in_parts<S: PartStore>(store: &S, local_path: &Path, key: &s
         let offset = u64::from(part_number - 1) * part_size;
         let length = (total - offset).min(part_size) as usize;
         let mut bytes = vec![0u8; length];
-        file.seek(SeekFrom::Start(offset))
-            .and_then(|_| file.read_exact(&mut bytes))
-            .map_err(|e| FileStorageError::LocalFile(format!("Failed to read {}: {}", local_path.display(), e)))?;
+        source.read_at(offset, &mut bytes)
+            .map_err(|e| FileStorageError::LocalFile(format!("Failed to read part {} of {}: {}", part_number, key, e)))?;
         let etag = store.put_part(key, &upload_id, part_number, bytes).await?;
         journal.part_done(part_number, &etag)?;
         parts.push((part_number, etag));
@@ -406,28 +400,53 @@ pub struct UploadPendingResult {
 pub async fn upload_pending_audio_files(
     db: &Database,
     audiofile_directory: &Path,
+    recording_key: Option<&crate::crypto::RecordingKey>,
 ) -> Result<UploadPendingResult, FileStorageError> {
-    upload_pending_audio_files_watched(db, audiofile_directory, None, None).await
+    upload_pending_audio_files_watched(db, audiofile_directory, None, None, recording_key).await
 }
 
 /// `upload_pending_audio_files` with a cancel flag, read between parts and
-/// files, and a sink that hears how far a large file is (Stage 13).
+/// files, and a sink that hears how far a large file is (Stage 13). With
+/// encryption on (ENC-3) the recording key is needed and every upload is
+/// encrypted; without it the run refuses before touching the bucket.
 #[cfg(feature = "file-storage")]
 pub async fn upload_pending_audio_files_watched(
     db: &Database,
     audiofile_directory: &Path,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
+    recording_key: Option<&crate::crypto::RecordingKey>,
 ) -> Result<UploadPendingResult, FileStorageError> {
     let storage = create_storage_service(db)?.ok_or_else(|| {
         FileStorageError::Config(
             "Cloud storage is not enabled. Use 'storage configure-s3' first.".to_string(),
         )
     })?;
-
     let pending_files = db
         .get_audio_files_pending_upload()
         .map_err(|e| FileStorageError::Config(format!("Failed to get pending files: {}", e)))?;
+    upload_files_with(&storage, db, audiofile_directory, pending_files, cancel, sink, recording_key).await
+}
+
+/// The sentence when encryption is on and this device holds no key.
+pub const NO_RECORDING_KEY: &str = "Encryption is on for this account, but this device holds no recording key: import it (account recording-key import) before uploading";
+
+/// Upload the given rows to a storage service: the loop behind
+/// `upload_pending_audio_files` and "Re-upload existing recordings
+/// encrypted" (ENC-3), tested against a store in memory.
+pub async fn upload_files_with<S: FileStorageService>(
+    storage: &S,
+    db: &Database,
+    audiofile_directory: &Path,
+    pending_files: Vec<AudioFileRow>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
+    recording_key: Option<&crate::crypto::RecordingKey>,
+) -> Result<UploadPendingResult, FileStorageError> {
+    let encrypt = db.encryption_on().map_err(|e| FileStorageError::Config(e.to_string()))?;
+    if encrypt && recording_key.is_none() {
+        return Err(FileStorageError::Config(NO_RECORDING_KEY.to_string()));
+    }
 
     tracing::debug!(count = pending_files.len(), "Audio file records pending upload");
 
@@ -480,14 +499,18 @@ pub async fn upload_pending_audio_files_watched(
             },
         };
         // Generate storage key WITHOUT prefix - the storage service adds the prefix.
-        let storage_key = storage_key_for(None, &audio_file.id, &audio_file.filename, hash.as_deref());
+        // An encrypted object carries the suffix (ENC-3).
+        let mut storage_key = storage_key_for(None, &audio_file.id, &audio_file.filename, hash.as_deref());
+        if encrypt {
+            storage_key.push_str(crate::crypto::OBJECT_SUFFIX);
+        }
 
         // Already there? One request instead of a whole file (Stage 8): a
         // row can say "not uploaded" after a snapshot restore while the
         // object is in the bucket
         let full_key = storage.full_storage_key(&storage_key);
         if let Ok(true) = storage.exists(&full_key).await {
-            match db.update_audio_file_storage(&audio_file.id, storage.provider_name(), &full_key) {
+            match db.update_audio_file_storage_encrypted(&audio_file.id, storage.provider_name(), &full_key, encrypt) {
                 Ok(_) => {
                     tracing::info!(audio_id = %audio_file.id, storage_key = %full_key, "The object was in the bucket already; the row now says so");
                     result.uploaded += 1;
@@ -512,17 +535,27 @@ pub async fn upload_pending_audio_files_watched(
             result.deferred = total - index;
             break;
         }
-        // A large file goes in parts (Stage 13), so a failure loses one part and not the file
+        // A large file goes in parts (Stage 13), so a failure loses one part and
+        // not the file; an encrypted one always does, read through the cipher (ENC-3)
         let large = std::fs::metadata(&local_path).map(|m| m.len() > PART_SIZE).unwrap_or(false);
-        let uploaded = if large {
+        let uploaded = if let (true, Some(key)) = (encrypt, recording_key) {
             let journal = DatabaseJournal { db, audio_id: &audio_file.id, cancel: cancel.clone(), sink: sink.clone() };
-            storage.upload_in_parts(&local_path, &storage_key, &journal).await
+            match crate::crypto::EncryptedView::open(&local_path, key) {
+                Ok(mut view) => storage.upload_in_parts(&mut view, &storage_key, &journal).await,
+                Err(e) => Err(FileStorageError::LocalFile(format!("Failed to open {}: {}", local_path.display(), e))),
+            }
+        } else if large {
+            let journal = DatabaseJournal { db, audio_id: &audio_file.id, cancel: cancel.clone(), sink: sink.clone() };
+            match std::fs::File::open(&local_path) {
+                Ok(mut file) => storage.upload_in_parts(&mut file, &storage_key, &journal).await,
+                Err(e) => Err(FileStorageError::LocalFile(format!("Failed to open {}: {}", local_path.display(), e))),
+            }
         } else {
             storage.upload(&local_path, &storage_key).await
         };
         match uploaded {
             Ok(upload) => {
-                match db.update_audio_file_storage(&audio_file.id, &upload.provider, &upload.storage_key) {
+                match db.update_audio_file_storage_encrypted(&audio_file.id, &upload.provider, &upload.storage_key, encrypt) {
                     Ok(_) => {
                         tracing::info!(
                             audio_id = %audio_file.id,
@@ -574,6 +607,52 @@ pub async fn upload_pending_audio_files_watched(
     Ok(result)
 }
 
+/// "Re-upload existing recordings encrypted" (ENC-3): every recording in
+/// the bucket as a plain object whose file is on this device goes up again
+/// encrypted, one at a time, resumable by the parts journal; the plain
+/// object is remembered for the purge tag. Needs encryption on and the key.
+#[cfg(feature = "file-storage")]
+pub async fn reupload_encrypted(
+    db: &Database,
+    audiofile_directory: &Path,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
+    recording_key: Option<&crate::crypto::RecordingKey>,
+) -> Result<UploadPendingResult, FileStorageError> {
+    let storage = create_storage_service(db)?.ok_or_else(|| FileStorageError::Config("Cloud storage is not enabled.".to_string()))?;
+    reupload_encrypted_with(&storage, db, audiofile_directory, cancel, sink, recording_key).await
+}
+
+#[cfg(feature = "file-storage")]
+pub async fn reupload_encrypted_with<S: FileStorageService>(
+    storage: &S,
+    db: &Database,
+    audiofile_directory: &Path,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
+    recording_key: Option<&crate::crypto::RecordingKey>,
+) -> Result<UploadPendingResult, FileStorageError> {
+    if !db.encryption_on().map_err(|e| FileStorageError::Config(e.to_string()))? {
+        return Err(FileStorageError::Config("Encryption is off; turn it on first".to_string()));
+    }
+    let plain_in_bucket: Vec<AudioFileRow> = db
+        .get_all_audio_files()
+        .map_err(|e| FileStorageError::Config(e.to_string()))?
+        .into_iter()
+        .filter(|row| row.deleted_at.is_none() && row.storage_key.is_some() && !row.storage_encrypted)
+        .collect();
+    let old_keys: Vec<(String, String)> = plain_in_bucket.iter().filter_map(|r| r.storage_key.clone().map(|k| (r.id.clone(), k))).collect();
+    let result = upload_files_with(storage, db, audiofile_directory, plain_in_bucket, cancel, sink, recording_key).await?;
+    for (id, old_key) in old_keys {
+        if let Ok(Some(row)) = db.get_audio_file(&id) {
+            if row.storage_encrypted && row.storage_key.as_deref() != Some(old_key.as_str()) {
+                let _ = db.remember_purged_object(&old_key);
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Outcome of a single on-demand download.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadOutcome {
@@ -596,6 +675,7 @@ pub async fn download_audio_file(
     db: &Database,
     audiofile_directory: &Path,
     audio_file_id: &str,
+    recording_key: Option<&crate::crypto::RecordingKey>,
 ) -> Result<DownloadOutcome, FileStorageError> {
     let audio_file = db
         .get_audio_file(audio_file_id)
@@ -625,10 +705,35 @@ pub async fn download_audio_file(
     );
 
     let bytes = storage.download(&storage_key, &local_path).await?;
+    let bytes = decrypt_downloaded(&audio_file, &local_path, recording_key).await?.unwrap_or(bytes);
     verify_downloaded(&audio_file, &local_path)?;
 
     tracing::info!(audio_id = %audio_file.id, size_bytes = bytes, "Downloaded audio file");
     Ok(DownloadOutcome::Downloaded(bytes))
+}
+
+/// A downloaded object that is encrypted (ENC-4): opened with the recording
+/// key into the plain file, written whole before it exists; without the key
+/// the bytes stay as the bucket holds them, marked by their header, and a
+/// warning says so. Returns the plain length when it was decrypted.
+async fn decrypt_downloaded(audio_file: &AudioFileRow, local_path: &Path, recording_key: Option<&crate::crypto::RecordingKey>) -> Result<Option<u64>, FileStorageError> {
+    if !crate::crypto::file_is_encrypted(local_path) {
+        return Ok(None);
+    }
+    let Some(key) = recording_key else {
+        tracing::warn!(audio_id = %audio_file.id, "The object is encrypted and this device holds no recording key; kept as it is");
+        return Ok(None);
+    };
+    let mut encrypted_name = local_path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    encrypted_name.push(crate::crypto::OBJECT_SUFFIX);
+    let encrypted = local_path.with_file_name(encrypted_name);
+    std::fs::rename(local_path, &encrypted)?;
+    let opened = crate::crypto::decrypt_file(key, &encrypted, local_path);
+    let _ = std::fs::remove_file(&encrypted);
+    match opened {
+        Ok(n) => Ok(Some(n)),
+        Err(e) => Err(FileStorageError::Download(format!("The object of {} did not open with the recording key: {}", audio_file.id, e))),
+    }
 }
 
 /// A downloaded file against the row's content hash (Stage 13): when the
@@ -636,6 +741,10 @@ pub async fn download_audio_file(
 /// reported as failed, so a wrong object never looks like the recording.
 fn verify_downloaded(audio_file: &AudioFileRow, local_path: &Path) -> Result<(), FileStorageError> {
     let Some(expected) = audio_file.content_sha256.as_deref() else { return Ok(()) };
+    if crate::crypto::file_is_encrypted(local_path) {
+        // Kept as the bucket holds it, for a device without the key (ENC-4); the hash is of the plain bytes
+        return Ok(());
+    }
     let actual = crate::transfer::file_sha256(local_path)
         .map_err(|e| FileStorageError::LocalFile(format!("Could not hash {}: {}", local_path.display(), e)))?;
     if actual != expected {
@@ -670,6 +779,7 @@ async fn download_audio_file_set<S: FileStorageService>(
     storage: &S,
     audiofile_directory: &Path,
     audio_files: Vec<AudioFileRow>,
+    recording_key: Option<&crate::crypto::RecordingKey>,
 ) -> DownloadMissingResult {
     let mut result = DownloadMissingResult::default();
     let total = audio_files.len();
@@ -695,7 +805,14 @@ async fn download_audio_file_set<S: FileStorageService>(
             "Downloading audio file from cloud storage"
         );
 
-        match storage.download(&storage_key, &local_path).await.and_then(|bytes| verify_downloaded(&audio_file, &local_path).map(|_| bytes)) {
+        let downloaded = match storage.download(&storage_key, &local_path).await {
+            Ok(bytes) => match decrypt_downloaded(&audio_file, &local_path, recording_key).await {
+                Ok(plain) => verify_downloaded(&audio_file, &local_path).map(|_| plain.unwrap_or(bytes)),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        match downloaded {
             Ok(bytes) => {
                 tracing::info!(audio_id = %audio_file.id, size_bytes = bytes, "Downloaded audio file");
                 result.downloaded += 1;
@@ -730,6 +847,7 @@ pub async fn download_audio_files_for_note(
     db: &Database,
     audiofile_directory: &Path,
     note_id: &str,
+    recording_key: Option<&crate::crypto::RecordingKey>,
 ) -> Result<DownloadMissingResult, FileStorageError> {
     let audio_files = db
         .get_audio_files_for_note(note_id)
@@ -759,7 +877,7 @@ pub async fn download_audio_files_for_note(
         )
     })?;
 
-    Ok(download_audio_file_set(&storage, audiofile_directory, audio_files).await)
+    Ok(download_audio_file_set(&storage, audiofile_directory, audio_files, recording_key).await)
 }
 
 /// Download every non-deleted audio file that is in cloud storage but not on
@@ -771,6 +889,7 @@ pub async fn download_audio_files_for_note(
 pub async fn download_missing_audio_files(
     db: &Database,
     audiofile_directory: &Path,
+    recording_key: Option<&crate::crypto::RecordingKey>,
 ) -> Result<DownloadMissingResult, FileStorageError> {
     let storage = match create_storage_service(db)? {
         Some(s) => s,
@@ -787,7 +906,7 @@ pub async fn download_missing_audio_files(
         .filter(|af| af.deleted_at.is_none())
         .collect();
 
-    Ok(download_audio_file_set(&storage, audiofile_directory, audio_files).await)
+    Ok(download_audio_file_set(&storage, audiofile_directory, audio_files, recording_key).await)
 }
 
 #[cfg(test)]
@@ -986,12 +1105,12 @@ mod tests {
             *store.fail_part.borrow_mut() = Some(2);
             let journal = MemoryJournal::default();
 
-            let failed = upload_in_parts(&store, &path, "audio/x.ogg", &journal, 1000).await;
+            let failed = upload_in_parts(&store, &mut std::fs::File::open(&path).unwrap(), "audio/x.ogg", &journal, 1000).await;
             assert!(matches!(failed, Err(FileStorageError::Network(_))), "{:?}", failed.err());
             assert_eq!(journal.begun.borrow().as_ref().unwrap().parts.len(), 1, "part 1 is remembered");
             assert!(store.objects.borrow().is_empty(), "no object until every part is there");
 
-            let total = upload_in_parts(&store, &path, "audio/x.ogg", &journal, 1000).await.unwrap();
+            let total = upload_in_parts(&store, &mut std::fs::File::open(&path).unwrap(), "audio/x.ogg", &journal, 1000).await.unwrap();
             assert_eq!(total, 2500);
             assert_eq!(*store.puts.borrow(), vec![1, 2, 3], "part 1 was not sent twice");
             assert_eq!(store.objects.borrow()["audio/x.ogg"], std::fs::read(&path).unwrap());
@@ -1005,14 +1124,14 @@ mod tests {
             let store = MemoryStore::default();
             let journal = MemoryJournal::default();
             journal.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            let stopped = upload_in_parts(&store, &path, "audio/x.ogg", &journal, 1000).await;
+            let stopped = upload_in_parts(&store, &mut std::fs::File::open(&path).unwrap(), "audio/x.ogg", &journal, 1000).await;
             assert!(stopped.unwrap_err().to_string().ends_with(crate::sync_client::CANCELLED));
             assert!(store.puts.borrow().is_empty());
             assert!(journal.begun.borrow().is_some(), "the begun upload is kept for the next run");
             journal.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
 
             // Another part size: the remembered upload does not fit, a new one begins
-            upload_in_parts(&store, &path, "audio/x.ogg", &journal, 2000).await.unwrap();
+            upload_in_parts(&store, &mut std::fs::File::open(&path).unwrap(), "audio/x.ogg", &journal, 2000).await.unwrap();
             assert_eq!(*store.puts.borrow(), vec![1, 2]);
             assert_eq!(store.uploads.borrow().len(), 2, "the first upload was abandoned to the bucket's rule");
             assert_eq!(store.objects.borrow()["audio/x.ogg"].len(), 2500);
@@ -1056,6 +1175,8 @@ mod tests {
             objects: std::collections::HashMap<String, Vec<u8>>,
             downloads: Mutex<usize>,
             fail_after: Option<usize>,
+            /// What an upload in parts put, by key
+            uploaded: Mutex<std::collections::HashMap<String, Vec<u8>>>,
         }
 
         impl FileStorageService for FakeStorage {
@@ -1083,8 +1204,11 @@ mod tests {
             fn provider_name(&self) -> &'static str { "fake" }
             fn full_storage_key(&self, remote_key: &str) -> String { remote_key.to_string() }
             async fn tag_purged(&self, _k: &str) -> Result<(), FileStorageError> { Ok(()) }
-            async fn upload_in_parts(&self, local_path: &Path, remote_key: &str, _journal: &dyn PartJournal) -> Result<UploadResult, FileStorageError> {
-                self.upload(local_path, remote_key).await
+            async fn upload_in_parts(&self, source: &mut dyn crate::crypto::ByteSource, remote_key: &str, _journal: &dyn PartJournal) -> Result<UploadResult, FileStorageError> {
+                let mut bytes = vec![0u8; source.len() as usize];
+                source.read_at(0, &mut bytes)?;
+                self.uploaded.lock().unwrap().insert(remote_key.to_string(), bytes);
+                Ok(UploadResult { storage_key: remote_key.to_string(), provider: "fake".into(), size_bytes: source.len() })
             }
         }
 
@@ -1116,9 +1240,9 @@ mod tests {
 
             let mut objects = std::collections::HashMap::new();
             objects.insert(remote.storage_key.clone().unwrap(), b"wav-bytes".to_vec());
-            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None };
+            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
 
-            let result = download_audio_file_set(&storage, &dir, vec![local.clone(), not_uploaded.clone(), remote.clone()]).await;
+            let result = download_audio_file_set(&storage, &dir, vec![local.clone(), not_uploaded.clone(), remote.clone()], None).await;
             assert_eq!(result.already_local, 1);
             assert_eq!(result.not_in_cloud, 1);
             assert_eq!(result.downloaded, 1);
@@ -1140,9 +1264,9 @@ mod tests {
             for r in &rows {
                 objects.insert(r.storage_key.clone().unwrap(), vec![1u8; 10]);
             }
-            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: Some(1) };
+            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: Some(1), uploaded: Mutex::new(Default::default()) };
 
-            let result = download_audio_file_set(&storage, &dir, rows).await;
+            let result = download_audio_file_set(&storage, &dir, rows, None).await;
             assert_eq!(result.downloaded, 1);
             assert_eq!(result.failed, 1);
             assert_eq!(result.deferred, 2, "remaining files must be deferred, not attempted");
@@ -1159,9 +1283,9 @@ mod tests {
             let present = row(&db, "here.mp3", true);
             let mut objects = std::collections::HashMap::new();
             objects.insert(present.storage_key.clone().unwrap(), vec![2u8; 5]);
-            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None };
+            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
 
-            let result = download_audio_file_set(&storage, &dir, vec![missing, present]).await;
+            let result = download_audio_file_set(&storage, &dir, vec![missing, present], None).await;
             assert_eq!(result.failed, 1);
             assert_eq!(result.downloaded, 1);
             assert_eq!(result.deferred, 0);
@@ -1172,7 +1296,7 @@ mod tests {
             let (db, temp) = setup();
             let dir = temp.path().join("audio");
             row(&db, "a.mp3", false);
-            let result = download_missing_audio_files(&db, &dir).await.unwrap();
+            let result = download_missing_audio_files(&db, &dir, None).await.unwrap();
             assert_eq!(result.downloaded, 0);
             assert!(result.errors.is_empty());
         }
@@ -1185,26 +1309,26 @@ mod tests {
 
             let pending = row(&db, "pending.mp3", false);
             assert_eq!(
-                download_audio_file(&db, &dir, &pending.id).await.unwrap(),
+                download_audio_file(&db, &dir, &pending.id, None).await.unwrap(),
                 DownloadOutcome::NotInCloud
             );
 
             let local = row(&db, "local.mp3", true);
             std::fs::write(audio_local_path(&dir, &local.local_name), b"x").unwrap();
             assert_eq!(
-                download_audio_file(&db, &dir, &local.id).await.unwrap(),
+                download_audio_file(&db, &dir, &local.id, None).await.unwrap(),
                 DownloadOutcome::AlreadyLocal
             );
 
             // In cloud, not local, no config on this device: a clear Config error
             let remote = row(&db, "remote.mp3", true);
-            match download_audio_file(&db, &dir, &remote.id).await {
+            match download_audio_file(&db, &dir, &remote.id, None).await {
                 Err(FileStorageError::Config(_)) => {}
                 other => panic!("expected Config error, got {:?}", other.map(|_| ())),
             }
 
             // Unknown id
-            match download_audio_file(&db, &dir, "00000000000070008000000000000099").await {
+            match download_audio_file(&db, &dir, "00000000000070008000000000000099", None).await {
                 Err(FileStorageError::NotFound(_)) => {}
                 other => panic!("expected NotFound, got {:?}", other.map(|_| ())),
             }
@@ -1220,7 +1344,7 @@ mod tests {
             let pending = row(&db, "pending.mp3", false);
             db.attach_to_note(&note_id, &pending.id, "audio_file").unwrap();
 
-            let result = download_audio_files_for_note(&db, &dir, &note_id).await.unwrap();
+            let result = download_audio_files_for_note(&db, &dir, &note_id, None).await.unwrap();
             assert_eq!(result.not_in_cloud, 1);
             assert_eq!(result.downloaded, 0);
         }
@@ -1242,18 +1366,97 @@ mod tests {
 
             let mut objects = std::collections::HashMap::new();
             objects.insert(remote.storage_key.clone().unwrap(), b"something else".to_vec());
-            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None };
-            let result = download_audio_file_set(&storage, &dir, vec![remote.clone()]).await;
+            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
+            let result = download_audio_file_set(&storage, &dir, vec![remote.clone()], None).await;
             assert_eq!((result.downloaded, result.failed), (0, 1));
             assert!(result.errors[0].contains("not the recording"), "{:?}", result.errors);
             assert!(!dir.join(&remote.local_name).exists(), "a wrong object is not left looking like the recording");
 
             let mut objects = std::collections::HashMap::new();
             objects.insert(remote.storage_key.clone().unwrap(), b"the recording".to_vec());
-            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None };
-            let result = download_audio_file_set(&storage, &dir, vec![remote.clone()]).await;
+            let storage = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
+            let result = download_audio_file_set(&storage, &dir, vec![remote.clone()], None).await;
             assert_eq!((result.downloaded, result.failed), (1, 0), "{:?}", result.errors);
             assert!(dir.join(&remote.local_name).is_file());
+        }
+
+        /// ENC-3, ENC-4: with encryption on, the object is `.enc` and opens
+        /// only with the key; a download with the key gives the plain file
+        /// back, one without keeps the bytes as the bucket holds them.
+        #[tokio::test]
+        async fn an_encrypted_upload_makes_an_enc_object_that_a_download_with_the_key_opens() {
+            let (db, temp) = setup();
+            let dir = temp.path().join("audio");
+            std::fs::create_dir_all(&dir).unwrap();
+            db.set_file_storage_config("s3", Some(&serde_json::json!({"bucket": "b", "region": "us-east-1", "access_key_id": "k", "secret_access_key": "s"}))).unwrap();
+            assert!(!db.encryption_on().unwrap());
+            db.set_encryption_on(true).unwrap();
+            assert!(db.encryption_on().unwrap());
+            let row = row(&db, "שיר.ogg", false);
+            let plain: Vec<u8> = (0..(crate::crypto::CHUNK_PLAIN + 777)).map(|i| (i % 253) as u8).collect();
+            std::fs::write(audio_local_path(&dir, &row.local_name), &plain).unwrap();
+            let hash = db.store_content_hash(&row.id, &dir).unwrap();
+            let key = crate::crypto::RecordingKey::generate();
+            let storage = FakeStorage { objects: Default::default(), downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
+
+            let without = upload_files_with(&storage, &db, &dir, vec![db.get_audio_file(&row.id).unwrap().unwrap()], None, None, None).await;
+            assert!(matches!(&without, Err(FileStorageError::Config(m)) if m == NO_RECORDING_KEY), "{:?}", without.err());
+
+            let result = upload_files_with(&storage, &db, &dir, vec![db.get_audio_file(&row.id).unwrap().unwrap()], None, None, Some(&key)).await.unwrap();
+            assert_eq!((result.uploaded, result.failed), (1, 0), "{:?}", result.errors);
+            let after = db.get_audio_file(&row.id).unwrap().unwrap();
+            let object_key = after.storage_key.clone().unwrap();
+            assert_eq!(object_key, format!("{}.ogg{}", hash, crate::crypto::OBJECT_SUFFIX));
+            assert!(after.storage_encrypted);
+            let object = storage.uploaded.lock().unwrap()[&object_key].clone();
+            assert!(crate::crypto::is_encrypted_header(&object) && object.len() as u64 == crate::crypto::encrypted_len(plain.len() as u64));
+            let mut opened = Vec::new();
+            crate::crypto::decrypt_stream(&key, &mut object.as_slice(), &mut opened).unwrap();
+            assert_eq!(opened, plain);
+
+            // A download with the key: the plain file, verified by its hash; without: kept as it is
+            std::fs::remove_file(audio_local_path(&dir, &after.local_name)).unwrap();
+            let mut objects = std::collections::HashMap::new();
+            objects.insert(object_key.clone(), object.clone());
+            let bucket = FakeStorage { objects, downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
+            let result = download_audio_file_set(&bucket, &dir, vec![after.clone()], Some(&key)).await;
+            assert_eq!((result.downloaded, result.failed), (1, 0), "{:?}", result.errors);
+            assert_eq!(std::fs::read(audio_local_path(&dir, &after.local_name)).unwrap(), plain);
+            std::fs::remove_file(audio_local_path(&dir, &after.local_name)).unwrap();
+            let result = download_audio_file_set(&bucket, &dir, vec![after.clone()], None).await;
+            assert_eq!((result.downloaded, result.failed), (1, 0), "{:?}", result.errors);
+            assert!(crate::crypto::file_is_encrypted(&audio_local_path(&dir, &after.local_name)), "a keyless device keeps the object as it is");
+            let result = download_audio_file_set(&bucket, &dir, vec![after.clone()], Some(&crate::crypto::RecordingKey::generate())).await;
+            assert_eq!(result.already_local, 1, "the file is there, encrypted or not");
+            std::fs::remove_file(audio_local_path(&dir, &after.local_name)).unwrap();
+            let result = download_audio_file_set(&bucket, &dir, vec![after.clone()], Some(&crate::crypto::RecordingKey::generate())).await;
+            assert_eq!((result.downloaded, result.failed), (0, 1), "the wrong key does not open it");
+            assert!(!audio_local_path(&dir, &after.local_name).exists());
+        }
+
+        /// ENC-3: "Re-upload existing recordings encrypted" sends the plain
+        /// objects' files up again encrypted and remembers the plain objects
+        /// for the purge tag.
+        #[tokio::test]
+        async fn reupload_encrypted_replaces_plain_objects_and_remembers_them_for_the_purge() {
+            let (db, temp) = setup();
+            let dir = temp.path().join("audio");
+            std::fs::create_dir_all(&dir).unwrap();
+            db.set_file_storage_config("s3", Some(&serde_json::json!({"bucket": "b", "region": "us-east-1", "access_key_id": "k", "secret_access_key": "s"}))).unwrap();
+            let plain_here = row(&db, "here.ogg", true);
+            std::fs::write(audio_local_path(&dir, &plain_here.local_name), b"plain bytes here").unwrap();
+            let plain_elsewhere = row(&db, "elsewhere.ogg", true);
+            let key = crate::crypto::RecordingKey::generate();
+            let storage = FakeStorage { objects: Default::default(), downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
+            assert!(reupload_encrypted_with(&storage, &db, &dir, None, None, Some(&key)).await.is_err(), "encryption is off");
+            db.set_encryption_on(true).unwrap();
+            let result = reupload_encrypted_with(&storage, &db, &dir, None, None, Some(&key)).await.unwrap();
+            assert_eq!((result.uploaded, result.skipped, result.failed), (1, 1, 0), "{:?}", result.errors);
+            let after = db.get_audio_file(&plain_here.id).unwrap().unwrap();
+            assert!(after.storage_encrypted && after.storage_key.as_deref().unwrap().ends_with(".enc"));
+            assert_eq!(db.purged_objects().unwrap(), vec![plain_here.storage_key.clone().unwrap()], "the plain object is remembered for the tag");
+            let untouched = db.get_audio_file(&plain_elsewhere.id).unwrap().unwrap();
+            assert!(!untouched.storage_encrypted, "a file another device holds is left for that device");
         }
 
         #[tokio::test]
@@ -1265,7 +1468,7 @@ mod tests {
             row(&db, "elsewhere.mp3", false);
 
             // Storage not configured -> Config error for the explicit call
-            match upload_pending_audio_files(&db, &dir).await {
+            match upload_pending_audio_files(&db, &dir, None).await {
                 Err(FileStorageError::Config(_)) => {}
                 other => panic!("expected Config error, got {:?}", other.map(|_| ())),
             }
@@ -1277,7 +1480,7 @@ mod tests {
                 "access_key_id": "k", "secret_access_key": "s"
             });
             db.set_file_storage_config("s3", Some(&cfg)).unwrap();
-            let result = upload_pending_audio_files(&db, &dir).await.unwrap();
+            let result = upload_pending_audio_files(&db, &dir, None).await.unwrap();
             assert_eq!(result.skipped, 1);
             assert_eq!(result.uploaded, 0);
             assert_eq!(result.failed, 0);

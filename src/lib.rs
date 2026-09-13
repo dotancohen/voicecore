@@ -17,6 +17,7 @@
 //! - `uniffi`: Generate UniFFI bindings for mobile platforms (Android, iOS).
 
 pub mod config;
+pub mod crypto;
 pub mod conflicts;
 pub mod database;
 pub mod error;

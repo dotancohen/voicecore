@@ -293,9 +293,9 @@ impl FileStorageService for S3StorageService {
         })
     }
 
-    async fn upload_in_parts(&self, local_path: &Path, remote_key: &str, journal: &dyn crate::file_storage::PartJournal) -> Result<UploadResult, FileStorageError> {
+    async fn upload_in_parts(&self, source: &mut dyn crate::crypto::ByteSource, remote_key: &str, journal: &dyn crate::file_storage::PartJournal) -> Result<UploadResult, FileStorageError> {
         let full_key = self.full_key(remote_key);
-        let size_bytes = crate::file_storage::upload_in_parts(self, local_path, &full_key, journal, crate::file_storage::PART_SIZE).await?;
+        let size_bytes = crate::file_storage::upload_in_parts(self, source, &full_key, journal, crate::file_storage::PART_SIZE).await?;
         tracing::info!(key = %full_key, bucket = %self.bucket.name(), size_bytes = size_bytes, "Uploaded file to S3 in parts");
         Ok(UploadResult { storage_key: full_key, provider: "s3".to_string(), size_bytes })
     }

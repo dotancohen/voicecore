@@ -105,6 +105,17 @@ pub struct SyncConfig {
     /// only the phone writes it. The clear key is in memory alone.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub device_key_wrapped: String,
+    /// The account's recording key (Stage 15, ENC-1): 43 base64url characters,
+    /// carried to every device by pairing; empty until encryption was set up.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recording_key: String,
+    /// The recording key wrapped by the platform's key store (AUTH-9)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recording_key_wrapped: String,
+    /// Whether this device exported the recording key once (ENC-1): the
+    /// encryption switch stays off until it did. Local.
+    #[serde(default)]
+    pub recording_key_exported: bool,
     /// The peer of the last operation (Stage 5): the one visible button
     /// names it. Local.
     #[serde(default)]
@@ -138,6 +149,9 @@ impl Default for SyncConfig {
             mirror_audio_files: false,
             device_key: String::new(),
             device_key_wrapped: String::new(),
+            recording_key: String::new(),
+            recording_key_wrapped: String::new(),
+            recording_key_exported: false,
             last_peer_id: String::new(),
             forgotten_peers: Vec::new(),
             listener_idle_stop_hours: 0,
@@ -375,6 +389,26 @@ pub trait SecretWrapper: Send + Sync + std::fmt::Debug {
     fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>, String>;
 }
 
+/// A secret wrapped for the disk, base64url; empty stays empty.
+fn wrap_secret(wrapper: &dyn SecretWrapper, what: &str, clear: &str) -> VoiceResult<String> {
+    if clear.is_empty() {
+        return Ok(String::new());
+    }
+    let wrapped = wrapper.wrap(clear.as_bytes()).map_err(|e| VoiceError::Config(format!("The {} could not be wrapped: {}", what, e)))?;
+    Ok(base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, wrapped))
+}
+
+/// The clear secret: the clear one when the file still holds it, else the wrapped one opened.
+fn unwrap_secret(wrapper: &dyn SecretWrapper, what: &str, clear: &str, wrapped: &str) -> VoiceResult<String> {
+    if !clear.is_empty() || wrapped.is_empty() {
+        return Ok(clear.to_string());
+    }
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, wrapped.as_bytes())
+        .map_err(|e| VoiceError::Config(format!("The wrapped {} is not base64: {}", what, e)))?;
+    let opened = wrapper.unwrap(&bytes).map_err(|e| VoiceError::Config(format!("The {} could not be unwrapped: {}", what, e)))?;
+    String::from_utf8(opened).map_err(|_| VoiceError::Config(format!("The unwrapped {} is not text", what)))
+}
+
 impl Config {
     /// Create a new configuration manager
     ///
@@ -433,14 +467,8 @@ impl Config {
         }
 
         if let Some(wrapper) = &wrapper {
-            if data.sync.device_key.is_empty() && !data.sync.device_key_wrapped.is_empty() {
-                use base64::Engine;
-                let wrapped = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(&data.sync.device_key_wrapped)
-                    .map_err(|e| VoiceError::Config(format!("The wrapped device key is not base64: {}", e)))?;
-                let clear = wrapper.unwrap(&wrapped).map_err(|e| VoiceError::Config(format!("The device key could not be unwrapped: {}", e)))?;
-                data.sync.device_key = String::from_utf8(clear).map_err(|_| VoiceError::Config("The unwrapped device key is not text".to_string()))?;
-            }
+            data.sync.device_key = unwrap_secret(wrapper.as_ref(), "device key", &data.sync.device_key, &data.sync.device_key_wrapped)?;
+            data.sync.recording_key = unwrap_secret(wrapper.as_ref(), "recording key", &data.sync.recording_key, &data.sync.recording_key_wrapped)?;
         }
 
         let config = Self {
@@ -452,8 +480,11 @@ impl Config {
             wrapper,
         };
 
-        // Save default config if it doesn't exist, or the key is still in clear under a wrapper
-        if !config.config_file.exists() || (config.wrapper.is_some() && !config.data.sync.device_key.is_empty() && config.data.sync.device_key_wrapped.is_empty()) {
+        // Save default config if it doesn't exist, or a key is still in clear under a wrapper
+        let clear_under_wrapper = config.wrapper.is_some()
+            && ((!config.data.sync.device_key.is_empty() && config.data.sync.device_key_wrapped.is_empty())
+                || (!config.data.sync.recording_key.is_empty() && config.data.sync.recording_key_wrapped.is_empty()));
+        if !config.config_file.exists() || clear_under_wrapper {
             config.save()?;
         }
 
@@ -531,16 +562,16 @@ impl Config {
     /// machine's file as well when that is a different file.
     pub fn save(&self) -> VoiceResult<()> {
         let content = match &self.wrapper {
-            // The device key leaves memory wrapped only (AUTH-9)
-            Some(wrapper) if !self.data.sync.device_key.is_empty() => {
-                use base64::Engine;
-                let wrapped = wrapper.wrap(self.data.sync.device_key.as_bytes()).map_err(|e| VoiceError::Config(format!("The device key could not be wrapped: {}", e)))?;
+            // The keys leave memory wrapped only (AUTH-9)
+            Some(wrapper) => {
                 let mut on_disk = self.data.clone();
-                on_disk.sync.device_key_wrapped = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wrapped);
+                on_disk.sync.device_key_wrapped = wrap_secret(wrapper.as_ref(), "device key", &self.data.sync.device_key)?;
                 on_disk.sync.device_key = String::new();
+                on_disk.sync.recording_key_wrapped = wrap_secret(wrapper.as_ref(), "recording key", &self.data.sync.recording_key)?;
+                on_disk.sync.recording_key = String::new();
                 serde_json::to_string_pretty(&on_disk)?
             }
-            _ => serde_json::to_string_pretty(&self.data)?,
+            None => serde_json::to_string_pretty(&self.data)?,
         };
         fs::write(&self.config_file, content)?;
         if let Some(machine_file) = &self.machine_file {
@@ -610,6 +641,37 @@ impl Config {
     /// issued at pairing).
     pub fn set_device_key(&mut self, key: &str) -> VoiceResult<()> {
         self.data.sync.device_key = key.to_string();
+        self.save()
+    }
+
+    /// The account's recording key (Stage 15), or None until encryption was set up here.
+    pub fn recording_key(&self) -> Option<crate::crypto::RecordingKey> {
+        if self.data.sync.recording_key.is_empty() {
+            None
+        } else {
+            crate::crypto::RecordingKey::from_text(&self.data.sync.recording_key).ok()
+        }
+    }
+
+    /// The recording key's text, for pairing replies and export; empty when there is none.
+    pub fn recording_key_text(&self) -> &str {
+        &self.data.sync.recording_key
+    }
+
+    /// Keep the account's recording key: made here, imported, or received at pairing.
+    pub fn set_recording_key(&mut self, text: &str) -> VoiceResult<()> {
+        let key = crate::crypto::RecordingKey::from_text(text)?;
+        self.data.sync.recording_key = key.to_text();
+        self.save()
+    }
+
+    /// Whether the recording key was exported from this device once (ENC-1).
+    pub fn recording_key_exported(&self) -> bool {
+        self.data.sync.recording_key_exported
+    }
+
+    pub fn set_recording_key_exported(&mut self, exported: bool) -> VoiceResult<()> {
+        self.data.sync.recording_key_exported = exported;
         self.save()
     }
 
@@ -940,8 +1002,14 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&file).unwrap();
         assert_eq!(json["sync"]["device_key"], "");
 
-        let again = Config::new_wrapped(Some(dir.clone()), Some(wrapper)).unwrap();
+        let mut again = Config::new_wrapped(Some(dir.clone()), Some(wrapper.clone())).unwrap();
         assert_eq!(again.device_key(), "kEy0123456789abcdefghijklmnopqrstuvwxyzABC");
+        // The recording key is wrapped the same way (Stage 15)
+        let recording = crate::crypto::RecordingKey::generate().to_text();
+        again.set_recording_key(&recording).unwrap();
+        let file = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(!file.contains(&recording) && file.contains("recording_key_wrapped"));
+        assert_eq!(Config::new_wrapped(Some(dir.clone()), Some(wrapper)).unwrap().recording_key_text(), recording);
         let without = Config::new(Some(dir.clone())).unwrap();
         assert_eq!(without.device_key(), "", "without the wrapper the key is not readable");
 

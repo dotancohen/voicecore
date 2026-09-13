@@ -2089,6 +2089,76 @@ impl VoiceClient {
         }
     }
 
+    /// The recording key's text (Stage 15, ENC-1), made now when the account
+    /// has none; showing it counts as the export the switch waits for.
+    pub fn recording_key_export(&self) -> Result<String, VoiceCoreError> {
+        let mut config = self.config.lock().unwrap();
+        if config.recording_key_text().is_empty() {
+            let key = crate::crypto::RecordingKey::generate();
+            config.set_recording_key(&key.to_text())?;
+        }
+        config.set_recording_key_exported(true)?;
+        Ok(config.recording_key_text().to_string())
+    }
+
+    /// Keep a recording key typed or scanned from an export (ENC-1): how a
+    /// device that lost everything reads the bucket again.
+    pub fn recording_key_import(&self, text: String) -> Result<(), VoiceCoreError> {
+        let mut config = self.config.lock().unwrap();
+        config.set_recording_key(&text)?;
+        config.set_recording_key_exported(true)?;
+        Ok(())
+    }
+
+    /// Whether this device holds the key, exported it, and whether new uploads are encrypted.
+    pub fn encryption_state(&self) -> Result<EncryptionStateData, VoiceCoreError> {
+        let config = self.config.lock().unwrap();
+        let db = self.db.lock().unwrap();
+        Ok(EncryptionStateData {
+            has_key: !config.recording_key_text().is_empty(),
+            exported: config.recording_key_exported(),
+            on: db.encryption_on()?,
+        })
+    }
+
+    /// Turn encryption of new uploads on or off for the account (ENC-3);
+    /// on needs the key exported from this device first.
+    pub fn set_encryption_on(&self, on: bool) -> Result<(), VoiceCoreError> {
+        let config = self.config.lock().unwrap();
+        if on && (config.recording_key_text().is_empty() || !config.recording_key_exported()) {
+            return Err(VoiceCoreError::Config { msg: "Export the recording key first: without it these recordings cannot be played".to_string() });
+        }
+        let db = self.db.lock().unwrap();
+        db.set_encryption_on(on)?;
+        Ok(())
+    }
+
+    /// "Re-upload existing recordings encrypted" (ENC-3): the plain objects
+    /// whose files are here go up again encrypted, one at a time, resumable.
+    pub fn reupload_encrypted(&self, progress: Option<Box<dyn OperationProgress>>) -> Result<UploadResultData, VoiceCoreError> {
+        #[cfg(feature = "file-storage")]
+        {
+            let dir = self.config.lock().unwrap().audiofile_directory().map(std::path::PathBuf::from)
+                .ok_or_else(|| VoiceCoreError::Sync { msg: "No audio directory is configured".to_string() })?;
+            let key = self.config.lock().ok().and_then(|c| c.recording_key());
+            let sink: Option<Arc<dyn crate::sync_client::ProgressSink>> = progress.map(|p| Arc::new(ProgressBridge(p)) as Arc<dyn crate::sync_client::ProgressSink>);
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
+            self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+            let db = self.db.lock().unwrap();
+            let result = rt.block_on(crate::file_storage::reupload_encrypted(&db, &dir, Some(self.cancel.clone()), sink, key.as_ref()));
+            match result {
+                Ok(r) => Ok(UploadResultData { uploaded: r.uploaded as i32, skipped: r.skipped as i32, failed: r.failed as i32, deferred: r.deferred as i32, errors: r.errors }),
+                Err(e) => Err(VoiceCoreError::Sync { msg: e.to_string() }),
+            }
+        }
+        #[cfg(not(feature = "file-storage"))]
+        {
+            let _ = progress;
+            Err(VoiceCoreError::Config { msg: "File storage feature not enabled".to_string() })
+        }
+    }
+
     /// Upload every recording whose row says the bucket does not hold it yet.
     /// Runs only when the user asks; a sync never uploads.
     pub fn upload(&self) -> Result<UploadResultData, VoiceCoreError> {
@@ -2106,7 +2176,8 @@ impl VoiceClient {
                 .build()
                 .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
             let db = self.db.lock().unwrap();
-            let result = rt.block_on(crate::file_storage::upload_pending_audio_files(&db, &dir));
+            let key = self.config.lock().ok().and_then(|c| c.recording_key());
+            let result = rt.block_on(crate::file_storage::upload_pending_audio_files(&db, &dir, key.as_ref()));
             match result {
                 Ok(r) => Ok(UploadResultData {
                     uploaded: r.uploaded as i32,
@@ -2389,6 +2460,14 @@ pub struct SnapshotData {
     pub size_bytes: u64,
     /// Notes in the snapshot that are not in the trash
     pub note_count: i64,
+}
+
+/// Where encryption of recordings stands on this device (Stage 15)
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct EncryptionStateData {
+    pub has_key: bool,
+    pub exported: bool,
+    pub on: bool,
 }
 
 /// Result of uploading recordings to the bucket

@@ -268,6 +268,8 @@ pub struct AudioFileRow {
     /// metadata, written by import and by recording; the bucket object is
     /// keyed by it and a fetched file is verified by it
     pub content_sha256: Option<String>,
+    /// Whether the bucket object is encrypted with the recording key (Stage 15)
+    pub storage_encrypted: bool,
 }
 
 /// Transcription data returned from database queries
@@ -3788,6 +3790,35 @@ impl Database {
         Ok(())
     }
 
+    /// Whether new uploads are encrypted (Stage 15, ENC-3): `encrypt` in the
+    /// synced storage configuration, so every device of the account agrees.
+    pub fn encryption_on(&self) -> VoiceResult<bool> {
+        Ok(self.get_file_storage_config()?
+            .and_then(|v| v.get("config").cloned())
+            .and_then(|c| match c { serde_json::Value::String(text) => serde_json::from_str(&text).ok(), other => Some(other) })
+            .and_then(|c: serde_json::Value| c.get("encrypt").and_then(|e| e.as_bool()))
+            .unwrap_or(false))
+    }
+
+    /// Turn encryption of new uploads on or off, in the synced storage configuration.
+    pub fn set_encryption_on(&self, on: bool) -> VoiceResult<()> {
+        let saved = self.get_file_storage_config()?.ok_or_else(|| VoiceError::Config("No bucket is configured yet".to_string()))?;
+        let provider = saved.get("provider").and_then(|p| p.as_str()).unwrap_or("none").to_string();
+        let mut config = saved.get("config").cloned()
+            .and_then(|c| match c { serde_json::Value::String(text) => serde_json::from_str(&text).ok(), other => Some(other) })
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(map) = config.as_object_mut() {
+            map.insert("encrypt".to_string(), serde_json::Value::Bool(on));
+        }
+        self.set_file_storage_config(&provider, Some(&config))
+    }
+
+    /// Remember a bucket object to tag purged at the next upload run (Stage 14).
+    pub fn remember_purged_object(&self, storage_key: &str) -> VoiceResult<()> {
+        self.conn.execute("INSERT OR IGNORE INTO purged_objects (storage_key, at) VALUES (?, ?)", params![storage_key, Utc::now().timestamp()])?;
+        Ok(())
+    }
+
     /// The bucket objects of purged recordings not yet tagged (Stage 14).
     pub fn purged_objects(&self) -> VoiceResult<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT storage_key FROM purged_objects ORDER BY at")?;
@@ -4120,16 +4151,16 @@ impl Database {
 
         // Audio files
         {
-            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>);
+            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64);
             let rows: Vec<AudioRow> = self.feed_query(
-                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256", "audio_files",
+                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted", "audio_files",
                 "sync_received_at >= ?1 OR modified_at >= ?1 OR imported_at >= ?1",
                 "COALESCE(sync_received_at, modified_at, imported_at)", "COALESCE(modified_at, imported_at)",
                 filter, limit,
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(21)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0))),
             )?;
             saturated |= rows.len() as i64 >= limit;
-            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256) in rows {
+            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted) in rows {
                 let timestamp = modified_at.unwrap_or(imported_at);
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
                 let mut data = serde_json::Map::new();
@@ -4144,6 +4175,7 @@ impl Database {
                 data.insert("storage_key".to_string(), str_val(storage_key));
                 data.insert("storage_uploaded_at".to_string(), ts_val(storage_uploaded_at));
                 data.insert("content_sha256".to_string(), str_val(content_sha256));
+                data.insert("storage_encrypted".to_string(), serde_json::Value::Bool(storage_encrypted != 0));
                 data.insert(
                     "primary_transcription_id".to_string(),
                     str_val(primary_transcription.and_then(|b| uuid_bytes_to_hex(&b))),
@@ -4486,7 +4518,7 @@ impl Database {
         // Get all audio_files
         let mut stmt = self.conn.prepare(
             r#"SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
-                      storage_provider, storage_key, storage_uploaded_at, content_sha256 FROM audio_files"#
+                      storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted FROM audio_files"#
         )?;
         let af_rows = stmt.query_map([], |row| {
             Ok((
@@ -4503,12 +4535,13 @@ impl Database {
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, Option<i64>>(11)?,
                 row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<i64>>(13)?.unwrap_or(0),
             ))
         })?;
 
         let mut audio_files = Vec::new();
         for row in af_rows {
-            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, content_sha256) = row?;
+            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted) = row?;
             let mut af = HashMap::new();
             af.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
             af.insert("imported_at".to_string(), serde_json::json!(imported_at));
@@ -4523,6 +4556,7 @@ impl Database {
             af.insert("storage_key".to_string(), storage_key.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
             af.insert("storage_uploaded_at".to_string(), storage_uploaded_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
             af.insert("content_sha256".to_string(), content_sha256.map_or(serde_json::Value::Null, serde_json::Value::String));
+            af.insert("storage_encrypted".to_string(), serde_json::Value::Bool(storage_encrypted != 0));
             audio_files.push(af);
         }
         result.insert("audio_files".to_string(), audio_files);
@@ -5128,7 +5162,7 @@ impl Database {
             SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256, storage_encrypted
             FROM audio_files
             WHERE id = ?
             "#,
@@ -5159,7 +5193,7 @@ impl Database {
                    af.summary, af.device_id, af.modified_at, af.deleted_at,
                    af.storage_provider, af.storage_key, af.storage_uploaded_at,
                    af.imported_at_offset, af.imported_at_zone, af.file_created_at_offset, af.file_created_at_zone,
-                   af.modified_at_offset, af.modified_at_zone, af.deleted_at_offset, af.deleted_at_zone, af.local_name, af.content_sha256
+                   af.modified_at_offset, af.modified_at_zone, af.deleted_at_offset, af.deleted_at_zone, af.local_name, af.content_sha256, af.storage_encrypted
             FROM audio_files af
             INNER JOIN note_attachments na ON af.id = na.attachment_id
             WHERE na.note_id = ?
@@ -5221,7 +5255,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256, storage_encrypted
             FROM audio_files
             ORDER BY imported_at DESC
             "#,
@@ -5345,7 +5379,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256, storage_encrypted
             FROM audio_files
             WHERE duration_seconds IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -5397,6 +5431,7 @@ impl Database {
             deleted_at_zone: row.get(19)?,
             local_name: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
             content_sha256: row.get(21)?,
+            storage_encrypted: row.get::<_, Option<i64>>(22)?.unwrap_or(0) != 0,
         })
     }
 
@@ -5415,7 +5450,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, local_name, content_sha256, storage_encrypted
             FROM audio_files
             WHERE storage_provider IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -5439,6 +5474,17 @@ impl Database {
         storage_provider: &str,
         storage_key: &str,
     ) -> VoiceResult<bool> {
+        self.update_audio_file_storage_encrypted(audio_file_id, storage_provider, storage_key, false)
+    }
+
+    /// `update_audio_file_storage`, saying whether the object is encrypted (Stage 15).
+    pub fn update_audio_file_storage_encrypted(
+        &self,
+        audio_file_id: &str,
+        storage_provider: &str,
+        storage_key: &str,
+        encrypted: bool,
+    ) -> VoiceResult<bool> {
         let resolved_id = match self.try_resolve_audio_file_id(audio_file_id)? {
             Some(id) => id,
             None => return Ok(false),
@@ -5453,12 +5499,13 @@ impl Database {
             UPDATE audio_files
             SET storage_provider = ?,
                 storage_key = ?,
+                storage_encrypted = ?,
                 storage_uploaded_at = strftime('%s', 'now'),
                 modified_at = strftime('%s', 'now'),
                 device_id = ?
             WHERE id = ? AND deleted_at IS NULL
             "#,
-            params![storage_provider, storage_key, device_id.as_bytes().to_vec(), uuid_bytes],
+            params![storage_provider, storage_key, encrypted as i64, device_id.as_bytes().to_vec(), uuid_bytes],
         )?;
 
         Ok(updated > 0)
@@ -5780,7 +5827,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at,
-                   storage_provider, storage_key, storage_uploaded_at, content_sha256
+                   storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted
             FROM audio_files
             WHERE id = ?
             "#,
@@ -5799,6 +5846,7 @@ impl Database {
             let storage_key: Option<String> = row.get(9)?;
             let storage_uploaded_at: Option<i64> = row.get(10)?;
             let content_sha256: Option<String> = row.get(11)?;
+            let storage_encrypted: Option<i64> = row.get(12)?;
 
             Ok(serde_json::json!({
                 "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -5813,6 +5861,7 @@ impl Database {
                 "storage_key": storage_key,
                 "storage_uploaded_at": storage_uploaded_at,
                 "content_sha256": content_sha256,
+                "storage_encrypted": storage_encrypted.unwrap_or(0) != 0,
             }))
         });
 
@@ -5845,6 +5894,8 @@ impl Database {
         file_created_at_offset: Option<i32>,
         // The content hash the sender knows (Stage 13); never erased by a row without one
         content_sha256: Option<&str>,
+        // Whether the object is encrypted (Stage 15); travels with the storage key
+        storage_encrypted: Option<bool>,
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
@@ -5854,9 +5905,12 @@ impl Database {
 
         self.conn.execute(
             r#"
-            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at, local_name, content_sha256)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at, sync_received_at, storage_provider, storage_key, storage_uploaded_at, local_name, content_sha256, storage_encrypted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                storage_encrypted = CASE WHEN excluded.storage_key IS NOT NULL
+                                           AND (audio_files.storage_key IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
+                                         THEN excluded.storage_encrypted ELSE audio_files.storage_encrypted END,
                 local_name = COALESCE(NULLIF(audio_files.local_name, ''), excluded.local_name),
                 content_sha256 = CASE WHEN excluded.content_sha256 IS NOT NULL
                                         AND (audio_files.content_sha256 IS NULL OR COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
@@ -5907,6 +5961,7 @@ impl Database {
                 storage_uploaded_at,
                 local_name,
                 content_sha256,
+                storage_encrypted.unwrap_or(false) as i64,
             ],
         )?;
 
@@ -7059,16 +7114,16 @@ mod tests {
         assert_eq!(a.get_audio_file_raw(&id).unwrap().unwrap()["content_sha256"].as_str(), Some(hash.as_str()));
 
         let b = Database::new(&temp.path().join("b.db")).unwrap();
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689601), None, Some(1735689602), None, None, None, None, None, Some(&hash)).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689601), None, Some(1735689602), None, None, None, None, None, Some(&hash), None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()));
         // A newer row without a hash: the hash stays
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689700), None, Some(1735689701), None, None, None, None, None, None).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689700), None, Some(1735689701), None, None, None, None, None, None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()), "never erased");
         // An older row with another hash: ignored; a newer one: taken
         let other = "b".repeat(64);
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689650), None, Some(1735689702), None, None, None, None, None, Some(&other)).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689650), None, Some(1735689702), None, None, None, None, None, Some(&other), None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()), "an older row does not replace it");
-        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689800), None, Some(1735689703), None, None, None, None, None, Some(&other)).unwrap();
+        b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689800), None, Some(1735689703), None, None, None, None, None, Some(&other), None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(other.as_str()), "a newer row does");
         assert!(b.get_full_dataset().unwrap()["audio_files"][0]["content_sha256"].is_string());
     }
@@ -7585,6 +7640,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         // Verify storage info was applied
@@ -7801,6 +7857,10 @@ impl Database {
         if !self.column_exists("audio_files", "content_sha256")? {
             self.conn.execute("ALTER TABLE audio_files ADD COLUMN content_sha256 TEXT", [])?;
         }
+        // Whether the object is encrypted (Stage 15): travels with the storage key
+        if !self.column_exists("audio_files", "storage_encrypted")? {
+            self.conn.execute("ALTER TABLE audio_files ADD COLUMN storage_encrypted INTEGER NOT NULL DEFAULT 0", [])?;
+        }
         {
             let unnamed: Vec<(Vec<u8>, String, i64, Option<i64>, Option<i64>)> = {
                 let mut stmt = self.conn.prepare("SELECT id, filename, imported_at, file_created_at, file_created_at_offset FROM audio_files WHERE local_name IS NULL OR local_name = ''")?;
@@ -7887,7 +7947,7 @@ impl Database {
             ("tags", &["name", "parent_id", "modified_at", "deleted_at"]),
             ("note_tags", &["modified_at", "deleted_at"]),
             ("note_attachments", &["modified_at", "deleted_at"]),
-            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256"]),
+            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256", "storage_encrypted"]),
             ("transcriptions", &["content", "content_segments", "service_response", "state", "modified_at", "deleted_at"]),
             ("file_storage_config", &["provider", "config", "modified_at"]),
             // A purge is written once and never changed, so it only needs

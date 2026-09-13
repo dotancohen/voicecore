@@ -363,6 +363,11 @@ async fn pair_grant(
     let own = {
         let db = account.db.lock().unwrap();
         let mut config = account.config.lock().unwrap();
+        if let Some(key) = request.recording_key.as_deref().filter(|k| !k.is_empty()) {
+            if let Err(e) = config.set_recording_key(key) {
+                return refuse(StatusCode::BAD_REQUEST, format!("The recording key in the grant is not one: {}", e), codes::SETUP_TEXT_INVALID);
+            }
+        }
         if let Err(e) = db.admit_device_card(&crate::versions::DeviceCard {
             device_id: request.holder_id.clone(),
             name: request.holder_name.clone(),
@@ -496,6 +501,8 @@ async fn pair_claim(
             let (certificate_fingerprint, addresses) = own_card
                 .map(|c| (c.certificate_fingerprint, c.addresses))
                 .unwrap_or_default();
+            // The recording key travels to a device just let in (ENC-1)
+            let recording_key = account.config.lock().ok().map(|c| c.recording_key_text().to_string()).filter(|k| !k.is_empty());
             Json(PairClaimResponse {
                 account_id,
                 device_key,
@@ -503,6 +510,7 @@ async fn pair_claim(
                 device_name: state.device_name.clone(),
                 certificate_fingerprint,
                 addresses,
+                recording_key,
             })
             .into_response()
         }
@@ -995,8 +1003,13 @@ async fn serve_audio_file(
     if start > total {
         return Err((StatusCode::RANGE_NOT_SATISFIABLE, format!("The file is {} bytes", total)));
     }
+    // A file kept as the bucket holds it, by a device without the key (ENC-4):
+    // served as it is, its own hash, and a header that says so
+    let encrypted = crate::crypto::file_is_encrypted(&file_path);
     // The row's hash (Stage 13), computed and stored once when it is missing
-    let hash = {
+    let hash = if encrypted {
+        crate::transfer::file_sha256(&file_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
         let db = account.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
         match db.get_audio_file(&audio_id).ok().flatten().and_then(|r| r.content_sha256) {
             Some(h) => h,
@@ -1020,6 +1033,9 @@ async fn serve_audio_file(
     h.insert("content-length", (total - start).to_string().parse().unwrap());
     h.insert("accept-ranges", "bytes".parse().unwrap());
     h.insert(HEADER_FILE_SHA256, hash.parse().unwrap());
+    if encrypted {
+        h.insert(crate::sync_protocol::HEADER_ENCRYPTED, "1".parse().unwrap());
+    }
     if start > 0 {
         h.insert("content-range", format!("bytes {}-{}/{}", start, total - 1, total).parse().unwrap());
     }
@@ -2170,6 +2186,26 @@ mod tests {
             task.abort();
         }
 
+        /// ENC-1: the recording key reaches a device let in by the code.
+        #[tokio::test]
+        async fn the_recording_key_travels_to_a_device_let_in_by_the_code() {
+            let desk = device("Desk");
+            let key = crate::crypto::RecordingKey::generate().to_text();
+            desk.config.lock().unwrap().set_recording_key(&key).unwrap();
+            let (url, task) = serve_tls(&desk);
+            let setup = {
+                let db = desk.db.lock().unwrap();
+                let cfg = desk.config.lock().unwrap();
+                crate::pairing::offer(&db, &cfg, vec![url.clone()]).unwrap()
+            };
+            let phone = device("Phone");
+            assert!(phone.config.lock().unwrap().recording_key().is_none());
+            let client = SyncClient::new(phone.db.clone(), phone.config.clone()).unwrap();
+            client.join(&setup.to_text()).await.unwrap();
+            assert_eq!(phone.config.lock().unwrap().recording_key_text(), key, "the key came with the claim reply");
+            task.abort();
+        }
+
         #[tokio::test]
         async fn a_device_with_notes_moves_to_another_account_by_its_code_and_tags_with_one_path_become_one() {
             let desk = device("Desk");
@@ -2388,6 +2424,7 @@ mod tests {
                 holder_certificate_fingerprint: String::new(),
                 holder_addresses: "[]".to_string(),
                 holder_key_hash: String::new(),
+                recording_key: None,
             };
             let response = http.post(format!("{}/pair/grant", url)).json(&grant).send().await.unwrap();
             assert_eq!(response.status(), 403);
@@ -2414,6 +2451,7 @@ mod tests {
                 holder_certificate_fingerprint: String::new(),
                 holder_addresses: "[]".to_string(),
                 holder_key_hash: String::new(),
+                recording_key: None,
             };
             let response = reqwest::Client::new().post(format!("{}/pair/grant", url)).json(&grant).send().await.unwrap();
             assert_eq!(response.status(), 403, "no token was ever offered");
@@ -2967,6 +3005,30 @@ mod tests {
             let path = path_of(d, &audio_id);
             std::fs::rename(&source, &path).unwrap();
             (audio_id, path)
+        }
+
+        /// ENC-4: a device without the key serves an encrypted file as it is,
+        /// with the header, and a device with the key opens it on arrival.
+        #[tokio::test]
+        async fn an_encrypted_file_served_by_a_keyless_device_is_opened_by_one_with_the_key() {
+            let (a, b, _url, task) = pair();
+            let (id, path_b) = recording(&b, 250_000);
+            let plain = std::fs::read(&path_b).unwrap();
+            let key = crate::crypto::RecordingKey::generate();
+            // B keeps the object as the bucket holds it: encrypted, no key of its own
+            let mut view = crate::crypto::EncryptedView::open(&path_b, &key).unwrap();
+            let mut encrypted = vec![0u8; crate::crypto::ByteSource::len(&view) as usize];
+            crate::crypto::ByteSource::read_at(&mut view, 0, &mut encrypted).unwrap();
+            std::fs::write(&path_b, &encrypted).unwrap();
+            a.config.lock().unwrap().set_recording_key(&key.to_text()).unwrap();
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let result = client.exchange(&b.id).await;
+            assert!(result.success, "{:?}", result.errors);
+            assert_eq!(result.fetched, 1);
+            assert_eq!(std::fs::read(path_of(&a, &id)).unwrap(), plain, "opened on arrival with the key");
+            assert!(!crate::transfer::part_path(&path_of(&a, &id)).exists());
+            assert!(crate::crypto::file_is_encrypted(&path_b), "B still keeps it as it came");
+            task.abort();
         }
 
         #[tokio::test]
@@ -3798,6 +3860,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).unwrap();
 
         // Apply attachment to Instance B
@@ -3912,6 +3975,7 @@ mod tests {
             audio_data.get("storage_provider").and_then(|v| v.as_str()),
             audio_data.get("storage_key").and_then(|v| v.as_str()),
             audio_data.get("storage_uploaded_at").and_then(|v| v.as_i64()),
+            None,
             None,
             None,
             None,
@@ -4653,7 +4717,7 @@ mod tests {
         let audio = a.create_audio_file("הקלטה.mp3", None).unwrap();
         a.update_audio_file_storage(&audio, "s3", &format!("audio/{}.mp3", audio)).unwrap();
         // An older copy of the row (from a peer that never saw the upload)
-        a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None, None, None).unwrap();
+        a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None, None, None, None).unwrap();
         let row = a.get_audio_file_raw(&audio).unwrap().unwrap();
         assert_eq!(row["storage_key"].as_str().unwrap(), format!("audio/{}.mp3", audio));
         assert_eq!(row["storage_provider"].as_str().unwrap(), "s3");

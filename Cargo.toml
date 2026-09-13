@@ -60,6 +60,8 @@ tokio-util = { version = "0.7", features = ["io"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2.0"
 sha2 = "0.10"
+# AES-256-GCM for recordings in the bucket (Stage 15); ring is already built for Android's TLS
+ring = "0.17"
 # URL parsing for the signed bucket requests (Stage 14)
 url = "2"
 rcgen = "0.13"

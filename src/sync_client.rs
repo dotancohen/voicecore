@@ -192,6 +192,7 @@ impl SyncClient {
             holder_certificate_fingerprint: own_card.certificate_fingerprint.clone(),
             holder_addresses: own_card.addresses.clone(),
             holder_key_hash: own_card.key_hash.clone(),
+            recording_key: self.config.lock().ok().map(|c| c.recording_key_text().to_string()).filter(|k| !k.is_empty()),
         };
         let client = build_client(&setup.certificate_fingerprint, &setup.urls[0])?;
         let mut last_error = String::new();
@@ -530,6 +531,9 @@ impl SyncClient {
             })?;
             let mut config = self.config.lock().unwrap();
             config.set_device_key(&reply.device_key)?;
+            if let Some(key) = reply.recording_key.as_deref().filter(|k| !k.is_empty()) {
+                config.set_recording_key(key)?;
+            }
             let pin = if setup.certificate_fingerprint.is_empty() { None } else { Some(setup.certificate_fingerprint.as_str()) };
             config.add_peer(&reply.device_id, &reply.device_name, &url, pin, true)?;
             config.set_sync_enabled(true)?;
@@ -1476,6 +1480,7 @@ impl SyncClient {
             .get(crate::sync_protocol::HEADER_FILE_SHA256)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        let encrypted = response.headers().get(crate::sync_protocol::HEADER_ENCRYPTED).is_some();
         if let (Some(remaining), Some(parent)) = (remaining, dest_path.parent()) {
             crate::transfer::check_free_space(parent, remaining)?;
         }
@@ -1506,6 +1511,23 @@ impl SyncClient {
         drop(out);
         let total = total.unwrap_or(start + received);
         crate::transfer::complete(dest_path, total, expected_hash.as_deref())?;
+        // Bytes a keyless device kept as the bucket holds them (ENC-4): opened
+        // here when this device holds the recording key, kept as they are otherwise
+        if encrypted {
+            let key = self.config.lock().ok().and_then(|c| c.recording_key());
+            match key {
+                Some(key) => {
+                    let mut name = dest_path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+                    name.push(crate::crypto::OBJECT_SUFFIX);
+                    let enc = dest_path.with_file_name(name);
+                    std::fs::rename(dest_path, &enc)?;
+                    let opened = crate::crypto::decrypt_file(&key, &enc, dest_path);
+                    let _ = std::fs::remove_file(&enc);
+                    opened.map_err(|e| VoiceError::Sync(format!("The recording {} did not open with the recording key: {}", audio_id, e)))?;
+                }
+                None => tracing::warn!("Recording {} arrived encrypted and this device holds no recording key; kept as it is", audio_id),
+            }
+        }
         Ok(received)
     }
 
@@ -1919,7 +1941,8 @@ impl SyncClient {
         let db = self.db.lock().map_err(|_| {
             crate::file_storage::FileStorageError::Config("Failed to lock database".to_string())
         })?;
-        let result = crate::file_storage::download_missing_audio_files(&db, audiofile_directory).await?;
+        let key = self.config.lock().ok().and_then(|c| c.recording_key());
+        let result = crate::file_storage::download_missing_audio_files(&db, audiofile_directory, key.as_ref()).await?;
         if result.downloaded > 0 {
             tracing::info!("Downloaded {} audio files from cloud storage", result.downloaded);
         }
@@ -1936,7 +1959,8 @@ impl SyncClient {
         let db = self.db.lock().map_err(|_| {
             crate::file_storage::FileStorageError::Config("Failed to lock database".to_string())
         })?;
-        crate::file_storage::download_audio_file(&db, audiofile_directory, audio_file_id).await
+        let key = self.config.lock().ok().and_then(|c| c.recording_key());
+        crate::file_storage::download_audio_file(&db, audiofile_directory, audio_file_id, key.as_ref()).await
     }
 
     /// Download all missing audio files attached to a note on demand.
@@ -1949,7 +1973,8 @@ impl SyncClient {
         let db = self.db.lock().map_err(|_| {
             crate::file_storage::FileStorageError::Config("Failed to lock database".to_string())
         })?;
-        crate::file_storage::download_audio_files_for_note(&db, audiofile_directory, note_id).await
+        let key = self.config.lock().ok().and_then(|c| c.recording_key());
+        crate::file_storage::download_audio_files_for_note(&db, audiofile_directory, note_id, key.as_ref()).await
     }
 
 }

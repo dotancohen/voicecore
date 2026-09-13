@@ -188,6 +188,9 @@ pub struct PairClaimResponse {
     pub certificate_fingerprint: String,
     #[serde(default)]
     pub addresses: String,
+    /// The account's recording key (Stage 15, ENC-1), when the shower holds one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_key: Option<String>,
 }
 
 /// `POST /pair/grant` request body (PAIR-5): the holder of an account gives
@@ -210,6 +213,9 @@ pub struct PairGrantRequest {
     #[serde(default)]
     pub holder_addresses: String,
     pub holder_key_hash: String,
+    /// The account's recording key (Stage 15, ENC-1), when the holder has one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_key: Option<String>,
 }
 
 /// `POST /pair/grant` response body: the empty device's own card.
@@ -245,6 +251,9 @@ pub struct MissingFilesResponse {
 /// The header a sender puts the whole file's hex SHA-256 in, so the
 /// receiver can verify what it assembled (FILE-13).
 pub const HEADER_FILE_SHA256: &str = "x-file-sha256";
+/// `1` on a served recording whose bytes are encrypted with the recording
+/// key (Stage 15, ENC-4): a device without the key kept the object as it was.
+pub const HEADER_ENCRYPTED: &str = "x-voice-encrypted";
 
 /// One id per operation (a button press), sent on every request of it and
 /// written in every log line on both sides (Stage 12).
