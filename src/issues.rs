@@ -28,6 +28,9 @@ pub enum NotInCloudReason {
     WaitingForUpload,
     /// No device and no bucket is known to hold the file
     NoCopyKnown,
+    /// No place is known to hold the file, this device imported it, and its file
+    /// is not in the audio folder: the import made the row and the file is gone
+    ImportedHereFileMissing,
 }
 
 impl NotInCloudReason {
@@ -37,6 +40,7 @@ impl NotInCloudReason {
             NotInCloudReason::TooLarge => "too_large",
             NotInCloudReason::WaitingForUpload => "waiting_for_upload",
             NotInCloudReason::NoCopyKnown => "no_copy_known",
+            NotInCloudReason::ImportedHereFileMissing => "imported_here_file_missing",
         }
     }
 }
@@ -143,6 +147,11 @@ pub fn issues(db: &Database, audio_dir: Option<&Path>, here: &str) -> VoiceResul
             NotInCloudReason::TooLarge
         } else if !held_by.is_empty() {
             NotInCloudReason::WaitingForUpload
+        } else if match audio_dir {
+            Some(dir) => db.imported_here_but_missing(&audio_id, dir)?,
+            None => false,
+        } {
+            NotInCloudReason::ImportedHereFileMissing
         } else {
             NotInCloudReason::NoCopyKnown
         };
@@ -237,6 +246,34 @@ mod tests {
 
     fn reasons(issues: &Issues) -> Vec<(String, NotInCloudReason)> {
         issues.recordings_not_in_cloud.iter().map(|r| (r.filename.clone(), r.reason)).collect()
+    }
+
+    /// Q1 of 2026-09-14: a recording this device imported, no place known to
+    /// hold it, and its file not in the folder is told apart from a recording
+    /// nobody is known to hold; a peer's recording is not.
+    #[test]
+    fn a_recording_imported_here_whose_file_is_gone_has_its_own_reason() {
+        let (db, temp) = open();
+        let dir = temp.path().join("audio");
+        std::fs::create_dir_all(&dir).unwrap();
+        with_bucket(&db);
+        let here = crate::database::get_local_device_id().simple().to_string();
+        let note = db.create_note("").unwrap();
+        let gone = db.create_audio_file("נעלם.mp3", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
+        db.attach_to_note(&note, &gone, "audio_file").unwrap();
+        let elsewhere = uuid::Uuid::now_v7().simple().to_string();
+        from_peer(&db, "audio_file", &elsewhere, serde_json::json!({"imported_at": 1_735_689_600, "filename": "אצל מישהו.3gp", "disk_name": "אצל מישהו.3gp", "modified_at": 1_735_689_600}));
+
+        let found = issues(&db, Some(&dir), &here).unwrap();
+        let reason_of = |id: &str| found.recordings_not_in_cloud.iter().find(|r| r.audio_id == id).map(|r| r.reason);
+        assert_eq!(reason_of(&gone), Some(NotInCloudReason::ImportedHereFileMissing));
+        assert_eq!(reason_of(&elsewhere), Some(NotInCloudReason::NoCopyKnown));
+        assert_eq!(NotInCloudReason::ImportedHereFileMissing.as_str(), "imported_here_file_missing");
+
+        // Put back, it is this device's to upload
+        std::fs::write(dir.join(db.get_audio_file(&gone).unwrap().unwrap().disk_name), b"audio").unwrap();
+        let back = issues(&db, Some(&dir), &here).unwrap();
+        assert_eq!(back.recordings_not_in_cloud.iter().find(|r| r.audio_id == gone).map(|r| r.reason), Some(NotInCloudReason::WaitingForUpload));
     }
 
     /// ISSUE-1: without a bucket every recording is "no bucket"; with one,

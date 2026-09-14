@@ -293,26 +293,25 @@ impl PartJournal for DatabaseJournal<'_> {
     }
 }
 
-/// The bucket key of a recording (Stage 13): by its content hash when the
-/// row has one, so two devices importing one file share one object; by
-/// its id otherwise.
-pub fn storage_key_for(prefix: Option<&str>, audio_file_id: &str, filename: &str, content_sha256: Option<&str>) -> String {
+/// The bucket key of a recording (Stage 13, FILE-18): by its content hash, so
+/// two devices importing one file share one object. None when the hash is not
+/// a SHA-256 in hex: a key is never made from the recording's id.
+pub fn storage_key_for(prefix: Option<&str>, filename: &str, content_sha256: &str) -> Option<String> {
+    if content_sha256.len() != 64 || !content_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
     let extension = audio_file_extension(filename);
-    let stem = match content_sha256 {
-        Some(hash) if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) => hash,
-        _ => audio_file_id,
-    };
-    match prefix {
+    Some(match prefix {
         Some(p) => {
             let p = p.trim_end_matches('/');
             if p.is_empty() {
-                format!("{}.{}", stem, extension)
+                format!("{}.{}", content_sha256, extension)
             } else {
-                format!("{}/{}.{}", p, stem, extension)
+                format!("{}/{}.{}", p, content_sha256, extension)
             }
         }
-        None => format!("{}.{}", stem, extension),
-    }
+        None => format!("{}.{}", content_sha256, extension),
+    })
 }
 
 /// Build the storage service described by the `file_storage_config` table.
@@ -374,7 +373,7 @@ pub struct UploadPendingResult {
     pub skipped: usize,
     /// Number of files that failed to upload
     pub failed: usize,
-    /// Number of files not attempted because an earlier remote failure stopped the batch
+    /// Number of files not attempted because three files failed every try and the batch stopped
     pub deferred: usize,
     /// Number of files not uploaded because they are larger than the account's upload limit (FILE-23)
     pub too_large: usize,
@@ -494,8 +493,13 @@ pub async fn upload_files_with<S: FileStorageService>(
             },
         };
         // Generate storage key WITHOUT prefix - the storage service adds the prefix.
-        // An encrypted object carries the suffix (ENC-3).
-        let mut storage_key = storage_key_for(None, &audio_file.id, &audio_file.filename, hash.as_deref());
+        // An encrypted object carries the suffix (ENC-3). Without a hash there is
+        // no key: the file is reported and tried again at the next upload.
+        let Some(mut storage_key) = hash.as_deref().and_then(|h| storage_key_for(None, &audio_file.filename, h)) else {
+            result.failed += 1;
+            result.errors.push(format!("{}: not uploaded, its content hash could not be calculated", audio_file.filename));
+            continue;
+        };
         if encrypt {
             storage_key.push_str(crate::crypto::OBJECT_SUFFIX);
         }
@@ -531,22 +535,37 @@ pub async fn upload_files_with<S: FileStorageService>(
             break;
         }
         // A large file goes in parts (Stage 13), so a failure loses one part and
-        // not the file; an encrypted one always does, read through the cipher (ENC-3)
+        // not the file; an encrypted one always does, read through the cipher (ENC-3).
+        // Tried three times, the third a minute after the second (FILE-14); the
+        // parts already in the bucket are not sent again
         let large = std::fs::metadata(&local_path).map(|m| m.len() > PART_SIZE).unwrap_or(false);
-        let uploaded = if let (true, Some(key)) = (encrypt, recording_key) {
-            let journal = DatabaseJournal { db, audio_id: &audio_file.id, cancel: cancel.clone(), sink: sink.clone() };
-            match crate::crypto::EncryptedView::open(&local_path, key) {
-                Ok(mut view) => storage.upload_in_parts(&mut view, &storage_key, &journal).await,
-                Err(e) => Err(FileStorageError::LocalFile(format!("Failed to open {}: {}", local_path.display(), e))),
+        let mut try_number = 1;
+        let uploaded = loop {
+            let attempt = if let (true, Some(key)) = (encrypt, recording_key) {
+                let journal = DatabaseJournal { db, audio_id: &audio_file.id, cancel: cancel.clone(), sink: sink.clone() };
+                match crate::crypto::EncryptedView::open(&local_path, key) {
+                    Ok(mut view) => storage.upload_in_parts(&mut view, &storage_key, &journal).await,
+                    Err(e) => Err(FileStorageError::LocalFile(format!("Failed to open {}: {}", local_path.display(), e))),
+                }
+            } else if large {
+                let journal = DatabaseJournal { db, audio_id: &audio_file.id, cancel: cancel.clone(), sink: sink.clone() };
+                match std::fs::File::open(&local_path) {
+                    Ok(mut file) => storage.upload_in_parts(&mut file, &storage_key, &journal).await,
+                    Err(e) => Err(FileStorageError::LocalFile(format!("Failed to open {}: {}", local_path.display(), e))),
+                }
+            } else {
+                storage.upload(&local_path, &storage_key).await
+            };
+            match &attempt {
+                Err(e) if !e.is_local() && !e.to_string().ends_with(crate::sync_client::CANCELLED) && try_number < crate::transfer::TRIES => {
+                    tracing::warn!(audio_id = %audio_file.id, "Upload failed (try {} of {}): {}; trying again", try_number, crate::transfer::TRIES, e);
+                    if try_number + 1 == crate::transfer::TRIES {
+                        tokio::time::sleep(crate::transfer::wait_before_last_try()).await;
+                    }
+                    try_number += 1;
+                }
+                _ => break attempt,
             }
-        } else if large {
-            let journal = DatabaseJournal { db, audio_id: &audio_file.id, cancel: cancel.clone(), sink: sink.clone() };
-            match std::fs::File::open(&local_path) {
-                Ok(mut file) => storage.upload_in_parts(&mut file, &storage_key, &journal).await,
-                Err(e) => Err(FileStorageError::LocalFile(format!("Failed to open {}: {}", local_path.display(), e))),
-            }
-        } else {
-            storage.upload(&local_path, &storage_key).await
         };
         match uploaded {
             Ok(upload) => {
@@ -582,17 +601,11 @@ pub async fn upload_files_with<S: FileStorageService>(
                     result.deferred = total - index - 1;
                     break;
                 }
-                if !e.is_local() {
-                    // Probably offline or the service is down: do not burn a
-                    // timeout per remaining file. They stay pending and are
-                    // retried on the next sync.
+                // Three files failed every try: the bucket is out of reach, and
+                // the rest wait for the next upload (FILE-14)
+                if let Some(sentence) = crate::transfer::stop_after_failures(result.failed, total - index - 1, "upload") {
                     result.deferred = total - index - 1;
-                    if result.deferred > 0 {
-                        result.errors.push(format!(
-                            "Stopped after a cloud storage failure; {} file(s) will be retried on the next sync",
-                            result.deferred
-                        ));
-                    }
+                    result.errors.push(sentence);
                     break;
                 }
             }
@@ -712,7 +725,23 @@ pub async fn download_audio_file(
         "Downloading audio file from cloud storage"
     );
 
-    let bytes = match storage.download(&storage_key, &local_path).await {
+    // Tried three times, the third a minute after the second (FILE-14); a
+    // missing object is an answer and is not tried again
+    let mut try_number = 1;
+    let downloaded = loop {
+        let attempt = storage.download(&storage_key, &local_path).await;
+        match &attempt {
+            Err(e) if !e.is_local() && !matches!(e, FileStorageError::NotFound(_)) && try_number < crate::transfer::TRIES => {
+                tracing::warn!(audio_id = %audio_file.id, "Download failed (try {} of {}): {}; trying again", try_number, crate::transfer::TRIES, e);
+                if try_number + 1 == crate::transfer::TRIES {
+                    tokio::time::sleep(crate::transfer::wait_before_last_try()).await;
+                }
+                try_number += 1;
+            }
+            _ => break attempt,
+        }
+    };
+    let bytes = match downloaded {
         Ok(bytes) => bytes,
         Err(FileStorageError::NotFound(key)) => {
             // The bucket does not hold it any more (FILE-22)
@@ -801,7 +830,7 @@ pub struct DownloadMissingResult {
     pub not_in_cloud: usize,
     /// Number of downloads that failed
     pub failed: usize,
-    /// Number of files not attempted because an earlier remote failure stopped the batch
+    /// Number of files not attempted because three files failed every try and the batch stopped
     pub deferred: usize,
     /// Error messages for failed downloads
     pub errors: Vec<String>,
@@ -838,12 +867,27 @@ async fn download_audio_file_set<S: FileStorageService>(
             "Downloading audio file from cloud storage"
         );
 
-        let downloaded = match storage.download(&storage_key, &local_path).await {
-            Ok(bytes) => match decrypt_downloaded(&audio_file, &local_path, recording_key).await {
-                Ok(plain) => verify_downloaded(&audio_file, &local_path).map(|_| plain.unwrap_or(bytes)),
+        // Tried three times, the third a minute after the second (FILE-14); an
+        // object that is not there is an answer, not a failure of the link
+        let mut try_number = 1;
+        let downloaded = loop {
+            let attempt = match storage.download(&storage_key, &local_path).await {
+                Ok(bytes) => match decrypt_downloaded(&audio_file, &local_path, recording_key).await {
+                    Ok(plain) => verify_downloaded(&audio_file, &local_path).map(|_| plain.unwrap_or(bytes)),
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
-            },
-            Err(e) => Err(e),
+            };
+            match &attempt {
+                Err(e) if !e.is_local() && !matches!(e, FileStorageError::NotFound(_)) && try_number < crate::transfer::TRIES => {
+                    tracing::warn!(audio_id = %audio_file.id, "Download failed (try {} of {}): {}; trying again", try_number, crate::transfer::TRIES, e);
+                    if try_number + 1 == crate::transfer::TRIES {
+                        tokio::time::sleep(crate::transfer::wait_before_last_try()).await;
+                    }
+                    try_number += 1;
+                }
+                _ => break attempt,
+            }
         };
         match downloaded {
             Ok(bytes) => {
@@ -856,14 +900,9 @@ async fn download_audio_file_set<S: FileStorageService>(
                 result.errors.push(msg);
                 result.failed += 1;
 
-                if !e.is_local() && !matches!(e, FileStorageError::NotFound(_)) {
+                if let Some(sentence) = crate::transfer::stop_after_failures(result.failed, total - index - 1, "download") {
                     result.deferred = total - index - 1;
-                    if result.deferred > 0 {
-                        result.errors.push(format!(
-                            "Stopped after a cloud storage failure; {} file(s) not attempted",
-                            result.deferred
-                        ));
-                    }
+                    result.errors.push(sentence);
                     break;
                 }
             }
@@ -962,60 +1001,54 @@ pub async fn download_missing_audio_files(
 mod tests {
     use super::*;
 
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     #[test]
     fn test_storage_key_for_with_prefix() {
-        let key = storage_key_for(Some("audio"), "019abc123def", "recording.mp3", None);
-        assert_eq!(key, "audio/019abc123def.mp3");
+        assert_eq!(storage_key_for(Some("audio"), "recording.mp3", HASH).unwrap(), format!("audio/{}.mp3", HASH));
     }
 
     #[test]
     fn test_storage_key_for_with_trailing_slash() {
-        let key = storage_key_for(Some("audio/"), "019abc123def", "recording.mp3", None);
-        assert_eq!(key, "audio/019abc123def.mp3");
+        assert_eq!(storage_key_for(Some("audio/"), "recording.mp3", HASH).unwrap(), format!("audio/{}.mp3", HASH));
     }
 
     #[test]
     fn test_storage_key_for_no_prefix() {
-        let key = storage_key_for(None, "019abc123def", "recording.wav", None);
-        assert_eq!(key, "019abc123def.wav");
+        assert_eq!(storage_key_for(None, "recording.wav", HASH).unwrap(), format!("{}.wav", HASH));
     }
 
     #[test]
-    fn a_key_is_by_the_content_hash_when_the_row_has_one() {
+    fn a_key_is_by_the_content_hash_and_never_by_the_id() {
         let hash = "a".repeat(64);
-        assert_eq!(storage_key_for(Some("audio"), "019abc123def", "REC.MP3", Some(&hash)), format!("audio/{}.mp3", hash));
-        assert_eq!(storage_key_for(None, "019abc123def", "REC.MP3", Some("not a hash")), "019abc123def.mp3");
-        assert_eq!(storage_key_for(None, "019abc123def", "REC.MP3", None), storage_key_for(None, "019abc123def", "REC.MP3", None));
+        assert_eq!(storage_key_for(Some("audio"), "REC.MP3", &hash).unwrap(), format!("audio/{}.mp3", hash));
+        assert_eq!(storage_key_for(None, "REC.MP3", "not a hash"), None);
+        assert_eq!(storage_key_for(None, "REC.MP3", ""), None);
     }
 
     #[test]
     fn test_storage_key_for_empty_prefix() {
-        let key = storage_key_for(Some(""), "019abc123def", "test.flac", None);
-        assert_eq!(key, "019abc123def.flac");
+        assert_eq!(storage_key_for(Some(""), "test.flac", HASH).unwrap(), format!("{}.flac", HASH));
     }
 
     #[test]
     fn test_storage_key_for_no_extension() {
-        let key = storage_key_for(Some("files"), "019abc123def", "noextension", None);
-        assert_eq!(key, "files/019abc123def.bin");
+        assert_eq!(storage_key_for(Some("files"), "noextension", HASH).unwrap(), format!("files/{}.bin", HASH));
     }
 
     #[test]
     fn test_storage_key_for_uppercase_extension_is_lowercased() {
-        let key = storage_key_for(Some("audio"), "019abc123def", "REC.MP3", None);
-        assert_eq!(key, "audio/019abc123def.mp3");
+        assert_eq!(storage_key_for(Some("audio"), "REC.MP3", HASH).unwrap(), format!("audio/{}.mp3", HASH));
     }
 
     #[test]
     fn test_storage_key_for_multiple_dots() {
-        let key = storage_key_for(Some("audio"), "019abc123def", "my.recording.mp3", None);
-        assert_eq!(key, "audio/019abc123def.mp3");
+        assert_eq!(storage_key_for(Some("audio"), "my.recording.mp3", HASH).unwrap(), format!("audio/{}.mp3", HASH));
     }
 
     #[test]
     fn test_storage_key_for_hebrew_filename() {
-        let key = storage_key_for(Some("audio"), "019abc123def", "הקלטה של פגישה.OGG", None);
-        assert_eq!(key, "audio/019abc123def.ogg");
+        assert_eq!(storage_key_for(Some("audio"), "הקלטה של פגישה.OGG", HASH).unwrap(), format!("audio/{}.ogg", HASH));
     }
 
     #[test]
@@ -1292,7 +1325,7 @@ mod tests {
         fn row(db: &Database, filename: &str, in_cloud: bool) -> AudioFileRow {
             let id = db.create_audio_file(filename, None, None, crate::models::FileOrigin::Imported, None).unwrap();
             if in_cloud {
-                let key = storage_key_for(Some("audio"), &id, filename, None);
+                let key = storage_key_for(Some("audio"), filename, &format!("{:0>64}", id.replace('-', ""))).unwrap();
                 db.update_audio_file_storage(&id, "fake", &key, false).unwrap();
             }
             db.get_audio_file(&id).unwrap().unwrap()
@@ -1324,13 +1357,15 @@ mod tests {
             assert!(dir.join(&remote.disk_name).is_file());
         }
 
+        /// FILE-14: each file is tried three times; after three files failed
+        /// every try the batch stops, and the rest are not attempted.
         #[tokio::test]
-        async fn download_set_stops_after_first_network_failure() {
+        async fn download_set_stops_after_three_files_failed_every_try() {
             let (db, temp) = setup();
             let dir = temp.path().join("audio");
             std::fs::create_dir_all(&dir).unwrap();
 
-            let rows: Vec<AudioFileRow> = (0..4).map(|i| row(&db, &format!("f{}.mp3", i), true)).collect();
+            let rows: Vec<AudioFileRow> = (0..6).map(|i| row(&db, &format!("f{}.mp3", i), true)).collect();
             let mut objects = std::collections::HashMap::new();
             for r in &rows {
                 objects.insert(r.storage_key.clone().unwrap(), vec![1u8; 10]);
@@ -1339,9 +1374,10 @@ mod tests {
 
             let result = download_audio_file_set(&storage, &dir, rows, None).await;
             assert_eq!(result.downloaded, 1);
-            assert_eq!(result.failed, 1);
-            assert_eq!(result.deferred, 2, "remaining files must be deferred, not attempted");
-            assert_eq!(result.errors.len(), 2);
+            assert_eq!(result.failed, 3, "{:?}", result.errors);
+            assert_eq!(result.deferred, 2, "the files after the third failure are not attempted");
+            assert_eq!(result.errors.len(), 4, "three failures and the sentence that stops: {:?}", result.errors);
+            assert!(result.errors[3].starts_with("Stopped after 3 files failed; 2 file(s) not attempted"), "{:?}", result.errors);
         }
 
         #[tokio::test]

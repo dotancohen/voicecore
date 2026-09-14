@@ -47,6 +47,8 @@ pub mod codes {
     pub const DEVICE_MISMATCH: &str = "DEVICE_MISMATCH";
     /// A peer's address is plain http and not this machine.
     pub const TLS_REQUIRED: &str = "TLS_REQUIRED";
+    /// No address is known for the peer yet (its card names none, and none was given).
+    pub const NO_ADDRESS: &str = "NO_ADDRESS";
     /// The peer's certificate is not the pinned one.
     pub const CERTIFICATE_MISMATCH: &str = "CERTIFICATE_MISMATCH";
     /// The pairing token is unknown, spent, expired or mistyped.

@@ -43,6 +43,26 @@ pub struct ApplyOutcome {
     pub retried_ok: i64,
 }
 
+/// The words for a change that could not be applied and was queued for retry.
+pub fn apply_error_message(entity_type: &str, entity_id: &str, error: &str) -> String {
+    format!("Error applying {} {}: {}", entity_type, entity_id, error)
+}
+
+/// The errors of an operation that still stand once its retries ran: a change
+/// refused because the row it needs had not arrived yet, and applied by a later
+/// retry in the same operation, is not a failure (Q2 of 2026-09-14). `pending`
+/// holds the (entity type, entity id) of every change still queued for retry;
+/// an error that is not about applying a change always stands.
+pub fn errors_still_standing(errors: Vec<String>, pending: &[(String, String)]) -> Vec<String> {
+    errors
+        .into_iter()
+        .filter(|message| {
+            let Some(rest) = message.strip_prefix("Error applying ") else { return true };
+            pending.iter().any(|(entity_type, entity_id)| rest.starts_with(&format!("{} {}: ", entity_type, entity_id)))
+        })
+        .collect()
+}
+
 /// Apply order: versions first (so rows that follow find their history and
 /// never need fallback roots), then rows, then links.
 fn entity_order(entity_type: &str) -> u8 {
@@ -128,7 +148,7 @@ fn apply_changes_in_batch(
             Ok(ApplyResult::Applied) => outcome.applied += 1,
             Ok(ApplyResult::Skipped) => {}
             Err(e) => {
-                let msg = format!("Error applying {} {}: {}", change.entity_type, change.entity_id, e);
+                let msg = apply_error_message(&change.entity_type, &change.entity_id, &e.to_string());
                 tracing::warn!("{}", msg);
                 // Queue known types for retry; an unknown type can never apply here.
                 if ALL_SYNC_ENTITY_TYPES.contains(&change.entity_type.as_str()) {
@@ -417,3 +437,21 @@ pub const ALL_SYNC_ENTITY_TYPES: &[&str] = &[
     "purge",
     "file_location",
 ];
+
+#[cfg(test)]
+mod standing_errors_tests {
+    #[test]
+    fn a_refusal_applied_by_a_later_retry_is_not_an_error() {
+        let errors = vec![
+            super::apply_error_message("transcription", "t1", "FOREIGN KEY constraint failed"),
+            super::apply_error_message("note", "n1", "invalid"),
+            "Failed to save cursor: disk full".to_string(),
+        ];
+        let pending = vec![("note".to_string(), "n1".to_string())];
+        let standing = super::errors_still_standing(errors, &pending);
+        assert_eq!(standing.len(), 2, "{:?}", standing);
+        assert!(standing[0].contains("note n1"));
+        assert!(standing[1].starts_with("Failed to save cursor"));
+        assert!(super::errors_still_standing(vec![super::apply_error_message("transcription", "t1", "x")], &[]).is_empty());
+    }
+}

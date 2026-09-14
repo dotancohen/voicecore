@@ -252,6 +252,14 @@ pub struct Joined {
 
 /// Plain http is accepted only to this machine itself (AUTH-7).
 fn check_scheme(peer_url: &str) -> VoiceResult<()> {
+    // A peer paired but never heard listening has no address yet: say so in
+    // words, not as the URL parser's "relative URL without a base" (D30)
+    if peer_url.trim().is_empty() {
+        return Err(VoiceError::Network(format!(
+            "no address is known for this peer yet: it has not listened on this network, or its card has not arrived; sync with a device that knows it, or add its address ({})",
+            codes::NO_ADDRESS
+        )));
+    }
     let url = reqwest::Url::parse(peer_url)
         .map_err(|e| VoiceError::Network(format!("{} is not a URL: {}", peer_url, e)))?;
     let host = url.host_str().unwrap_or("");
@@ -1083,6 +1091,19 @@ impl SyncClient {
                                 outcome.conflicts += conflicts;
                             }
                         }
+                        // A refusal a retry has applied since is no failure: only the
+                        // changes still queued stand as errors (Q2 of 2026-09-14)
+                        let pending: Vec<(String, String)> = self
+                            .db
+                            .lock()
+                            .ok()
+                            .and_then(|db| db.get_pending_sync_failures().ok())
+                            .map(|failures| failures.into_iter().map(|(_, change)| (change.entity_type, change.entity_id)).collect())
+                            .unwrap_or_default();
+                        outcome.errors = crate::sync_apply::errors_still_standing(std::mem::take(&mut outcome.errors), &pending);
+                        // Tell the peer this device holds its feed up to here (D29): it
+                        // counts what it duplicated by the cursor a device asks after
+                        self.confirm_received(peer_url, cursor).await;
                         break;
                     }
                     if page + 1 == MAX_PAGES {
@@ -1328,6 +1349,20 @@ impl SyncClient {
 
     /// One page of the peer's feed after `cursor`. Returns what was applied,
     /// the cursor to continue from, and whether the feed is exhausted.
+    /// One request for the changes after `cursor`, whose answer is not applied:
+    /// the peer learns this device holds its feed up to `cursor` (PROOF-1, D29).
+    /// A failure changes nothing here; the next pull says the same.
+    async fn confirm_received(&self, peer_url: &str, cursor: i64) {
+        let url = format!("{}/sync/changes?cursor={}&limit=1", peer_url, cursor);
+        let sent = match self.client_for(peer_url) {
+            Ok(client) => self.authed(client.get(&url)).send().await.map(|_| ()).map_err(|e| describe(&e)),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = sent {
+            tracing::debug!("The peer was not told this device holds its feed up to {}: {}", cursor, e);
+        }
+    }
+
     async fn pull_page(&self, peer_url: &str, peer_id: &str, peer_name: &str, cursor: i64) -> VoiceResult<(PullOutcome, i64, bool)> {
         let url = format!("{}/sync/changes?cursor={}&limit={}", peer_url, cursor, self.page_size());
 
@@ -1719,28 +1754,30 @@ impl SyncClient {
             .map_err(|e| VoiceError::Sync(format!("Could not read the peer's missing list: {}", e)))
     }
 
-    /// A transfer is tried up to three times, waiting one, two and four
-    /// seconds between tries (FILE-14). A refusal (HTTP 4xx) is not retried.
+    /// A transfer is tried three times: the second try straight after the
+    /// first, the third after a minute (FILE-14). A refusal (HTTP 4xx) and a
+    /// cancel are not tried again.
     async fn with_retries<F, Fut>(&self, what: &str, mut attempt: F) -> VoiceResult<u64>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = VoiceResult<u64>>,
     {
-        let mut wait = Duration::from_secs(1);
         let mut last = None;
-        for tries_left in (0..3).rev() {
+        for try_number in 1..=crate::transfer::TRIES {
             match attempt().await {
                 Ok(n) => return Ok(n),
                 Err(e) => {
                     let text = e.to_string();
                     let refused = text.contains("HTTP 4") || text.ends_with(CANCELLED);
-                    tracing::warn!("{} failed: {}{}", what, text, if tries_left > 0 && !refused { "; trying again" } else { "" });
+                    let again = !refused && try_number < crate::transfer::TRIES;
+                    tracing::warn!("{} failed (try {} of {}): {}{}", what, try_number, crate::transfer::TRIES, text, if again { "; trying again" } else { "" });
                     last = Some(e);
-                    if refused || tries_left == 0 {
+                    if !again {
                         break;
                     }
-                    tokio::time::sleep(wait).await;
-                    wait *= 2;
+                    if try_number + 1 == crate::transfer::TRIES {
+                        tokio::time::sleep(crate::transfer::wait_before_last_try()).await;
+                    }
                 }
             }
         }
@@ -1773,7 +1810,8 @@ impl SyncClient {
         let mut bytes = 0u64;
         let to_send: Vec<_> = local.into_iter().filter(|(id, _)| missing.missing.contains(id)).collect();
         let total = to_send.len() as i64;
-        for (audio_id, path) in to_send {
+        let mut failed_files = 0usize;
+        for (index, (audio_id, path)) in to_send.into_iter().enumerate() {
             if self.cancelled() {
                 errors.push(CANCELLED.to_string());
                 break;
@@ -1814,7 +1852,14 @@ impl SyncClient {
                     errors.push(CANCELLED.to_string());
                     break;
                 }
-                Err(e) => errors.push(e.to_string()),
+                Err(e) => {
+                    errors.push(e.to_string());
+                    failed_files += 1;
+                    if let Some(sentence) = crate::transfer::stop_after_failures(failed_files, total as usize - index - 1, "send") {
+                        errors.push(sentence);
+                        break;
+                    }
+                }
             }
         }
         (sent, bytes, errors)
@@ -1836,7 +1881,8 @@ impl SyncClient {
             .filter(|r| r.deleted_at.is_none() && !audio_local_path(audiofile_directory, &r.disk_name).is_file())
             .collect();
         let total = wanted.len() as i64;
-        for row in wanted {
+        let mut failed_files = 0usize;
+        for (index, row) in wanted.into_iter().enumerate() {
             if self.cancelled() {
                 errors.push(CANCELLED.to_string());
                 break;
@@ -1871,7 +1917,14 @@ impl SyncClient {
                     break;
                 }
                 Err(e) if e.to_string().contains("HTTP 404") => {}
-                Err(e) => errors.push(e.to_string()),
+                Err(e) => {
+                    errors.push(e.to_string());
+                    failed_files += 1;
+                    if let Some(sentence) = crate::transfer::stop_after_failures(failed_files, total as usize - index - 1, "fetch") {
+                        errors.push(sentence);
+                        break;
+                    }
+                }
             }
         }
         // The peer learns what this device holds now (Stage 10): one
@@ -2117,6 +2170,22 @@ pub async fn sync_all_peers(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_peer_without_an_address_is_refused_in_words() {
+        for empty in ["", "   "] {
+            let text = super::check_scheme(empty).unwrap_err().to_string();
+            assert!(text.contains("no address is known for this peer yet"), "{}", text);
+            assert!(text.contains(crate::sync_protocol::codes::NO_ADDRESS), "{}", text);
+            assert!(!text.contains("is not a URL"), "{}", text);
+        }
+    }
+
+    #[test]
+    fn a_malformed_address_is_still_named_as_not_a_url() {
+        let text = super::check_scheme("not a url").unwrap_err().to_string();
+        assert!(text.contains("is not a URL"), "{}", text);
+    }
+
     use super::*;
     use tempfile::TempDir;
 

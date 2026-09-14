@@ -405,6 +405,16 @@ pub struct SnapshotInfo {
     pub note_count: i64,
 }
 
+
+/// A recording removed for good with its note: its id, and the name its file
+/// has on this device (empty when the row named none). The application deletes
+/// that file; the core does not know where a platform keeps recordings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgedRecording {
+    pub id: String,
+    pub disk_name: String,
+}
+
 impl Database {
     /// Create a new database connection
     pub fn new<P: AsRef<Path>>(db_path: P) -> VoiceResult<Self> {
@@ -425,6 +435,7 @@ impl Database {
         let mut db = Self { conn, path: Some(path), renamed_recordings: Default::default() };
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
+        db.migrate_add_local_origin()?;
         db.migrate_timestamps_to_unix()?;
         db.migrate_add_storage_columns()?;
         db.migrate_add_file_storage_config_table()?;
@@ -442,6 +453,7 @@ impl Database {
         let mut db = Self { conn, path: None, renamed_recordings: Default::default() };
         db.init_database()?;
         db.migrate_add_sync_received_at()?;
+        db.migrate_add_local_origin()?;
         db.migrate_timestamps_to_unix()?;
         db.migrate_add_storage_columns()?;
         db.migrate_add_file_storage_config_table()?;
@@ -982,6 +994,27 @@ impl Database {
             }
         }
 
+        Ok(())
+    }
+
+    /// Add `audio_files.local_origin` (Q1 of 2026-09-14): "imported" or
+    /// "recorded" when this device made the row, empty for a row received by
+    /// sync. Kept on this device only: never in the feed, never in a trigger.
+    fn migrate_add_local_origin(&mut self) -> VoiceResult<()> {
+        let exists: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(audio_files)")?;
+            let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for name in names.flatten() {
+                if name == "local_origin" {
+                    found = true;
+                }
+            }
+            found
+        };
+        if !exists {
+            self.conn.execute("ALTER TABLE audio_files ADD COLUMN local_origin TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -2036,7 +2069,7 @@ impl Database {
     ///
     /// A recording that is also attached to a note which is staying is left
     /// alone, along with its transcriptions.
-    pub fn purge_note(&self, note_id: &str) -> VoiceResult<Vec<String>> {
+    pub fn purge_note(&self, note_id: &str) -> VoiceResult<Vec<PurgedRecording>> {
         let resolved = self.resolve_note_id(note_id)?;
         let uuid = Uuid::parse_str(&resolved)
             .map_err(|e| VoiceError::validation("note_id", e.to_string()))?;
@@ -2107,6 +2140,20 @@ impl Database {
             }
         }
 
+        // The name of each recording's file on this device, read before the rows
+        // go: the application deletes exactly that file (FILE-15), never a file
+        // found by the id
+        let mut purged: Vec<PurgedRecording> = Vec::new();
+        for audio_id in &audio_ids {
+            let disk_name: Option<Option<String>> = self
+                .conn
+                .query_row("SELECT disk_name FROM audio_files WHERE id = ?", params![audio_id], |r| r.get(0))
+                .optional()?;
+            if let Some(id) = uuid_bytes_to_hex(audio_id) {
+                purged.push(PurgedRecording { id, disk_name: disk_name.flatten().unwrap_or_default() });
+            }
+        }
+
         // The bucket objects of the recordings that go: tagged purged at the
         // next upload run, and deleted by the lifecycle rule a day later
         // (Stage 14). Remembered before the rows go.
@@ -2129,10 +2176,7 @@ impl Database {
         }
         let _ = tag_ids;
 
-        Ok(audio_ids
-            .iter()
-            .filter_map(|b| uuid_bytes_to_hex(b))
-            .collect())
+        Ok(purged)
     }
 
     /// Write down that an entity was removed for good.
@@ -4056,6 +4100,46 @@ impl Database {
         Ok(hash)
     }
 
+    /// Whether this device imported the recording, no place is known to hold it,
+    /// and its file is not in `audio_dir` under the name its row stores (Q1 of
+    /// 2026-09-14): the import made the row and the file is not there.
+    pub fn imported_here_but_missing(&self, audio_id: &str, audio_dir: &Path) -> VoiceResult<bool> {
+        let row: Option<(Option<String>, Option<String>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT a.local_origin, a.disk_name, (SELECT COUNT(*) FROM file_locations l WHERE l.audio_id = a.id) FROM audio_files a WHERE a.id = ?",
+                [audio_id_bytes(audio_id)?],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(origin), disk_name, 0)) if origin == "imported" => {
+                !disk_name.filter(|n| !n.is_empty()).is_some_and(|n| crate::models::audio_local_path(audio_dir, &n).is_file())
+            }
+            _ => false,
+        })
+    }
+
+    /// The live recording imported under this file name with these bytes, if
+    /// there is one (D31): importing a folder again finds the files the account
+    /// already holds and skips them, while a copy of the same bytes under
+    /// another name is a recording of its own. The oldest such recording.
+    pub fn find_imported_audio_file(&self, filename: &str, content_sha256: &str) -> VoiceResult<Option<String>> {
+        let hash = content_sha256.trim().to_ascii_lowercase();
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let id: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT id FROM audio_files WHERE filename = ? AND content_sha256 = ? AND deleted_at IS NULL ORDER BY imported_at, id LIMIT 1",
+                params![filename, hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id.and_then(|b| uuid_bytes_to_hex(&b)))
+    }
+
     /// Write a content hash that is known already.
     pub fn set_content_hash(&self, audio_id: &str, hash: &str) -> VoiceResult<()> {
         let id = Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
@@ -5708,7 +5792,11 @@ impl Database {
             }
             crate::models::FileOrigin::Imported => filename.to_string(),
         };
-        self.conn.execute("UPDATE audio_files SET disk_name = ? WHERE id = ?", params![wanted, uuid_bytes])?;
+        let local_origin = match origin {
+            crate::models::FileOrigin::Recorded => "recorded",
+            crate::models::FileOrigin::Imported => "imported",
+        };
+        self.conn.execute("UPDATE audio_files SET disk_name = ?, local_origin = ? WHERE id = ?", params![wanted, local_origin, uuid_bytes])?;
         // Two recordings with identical names both take their suffix; the new
         // one has no file yet, so only the other's file waits to be renamed
         self.resolve_name_collision(&id_hex, false)?;
@@ -6492,7 +6580,9 @@ impl Database {
             (Some(incoming), None) => incoming.to_string(),
             (None, Some(name_here)) => name_here.clone(),
             (None, None) if crate::models::valid_file_name(filename) => filename.to_string(),
-            (None, None) => format!("{}.{}", id_uuid.simple(), crate::models::audio_file_extension(filename)),
+            // No usable name anywhere: named like a new recording (its start and the
+            // tail of its id), never `<id>.<ext>` (FILE-15)
+            (None, None) => crate::models::recording_file_name(&id_uuid.simple().to_string(), filename, file_created_at.unwrap_or(imported_at), None),
         };
 
         self.conn.execute(
@@ -8130,6 +8220,46 @@ mod tests {
         };
         let db = Database::new(&path).unwrap();
         assert_eq!(db.get_audio_file(&id).unwrap().unwrap().disk_name, format!("{}.ogg", id));
+    }
+
+    /// D31: a recording is found by its file name and its bytes together; a
+    /// copy under another name, other bytes under the same name and a deleted
+    /// recording are not "already imported".
+    #[test]
+    fn an_imported_file_is_found_by_its_name_and_its_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("audio");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::new(":memory:").unwrap();
+        let id = db.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
+        let disk = db.get_audio_file(&id).unwrap().unwrap().disk_name;
+        std::fs::write(dir.join(&disk), b"the bytes of one recording").unwrap();
+        let hash = db.store_content_hash(&id, &dir).unwrap();
+
+        assert_eq!(db.find_imported_audio_file("הקלטה.mp3", &hash).unwrap(), Some(id.clone()));
+        assert_eq!(db.find_imported_audio_file("הקלטה.mp3", &hash.to_uppercase()).unwrap(), Some(id.clone()));
+        assert_eq!(db.find_imported_audio_file("copy.mp3", &hash).unwrap(), None, "same bytes, another name");
+        assert_eq!(db.find_imported_audio_file("הקלטה.mp3", &"0".repeat(64)).unwrap(), None, "same name, other bytes");
+        assert_eq!(db.find_imported_audio_file("הקלטה.mp3", "not a hash").unwrap(), None);
+
+        db.delete_audio_file(&id).unwrap();
+        assert_eq!(db.find_imported_audio_file("הקלטה.mp3", &hash).unwrap(), None, "a deleted recording is not held");
+    }
+
+    /// FILE-15: a synced row with no usable name, from the peer or here, is
+    /// named like a new recording (its start and the tail of its id), never
+    /// `<id>.<ext>`.
+    #[test]
+    fn a_synced_row_without_a_usable_name_is_named_like_a_recording() {
+        let db = Database::new(":memory:").unwrap();
+        let id = "01a09e17299276c0a72d86fa589572c0";
+        db.apply_sync_audio_file(id, 1735689600, "", Some(1735689600), None, None, Some(1735689600), None, None, None, None, None, None, None, None, None, None).unwrap();
+        let name = db.get_audio_file(id).unwrap().unwrap().disk_name;
+        assert_ne!(name, format!("{}.bin", id));
+        // YYYY_MM_DD_HH_MM_SS-<last eight of the id>.bin
+        let (stamp, rest) = name.split_at(19);
+        assert_eq!(rest, "-589572c0.bin", "{}", name);
+        assert!(stamp.chars().enumerate().all(|(i, c)| if [4, 7, 10, 13, 16].contains(&i) { c == '_' } else { c.is_ascii_digit() }), "{}", name);
     }
 
     /// FILE-18: the content hash is computed from the file the row names,

@@ -30,6 +30,34 @@ pub fn part_len(path: &Path) -> u64 {
 }
 
 /// Hex SHA-256 of a whole file, read in chunks.
+/// How many times a transfer is tried: send, fetch, upload and download alike (FILE-14).
+pub const TRIES: usize = 3;
+/// After this many files have failed every try, the operation stops (FILE-14).
+pub const FAILED_FILES_BEFORE_STOP: usize = 3;
+
+/// The wait before the last try: the second try comes straight after the first,
+/// the third a minute later (FILE-14). The core's own tests wait a moment.
+pub fn wait_before_last_try() -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(20)
+    } else {
+        std::time::Duration::from_secs(60)
+    }
+}
+
+/// When `failed` files have failed every try, the sentence that stops the
+/// operation, naming the `left` files not attempted; None while it goes on.
+pub fn stop_after_failures(failed: usize, left: usize, operation: &str) -> Option<String> {
+    if failed < FAILED_FILES_BEFORE_STOP {
+        return None;
+    }
+    Some(if left == 0 {
+        format!("{} files failed; the {} stopped", failed, operation)
+    } else {
+        format!("Stopped after {} files failed; {} file(s) not attempted; {} again when the connection works", failed, left, operation)
+    })
+}
+
 pub fn file_sha256(path: &Path) -> VoiceResult<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
@@ -206,5 +234,17 @@ mod tests {
         let err = check_free_space(dir.path(), u64::MAX / 2).unwrap_err().to_string();
         assert!(err.contains("Not enough free space"), "{}", err);
         assert!(err.contains("MB free on"));
+    }
+}
+
+#[cfg(test)]
+mod retry_rule_tests {
+    #[test]
+    fn an_operation_goes_on_until_three_files_failed() {
+        assert_eq!(super::stop_after_failures(1, 5, "send"), None);
+        assert_eq!(super::stop_after_failures(2, 5, "send"), None);
+        assert_eq!(super::stop_after_failures(3, 5, "send").as_deref(), Some("Stopped after 3 files failed; 5 file(s) not attempted; send again when the connection works"));
+        assert_eq!(super::stop_after_failures(3, 0, "upload").as_deref(), Some("3 files failed; the upload stopped"));
+        assert_eq!(super::TRIES, 3);
     }
 }

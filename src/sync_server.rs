@@ -746,6 +746,7 @@ async fn handshake(
 async fn get_changes(
     State(state): State<AppState>,
     Extension(account): Extension<AccountHandle>,
+    caller: Option<Extension<CallerDevice>>,
     Query(query): Query<ChangesQuery>,
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(1000).min(10000);
@@ -755,6 +756,16 @@ async fn get_changes(
     let (changes, latest_timestamp, next_cursor, is_complete, database_id) = {
         let db = account.db.lock().unwrap();
         let database_id = db.database_id().unwrap_or_default();
+        // A device asking for the changes after a cursor holds everything up to
+        // it: that is what this device has duplicated to it (PROOF-1, D29). A
+        // phone pulling from this listener counts as much as a push to it.
+        if let (Some(cursor), Some(Extension(CallerDevice(device)))) = (query.cursor, caller.as_ref()) {
+            if !device.is_empty() {
+                if let Err(e) = db.set_peer_cursors(device, None, None, Some(cursor), None) {
+                    tracing::warn!("Could not note what {} holds: {}", device, e);
+                }
+            }
+        }
         let result = match query.cursor {
             Some(cursor) => db
                 .get_changes_after_seq_as_sync_changes(cursor, None, limit)
@@ -2786,8 +2797,11 @@ mod tests {
             let requests = feed_requests.load(Ordering::SeqCst) as i64;
             let whole_feed_pages = (received + after + page as i64 - 1) / page as i64 + 1;
             let pages_after = after / page as i64 + 1;
-            assert!(requests <= 1 + 1 + pages_after, "one page, the cut, then the rest from the saved cursor: {} requests for {} changes after the cut, {} pages", requests, after, pages_after);
-            assert!(1 + 1 + pages_after < 1 + 1 + whole_feed_pages, "the bound tells a restart from zero apart");
+            // After the last page the client confirms the cursor it holds (D29):
+            // one request of its own, not a page of the feed
+            let confirmation = 1;
+            assert!(requests <= 1 + 1 + pages_after + confirmation, "one page, the cut, then the rest from the saved cursor and the confirmation: {} requests for {} changes after the cut, {} pages", requests, after, pages_after);
+            assert!(1 + 1 + pages_after + confirmation < 1 + 1 + whole_feed_pages + confirmation, "the bound tells a restart from zero apart");
             task.abort();
         }
 
@@ -4397,7 +4411,7 @@ mod tests {
         assert!(db.purge_note(&note_id).is_err());
 
         db.delete_note(&note_id).unwrap();
-        let removed_audio = db.purge_note(&note_id).unwrap();
+        let removed_audio: Vec<String> = db.purge_note(&note_id).unwrap().into_iter().map(|r| r.id).collect();
         assert_eq!(removed_audio, vec![audio_id.clone()], "the caller is told which files to delete");
 
         assert!(db.get_note_raw(&note_id).unwrap().is_none(), "the note itself is gone");
@@ -4420,7 +4434,7 @@ mod tests {
         db.attach_to_note(&doomed, &audio_id, "audio_file").unwrap();
 
         db.delete_note(&doomed).unwrap();
-        let removed_audio = db.purge_note(&doomed).unwrap();
+        let removed_audio: Vec<String> = db.purge_note(&doomed).unwrap().into_iter().map(|r| r.id).collect();
 
         assert!(removed_audio.is_empty(), "nothing to delete from disk");
         assert!(db.get_audio_file(&audio_id).unwrap().is_some(), "the recording stays");

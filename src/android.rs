@@ -101,6 +101,13 @@ pub struct NoteData {
 }
 
 /// An audio file from the database
+/// A recording removed for good with its note, and the name its file has here.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PurgedRecordingData {
+    pub id: String,
+    pub disk_name: String,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AudioFileData {
     pub id: String,
@@ -2142,12 +2149,29 @@ impl VoiceClient {
 
     /// Empty one note out of the trash for good.
     ///
-    /// Returns the ids of the recordings that went with it, so the app can
-    /// delete the files from the phone. The removal travels to the other
-    /// devices and cannot be undone.
-    pub fn purge_note(&self, note_id: String) -> Result<Vec<String>, VoiceCoreError> {
+    /// Returns the recordings that went with it, each with the name its file
+    /// has here, so the app deletes exactly those files (FILE-15). The removal
+    /// travels to the other devices and cannot be undone.
+    pub fn purge_note(&self, note_id: String) -> Result<Vec<PurgedRecordingData>, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.purge_note(&note_id)
+            .map(|purged| purged.into_iter().map(|r| PurgedRecordingData { id: r.id, disk_name: r.disk_name }).collect())
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// Whether this phone imported the recording, no place is known to hold it,
+    /// and its file is not in the audio folder (the "Where are the copies?" line).
+    pub fn imported_here_but_missing(&self, audio_id: String, audio_dir: String) -> Result<bool, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.imported_here_but_missing(&audio_id, std::path::Path::new(&audio_dir))
+            .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
+    }
+
+    /// The live recording imported under this file name with these bytes, if
+    /// any (D31): an import skips a file the account already holds.
+    pub fn find_imported_audio_file(&self, filename: String, content_sha256: String) -> Result<Option<String>, VoiceCoreError> {
+        let db = self.db.lock().unwrap();
+        db.find_imported_audio_file(&filename, &content_sha256)
             .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
     }
 
