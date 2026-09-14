@@ -702,6 +702,17 @@ async fn handshake(
         }
     }
 
+    // What this device holds is stated before the peer reads the feed (FILE-22):
+    // a device that only serves syncs compares its folder too
+    {
+        let dir = account.config.lock().ok().and_then(|c| c.audiofile_directory().map(std::path::PathBuf::from));
+        if let Some(dir) = dir {
+            if let Err(e) = account.db.lock().unwrap().check_files_here(&dir, &state.device_id) {
+                tracing::warn!("Could not compare the audio folder with the statements: {}", e);
+            }
+        }
+    }
+
     // Whether recordings are served, and how much room the disk has
     let (supports_audiofiles, free_bytes) = {
         let config = account.config.lock().unwrap();
@@ -1093,6 +1104,39 @@ fn note_copy(account: &AccountHandle, audio_id: &str, device_id: &str) {
     }
 }
 
+/// `POST /sync/audio/:id/keep` (FILE-26): the caller is removing its copy of a
+/// recording and asks this device to promise to keep its own meanwhile.
+async fn keep_audio_file(
+    State(state): State<AppState>,
+    Extension(account): Extension<AccountHandle>,
+    Extension(caller): Extension<CallerDevice>,
+    Path(audio_id): Path<String>,
+) -> Result<Json<crate::sync_protocol::KeepResponse>, (StatusCode, String)> {
+    use crate::sync_protocol::KeepResponse;
+    Uuid::parse_str(&audio_id).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid audio ID".to_string()))?;
+    let dir = account
+        .config
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Config lock error".to_string()))?
+        .audiofile_directory()
+        .map(std::path::PathBuf::from);
+    let Some(dir) = dir else {
+        return Ok(Json(KeepResponse { holds: false, until_ms: 0, reason: "no audio folder is set on this device".to_string() }));
+    };
+    let db = account.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Database lock error".to_string()))?;
+    if let Err(e) = db.apply_pending_file_renames(&dir) {
+        tracing::warn!("Recording names were not all settled on disk: {}", e);
+    }
+    match db.promise_to_keep(&audio_id, &caller.0, &dir, &state.device_id) {
+        Ok(Ok(until_ms)) => {
+            tracing::info!("Promised {} to keep {} until {}", short(&caller.0), short(&audio_id), until_ms);
+            Ok(Json(KeepResponse { holds: true, until_ms, reason: String::new() }))
+        }
+        Ok(Err(reason)) => Ok(Json(KeepResponse { holds: false, until_ms: 0, reason })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
 /// `POST /sync/audio/missing` (FILE-12): of the ids a sender holds, which
 /// this device lacks, and how many bytes of each it already has in a part.
 async fn missing_audio_files(
@@ -1207,6 +1251,7 @@ pub fn create_router_for(accounts: Arc<dyn AccountSource>, machine: Arc<Mutex<Co
         .route("/sync/audio/missing", post(missing_audio_files))
         .route("/sync/audio/:audio_id/file", get(serve_audio_file))
         .route("/sync/audio/:audio_id/file", post(receive_audio_file))
+        .route("/sync/audio/:audio_id/keep", post(keep_audio_file))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
 
     Router::new()
@@ -2946,7 +2991,8 @@ mod tests {
             }
 
             // A copy removed to save space on A, and B's file deleted from B's folder by hand
-            a.db.lock().unwrap().remove_local_copy(&id_a, &a.audio, &a.id).unwrap();
+            let removed = client.remove_local_copy(&id_a).await.unwrap();
+            assert!(removed.contains("B holds it"), "{}", removed);
             assert!(!path_a.exists());
             std::fs::remove_file(path_of(&b, &id_b)).unwrap();
             let synced = client.sync_with_peer(&b.id).await;
@@ -2961,6 +3007,37 @@ mod tests {
             assert_eq!(holding(&a, &id_b), vec![a.id.clone()], "A knows B's file is gone");
             assert_eq!(a.db.lock().unwrap().file_locations(&id_a).unwrap(), b.db.lock().unwrap().file_locations(&id_a).unwrap());
             assert_eq!(a.db.lock().unwrap().file_locations(&id_b).unwrap(), b.db.lock().unwrap().file_locations(&id_b).unwrap());
+            task.abort();
+        }
+
+        /// FILE-26 between two instances: a copy that no other place is known
+        /// to hold stays; A's copy goes once B promises to keep its own, and B's
+        /// own removal is refused while the promise lasts; a device that is
+        /// removing its copy promises nothing, and the refusal says so.
+        #[tokio::test]
+        async fn a_copy_goes_only_when_a_peer_promises_to_keep_its_own() {
+            let (a, b, _url, task) = pair();
+            let (id, path_a) = recording(&a, 5000);
+            let (id2, path2_a) = recording(&a, 3000);
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            let refused = client.remove_local_copy(&id).await.unwrap_err().to_string();
+            assert!(refused.contains("no other place is known to hold it"), "{}", refused);
+            assert!(path_a.is_file());
+
+            let delivered = client.deliver(&b.id).await;
+            assert!(delivered.success, "{:?}", delivered.errors);
+            let removed = client.remove_local_copy(&id).await.unwrap();
+            assert!(removed.contains("B holds it"), "{}", removed);
+            assert!(!path_a.exists());
+            assert!(path_of(&b, &id).is_file());
+            let refused = b.db.lock().unwrap().begin_removal(&id).unwrap().unwrap_err();
+            assert!(refused.contains("promised A"), "{}", refused);
+
+            assert_eq!(b.db.lock().unwrap().begin_removal(&id2).unwrap(), Ok(()));
+            let refused = client.remove_local_copy(&id2).await.unwrap_err().to_string();
+            assert!(refused.contains("B does not keep it: this device is removing its own copy"), "{}", refused);
+            assert!(path2_a.is_file(), "nothing confirmed: the copy stays");
+            assert!(path_of(&b, &id2).is_file());
             task.abort();
         }
 

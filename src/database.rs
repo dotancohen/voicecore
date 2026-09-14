@@ -382,6 +382,10 @@ pub struct Database {
 /// The place in `file_locations` that stands for the account's bucket (FILE-22).
 pub const PLACE_CLOUD: &str = "cloud";
 
+/// How long a device keeps a copy it promised a peer, and how long a removal
+/// under way refuses such promises (FILE-26), in milliseconds.
+pub const HOLD_MS: i64 = 10 * 60 * 1000;
+
 /// The account's upload limit when the storage configuration names none (FILE-23).
 pub const DEFAULT_MAX_UPLOAD_MB: u64 = 100;
 
@@ -772,6 +776,20 @@ impl Database {
                 part_number INTEGER NOT NULL,
                 etag TEXT NOT NULL,
                 PRIMARY KEY (audio_id, part_number)
+            );
+
+            -- A promise this device gave a peer to keep its copy of a recording
+            -- while that peer removes its own (FILE-26). Local, never synced.
+            CREATE TABLE IF NOT EXISTS file_holds (
+                audio_id BLOB NOT NULL,
+                for_device TEXT NOT NULL,
+                until_ms INTEGER NOT NULL,
+                PRIMARY KEY (audio_id, for_device)
+            );
+            -- A removal of this device's copy that is under way (FILE-26). Local, never synced.
+            CREATE TABLE IF NOT EXISTS file_removals (
+                audio_id BLOB PRIMARY KEY,
+                since_ms INTEGER NOT NULL
             );
 
             -- Where each copy of a recording is (FILE-22): one row per recording
@@ -1537,10 +1555,22 @@ impl Database {
                 .query_row("SELECT storage_key FROM audio_files WHERE id = ? AND storage_key IS NOT NULL", params![audio_id], |r| r.get(0))
                 .optional()?;
             if let Some(Some(key)) = key {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO purged_objects (storage_key, at) VALUES (?, ?)",
-                    params![key, Utc::now().timestamp()],
+                // The object is keyed by the content hash (FILE-18): a recording
+                // that stays may use the same object, and then it is not tagged
+                let marks = vec!["?"; audio_ids.len()].join(", ");
+                let mut values: Vec<rusqlite::types::Value> = vec![key.clone().into()];
+                values.extend(audio_ids.iter().map(|id| rusqlite::types::Value::Blob(id.clone())));
+                let shared: i64 = self.conn.query_row(
+                    &format!("SELECT COUNT(*) FROM audio_files WHERE storage_key = ? AND id NOT IN ({})", marks),
+                    rusqlite::params_from_iter(values.iter()),
+                    |r| r.get(0),
                 )?;
+                if shared == 0 {
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO purged_objects (storage_key, at) VALUES (?, ?)",
+                        params![key, Utc::now().timestamp()],
+                    )?;
+                }
             }
         }
 
@@ -3446,15 +3476,14 @@ impl Database {
     }
 
     /// Store a recording's content hash (Stage 13), computed from its file
-    /// in the audio directory; the row is published again so it travels.
-    /// Returns the hash.
-    pub fn store_content_hash(&self, audio_id: &str, audio_dir: &Path) -> VoiceResult<String> {
+    /// in the audio directory; the row is published again so it travels. The
+    /// file is here, whole: its size is stored (FILE-23) and this device,
+    /// `here`, states that it holds it (FILE-22). Returns the hash.
+    pub fn store_content_hash(&self, audio_id: &str, audio_dir: &Path, here: &str) -> VoiceResult<String> {
         let row = self.get_audio_file(audio_id)?.ok_or_else(|| VoiceError::NotFound(audio_id.to_string()))?;
         let path = crate::models::audio_local_path(audio_dir, &row.disk_name);
         let hash = crate::transfer::file_sha256(&path)?;
         self.set_content_hash(audio_id, &hash)?;
-        // The file is here, whole: its size (FILE-23). Which device holds it
-        // is stated by the caller that knows the device (FILE-22)
         if let Ok(meta) = std::fs::metadata(&path) {
             let id = Uuid::parse_str(&row.id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
             self.conn.execute(
@@ -3462,6 +3491,7 @@ impl Database {
                 params![meta.len() as i64, id.as_bytes().to_vec(), meta.len() as i64],
             )?;
         }
+        self.set_file_location(audio_id, here, true)?;
         Ok(hash)
     }
 
@@ -3765,25 +3795,131 @@ impl Database {
         Ok((arrived, gone))
     }
 
-    /// Remove this device's copy of a recording to save space, leaving the
-    /// recording and every other copy (FILE-22). Refused when no other place
-    /// is known to hold the file, because the file would then be gone.
-    /// `here` is this device's id, from its configuration.
-    pub fn remove_local_copy(&self, audio_id: &str, audio_dir: &Path, here: &str) -> VoiceResult<()> {
-        let row = self.get_audio_file(audio_id)?.ok_or_else(|| VoiceError::NotFound(audio_id.to_string()))?;
-        let path = crate::models::audio_local_path(audio_dir, &row.disk_name);
-        if !path.is_file() {
-            return Err(VoiceError::validation("audio_id", format!("{} is not on this device", row.disk_name)));
+    /// Run `work` inside one write transaction (`BEGIN IMMEDIATE`), so that
+    /// another process's promise or removal of the same copy waits for it; run
+    /// it as it is when a transaction is already open.
+    fn in_write_transaction<T>(&self, work: impl FnOnce() -> VoiceResult<T>) -> VoiceResult<T> {
+        if !self.conn.is_autocommit() {
+            return work();
         }
-        let elsewhere: Vec<String> = self.places_holding(&row.id)?.into_iter().filter(|p| p != here).collect();
-        if elsewhere.is_empty() {
-            return Err(VoiceError::validation(
-                "audio_id",
-                format!("{} is on this device only; it can be removed from here once the bucket or another device holds it", row.disk_name),
-            ));
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match work() {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
-        std::fs::remove_file(&path)?;
-        self.set_file_location(&row.id, here, false)?;
+    }
+
+    /// A device's name from its card, or the start of its id.
+    fn device_label(&self, device_id: &str) -> String {
+        self.get_device_card(device_id)
+            .ok()
+            .flatten()
+            .map(|card| card.name)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| short(device_id).to_string())
+    }
+
+    /// Promise `for_device` to keep this device's copy of a recording for
+    /// [`HOLD_MS`] while that device removes its own (FILE-26). Refused, with
+    /// the reason, when the file is not here whole, or when this device is
+    /// removing its own copy: two devices that each count on the other never
+    /// both remove. States that this device holds the file. Returns when the
+    /// promise ends, in milliseconds.
+    pub fn promise_to_keep(&self, audio_id: &str, for_device: &str, audio_dir: &Path, here: &str) -> VoiceResult<Result<i64, String>> {
+        let id = audio_id_bytes(audio_id)?;
+        self.in_write_transaction(|| {
+            let Some(row) = self.get_audio_file(audio_id)? else {
+                return Ok(Err("this device has no such recording".to_string()));
+            };
+            let path = crate::models::audio_local_path(audio_dir, &row.disk_name);
+            let Some(size) = std::fs::metadata(&path).ok().filter(|m| m.is_file()).map(|m| m.len()) else {
+                return Ok(Err(format!("{} is not on this device", row.disk_name)));
+            };
+            let known: Option<i64> = self.conn.query_row("SELECT size_bytes FROM audio_files WHERE id = ?", params![id], |r| r.get(0))?;
+            if known.is_some_and(|n| n as u64 != size) {
+                return Ok(Err(format!("the copy of {} on this device is not whole", row.disk_name)));
+            }
+            let now = Utc::now().timestamp_millis();
+            let removing: Option<i64> = self
+                .conn
+                .query_row("SELECT since_ms FROM file_removals WHERE audio_id = ?", params![id], |r| r.get(0))
+                .optional()?;
+            if removing.is_some_and(|since| now - since < HOLD_MS) {
+                return Ok(Err("this device is removing its own copy".to_string()));
+            }
+            let until = now + HOLD_MS;
+            self.conn.execute(
+                "INSERT INTO file_holds (audio_id, for_device, until_ms) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(audio_id, for_device) DO UPDATE SET until_ms = ?3",
+                params![id, for_device, until],
+            )?;
+            self.set_file_location(audio_id, here, true)?;
+            Ok(Ok(until))
+        })
+    }
+
+    /// Begin removing this device's copy of a recording (FILE-26): refused,
+    /// with the reason, while this device has promised a peer to keep it;
+    /// otherwise marked, so that a peer asking this device to keep its copy is
+    /// refused until the removal is finished or abandoned.
+    pub fn begin_removal(&self, audio_id: &str) -> VoiceResult<Result<(), String>> {
+        let id = audio_id_bytes(audio_id)?;
+        self.in_write_transaction(|| {
+            let now = Utc::now().timestamp_millis();
+            let promised: Option<(String, i64)> = self
+                .conn
+                .query_row(
+                    "SELECT for_device, until_ms FROM file_holds WHERE audio_id = ? AND until_ms > ? ORDER BY until_ms DESC LIMIT 1",
+                    params![id, now],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((device, until)) = promised {
+                return Ok(Err(format!(
+                    "this device promised {} to keep its copy until {}, while {} removes its own",
+                    self.device_label(&device),
+                    crate::timezone::format_at_offset(until / 1000, None),
+                    self.device_label(&device)
+                )));
+            }
+            self.conn.execute("INSERT OR REPLACE INTO file_removals (audio_id, since_ms) VALUES (?, ?)", params![id, now])?;
+            Ok(Ok(()))
+        })
+    }
+
+    /// Finish a removal that another place confirmed (FILE-26): the file
+    /// goes, this device states that it no longer holds it, and the mark is
+    /// cleared. The recording and every other copy stay.
+    pub fn finish_removal(&self, audio_id: &str, audio_dir: &Path, here: &str) -> VoiceResult<()> {
+        let id = audio_id_bytes(audio_id)?;
+        self.in_write_transaction(|| {
+            let row = self.get_audio_file(audio_id)?.ok_or_else(|| VoiceError::NotFound(audio_id.to_string()))?;
+            let marked: Option<i64> = self
+                .conn
+                .query_row("SELECT since_ms FROM file_removals WHERE audio_id = ?", params![id], |r| r.get(0))
+                .optional()?;
+            if marked.is_none() {
+                return Err(VoiceError::validation("audio_id", "no removal of this copy is under way"));
+            }
+            let path = crate::models::audio_local_path(audio_dir, &row.disk_name);
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+            self.set_file_location(audio_id, here, false)?;
+            self.conn.execute("DELETE FROM file_removals WHERE audio_id = ?", params![id])?;
+            Ok(())
+        })
+    }
+
+    /// Give up a removal (FILE-26): the copy stays, and peers may be promised it again.
+    pub fn abandon_removal(&self, audio_id: &str) -> VoiceResult<()> {
+        self.conn.execute("DELETE FROM file_removals WHERE audio_id = ?", params![audio_id_bytes(audio_id)?])?;
         Ok(())
     }
 
@@ -7113,9 +7249,9 @@ mod tests {
             }
         }
 
-        /// FILE-22, the owner's case: one device removes its copy while
-        /// another uploads the file to the bucket. Neither statement undoes
-        /// the other, and after syncing both devices know both.
+        /// FILE-22, FILE-26, the owner's case: one device removes its copy
+        /// while another uploads the file to the bucket. Neither statement
+        /// undoes the other, and after syncing both devices know both.
         #[test]
         fn a_copy_removed_on_one_device_while_another_uploads_is_known_on_both() {
             let temp = tempfile::TempDir::new().unwrap();
@@ -7125,15 +7261,21 @@ mod tests {
             let id = phone.create_audio_file("ישיבה.m4a", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
             let name = phone.get_audio_file(&id).unwrap().unwrap().disk_name;
             std::fs::write(dir.join(&name), b"the recording").unwrap();
-            phone.store_content_hash(&id, &dir).unwrap();
+            phone.store_content_hash(&id, &dir, PHONE).unwrap();
             // The phone and the laptop both hold it, and each says so
-            assert_eq!(phone.check_files_here(&dir, PHONE).unwrap(), (1, 0));
+            assert_eq!(stated(&phone, &id), vec![(PHONE.to_string(), true)], "hashing the file states the phone's copy");
             phone.apply_sync_file_location(&id, LAPTOP, true, 1_000, Some(LAPTOP), 1).unwrap();
             sync(&phone, &laptop);
+            let laptop_dir = temp.path().join("laptop audio");
+            std::fs::create_dir_all(&laptop_dir).unwrap();
+            std::fs::write(laptop_dir.join(&name), b"the recording").unwrap();
 
-            // At once: the laptop uploads it; the phone removes its copy to save space
+            // At once: the laptop uploads it; the phone removes its copy to save
+            // space, once the laptop promised to keep its own (FILE-26)
             laptop.update_audio_file_storage(&id, "s3", "abc.m4a", false).unwrap();
-            phone.remove_local_copy(&id, &dir, PHONE).unwrap();
+            assert_eq!(phone.begin_removal(&id).unwrap(), Ok(()));
+            assert!(laptop.promise_to_keep(&id, PHONE, &laptop_dir, LAPTOP).unwrap().is_ok());
+            phone.finish_removal(&id, &dir, PHONE).unwrap();
             assert!(!dir.join(&name).exists());
 
             sync(&phone, &laptop);
@@ -7171,38 +7313,60 @@ mod tests {
             assert_eq!(stated(&db, &id), vec![(HERE.to_string(), false)]);
         }
 
-        /// FILE-22: a copy is removed from this device only when another place
-        /// holds the file; the file on disk goes, the recording stays.
+        /// FILE-26: a copy goes only through a removal that another place
+        /// confirmed. A promise to keep a copy blocks this device's own removal
+        /// of it, and a removal under way refuses a promise, so two devices
+        /// that each count on the other never both remove the file.
         #[test]
-        fn the_only_copy_is_never_removed() {
+        fn two_devices_that_count_on_each_other_never_both_remove() {
             let temp = tempfile::TempDir::new().unwrap();
-            let db = Database::new(temp.path().join("a.db")).unwrap();
-            let dir = temp.path().join("audio");
-            std::fs::create_dir_all(&dir).unwrap();
-            let id = db.create_audio_file("יחיד.ogg", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
-            let name = db.get_audio_file(&id).unwrap().unwrap().disk_name;
-            std::fs::write(dir.join(&name), b"only here").unwrap();
-            db.store_content_hash(&id, &dir).unwrap();
+            let a = Database::new(temp.path().join("a.db")).unwrap();
+            let b = Database::new(temp.path().join("b.db")).unwrap();
+            let (dir_a, dir_b) = (temp.path().join("a"), temp.path().join("b"));
+            for d in [&dir_a, &dir_b] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let id = a.create_audio_file("שני עותקים.ogg", None, None, FileOrigin::Imported, Some(&dir_a)).unwrap();
+            let name = a.get_audio_file(&id).unwrap().unwrap().disk_name;
+            std::fs::write(dir_a.join(&name), b"both hold it").unwrap();
+            a.store_content_hash(&id, &dir_a, PHONE).unwrap();
+            sync(&a, &b);
+            std::fs::write(dir_b.join(&name), b"both hold it").unwrap();
+            b.store_content_hash(&id, &dir_b, LAPTOP).unwrap();
 
-            let refused = db.remove_local_copy(&id, &dir, HERE).unwrap_err().to_string();
-            assert!(refused.contains("on this device only"), "{}", refused);
-            assert!(dir.join(&name).is_file());
+            // At once: each begins removing, and asks the other to keep its copy
+            assert_eq!(a.begin_removal(&id).unwrap(), Ok(()));
+            assert_eq!(b.begin_removal(&id).unwrap(), Ok(()));
+            let refused = b.promise_to_keep(&id, PHONE, &dir_b, LAPTOP).unwrap().unwrap_err();
+            assert!(refused.contains("removing its own copy"), "{}", refused);
+            assert!(a.promise_to_keep(&id, LAPTOP, &dir_a, PHONE).unwrap().is_err());
+            a.abandon_removal(&id).unwrap();
+            b.abandon_removal(&id).unwrap();
+            assert!(dir_a.join(&name).is_file() && dir_b.join(&name).is_file(), "neither removed");
 
-            db.set_file_location(&id, PHONE, true).unwrap();
-            db.set_file_location(&id, PHONE, false).unwrap();
-            assert!(db.remove_local_copy(&id, &dir, HERE).is_err(), "a device that no longer holds it is not a copy");
+            // One after the other: B promises A, A removes, and B's own removal
+            // is refused while the promise lasts
+            let until = b.promise_to_keep(&id, PHONE, &dir_b, LAPTOP).unwrap().unwrap();
+            assert!(until > Utc::now().timestamp_millis());
+            assert_eq!(a.begin_removal(&id).unwrap(), Ok(()));
+            a.finish_removal(&id, &dir_a, PHONE).unwrap();
+            assert!(!dir_a.join(&name).exists());
+            let refused = b.begin_removal(&id).unwrap().unwrap_err();
+            assert!(refused.contains("promised"), "{}", refused);
+            assert!(dir_b.join(&name).is_file(), "the last copy stays");
 
-            db.update_audio_file_storage(&id, "s3", "k.ogg", false).unwrap();
-            db.check_files_here(&dir, HERE).unwrap();
-            db.remove_local_copy(&id, &dir, HERE).unwrap();
-            assert!(!dir.join(&name).exists());
-            assert!(db.get_audio_file(&id).unwrap().unwrap().deleted_at.is_none(), "the recording stays");
-            assert_eq!(stated(&db, &id).into_iter().find(|(p, _)| p == HERE), Some((HERE.to_string(), false)), "this device states that it no longer holds it");
-            assert!(db.remove_local_copy(&id, &dir, HERE).unwrap_err().to_string().contains("not on this device"));
+            // A device that does not hold the file whole promises nothing
+            assert!(a.promise_to_keep(&id, LAPTOP, &dir_a, PHONE).unwrap().unwrap_err().contains("not on this device"));
+            std::fs::write(dir_a.join(&name), b"short").unwrap();
+            assert!(a.promise_to_keep(&id, LAPTOP, &dir_a, PHONE).unwrap().unwrap_err().contains("not whole"));
+            // A removal that was never begun is never finished
+            assert!(b.finish_removal(&id, &dir_b, LAPTOP).is_err());
+            assert!(dir_b.join(&name).is_file());
+            assert!(a.get_audio_file(&id).unwrap().unwrap().deleted_at.is_none(), "the recording stays");
         }
 
-        /// FILE-22, FILE-23: the hash states the size; the storage columns
-        /// state the bucket's copy; this device's copy is stated by the check.
+        /// FILE-22, FILE-23: the hash states the size and the copy of the
+        /// device that computed it; the storage columns state the bucket's copy.
         #[test]
         fn the_hash_states_the_size_and_the_storage_columns_state_the_bucket() {
             let temp = tempfile::TempDir::new().unwrap();
@@ -7212,12 +7376,10 @@ mod tests {
             let id = db.create_audio_file("גודל.wav", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
             let name = db.get_audio_file(&id).unwrap().unwrap().disk_name;
             std::fs::write(dir.join(&name), vec![7u8; 12_345]).unwrap();
-            db.store_content_hash(&id, &dir).unwrap();
+            db.store_content_hash(&id, &dir, HERE).unwrap();
             let size: Option<i64> = db.conn.query_row("SELECT size_bytes FROM audio_files", [], |r| r.get(0)).unwrap();
             assert_eq!(size, Some(12_345));
-            assert!(db.places_holding(&id).unwrap().is_empty(), "the hash names no device");
-            db.check_files_here(&dir, HERE).unwrap();
-            assert_eq!(db.places_holding(&id).unwrap(), vec![HERE.to_string()]);
+            assert_eq!(db.places_holding(&id).unwrap(), vec![HERE.to_string()], "the device that hashed the file holds it");
 
             db.update_audio_file_storage(&id, "s3", "k.wav", false).unwrap();
             assert_eq!(db.places_holding(&id).unwrap(), vec!["cloud".to_string(), HERE.to_string()]);
@@ -7418,7 +7580,7 @@ mod tests {
         let id = db.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let disk = db.get_audio_file(&id).unwrap().unwrap().disk_name;
         std::fs::write(dir.join(&disk), b"the bytes of one recording").unwrap();
-        let hash = db.store_content_hash(&id, &dir).unwrap();
+        let hash = db.store_content_hash(&id, &dir, &crate::database::get_local_device_id().simple().to_string()).unwrap();
 
         assert_eq!(db.find_imported_audio_file("הקלטה.mp3", &hash).unwrap(), Some(id.clone()));
         assert_eq!(db.find_imported_audio_file("הקלטה.mp3", &hash.to_uppercase()).unwrap(), Some(id.clone()));
@@ -7458,7 +7620,7 @@ mod tests {
         let row = a.get_audio_file(&id).unwrap().unwrap();
         assert!(row.content_sha256.is_none(), "not hashed before the file is there");
         std::fs::write(crate::models::audio_local_path(&dir, &row.disk_name), b"bytes of the recording").unwrap();
-        let hash = a.store_content_hash(&id, &dir).unwrap();
+        let hash = a.store_content_hash(&id, &dir, &crate::database::get_local_device_id().simple().to_string()).unwrap();
         assert_eq!(hash, crate::transfer::file_sha256(&crate::models::audio_local_path(&dir, &row.disk_name)).unwrap());
         assert_eq!(a.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()));
 

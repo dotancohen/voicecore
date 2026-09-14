@@ -392,6 +392,17 @@ impl FileStorageService for S3StorageService {
         self.full_key(remote_key)
     }
 
+    async fn purge_tagged(&self, storage_key: &str) -> Result<bool, FileStorageError> {
+        let url = self.object_url(storage_key, "tagging");
+        let answer = crate::bucket_setup::send_signed(&self.bucket_key(), "GET", &url, b"", None, crate::bucket_setup::STALL_TIMEOUT)
+            .await
+            .map_err(|e| FileStorageError::Network(format!("Tag check of {}: {}", storage_key, e)))?;
+        match answer.status {
+            200..=299 => Ok(answer.body.contains(&format!("<Key>{}</Key>", crate::bucket_setup::PURGED_TAG.0))),
+            status => Err(Self::refused("Tag check", storage_key, status, &answer.body)),
+        }
+    }
+
     async fn tag_purged(&self, storage_key: &str) -> Result<(), FileStorageError> {
         let response = self
             .bucket

@@ -793,8 +793,17 @@ impl VoiceClient {
     /// Replace the database with a snapshot (SNAP-4); the state replaced is
     /// snapshotted first, so this is undoable too.
     pub fn restore_snapshot(&self, name: String) -> Result<(), VoiceCoreError> {
+        let (dir, here) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
+        };
         let mut db = self.db.lock().unwrap();
         db.restore_snapshot(&name)?;
+        // The restored rows say where the copies were then; the folder says
+        // where this phone's are now (FILE-22)
+        if let Some(dir) = dir {
+            db.check_files_here(&dir, &here)?;
+        }
         Ok(())
     }
 
@@ -1033,13 +1042,15 @@ impl VoiceClient {
     }
 
     /// Compute and store a recording's content hash (Stage 13) from its file
-    /// in the audio directory, after the file is copied there. Returns the hash.
+    /// in the audio directory, after the file is copied there; this phone
+    /// states that it holds the file (FILE-22). Returns the hash.
     pub fn store_content_hash(&self, audio_file_id: String) -> Result<String, VoiceCoreError> {
         let audiofile_dir = self.get_audiofile_directory().ok_or_else(|| VoiceCoreError::Config {
             msg: "No audio directory is configured".to_string(),
         })?;
+        let here = self.config.lock().unwrap().device_id_hex().to_string();
         let db = self.db.lock().unwrap();
-        Ok(db.store_content_hash(&audio_file_id, std::path::Path::new(&audiofile_dir))?)
+        Ok(db.store_content_hash(&audio_file_id, std::path::Path::new(&audiofile_dir), &here)?)
     }
 
     /// Get all audio files in the database (for debugging)
@@ -1397,14 +1408,16 @@ impl VoiceClient {
     }
 
     /// Remove this phone's copy of a recording to save space; the recording
-    /// stays. Refused when no other place holds the file (FILE-22).
-    pub fn remove_local_copy(&self, audio_id: String) -> Result<(), VoiceCoreError> {
-        let (dir, here) = {
-            let cfg = self.config.lock().unwrap();
-            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
-        };
-        let dir = dir.ok_or_else(|| VoiceCoreError::Config { msg: "The audio folder is not set".to_string() })?;
-        Ok(self.db.lock().unwrap().remove_local_copy(&audio_id, &dir, &here)?)
+    /// stays. The copy goes only when the bucket, or a device that holds the
+    /// file, confirms now that it does (FILE-26). Returns the sentence naming
+    /// the place that confirmed; a refusal says what each place answered.
+    pub fn remove_local_copy(&self, audio_id: String) -> Result<String, VoiceCoreError> {
+        let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
+        Ok(rt.block_on(sync_client.remove_local_copy(&audio_id))?)
     }
 
     /// The account's upload limit in megabytes (FILE-23), the same on every device.

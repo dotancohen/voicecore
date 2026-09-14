@@ -290,7 +290,7 @@ mod tests {
             let id = db.create_audio_file(name, None, None, FileOrigin::Imported, Some(&dir)).unwrap();
             db.attach_to_note(&note, &id, "audio_file").unwrap();
             std::fs::write(dir.join(db.get_audio_file(&id).unwrap().unwrap().disk_name), vec![3u8; size]).unwrap();
-            db.store_content_hash(&id, &dir).unwrap();
+            db.store_content_hash(&id, &dir, HERE).unwrap();
             id
         };
         let big = recording("הרצאה ארוכה.wav", 2 * 1024 * 1024);

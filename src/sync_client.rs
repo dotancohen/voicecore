@@ -553,6 +553,115 @@ impl SyncClient {
         Ok(Joined { account_id: reply.account_id, peer_id: reply.device_id, peer_name: reply.device_name, peer_url: url })
     }
 
+    /// Remove this device's copy of a recording to save space (FILE-26). The
+    /// copy goes only when another place confirms, now, that it holds the
+    /// file: the bucket, asked directly, or a device that holds it and
+    /// promises to keep its copy while this one goes. Two devices that remove
+    /// at once each refuse the other's request, so neither removes. Returns
+    /// the sentence naming the place that confirmed.
+    pub async fn remove_local_copy(&self, audio_id: &str) -> VoiceResult<String> {
+        self.begin_operation();
+        let (dir, here) = {
+            let c = self.config.lock().unwrap();
+            (c.audiofile_directory().map(std::path::PathBuf::from), c.device_id_hex().to_string())
+        };
+        let dir = dir.ok_or_else(|| VoiceError::validation("audio_dir", "the audio folder is not set"))?;
+        let (row, holders) = {
+            let db = self.db.lock().unwrap();
+            let _ = db.apply_pending_file_renames(&dir);
+            let row = db.get_audio_file(audio_id)?.ok_or_else(|| VoiceError::NotFound(audio_id.to_string()))?;
+            if !crate::models::audio_local_path(&dir, &row.disk_name).is_file() {
+                return Err(VoiceError::validation("audio_id", format!("{} is not on this device", row.disk_name)));
+            }
+            if let Err(reason) = db.begin_removal(&row.id)? {
+                return Err(VoiceError::validation("audio_id", format!("{} was not removed: {}", row.disk_name, reason)));
+            }
+            let holders: Vec<String> = db
+                .places_holding(&row.id)?
+                .into_iter()
+                .filter(|p| p != &here && p != crate::database::PLACE_CLOUD)
+                .collect();
+            (row, holders)
+        };
+        let mut tried: Vec<String> = Vec::new();
+        let confirmed = self.confirm_held_elsewhere(&row, &holders, &mut tried).await;
+        let db = self.db.lock().unwrap();
+        match confirmed {
+            Some(place) => {
+                db.finish_removal(&row.id, &dir, &here)?;
+                tracing::info!("Removed {} from this device; {} confirmed that it holds it", row.disk_name, place);
+                Ok(format!("Removed {} from this device; {} holds it", row.disk_name, place))
+            }
+            None => {
+                db.abandon_removal(&row.id)?;
+                let why = if tried.is_empty() { "no other place is known to hold it".to_string() } else { tried.join("; ") };
+                Err(VoiceError::validation(
+                    "audio_id",
+                    format!("{} was not removed: no other place confirmed that it holds the file now ({})", row.disk_name, why),
+                ))
+            }
+        }
+    }
+
+    /// Ask the bucket, then each device said to hold the file, until one
+    /// confirms (FILE-26). What each answered goes into `tried`.
+    async fn confirm_held_elsewhere(&self, row: &crate::database::AudioFileRow, holders: &[String], tried: &mut Vec<String>) -> Option<String> {
+        #[cfg(feature = "file-storage")]
+        if let Some(key) = row.storage_key.clone().filter(|_| row.storage_provider.is_some()) {
+            let storage = {
+                let db = self.db.lock().unwrap();
+                crate::file_storage::create_storage_service(&db)
+            };
+            match storage {
+                Ok(Some(storage)) => match crate::file_storage::bucket_holds(&storage, &key).await {
+                    Ok(true) => return Some("the bucket".to_string()),
+                    Ok(false) => {
+                        tried.push("the bucket does not hold it".to_string());
+                        if let Err(e) = self.db.lock().unwrap().set_file_location(&row.id, crate::database::PLACE_CLOUD, false) {
+                            tracing::warn!("Could not record that the bucket lacks {}: {}", row.id, e);
+                        }
+                    }
+                    Err(e) => tried.push(format!("the bucket could not be asked: {}", e)),
+                },
+                Ok(None) => tried.push("no bucket is set up on this device".to_string()),
+                Err(e) => tried.push(format!("the bucket could not be asked: {}", e)),
+            }
+        }
+        for peer_id in holders {
+            let name = self
+                .config
+                .lock()
+                .ok()
+                .and_then(|c| c.get_peer(peer_id).map(|p| p.peer_name.clone()))
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| short_id(peer_id).to_string());
+            let Some(url) = self.peer_url_of(peer_id).filter(|u| !u.is_empty()) else {
+                tried.push(format!("{} has no address on this device", name));
+                continue;
+            };
+            let client = match self.client_for(&url) {
+                Ok(client) => client,
+                Err(e) => {
+                    tried.push(format!("{}: {}", name, e));
+                    continue;
+                }
+            };
+            let request = self
+                .authed(client.post(format!("{}/sync/audio/{}/keep", url.trim_end_matches('/'), row.id)))
+                .timeout(Duration::from_secs(15));
+            match request.send().await {
+                Ok(response) if response.status().is_success() => match response.json::<crate::sync_protocol::KeepResponse>().await {
+                    Ok(answer) if answer.holds => return Some(name),
+                    Ok(answer) => tried.push(format!("{} does not keep it: {}", name, answer.reason)),
+                    Err(e) => tried.push(format!("the answer of {} could not be read: {}", name, e)),
+                },
+                Ok(response) => tried.push(format!("{} answered with status {}", name, response.status())),
+                Err(e) => tried.push(format!("{} could not be reached: {}", name, describe(&e))),
+            }
+        }
+        None
+    }
+
     /// The three headers every request carries (AUTH-3): the account, the
     /// device, and the device's key as a bearer token.
     fn authed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

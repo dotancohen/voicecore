@@ -303,3 +303,15 @@ impl ErrorResponse {
         Self { error: error.into(), code: code.to_string() }
     }
 }
+
+/// `POST /sync/audio/:id/keep` response (FILE-26): whether the device promised
+/// to keep its copy of the recording while the caller removes its own, until
+/// when (milliseconds), or why it did not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeepResponse {
+    pub holds: bool,
+    #[serde(default)]
+    pub until_ms: i64,
+    #[serde(default)]
+    pub reason: String,
+}
