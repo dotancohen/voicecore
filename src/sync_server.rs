@@ -4,7 +4,6 @@
 //! - /sync/handshake - Exchange device info
 //! - /sync/changes - Get changes since timestamp
 //! - /sync/apply - Apply changes from peer
-//! - /sync/full - Get full dataset for initial sync
 //! - /sync/status - Health check
 //! - /sync/audio/:id/file - One recording's bytes: GET serves it to a fetching peer, POST receives it from a sending peer
 
@@ -703,10 +702,6 @@ async fn handshake(
         }
     }
 
-    // Get last sync timestamp for this peer
-    let last_sync = get_peer_last_sync(&account.db, &request.device_id);
-    tracing::debug!("Last sync with this peer: {:?}", last_sync);
-
     // Whether recordings are served, and how much room the disk has
     let (supports_audiofiles, free_bytes) = {
         let config = account.config.lock().unwrap();
@@ -732,7 +727,6 @@ async fn handshake(
         protocol_version: PROTOCOL_VERSION.to_string(),
         account_id: own_account,
         application: auth::APPLICATION_VOICE.to_string(),
-        last_sync_timestamp: last_sync,
         server_timestamp: Utc::now().timestamp(),
         supports_audiofiles,
         free_bytes,
@@ -750,10 +744,10 @@ async fn get_changes(
     Query(query): Query<ChangesQuery>,
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(1000).min(10000);
-    tracing::debug!("GET /sync/changes cursor={:?} since={:?} limit={}", query.cursor, query.since, limit);
+    tracing::debug!("GET /sync/changes cursor={:?} limit={}", query.cursor, limit);
 
-    // Get changes from database: cursor feed when asked for, timestamp filter otherwise
-    let (changes, latest_timestamp, next_cursor, is_complete, database_id) = {
+    // The cursor feed; no cursor is the start of it
+    let (changes, next_cursor, is_complete, database_id) = {
         let db = account.db.lock().unwrap();
         let database_id = db.database_id().unwrap_or_default();
         // A device asking for the changes after a cursor holds everything up to
@@ -766,19 +760,11 @@ async fn get_changes(
                 }
             }
         }
-        let result = match query.cursor {
-            Some(cursor) => db
-                .get_changes_after_seq_as_sync_changes(cursor, None, limit)
-                .map(|(changes, next, complete)| (changes, None, Some(next), complete)),
-            None => db
-                .get_changes_since_as_sync_changes(query.since, limit)
-                .map(|(changes, latest)| {
-                    let complete = (changes.len() as i64) < limit;
-                    (changes, latest, None, complete)
-                }),
-        };
+        let result = db
+            .get_changes_after_seq_as_sync_changes(query.cursor.unwrap_or(0), None, limit)
+            .map(|(changes, next, complete)| (changes, Some(next), complete));
         match result {
-            Ok((c, l, n, complete)) => (c, l, n, complete, database_id),
+            Ok((c, n, complete)) => (c, n, complete, database_id),
             Err(e) => {
                 tracing::error!("Failed to get changes: {}", e);
                 return (
@@ -798,9 +784,9 @@ async fn get_changes(
     };
 
     tracing::debug!(
-        "Returning {} changes, to_timestamp={:?}",
+        "Returning {} changes, next_cursor={:?}",
         changes.len(),
-        latest_timestamp
+        next_cursor
     );
     for change in &changes {
         tracing::trace!(
@@ -813,8 +799,6 @@ async fn get_changes(
 
     let response = ChangesResponse {
         changes,
-        from_timestamp: query.since,
-        to_timestamp: latest_timestamp,
         next_cursor,
         database_id,
         device_id: state.device_id.clone(),
@@ -896,7 +880,6 @@ async fn apply_changes(
     }
 
     // Update sync_peers to track when we last synced with this peer
-    // This allows the handshake to return accurate last_sync_timestamp
     if let Ok(db) = account.db.lock() {
         let _ = db.update_peer_sync_time(&request.device_id, Some(&request.device_name));
     }
@@ -912,50 +895,6 @@ async fn apply_changes(
     };
 
     Json(response).into_response()
-}
-
-async fn get_full_sync(State(state): State<AppState>, Extension(account): Extension<AccountHandle>) -> impl IntoResponse {
-    tracing::debug!("GET /sync/full (initial sync request)");
-
-    // Get all notes, tags, and note_tags
-    let mut data = match get_full_dataset(&account.db) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("Failed to get full dataset: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(e.to_string())),
-            )
-                .into_response();
-        }
-    };
-
-    // Log counts
-    if let Some(obj) = data.as_object() {
-        tracing::debug!(
-            "Full sync: {} notes, {} tags, {} note_tags",
-            obj.get("notes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
-            obj.get("tags").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
-            obj.get("note_tags").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
-        );
-    }
-
-    // Add required metadata fields that the client expects. The cursor is the
-    // end of the feed at this moment: a client that applied this dataset can
-    // continue incrementally from it.
-    let (database_id, cursor) = {
-        let db = account.db.lock().unwrap();
-        (db.database_id().unwrap_or_default(), db.current_seq().unwrap_or(0))
-    };
-    if let Some(obj) = data.as_object_mut() {
-        obj.insert("device_id".to_string(), serde_json::Value::String(state.device_id.clone()));
-        obj.insert("device_name".to_string(), serde_json::Value::String(state.device_name.clone()));
-        obj.insert("timestamp".to_string(), serde_json::json!(chrono::Utc::now().timestamp()));
-        obj.insert("database_id".to_string(), serde_json::Value::String(database_id));
-        obj.insert("cursor".to_string(), serde_json::json!(cursor));
-    }
-
-    Json(data).into_response()
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -1186,23 +1125,6 @@ async fn missing_audio_files(
     Ok(Json(MissingFilesResponse { missing, partial }))
 }
 
-fn get_peer_last_sync(db: &Arc<Mutex<Database>>, peer_id: &str) -> Option<i64> {
-    let peer_uuid = Uuid::parse_str(peer_id).ok()?;
-    let peer_bytes = peer_uuid.as_bytes().to_vec();
-
-    let db = db.lock().ok()?;
-    let conn = db.connection();
-
-    conn.query_row(
-        "SELECT last_sync_at FROM sync_peers WHERE peer_id = ?",
-        [peer_bytes],
-        |row| row.get::<_, Option<i64>>(0),
-    )
-    .ok()
-    .flatten()
-}
-
-
 fn apply_sync_changes(
     db: &Arc<Mutex<Database>>,
     changes: &[SyncChange],
@@ -1220,246 +1142,6 @@ fn apply_sync_changes(
     // Update peer's last sync timestamp
     db.update_peer_sync_time(peer_device_id, peer_device_name)?;
     Ok((outcome.applied, outcome.conflicts, outcome.errors))
-}
-
-fn get_full_dataset(db: &Arc<Mutex<Database>>) -> VoiceResult<serde_json::Value> {
-    let db = db.lock().unwrap();
-    let conn = db.connection();
-
-    // Get all notes
-    let mut notes = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT id, created_at, content, modified_at, deleted_at FROM notes",
-    )?;
-    let note_rows = stmt.query_map([], |row| {
-        let id_bytes: Vec<u8> = row.get(0)?;
-        let created_at: i64 = row.get(1)?;
-        let content: String = row.get(2)?;
-        let modified_at: Option<i64> = row.get(3)?;
-        let deleted_at: Option<i64> = row.get(4)?;
-        Ok((id_bytes, created_at, content, modified_at, deleted_at))
-    })?;
-
-    for row in note_rows {
-        let (id_bytes, created_at, content, modified_at, deleted_at) = row?;
-        let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
-        notes.push(serde_json::json!({
-            "id": id_hex,
-            "created_at": created_at,
-            "content": content,
-            "modified_at": modified_at,
-            "deleted_at": deleted_at,
-        }));
-    }
-
-    // Get all tags
-    let mut tags = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT id, name, parent_id, created_at, modified_at FROM tags",
-    )?;
-    let tag_rows = stmt.query_map([], |row| {
-        let id_bytes: Vec<u8> = row.get(0)?;
-        let name: String = row.get(1)?;
-        let parent_id_bytes: Option<Vec<u8>> = row.get(2)?;
-        let created_at: Option<i64> = row.get(3)?;
-        let modified_at: Option<i64> = row.get(4)?;
-        Ok((id_bytes, name, parent_id_bytes, created_at, modified_at))
-    })?;
-
-    for row in tag_rows {
-        let (id_bytes, name, parent_id_bytes, created_at, modified_at) = row?;
-        let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
-        let parent_id_hex = parent_id_bytes
-            .map(|b| crate::validation::uuid_bytes_to_hex(&b))
-            .transpose()?;
-        tags.push(serde_json::json!({
-            "id": id_hex,
-            "name": name,
-            "parent_id": parent_id_hex,
-            "created_at": created_at,
-            "modified_at": modified_at,
-        }));
-    }
-
-    // Get all note_tags
-    let mut note_tags = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT note_id, tag_id, created_at, modified_at, deleted_at FROM note_tags",
-    )?;
-    let note_tag_rows = stmt.query_map([], |row| {
-        let note_id_bytes: Vec<u8> = row.get(0)?;
-        let tag_id_bytes: Vec<u8> = row.get(1)?;
-        let created_at: i64 = row.get(2)?;
-        let modified_at: Option<i64> = row.get(3)?;
-        let deleted_at: Option<i64> = row.get(4)?;
-        Ok((note_id_bytes, tag_id_bytes, created_at, modified_at, deleted_at))
-    })?;
-
-    for row in note_tag_rows {
-        let (note_id_bytes, tag_id_bytes, created_at, modified_at, deleted_at) = row?;
-        let note_id_hex = crate::validation::uuid_bytes_to_hex(&note_id_bytes)?;
-        let tag_id_hex = crate::validation::uuid_bytes_to_hex(&tag_id_bytes)?;
-        note_tags.push(serde_json::json!({
-            "note_id": note_id_hex,
-            "tag_id": tag_id_hex,
-            "created_at": created_at,
-            "modified_at": modified_at,
-            "deleted_at": deleted_at,
-        }));
-    }
-
-    // Get all note_attachments
-    let mut note_attachments = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at FROM note_attachments",
-    )?;
-    let note_attachment_rows = stmt.query_map([], |row| {
-        let id_bytes: Vec<u8> = row.get(0)?;
-        let note_id_bytes: Vec<u8> = row.get(1)?;
-        let attachment_id_bytes: Vec<u8> = row.get(2)?;
-        let attachment_type: String = row.get(3)?;
-        let created_at: i64 = row.get(4)?;
-        let modified_at: Option<i64> = row.get(5)?;
-        let deleted_at: Option<i64> = row.get(6)?;
-        Ok((id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at))
-    })?;
-
-    for row in note_attachment_rows {
-        let (id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, modified_at, deleted_at) = row?;
-        let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
-        let note_id_hex = crate::validation::uuid_bytes_to_hex(&note_id_bytes)?;
-        let attachment_id_hex = crate::validation::uuid_bytes_to_hex(&attachment_id_bytes)?;
-        note_attachments.push(serde_json::json!({
-            "id": id_hex,
-            "note_id": note_id_hex,
-            "attachment_id": attachment_id_hex,
-            "attachment_type": attachment_type,
-            "created_at": created_at,
-            "modified_at": modified_at,
-            "deleted_at": deleted_at,
-        }));
-    }
-
-    // Get all audio_files
-    let mut audio_files = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at FROM audio_files",
-    )?;
-    let audio_file_rows = stmt.query_map([], |row| {
-        let id_bytes: Vec<u8> = row.get(0)?;
-        let imported_at: i64 = row.get(1)?;
-        let filename: String = row.get(2)?;
-        let file_created_at: Option<i64> = row.get(3)?;
-        let duration_seconds: Option<f64> = row.get(4)?;
-        let summary: Option<String> = row.get(5)?;
-        let modified_at: Option<i64> = row.get(6)?;
-        let deleted_at: Option<i64> = row.get(7)?;
-        let storage_provider: Option<String> = row.get(8)?;
-        let storage_key: Option<String> = row.get(9)?;
-        let storage_uploaded_at: Option<i64> = row.get(10)?;
-        Ok((id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at))
-    })?;
-
-    for row in audio_file_rows {
-        let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at) = row?;
-        let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
-        audio_files.push(serde_json::json!({
-            "id": id_hex,
-            "imported_at": imported_at,
-            "filename": filename,
-            "file_created_at": file_created_at,
-            "duration_seconds": duration_seconds,
-            "summary": summary,
-            "modified_at": modified_at,
-            "deleted_at": deleted_at,
-            "storage_provider": storage_provider,
-            "storage_key": storage_key,
-            "storage_uploaded_at": storage_uploaded_at,
-        }));
-    }
-
-    // Get all transcriptions
-    let mut transcriptions = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at FROM transcriptions",
-    )?;
-    let transcription_rows = stmt.query_map([], |row| {
-        let id_bytes: Vec<u8> = row.get(0)?;
-        let audio_file_id_bytes: Vec<u8> = row.get(1)?;
-        let content: String = row.get(2)?;
-        let content_segments: Option<String> = row.get(3)?;
-        let service: String = row.get(4)?;
-        let service_arguments: Option<String> = row.get(5)?;
-        let service_response: Option<String> = row.get(6)?;
-        let state: String = row.get(7)?;
-        let device_id_bytes: Vec<u8> = row.get(8)?;
-        let created_at: i64 = row.get(9)?;
-        let modified_at: Option<i64> = row.get(10)?;
-        let deleted_at: Option<i64> = row.get(11)?;
-        Ok((id_bytes, audio_file_id_bytes, content, content_segments, service, service_arguments, service_response, state, device_id_bytes, created_at, modified_at, deleted_at))
-    })?;
-
-    for row in transcription_rows {
-        let (id_bytes, audio_file_id_bytes, content, content_segments, service, service_arguments, service_response, state, device_id_bytes, created_at, modified_at, deleted_at) = row?;
-        let id_hex = crate::validation::uuid_bytes_to_hex(&id_bytes)?;
-        let audio_file_id_hex = crate::validation::uuid_bytes_to_hex(&audio_file_id_bytes)?;
-        let device_id_hex = crate::validation::uuid_bytes_to_hex(&device_id_bytes)?;
-        transcriptions.push(serde_json::json!({
-            "id": id_hex,
-            "audio_file_id": audio_file_id_hex,
-            "content": content,
-            "content_segments": content_segments,
-            "service": service,
-            "service_arguments": service_arguments,
-            "service_response": service_response,
-            "state": state,
-            "device_id": device_id_hex,
-            "created_at": created_at,
-            "modified_at": modified_at,
-            "deleted_at": deleted_at,
-        }));
-    }
-
-    // Every version: the complete history travels with the full dataset
-    let field_versions: Vec<serde_json::Value> = db
-        .get_versions_since(None, i64::MAX)?
-        .into_iter()
-        .map(|v| v.to_json())
-        .collect();
-
-    // Get file_storage_config (single row)
-    let file_storage_config: Option<serde_json::Value> = conn.query_row(
-        "SELECT provider, config, modified_at, device_id FROM file_storage_config WHERE id = 'default'",
-        [],
-        |row| {
-            let provider: String = row.get(0)?;
-            let config: Option<String> = row.get(1)?;
-            let modified_at: Option<i64> = row.get(2)?;
-            let device_id_bytes: Option<Vec<u8>> = row.get(3)?;
-            Ok((provider, config, modified_at, device_id_bytes))
-        },
-    ).ok().map(|(provider, config, modified_at, device_id_bytes)| {
-        let device_id_hex = device_id_bytes.and_then(|b| crate::validation::uuid_bytes_to_hex(&b).ok());
-        let config_val: Option<serde_json::Value> = config.and_then(|s| serde_json::from_str(&s).ok());
-        serde_json::json!({
-            "id": "default",
-            "provider": provider,
-            "config": config_val,
-            "modified_at": modified_at,
-            "device_id": device_id_hex,
-        })
-    });
-
-    Ok(serde_json::json!({
-        "notes": notes,
-        "tags": tags,
-        "note_tags": note_tags,
-        "note_attachments": note_attachments,
-        "audio_files": audio_files,
-        "transcriptions": transcriptions,
-        "file_storage_config": file_storage_config,
-        "field_versions": field_versions,
-    }))
 }
 
 /// Apply sync changes from a peer to the local database.
@@ -1522,7 +1204,6 @@ pub fn create_router_for(accounts: Arc<dyn AccountSource>, machine: Arc<Mutex<Co
         // file routes never are, a recording is compressed already
         .route("/sync/changes", get(get_changes).layer(tower_http::compression::CompressionLayer::new().gzip(true)))
         .route("/sync/apply", post(apply_changes))
-        .route("/sync/full", get(get_full_sync))
         .route("/sync/audio/missing", post(missing_audio_files))
         .route("/sync/audio/:audio_id/file", get(serve_audio_file))
         .route("/sync/audio/:audio_id/file", post(receive_audio_file))
@@ -2426,7 +2107,7 @@ mod tests {
             let stranger_id = stranger.db.lock().unwrap().account_id().unwrap();
             let http = reqwest::Client::new();
             let response = http
-                .get(format!("{}/sync/changes?since=0", url))
+                .get(format!("{}/sync/changes?cursor=0", url))
                 .header(auth::HEADER_ACCOUNT, &stranger_id)
                 .header(auth::HEADER_DEVICE, &stranger.id)
                 .bearer_auth("x")
@@ -3484,7 +3165,7 @@ mod tests {
         b.update_note(&note1_id, "Note 1 remote edit").unwrap();
         b.update_note(&note2_id, "Note 2 remote edit").unwrap();
 
-        let (changes, _) = b.get_changes_since_as_sync_changes(None, 100000).unwrap();
+        let (changes, _, _) = b.get_changes_after_seq_as_sync_changes(0, None, 100000).unwrap();
         let a = Arc::new(Mutex::new(a));
         let (applied, conflicts, errors) = apply_sync_changes(
             &a,
@@ -3688,7 +3369,7 @@ mod tests {
         assert!(a_note.is_none(), "Instance A should NOT see deleted note via get_note");
 
         // Get the changes from Instance A (this is what gets sent to the server)
-        let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
+        let changes = instance_a.get_changes_after_seq(0, None, 100).unwrap().changes;
 
         // Find the delete change for our note
         let delete_change = changes.iter().find(|c| {
@@ -3698,7 +3379,7 @@ mod tests {
         });
 
         assert!(delete_change.is_some(),
-            "CRITICAL: Instance A should report the delete operation in get_changes_since!");
+            "CRITICAL: Instance A should report the delete operation in get_changes_after_seq!");
 
         // Extract data from the change to apply to Instance B
         let change = delete_change.unwrap();
@@ -3760,7 +3441,7 @@ mod tests {
         assert!(a_tag.is_none(), "Instance A should NOT see deleted tag via get_tag");
 
         // Get the changes from Instance A (this is what gets sent to the server)
-        let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
+        let changes = instance_a.get_changes_after_seq(0, None, 100).unwrap().changes;
 
         // Find the delete change for our tag
         let delete_change = changes.iter().find(|c| {
@@ -3770,7 +3451,7 @@ mod tests {
         });
 
         assert!(delete_change.is_some(),
-            "CRITICAL: Instance A should report the tag delete operation in get_changes_since!");
+            "CRITICAL: Instance A should report the tag delete operation in get_changes_after_seq!");
 
         // Extract data from the change to apply to Instance B
         let change = delete_change.unwrap();
@@ -3799,8 +3480,8 @@ mod tests {
     }
 
     #[test]
-    fn test_get_changes_since_includes_deleted_notes() {
-        // Verify that get_changes_since properly reports deleted notes
+    fn test_get_changes_after_seq_includes_deleted_notes() {
+        // Verify that get_changes_after_seq properly reports deleted notes
         let (db, _temp) = create_test_db();
 
         // Create and delete a note
@@ -3808,7 +3489,7 @@ mod tests {
         db.delete_note(&note_id).unwrap();
 
         // Get changes
-        let (changes, _) = db.get_changes_since(None, 100).unwrap();
+        let changes = db.get_changes_after_seq(0, None, 100).unwrap().changes;
 
         // Find the change for our note
         let note_change = changes.iter().find(|c| {
@@ -3816,7 +3497,7 @@ mod tests {
             c.get("entity_id").and_then(|v| v.as_str()) == Some(&note_id)
         });
 
-        assert!(note_change.is_some(), "Deleted note should appear in get_changes_since");
+        assert!(note_change.is_some(), "Deleted note should appear in get_changes_after_seq");
 
         let change = note_change.unwrap();
         assert_eq!(
@@ -3833,8 +3514,8 @@ mod tests {
     }
 
     #[test]
-    fn test_get_changes_since_includes_deleted_tags() {
-        // Verify that get_changes_since properly reports deleted tags
+    fn test_get_changes_after_seq_includes_deleted_tags() {
+        // Verify that get_changes_after_seq properly reports deleted tags
         let (db, _temp) = create_test_db();
 
         // Create and delete a tag
@@ -3842,7 +3523,7 @@ mod tests {
         db.delete_tag(&tag_id).unwrap();
 
         // Get changes
-        let (changes, _) = db.get_changes_since(None, 100).unwrap();
+        let changes = db.get_changes_after_seq(0, None, 100).unwrap().changes;
 
         // Find the change for our tag
         let tag_change = changes.iter().find(|c| {
@@ -3850,7 +3531,7 @@ mod tests {
             c.get("entity_id").and_then(|v| v.as_str()) == Some(&tag_id)
         });
 
-        assert!(tag_change.is_some(), "Deleted tag should appear in get_changes_since");
+        assert!(tag_change.is_some(), "Deleted tag should appear in get_changes_after_seq");
 
         let change = tag_change.unwrap();
         assert_eq!(
@@ -3865,53 +3546,6 @@ mod tests {
             "deleted_at should be set in the tag data"
         );
     }
-
-    #[test]
-    fn test_full_dataset_includes_deleted_tags() {
-        // Verify that get_full_dataset properly includes deleted tags with their deleted_at
-        let (db, _temp) = create_test_db();
-
-        // Create a tag and delete it
-        let tag_id = db.create_tag("Deleted tag", None).unwrap();
-        db.delete_tag(&tag_id).unwrap();
-
-        // Create a non-deleted tag for comparison
-        let active_tag_id = db.create_tag("Active tag", None).unwrap();
-
-        // Get full dataset
-        let dataset = db.get_full_dataset().unwrap();
-        let tags = dataset.get("tags").unwrap();
-
-        // Find the deleted tag
-        let deleted_tag = tags.iter().find(|t| {
-            t.get("id").and_then(|v| v.as_str()) == Some(&tag_id)
-        });
-
-        assert!(deleted_tag.is_some(), "Full dataset should include deleted tags");
-
-        let deleted_tag = deleted_tag.unwrap();
-        assert!(
-            deleted_tag.get("deleted_at").is_some() && !deleted_tag.get("deleted_at").unwrap().is_null(),
-            "Deleted tag should have deleted_at in full dataset"
-        );
-
-        // Verify active tag doesn't have deleted_at
-        let active_tag = tags.iter().find(|t| {
-            t.get("id").and_then(|v| v.as_str()) == Some(&active_tag_id)
-        });
-
-        assert!(active_tag.is_some(), "Active tag should be in full dataset");
-        let active_tag = active_tag.unwrap();
-        assert!(
-            active_tag.get("deleted_at").is_none() || active_tag.get("deleted_at").unwrap().is_null(),
-            "Active tag should NOT have deleted_at set"
-        );
-    }
-
-    // =========================================================================
-    // ATTACHMENT SYNC TESTS
-    // These tests verify that notes with attachments sync correctly.
-    // =========================================================================
 
     #[test]
     fn test_two_instances_sync_note_with_audio_attachment() {
@@ -3929,7 +3563,7 @@ mod tests {
         let _attachment_id = instance_a.attach_to_note(&note_id, &audio_id, "audio_file").unwrap();
 
         // Get changes from Instance A
-        let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
+        let changes = instance_a.get_changes_after_seq(0, None, 100).unwrap().changes;
 
         // Should have: note, audio_file, note_attachment
         let note_change = changes.iter().find(|c| {
@@ -4015,7 +3649,7 @@ mod tests {
         instance_a.detach_from_note(&attachment_id).unwrap();
 
         // The feed carries the detach
-        let (changes2, _) = instance_a.get_changes_since(None, 100).unwrap();
+        let changes2 = instance_a.get_changes_after_seq(0, None, 100).unwrap().changes;
         let detach_change = changes2.iter().find(|c| {
             c.get("entity_type").and_then(|v| v.as_str()) == Some("note_attachment") &&
             c.get("operation").and_then(|v| v.as_str()) == Some("delete")
@@ -4057,7 +3691,7 @@ mod tests {
         ).unwrap();
 
         // Get changes from Instance A
-        let (changes, _) = instance_a.get_changes_since(None, 100).unwrap();
+        let changes = instance_a.get_changes_after_seq(0, None, 100).unwrap().changes;
 
         // Apply audio file to Instance B first
         let audio_change = changes.iter().find(|c| {
@@ -4098,14 +3732,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_changes_since_returns_all_entity_types() {
-        // CRITICAL TEST: Ensures get_changes_since returns ALL syncable entity types.
+    fn test_get_changes_after_seq_returns_all_entity_types() {
+        // CRITICAL TEST: Ensures get_changes_after_seq returns ALL syncable entity types.
         // This test exists because we had a bug where transcriptions were missing
-        // from get_changes_since, causing them to never sync to clients.
+        // from get_changes_after_seq, causing them to never sync to clients.
         //
         // If this test fails after adding a new entity type, you need to:
         // 1. Add the entity type to ALL_SYNC_ENTITY_TYPES above
-        // 2. Add the query for that entity type in get_changes_since()
+        // 2. Add the query for that entity type in get_changes_after_seq()
         // 3. Create test data for it below
 
         let (db, _temp) = create_test_db();
@@ -4142,7 +3776,7 @@ mod tests {
         db.purge_note(&doomed).unwrap();
 
         // Get all changes
-        let (changes, _) = db.get_changes_since(None, 1000).unwrap();
+        let changes = db.get_changes_after_seq(0, None, 1000).unwrap().changes;
 
         // Collect the entity types we got
         let mut found_types: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4156,10 +3790,10 @@ mod tests {
         for expected_type in ALL_SYNC_ENTITY_TYPES {
             assert!(
                 found_types.contains(*expected_type),
-                "CRITICAL: get_changes_since is missing entity type '{}'. \
+                "CRITICAL: get_changes_after_seq is missing entity type '{}'. \
                  Found types: {:?}. \
                  This will cause {} entities to never sync to clients! \
-                 Add the query for '{}' to get_changes_since().",
+                 Add the query for '{}' to get_changes_after_seq().",
                 expected_type,
                 found_types,
                 expected_type,
@@ -4171,7 +3805,7 @@ mod tests {
         for found_type in &found_types {
             assert!(
                 ALL_SYNC_ENTITY_TYPES.contains(&found_type.as_str()),
-                "Unexpected entity type '{}' in get_changes_since. \
+                "Unexpected entity type '{}' in get_changes_after_seq. \
                  If this is a new entity type, add it to ALL_SYNC_ENTITY_TYPES.",
                 found_type
             );
@@ -4179,10 +3813,10 @@ mod tests {
     }
 
     #[test]
-    fn test_get_changes_since_returns_modified_transcription() {
+    fn test_get_changes_after_seq_returns_modified_transcription() {
         // Specific test for the bug where transcription state changes weren't syncing.
         // When a transcription is modified (e.g., state changed from "original" to "verified"),
-        // it must appear in get_changes_since.
+        // it must appear in get_changes_after_seq.
 
         let (db, _temp) = create_test_db();
 
@@ -4198,17 +3832,14 @@ mod tests {
             None,  // state (uses default)
         ).unwrap();
 
-        // Record the current time as our "last sync"
-        let last_sync = chrono::Utc::now().timestamp();
-
-        // Wait a moment to ensure the modification timestamp is later
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Where the feed stood at the last sync
+        let cursor = db.current_seq().unwrap();
 
         // Modify the transcription (simulate changing state to "verified")
         db.update_transcription(&transcription_id, "Hello world", None, None, Some("verified")).unwrap();
 
         // Get changes since last sync
-        let (changes, _) = db.get_changes_since(Some(last_sync), 1000).unwrap();
+        let changes = db.get_changes_after_seq(cursor, None, 1000).unwrap().changes;
 
         // Find the transcription change
         let trans_change = changes.iter().find(|c| {
@@ -4218,7 +3849,7 @@ mod tests {
 
         assert!(
             trans_change.is_some(),
-            "Modified transcription must appear in get_changes_since! \
+            "Modified transcription must appear in get_changes_after_seq! \
              This bug caused transcription state changes to never sync."
         );
 
@@ -4237,7 +3868,7 @@ mod tests {
 
     /// Push every change from `from` to `to`, as a sync would.
     fn push_all(from: &Database, to: &Database, from_device: &str) -> (i64, i64, Vec<String>) {
-        let (changes, _) = from.get_changes_since_as_sync_changes(None, 100000).unwrap();
+        let (changes, _, _) = from.get_changes_after_seq_as_sync_changes(0, None, 100000).unwrap();
         let changes: Vec<SyncChange> = changes
             .into_iter()
             .map(|mut c| {
@@ -4773,7 +4404,7 @@ mod tests {
         let raw = db.get_note_raw(&note_id).unwrap().unwrap();
         assert!(raw["deleted_at"].as_i64().unwrap_or(0) > 0, "{:?}", raw);
         assert!(raw["modified_at"].as_i64().unwrap_or(0) > 0, "{:?}", raw);
-        let (changes, _) = db.get_changes_since(None, 100).unwrap();
+        let changes = db.get_changes_after_seq(0, None, 100).unwrap().changes;
         let del = changes.iter().find(|c| c["entity_type"] == "note" && c["operation"] == "delete").unwrap();
         assert!(del["data"]["deleted_at"].as_i64().unwrap() > 0);
     }
@@ -4859,35 +4490,12 @@ mod tests {
     }
 
     #[test]
-    fn test_versions_feed_carries_history_and_full_dataset_includes_it() {
+    fn test_versions_feed_carries_history() {
         let (db, _t) = create_test_db();
         let note_id = db.create_note("א").unwrap();
         db.update_note(&note_id, "ב").unwrap();
-        let (changes, _) = db.get_changes_since(None, 1000).unwrap();
+        let changes = db.get_changes_after_seq(0, None, 1000).unwrap().changes;
         let versions: Vec<_> = changes.iter().filter(|c| c["entity_type"] == "field_version").collect();
         assert!(versions.len() >= 2, "root and edit versions in the feed: {}", versions.len());
-        let full = db.get_full_dataset().unwrap();
-        assert!(full["field_versions"].len() >= 2);
-    }
-
-    #[test]
-    fn test_versions_migration_roots_are_identical_across_devices() {
-        let (a, _ta) = create_test_db();
-        let (b, _tb) = create_test_db();
-        // Pre-versioning data on both devices: the same note row
-        for db in [&a, &b] {
-            db.connection().execute(
-                "INSERT INTO notes (id, created_at, content) VALUES (?, 1735689600, ?)",
-                rusqlite::params![vec![7u8; 16], "תוכן ישן"],
-            ).unwrap();
-            db.connection().execute_batch("DELETE FROM field_heads; DELETE FROM field_versions;").unwrap();
-            db.migrate_create_root_versions().unwrap();
-        }
-        let id = crate::versions::hex(&[7u8; 16]);
-        assert_eq!(head_hex(&a, "note", &id, "content"), head_hex(&b, "note", &id, "content"));
-        // And syncing afterwards merges nothing
-        exchange(&a, &b);
-        assert!(a.get_conflicts(false).unwrap().is_empty());
-        assert_eq!(content(&a, &id), "תוכן ישן");
     }
 }

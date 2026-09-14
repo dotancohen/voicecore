@@ -749,7 +749,8 @@ impl Database {
                 published INTEGER NOT NULL DEFAULT 0,
                 -- Timezone the version was written in
                 created_at_offset INTEGER,
-                created_at_zone TEXT
+                created_at_zone TEXT,
+                seq INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_field_versions_entity
                 ON field_versions(entity_type, entity_id, field);
@@ -811,121 +812,9 @@ impl Database {
         Ok(())
     }
 
-    /// Create root versions for every row that has none yet. Idempotent.
-    ///
-    /// Root ids are derived from the value, so devices that already hold the
-    /// same data produce identical roots and converge without a merge.
-    pub(crate) fn migrate_create_root_versions(&self) -> VoiceResult<()> {
-        let has_any: i64 = self
-            .connection()
-            .query_row("SELECT COUNT(*) FROM field_heads", [], |r| r.get(0))?;
-        if has_any > 0 {
-            return Ok(());
-        }
-        tracing::info!("Creating root versions for existing data");
-
-        // Notes
-        let notes: Vec<(Vec<u8>, String, i64, Option<i64>)> = {
-            let mut stmt = self
-                .connection()
-                .prepare("SELECT id, content, created_at, deleted_at FROM notes")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, content, created_at, deleted_at) in notes {
-            let id_hex = hex(&id);
-            self.ensure_root_version(ENTITY_NOTE, &id_hex, FIELD_CONTENT, &content, created_at)?;
-            if let Some(d) = deleted_at {
-                self.ensure_root_version(ENTITY_NOTE, &id_hex, FIELD_DELETED, "1", d)?;
-            }
-        }
-
-        // Tags
-        let tags: Vec<(Vec<u8>, String, Option<Vec<u8>>, i64, Option<i64>)> = {
-            let mut stmt = self
-                .connection()
-                .prepare("SELECT id, name, parent_id, created_at, deleted_at FROM tags")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, name, parent, created_at, deleted_at) in tags {
-            let id_hex = hex(&id);
-            self.ensure_root_version(ENTITY_TAG, &id_hex, FIELD_NAME, &name, created_at)?;
-            let parent_hex = parent.map(|p| hex(&p)).unwrap_or_default();
-            self.ensure_root_version(ENTITY_TAG, &id_hex, FIELD_PARENT, &parent_hex, created_at)?;
-            if let Some(d) = deleted_at {
-                self.ensure_root_version(ENTITY_TAG, &id_hex, FIELD_DELETED, "1", d)?;
-            }
-        }
-
-        // Note-tag links
-        let links: Vec<(Vec<u8>, Vec<u8>, i64, Option<i64>)> = {
-            let mut stmt = self
-                .connection()
-                .prepare("SELECT note_id, tag_id, created_at, deleted_at FROM note_tags")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (note, tag, created_at, deleted_at) in links {
-            let entity_id = note_tag_entity_id(&hex(&note), &hex(&tag));
-            let active = if deleted_at.is_some() { "0" } else { "1" };
-            self.ensure_root_version(ENTITY_NOTE_TAG, &entity_id, FIELD_ACTIVE, active, deleted_at.unwrap_or(created_at))?;
-        }
-
-        // Attachments
-        let atts: Vec<(Vec<u8>, i64, Option<i64>)> = {
-            let mut stmt = self
-                .connection()
-                .prepare("SELECT id, created_at, deleted_at FROM note_attachments")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, created_at, deleted_at) in atts {
-            let active = if deleted_at.is_some() { "0" } else { "1" };
-            self.ensure_root_version(ENTITY_NOTE_ATTACHMENT, &hex(&id), FIELD_ACTIVE, active, deleted_at.unwrap_or(created_at))?;
-        }
-
-        // Transcriptions
-        let trs: Vec<(Vec<u8>, String, String, i64, Option<i64>)> = {
-            let mut stmt = self
-                .connection()
-                .prepare("SELECT id, content, state, created_at, deleted_at FROM transcriptions")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, content, state, created_at, deleted_at) in trs {
-            let id_hex = hex(&id);
-            self.ensure_root_version(ENTITY_TRANSCRIPTION, &id_hex, FIELD_CONTENT, &content, created_at)?;
-            self.ensure_root_version(ENTITY_TRANSCRIPTION, &id_hex, FIELD_STATE, &state, created_at)?;
-            if let Some(d) = deleted_at {
-                self.ensure_root_version(ENTITY_TRANSCRIPTION, &id_hex, FIELD_DELETED, "1", d)?;
-            }
-        }
-
-        // Audio files
-        let afs: Vec<(Vec<u8>, Option<String>, i64, Option<i64>)> = {
-            let mut stmt = self
-                .connection()
-                .prepare("SELECT id, summary, imported_at, deleted_at FROM audio_files")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, summary, imported_at, deleted_at) in afs {
-            let id_hex = hex(&id);
-            if let Some(s) = summary {
-                self.ensure_root_version(ENTITY_AUDIO_FILE, &id_hex, FIELD_SUMMARY, &s, imported_at)?;
-            }
-            if let Some(d) = deleted_at {
-                self.ensure_root_version(ENTITY_AUDIO_FILE, &id_hex, FIELD_DELETED, "1", d)?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Ensure a field has at least one version; if it has none, create a
     /// hash-derived root from `content` and make it the head. Used by the
-    /// migration and by entity rows that arrive from a peer without versions.
+    /// system tags and by entity rows that arrive from a peer before their versions.
     pub fn ensure_root_version(
         &self,
         entity_type: &str,
@@ -936,8 +825,8 @@ impl Database {
     ) -> VoiceResult<bool> {
         if self.head_id(entity_type, entity_id, field)?.is_some() {
             // The field has history: the row is only a hint (its value is, or
-            // will be, carried by a version). Protocol 1.1 peers always send
-            // versions, so nothing is lost by ignoring the row value here.
+            // will be, carried by a version). Peers always send versions, so
+            // nothing is lost by ignoring the row value here.
             return Ok(false);
         }
         let existing: i64 = self.connection().query_row(
@@ -1104,30 +993,6 @@ impl Database {
             params![entity_type, entity_id, field, head],
         )?;
         Ok(())
-    }
-
-    /// Versions in the sync feed: created locally or received since `since`.
-    pub fn get_versions_since(&self, since: Option<i64>, limit: i64) -> VoiceResult<Vec<VersionRow>> {
-        let sql = match since {
-            Some(_) => format!(
-                "SELECT {} FROM field_versions WHERE (created_at >= ?1 OR sync_received_at >= ?1) AND (device_id IS NOT NULL OR parent_id IS NULL OR published = 1) ORDER BY created_at, id LIMIT ?2",
-                Self::VERSION_COLUMNS
-            ),
-            None => format!(
-                "SELECT {} FROM field_versions WHERE (device_id IS NOT NULL OR parent_id IS NULL OR published = 1) ORDER BY created_at, id LIMIT ?1",
-                Self::VERSION_COLUMNS
-            ),
-        };
-        let mut stmt = self.connection().prepare(&sql)?;
-        let rows: Vec<VersionRow> = match since {
-            Some(ts) => stmt
-                .query_map(params![ts, limit], Self::row_to_version)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-            None => stmt
-                .query_map(params![limit], Self::row_to_version)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        };
-        Ok(rows)
     }
 
     /// Versions in write order: `seq > cursor` (and `<= upto` when given).

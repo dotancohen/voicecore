@@ -384,6 +384,7 @@ pub fn apply_one(
             if let Some(size) = data["size_bytes"].as_i64() {
                 db.apply_sync_size_bytes(&change.entity_id, size)?;
             }
+            db.apply_sync_audio_file_origin(&change.entity_id, data["origin_device_id"].as_str(), data["origin_kind"].as_str())?;
             db.apply_zones_by_id(
                 "audio_files",
                 &change.entity_id,
@@ -424,7 +425,7 @@ pub fn apply_one(
     }
 }
 
-/// Every entity type the feed can carry. Keep in sync with `get_changes_since`.
+/// Every entity type the feed can carry. Keep in sync with `collect_items` in `database.rs`.
 pub const ALL_SYNC_ENTITY_TYPES: &[&str] = &[
     "note",
     "tag",

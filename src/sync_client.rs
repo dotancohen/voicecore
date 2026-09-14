@@ -926,9 +926,7 @@ impl SyncClient {
         }
 
         // Step 2: Pull the peer's whole feed from the beginning, page by
-        // page. (One JSON document for the whole dataset, as /sync/full
-        // returns, does not fit in memory for a large database; the paged
-        // feed is resumable and bounded.)
+        // page: resumable, and bounded in memory for a large database.
         if let Err(e) = self.save_peer_cursors(peer_id, Some(0), Some(0), Some(handshake.database_id.as_str())) {
             result.errors.push(format!("Failed to reset cursors: {}", e));
         }

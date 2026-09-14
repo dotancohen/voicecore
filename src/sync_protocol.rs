@@ -1,9 +1,8 @@
 //! The messages of the sync protocol, shared by the client (`sync_client.rs`)
 //! and the server (`sync_server.rs`).
 //!
-//! One definition per message, so the two sides cannot drift apart. Fields a
-//! peer may leave out carry `serde(default)`, so a response from an older
-//! peer still parses; the sender always writes every field.
+//! One definition per message, so the two sides cannot drift apart. The
+//! sender always writes every field.
 
 use serde::{Deserialize, Serialize};
 
@@ -96,7 +95,6 @@ pub struct HandshakeResponse {
     /// Which application answers (Stage 16)
     #[serde(default)]
     pub application: String,
-    pub last_sync_timestamp: Option<i64>,
     #[serde(default)]
     pub server_timestamp: i64,
     #[serde(default)]
@@ -117,10 +115,8 @@ pub struct HandshakeResponse {
 /// `GET /sync/changes` query parameters.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChangesQuery {
-    /// Write-order cursor (primary). Takes precedence over `since`.
+    /// Write-order cursor; absent is the start of the feed.
     pub cursor: Option<i64>,
-    /// Timestamp filter (kept for tools and older clients).
-    pub since: Option<i64>,
     pub limit: Option<i64>,
     /// Only these entity types, comma-separated (Stage 16); absent means every type.
     pub types: Option<String>,
@@ -130,9 +126,7 @@ pub struct ChangesQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangesResponse {
     pub changes: Vec<SyncChange>,
-    pub from_timestamp: Option<i64>,
-    pub to_timestamp: Option<i64>,
-    /// Pass back as `cursor` to continue (cursor mode only).
+    /// Pass back as `cursor` to continue.
     pub next_cursor: Option<i64>,
     #[serde(default)]
     pub database_id: String,

@@ -135,6 +135,10 @@ pub struct AudioFileData {
     pub disk_name: String,
     /// The SHA-256 of the file's bytes, lowercase hex, once computed (Stage 13)
     pub content_sha256: Option<String>,
+    /// The installation that made the recording, and how: "recorded" or
+    /// "imported" (FILE-25)
+    pub origin_device_id: String,
+    pub origin_kind: String,
 }
 
 /// A note-attachment association from the database
@@ -983,6 +987,8 @@ impl VoiceClient {
                 storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
                 disk_name: a.disk_name,
                 content_sha256: a.content_sha256,
+                origin_device_id: a.origin_device_id,
+                origin_kind: a.origin_kind,
             })
             .collect())
     }
@@ -1007,6 +1013,8 @@ impl VoiceClient {
             storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
             disk_name: a.disk_name,
             content_sha256: a.content_sha256,
+            origin_device_id: a.origin_device_id,
+            origin_kind: a.origin_kind,
         }))
     }
 
@@ -1057,6 +1065,8 @@ impl VoiceClient {
                 storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
                 disk_name: a.disk_name,
                 content_sha256: a.content_sha256,
+                origin_device_id: a.origin_device_id,
+                origin_kind: a.origin_kind,
             })
             .collect())
     }
@@ -1123,6 +1133,8 @@ impl VoiceClient {
                 storage_uploaded_at: stamp_opt(a.storage_uploaded_at, None, None),
                 disk_name: a.disk_name,
                 content_sha256: a.content_sha256,
+                origin_device_id: a.origin_device_id,
+                origin_kind: a.origin_kind,
             })
             .collect())
     }
@@ -1446,48 +1458,6 @@ impl VoiceClient {
             .into_iter()
             .map(|p| PeerSummaryData { peer_id: p.peer_id, peer_name: p.peer_name.unwrap_or_default(), last_reached_at: p.last_reached_at, last_operation: p.last_operation.unwrap_or_default() })
             .collect())
-    }
-
-    /// Debug method to see sync state details
-    pub fn debug_sync_state(&self) -> Result<String, VoiceCoreError> {
-        let db = self.db.lock().unwrap();
-        let cfg = self.config.lock().unwrap();
-
-        let mut info = String::new();
-
-        info.push_str(&format!("Sync enabled: {}\n", cfg.is_sync_enabled()));
-        info.push_str(&format!("Peers count: {}\n", cfg.peers().len()));
-
-        if let Some(peer) = cfg.last_peer().or_else(|| cfg.peers().first()) {
-            info.push_str(&format!("Peer ID: {}...\n", &peer.peer_id[..UUID_SHORT_LEN.min(peer.peer_id.len())]));
-
-            if let Ok(Some(last_sync)) = db.get_peer_last_sync(&peer.peer_id) {
-                info.push_str(&format!("Last sync: {} ({})\n", last_sync, crate::timezone::format_at_offset(last_sync, None)));
-
-                // Check changes with >= (current behavior)
-                if let Ok((changes, _)) = db.get_changes_since(Some(last_sync), 10) {
-                    info.push_str(&format!("Changes (>=): {}\n", changes.len()));
-
-                    // Show details of first few changes
-                    for (i, change) in changes.iter().take(3).enumerate() {
-                        if let Some(entity_type) = change.get("entity_type").and_then(|v| v.as_str()) {
-                            if let Some(timestamp) = change.get("timestamp").and_then(|v| v.as_i64()) {
-                                info.push_str(&format!("  [{}] {}: {}\n", i, entity_type, timestamp));
-                            }
-                        }
-                    }
-                }
-
-                // Check changes with > (exclusive)
-                if let Ok((changes, _)) = db.get_changes_since_exclusive(Some(last_sync), 10) {
-                    info.push_str(&format!("Changes (>): {}\n", changes.len()));
-                }
-            } else {
-                info.push_str("Last sync: None\n");
-            }
-        }
-
-        Ok(info)
     }
 
     // =========================================================================
@@ -2159,11 +2129,13 @@ impl VoiceClient {
             .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
     }
 
-    /// Whether this phone imported the recording, no place is known to hold it,
-    /// and its file is not in the audio folder (the "Where are the copies?" line).
-    pub fn imported_here_but_missing(&self, audio_id: String, audio_dir: String) -> Result<bool, VoiceCoreError> {
+    /// "recorded" or "imported" when this phone made the recording, no place is
+    /// known to hold it, and its file is not in the audio folder; None otherwise
+    /// (the "Where are the copies?" line, FILE-25).
+    pub fn made_here_but_missing(&self, audio_id: String, audio_dir: String) -> Result<Option<String>, VoiceCoreError> {
+        let here = self.config.lock().unwrap().device_id_hex().to_string();
         let db = self.db.lock().unwrap();
-        db.imported_here_but_missing(&audio_id, std::path::Path::new(&audio_dir))
+        db.made_here_but_missing(&audio_id, std::path::Path::new(&audio_dir), &here)
             .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
     }
 

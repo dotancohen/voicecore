@@ -67,6 +67,16 @@ pub enum FileOrigin {
     Imported,
 }
 
+impl FileOrigin {
+    /// The word a recording's `origin_kind` holds (FILE-25).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileOrigin::Recorded => crate::database::ORIGIN_RECORDED,
+            FileOrigin::Imported => crate::database::ORIGIN_IMPORTED,
+        }
+    }
+}
+
 /// Whether a name can be a file's name in the audio folder: any POSIX name,
 /// which is anything but empty, `.`, `..`, or a name holding `/` or NUL.
 pub fn valid_file_name(name: &str) -> bool {

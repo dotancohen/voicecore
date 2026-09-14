@@ -31,6 +31,8 @@ pub enum NotInCloudReason {
     /// No place is known to hold the file, this device imported it, and its file
     /// is not in the audio folder: the import made the row and the file is gone
     ImportedHereFileMissing,
+    /// The same for a recording this device's recorder made
+    RecordedHereFileMissing,
 }
 
 impl NotInCloudReason {
@@ -41,6 +43,7 @@ impl NotInCloudReason {
             NotInCloudReason::WaitingForUpload => "waiting_for_upload",
             NotInCloudReason::NoCopyKnown => "no_copy_known",
             NotInCloudReason::ImportedHereFileMissing => "imported_here_file_missing",
+            NotInCloudReason::RecordedHereFileMissing => "recorded_here_file_missing",
         }
     }
 }
@@ -125,13 +128,11 @@ pub fn issues(db: &Database, audio_dir: Option<&Path>, here: &str) -> VoiceResul
         .unwrap_or(false);
     let max_upload_bytes = db.max_upload_bytes()?;
 
-    // Recordings not in the bucket: the bucket's own statement decides, and a
-    // row uploaded before statements existed counts as in the bucket
+    // Recordings not in the bucket: the bucket's own statement decides
     let mut stmt = conn.prepare(
         "SELECT lower(hex(a.id)), a.filename, a.size_bytes FROM audio_files a
          WHERE a.deleted_at IS NULL
            AND NOT EXISTS (SELECT 1 FROM file_locations l WHERE l.audio_id = a.id AND l.place = ?1 AND l.present = 1)
-           AND NOT (a.storage_key IS NOT NULL AND NOT EXISTS (SELECT 1 FROM file_locations l WHERE l.audio_id = a.id AND l.place = ?1))
          ORDER BY a.imported_at, a.id",
     )?;
     let rows: Vec<(String, String, Option<i64>)> = stmt
@@ -147,11 +148,11 @@ pub fn issues(db: &Database, audio_dir: Option<&Path>, here: &str) -> VoiceResul
             NotInCloudReason::TooLarge
         } else if !held_by.is_empty() {
             NotInCloudReason::WaitingForUpload
-        } else if match audio_dir {
-            Some(dir) => db.imported_here_but_missing(&audio_id, dir)?,
-            None => false,
+        } else if let Some(kind) = match audio_dir {
+            Some(dir) => db.made_here_but_missing(&audio_id, dir, here)?,
+            None => None,
         } {
-            NotInCloudReason::ImportedHereFileMissing
+            if kind == crate::database::ORIGIN_RECORDED { NotInCloudReason::RecordedHereFileMissing } else { NotInCloudReason::ImportedHereFileMissing }
         } else {
             NotInCloudReason::NoCopyKnown
         };

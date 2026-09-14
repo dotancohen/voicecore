@@ -192,11 +192,18 @@ pub const STAMPED_COLUMNS: &[(&str, &[&str])] = &[
 /// within the client timeout.
 pub const FEED_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 
+/// The schema this build writes, kept in the file as `PRAGMA user_version`.
+/// A database with tables and another number is refused (see `create_schema`).
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// A recording's `origin_kind` (FILE-25): made by this application's recorder,
+/// or taken from a file that already existed.
+pub const ORIGIN_RECORDED: &str = "recorded";
+pub const ORIGIN_IMPORTED: &str = "imported";
+
 /// How the change feed is filtered.
 #[derive(Debug, Clone)]
 pub enum FeedFilter {
-    /// Historical timestamp filter (per-type limits)
-    Since(Option<i64>),
     /// Write-order feed: `seq > cursor` and, when given, `seq <= upto`
     AfterSeq { cursor: i64, upto: Option<i64> },
     /// The recordings with these ids, whatever their `seq`: the ones a
@@ -296,6 +303,11 @@ pub struct AudioFileRow {
     pub content_sha256: Option<String>,
     /// Whether the bucket object is encrypted with the recording key (Stage 15)
     pub storage_encrypted: bool,
+    /// The installation that made the recording, by device id, and how:
+    /// [`ORIGIN_RECORDED`] or [`ORIGIN_IMPORTED`] (FILE-25). Synced; written
+    /// once and never changed.
+    pub origin_device_id: String,
+    pub origin_kind: String,
 }
 
 /// Transcription data returned from database queries
@@ -432,36 +444,16 @@ impl Database {
         // from other connections that may have written and closed
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
 
-        let mut db = Self { conn, path: Some(path), renamed_recordings: Default::default() };
-        db.init_database()?;
-        db.migrate_add_sync_received_at()?;
-        db.migrate_add_local_origin()?;
-        db.migrate_timestamps_to_unix()?;
-        db.migrate_add_storage_columns()?;
-        db.migrate_add_file_storage_config_table()?;
-        db.migrate_drop_legacy_conflict_tables()?;
-        db.create_version_tables()?;
-        db.migrate_create_root_versions()?;
-        db.migrate_add_sync_sequence()?;
-        db.migrate_add_timezone_columns()?;
+        let db = Self { conn, path: Some(path), renamed_recordings: Default::default() };
+        db.create_schema()?;
         Ok(db)
     }
 
     /// Create an in-memory database (for testing)
     pub fn new_in_memory() -> VoiceResult<Self> {
         let conn = Connection::open_in_memory()?;
-        let mut db = Self { conn, path: None, renamed_recordings: Default::default() };
-        db.init_database()?;
-        db.migrate_add_sync_received_at()?;
-        db.migrate_add_local_origin()?;
-        db.migrate_timestamps_to_unix()?;
-        db.migrate_add_storage_columns()?;
-        db.migrate_add_file_storage_config_table()?;
-        db.migrate_drop_legacy_conflict_tables()?;
-        db.create_version_tables()?;
-        db.migrate_create_root_versions()?;
-        db.migrate_add_sync_sequence()?;
-        db.migrate_add_timezone_columns()?;
+        let db = Self { conn, path: None, renamed_recordings: Default::default() };
+        db.create_schema()?;
         Ok(db)
     }
 
@@ -503,12 +495,59 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Initialize database schema
-    pub fn init_database(&mut self) -> VoiceResult<()> {
+    /// Make this build's schema in an empty database, or check that an existing
+    /// one has it. Nothing converts a database written by an earlier build: a
+    /// database whose schema number differs is refused, in words. One write
+    /// transaction, so several processes opening a new file at once make it once.
+    fn create_schema(&self) -> VoiceResult<()> {
+        if self.schema_version()? == SCHEMA_VERSION {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let made = (|| -> VoiceResult<()> {
+            let version = self.schema_version()?;
+            if version == SCHEMA_VERSION {
+                return Ok(());
+            }
+            let tables: i64 = self.conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
+            if tables > 0 {
+                return Err(VoiceError::Other(format!(
+                    "This database was written by another version of Voice (schema {}; this version reads schema {}) and is not opened. Start with an empty data directory.",
+                    version, SCHEMA_VERSION
+                )));
+            }
+            self.create_tables()?;
+            self.create_version_tables()?;
+            self.create_sequence_triggers()?;
+            self.create_identity()?;
+            self.create_system_tags()?;
+            self.conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
+            Ok(())
+        })();
+        match made {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// The schema number the file carries (`PRAGMA user_version`).
+    fn schema_version(&self) -> VoiceResult<i64> {
+        Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+    }
+
+    /// Every table of the notes and the sync, with its indexes. All timestamps
+    /// are Unix seconds; each user-visible one has `<stamp>_offset` (seconds
+    /// east of UTC) and `<stamp>_zone` (IANA name) beside it (TZ-1). `seq` is a
+    /// row's place in the write-order feed (see `create_sequence_triggers`).
+    fn create_tables(&self) -> VoiceResult<()> {
         self.conn.execute_batch(
             r#"
-            -- Create notes table with UUID7 BLOB primary key
-            -- All timestamps are Unix seconds (INTEGER) for timezone safety
             CREATE TABLE IF NOT EXISTS notes (
                 id BLOB PRIMARY KEY,
                 created_at INTEGER NOT NULL,
@@ -518,16 +557,17 @@ impl Database {
                 sync_received_at INTEGER,
                 di_cache_note_pane_display TEXT,
                 di_cache_note_list_pane_display TEXT,
-                -- Timezone of each action; see migrate_add_timezone_columns
                 created_at_offset INTEGER,
                 created_at_zone TEXT,
                 modified_at_offset INTEGER,
                 modified_at_zone TEXT,
                 deleted_at_offset INTEGER,
-                deleted_at_zone TEXT
+                deleted_at_zone TEXT,
+                -- Which attachment stands for the note; empty until the user chooses one
+                primary_attachment_id BLOB,
+                seq INTEGER
             );
 
-            -- Create tags table with UUID7 BLOB primary key
             CREATE TABLE IF NOT EXISTS tags (
                 id BLOB PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -536,17 +576,16 @@ impl Database {
                 modified_at INTEGER,
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
-                -- Timezone of each action; see migrate_add_timezone_columns
                 created_at_offset INTEGER,
                 created_at_zone TEXT,
                 modified_at_offset INTEGER,
                 modified_at_zone TEXT,
                 deleted_at_offset INTEGER,
                 deleted_at_zone TEXT,
+                seq INTEGER,
                 FOREIGN KEY (parent_id) REFERENCES tags (id) ON DELETE CASCADE
             );
 
-            -- Create note_tags junction table with timestamps for sync
             CREATE TABLE IF NOT EXISTS note_tags (
                 note_id BLOB NOT NULL,
                 tag_id BLOB NOT NULL,
@@ -554,136 +593,33 @@ impl Database {
                 modified_at INTEGER,
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
-                -- Timezone of each action; see migrate_add_timezone_columns
                 created_at_offset INTEGER,
                 created_at_zone TEXT,
                 modified_at_offset INTEGER,
                 modified_at_zone TEXT,
                 deleted_at_offset INTEGER,
                 deleted_at_zone TEXT,
+                seq INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE,
                 FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE,
                 PRIMARY KEY (note_id, tag_id)
             );
 
-            -- Create sync_peers table
+            -- The peers this database has exchanged with, and where each feed stands
             CREATE TABLE IF NOT EXISTS sync_peers (
                 peer_id BLOB PRIMARY KEY,
                 peer_name TEXT,
                 peer_url TEXT NOT NULL,
                 last_sync_at INTEGER,
-                last_received_timestamp INTEGER,
-                last_sent_timestamp INTEGER,
-                certificate_fingerprint BLOB
+                certificate_fingerprint BLOB,
+                last_received_cursor INTEGER,
+                last_sent_seq INTEGER,
+                peer_database_id TEXT,
+                peer_account_id TEXT,
+                last_operation TEXT,
+                peer_entity_types TEXT
             );
 
-            -- Create conflicts_note_content table
-            CREATE TABLE IF NOT EXISTS conflicts_note_content (
-                id BLOB PRIMARY KEY,
-                note_id BLOB NOT NULL,
-                local_content TEXT NOT NULL,
-                local_modified_at INTEGER NOT NULL,
-                local_device_id BLOB,
-                local_device_name TEXT,
-                remote_content TEXT NOT NULL,
-                remote_modified_at INTEGER NOT NULL,
-                remote_device_id BLOB,
-                remote_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (note_id) REFERENCES notes(id)
-            );
-
-            -- Create conflicts_note_delete table
-            CREATE TABLE IF NOT EXISTS conflicts_note_delete (
-                id BLOB PRIMARY KEY,
-                note_id BLOB NOT NULL,
-                surviving_content TEXT NOT NULL,
-                surviving_modified_at INTEGER NOT NULL,
-                surviving_device_id BLOB,
-                surviving_device_name TEXT,
-                deleted_content TEXT,
-                deleted_at INTEGER NOT NULL,
-                deleting_device_id BLOB,
-                deleting_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (note_id) REFERENCES notes(id)
-            );
-
-            -- Create conflicts_tag_rename table
-            CREATE TABLE IF NOT EXISTS conflicts_tag_rename (
-                id BLOB PRIMARY KEY,
-                tag_id BLOB NOT NULL,
-                local_name TEXT NOT NULL,
-                local_modified_at INTEGER NOT NULL,
-                local_device_id BLOB,
-                local_device_name TEXT,
-                remote_name TEXT NOT NULL,
-                remote_modified_at INTEGER NOT NULL,
-                remote_device_id BLOB,
-                remote_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (tag_id) REFERENCES tags(id)
-            );
-
-            -- Create conflicts_tag_parent table for parent_id conflicts
-            CREATE TABLE IF NOT EXISTS conflicts_tag_parent (
-                id BLOB PRIMARY KEY,
-                tag_id BLOB NOT NULL,
-                local_parent_id BLOB,
-                local_modified_at INTEGER NOT NULL,
-                local_device_id BLOB,
-                local_device_name TEXT,
-                remote_parent_id BLOB,
-                remote_modified_at INTEGER NOT NULL,
-                remote_device_id BLOB,
-                remote_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (tag_id) REFERENCES tags(id)
-            );
-
-            -- Create conflicts_tag_delete table for rename vs delete conflicts
-            CREATE TABLE IF NOT EXISTS conflicts_tag_delete (
-                id BLOB PRIMARY KEY,
-                tag_id BLOB NOT NULL,
-                surviving_name TEXT NOT NULL,
-                surviving_parent_id BLOB,
-                surviving_modified_at INTEGER NOT NULL,
-                surviving_device_id BLOB,
-                surviving_device_name TEXT,
-                deleted_at INTEGER NOT NULL,
-                deleting_device_id BLOB,
-                deleting_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (tag_id) REFERENCES tags(id)
-            );
-
-            -- Create conflicts_note_tag table
-            CREATE TABLE IF NOT EXISTS conflicts_note_tag (
-                id BLOB PRIMARY KEY,
-                note_id BLOB NOT NULL,
-                tag_id BLOB NOT NULL,
-                local_created_at INTEGER,
-                local_modified_at INTEGER,
-                local_deleted_at INTEGER,
-                local_device_id BLOB,
-                local_device_name TEXT,
-                remote_created_at INTEGER,
-                remote_modified_at INTEGER,
-                remote_deleted_at INTEGER,
-                remote_device_id BLOB,
-                remote_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (note_id) REFERENCES notes(id),
-                FOREIGN KEY (tag_id) REFERENCES tags(id)
-            );
-
-            -- Create sync_failures table
             CREATE TABLE IF NOT EXISTS sync_failures (
                 id BLOB PRIMARY KEY,
                 peer_id BLOB NOT NULL,
@@ -698,7 +634,7 @@ impl Database {
                 FOREIGN KEY (peer_id) REFERENCES sync_peers(peer_id)
             );
 
-            -- Create note_attachments junction table (polymorphic association)
+            -- A note's attachments (polymorphic: `attachment_type` names the table)
             CREATE TABLE IF NOT EXISTS note_attachments (
                 id BLOB PRIMARY KEY,
                 note_id BLOB NOT NULL,
@@ -709,17 +645,16 @@ impl Database {
                 modified_at INTEGER,
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
-                -- Timezone of each action; see migrate_add_timezone_columns
                 created_at_offset INTEGER,
                 created_at_zone TEXT,
                 modified_at_offset INTEGER,
                 modified_at_zone TEXT,
                 deleted_at_offset INTEGER,
                 deleted_at_zone TEXT,
+                seq INTEGER,
                 FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE
             );
 
-            -- Create audio_files table
             CREATE TABLE IF NOT EXISTS audio_files (
                 id BLOB PRIMARY KEY,
                 imported_at INTEGER NOT NULL,
@@ -731,11 +666,10 @@ impl Database {
                 modified_at INTEGER,
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
-                -- Cloud storage fields
-                storage_provider TEXT,     -- "s3", "backblaze", etc. NULL = local only
-                storage_key TEXT,          -- Object key/path in cloud storage
-                storage_uploaded_at INTEGER, -- When file was uploaded to cloud storage
-                -- Timezone of each action; see migrate_add_timezone_columns
+                -- The bucket: provider, object key, when uploaded (NULL: not uploaded)
+                storage_provider TEXT,
+                storage_key TEXT,
+                storage_uploaded_at INTEGER,
                 imported_at_offset INTEGER,
                 imported_at_zone TEXT,
                 file_created_at_offset INTEGER,
@@ -743,10 +677,26 @@ impl Database {
                 modified_at_offset INTEGER,
                 modified_at_zone TEXT,
                 deleted_at_offset INTEGER,
-                deleted_at_zone TEXT
+                deleted_at_zone TEXT,
+                -- The file's name on disk, the same on every device (FILE-15)
+                disk_name TEXT,
+                -- SHA-256 of the file's bytes, lowercase hex (Stage 13)
+                content_sha256 TEXT,
+                -- Whether the bucket object is encrypted with the recording key (Stage 15)
+                storage_encrypted INTEGER NOT NULL DEFAULT 0,
+                -- The levels a waveform is drawn from (FILE-20)
+                waveform_levels TEXT,
+                -- The file's size in bytes (FILE-23)
+                size_bytes INTEGER,
+                -- Which transcription stands for the recording; empty until chosen
+                primary_transcription_id BLOB,
+                seq INTEGER,
+                -- The installation that made the recording and how, "recorded" or
+                -- "imported" (FILE-25): written once, never changed
+                origin_device_id BLOB,
+                origin_kind TEXT
             );
 
-            -- Create transcriptions table
             CREATE TABLE IF NOT EXISTS transcriptions (
                 id BLOB PRIMARY KEY,
                 audio_file_id BLOB NOT NULL,
@@ -761,28 +711,95 @@ impl Database {
                 modified_at INTEGER,
                 deleted_at INTEGER,
                 sync_received_at INTEGER,
-                -- Timezone of each action; see migrate_add_timezone_columns
                 created_at_offset INTEGER,
                 created_at_zone TEXT,
                 modified_at_offset INTEGER,
                 modified_at_zone TEXT,
                 deleted_at_offset INTEGER,
                 deleted_at_zone TEXT,
+                seq INTEGER,
                 FOREIGN KEY (audio_file_id) REFERENCES audio_files (id) ON DELETE CASCADE
             );
 
-            -- Create file_storage_config table (single-row config that syncs between devices)
-            -- Uses a fixed ID ("default") since there's only one config
+            -- The bucket's configuration, one row for the account, synced
             CREATE TABLE IF NOT EXISTS file_storage_config (
                 id TEXT PRIMARY KEY DEFAULT 'default',
                 provider TEXT NOT NULL DEFAULT 'none',
                 config TEXT,
                 modified_at INTEGER,
                 device_id BLOB,
-                sync_received_at INTEGER
+                sync_received_at INTEGER,
+                seq INTEGER
             );
 
-            -- Create indexes
+            -- The last `seq` handed out
+            CREATE TABLE IF NOT EXISTS sync_sequence (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                value INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO sync_sequence (id, value) VALUES (1, 0);
+
+            -- The database's own id and the account's (ACCT-1)
+            CREATE TABLE IF NOT EXISTS sync_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            -- The hash of a token shown in a code, until it is spent, expired or
+            -- guessed at too often (PAIR-2). Local, never synced.
+            CREATE TABLE IF NOT EXISTS pairing_offers (
+                token_hash TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL,
+                failures INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Bucket objects of purged recordings, tagged at the next upload run
+            CREATE TABLE IF NOT EXISTS purged_objects (
+                storage_key TEXT PRIMARY KEY,
+                at INTEGER NOT NULL
+            );
+            -- A file here still under its old name after the name changed (FILE-15)
+            CREATE TABLE IF NOT EXISTS pending_file_renames (
+                audio_id BLOB PRIMARY KEY,
+                from_name TEXT NOT NULL
+            );
+            -- The parts of an upload in progress (FILE-19)
+            CREATE TABLE IF NOT EXISTS upload_parts (
+                audio_id BLOB NOT NULL,
+                storage_key TEXT NOT NULL,
+                upload_id TEXT NOT NULL,
+                part_size INTEGER NOT NULL,
+                part_number INTEGER NOT NULL,
+                etag TEXT NOT NULL,
+                PRIMARY KEY (audio_id, part_number)
+            );
+
+            -- Where each copy of a recording is (FILE-22): one row per recording
+            -- and place, synced; the newest statement about a place wins
+            CREATE TABLE IF NOT EXISTS file_locations (
+                audio_id BLOB NOT NULL,
+                place TEXT NOT NULL,
+                present INTEGER NOT NULL,
+                changed_at INTEGER NOT NULL,
+                changed_by BLOB,
+                sync_received_at INTEGER,
+                seq INTEGER,
+                PRIMARY KEY (audio_id, place)
+            );
+
+            -- What has been removed for good and must not come back from a peer
+            -- that has not heard yet (PURGE-1). Kept for ever.
+            CREATE TABLE IF NOT EXISTS purges (
+                entity_type TEXT NOT NULL,
+                entity_id BLOB NOT NULL,
+                purged_at INTEGER NOT NULL,
+                purged_at_offset INTEGER,
+                purged_at_zone TEXT,
+                device_id BLOB,
+                seq INTEGER,
+                PRIMARY KEY (entity_type, entity_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at);
             CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at);
             CREATE INDEX IF NOT EXISTS idx_notes_modified_at ON notes(modified_at);
@@ -805,744 +822,101 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_note_attachments_deleted_at ON note_attachments(deleted_at);
             CREATE INDEX IF NOT EXISTS idx_audio_files_modified_at ON audio_files(modified_at);
             CREATE INDEX IF NOT EXISTS idx_audio_files_deleted_at ON audio_files(deleted_at);
-            -- Note: idx_audio_files_storage_provider is created in migrate_add_storage_columns
+            CREATE INDEX IF NOT EXISTS idx_audio_files_disk_name ON audio_files(disk_name);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_audio_file_id ON transcriptions(audio_file_id);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_service ON transcriptions(service);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_created_at ON transcriptions(created_at);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_modified_at ON transcriptions(modified_at);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_deleted_at ON transcriptions(deleted_at);
-            -- Note: sync_received_at indexes are created in migrate_add_sync_received_at
-            -- Note: idx_audio_files_storage_provider is created in migrate_add_storage_columns
-            -- Note: idx_file_storage_config_sync_received_at is created in migrate_add_file_storage_config_table
+            CREATE INDEX IF NOT EXISTS idx_file_locations_place ON file_locations(place, present);
             "#,
         )?;
-
-        // Create system tags with deterministic UUIDs
-        // These are the same on all devices to prevent duplicates during sync
-        let system_uuid = Uuid::parse_str(SYSTEM_TAG_UUID)
-            .map_err(|e| VoiceError::Other(format!("Invalid SYSTEM_TAG_UUID: {}", e)))?;
-        let marked_uuid = Uuid::parse_str(MARKED_TAG_UUID)
-            .map_err(|e| VoiceError::Other(format!("Invalid MARKED_TAG_UUID: {}", e)))?;
-        let nonsynced_uuid = Uuid::parse_str(NONSYNCED_TAG_UUID)
-            .map_err(|e| VoiceError::Other(format!("Invalid NONSYNCED_TAG_UUID: {}", e)))?;
-        let too_big_uuid = Uuid::parse_str(TOO_BIG_TAG_UUID)
-            .map_err(|e| VoiceError::Other(format!("Invalid TOO_BIG_TAG_UUID: {}", e)))?;
-        let system_bytes = system_uuid.as_bytes().to_vec();
-        let marked_bytes = marked_uuid.as_bytes().to_vec();
-        let nonsynced_bytes = nonsynced_uuid.as_bytes().to_vec();
-        let too_big_bytes = too_big_uuid.as_bytes().to_vec();
-
-        // Insert system tags if they don't exist (OR IGNORE handles duplicates)
-        // _system (root)
-        self.conn.execute(
-            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, NULL, strftime('%s', 'now'))",
-            params![&system_bytes, SYSTEM_TAG_NAME],
-        )?;
-        // _system/_marked
-        self.conn.execute(
-            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
-            params![&marked_bytes, MARKED_TAG_NAME, &system_bytes],
-        )?;
-        // _system/_nonsynced
-        self.conn.execute(
-            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
-            params![&nonsynced_bytes, NONSYNCED_TAG_NAME, &system_bytes],
-        )?;
-        // _system/_nonsynced/_too-big
-        self.conn.execute(
-            "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
-            params![&too_big_bytes, TOO_BIG_TAG_NAME, &nonsynced_bytes],
-        )?;
-
         Ok(())
     }
 
-    /// Normalize database data for consistency.
-    ///
-    /// This runs various normalization passes on the database:
-    /// - Timestamp normalization (ISO 8601 -> SQLite format)
-    /// - (Future: Unicode normalization, etc.)
-    ///
-    /// This should be run via `cli maintenance database-normalize`.
-    pub fn normalize_database(&mut self) -> VoiceResult<()> {
-        self.normalize_timestamps()?;
-        // Future normalizations can be added here
-        Ok(())
-    }
-
-    /// Normalize all datetime values to SQLite format (YYYY-MM-DD HH:MM:SS).
-    ///
-    /// This fixes timestamps that may have been stored in ISO 8601 format
-    /// (with 'T' separator and/or microseconds) from earlier sync operations.
-    /// String comparison of timestamps requires consistent format.
-    ///
-    /// This is idempotent - the WHERE clauses only match rows needing updates.
-    fn normalize_timestamps(&mut self) -> VoiceResult<()> {
-        // Normalize notes timestamps
-        self.conn.execute_batch(
-            r#"
-            UPDATE notes SET created_at = REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
-            WHERE created_at LIKE '%T%';
-
-            UPDATE notes SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
-            WHERE modified_at LIKE '%T%';
-
-            UPDATE notes SET deleted_at = REPLACE(SUBSTR(deleted_at, 1, 19), 'T', ' ')
-            WHERE deleted_at LIKE '%T%';
-            "#,
-        )?;
-
-        // Normalize tags timestamps
-        self.conn.execute_batch(
-            r#"
-            UPDATE tags SET created_at = REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
-            WHERE created_at LIKE '%T%';
-
-            UPDATE tags SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
-            WHERE modified_at LIKE '%T%';
-            "#,
-        )?;
-
-        // Normalize note_tags timestamps
-        self.conn.execute_batch(
-            r#"
-            UPDATE note_tags SET created_at = REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
-            WHERE created_at LIKE '%T%';
-
-            UPDATE note_tags SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
-            WHERE modified_at LIKE '%T%';
-
-            UPDATE note_tags SET deleted_at = REPLACE(SUBSTR(deleted_at, 1, 19), 'T', ' ')
-            WHERE deleted_at LIKE '%T%';
-            "#,
-        )?;
-
-        // Normalize audio_files timestamps
-        self.conn.execute_batch(
-            r#"
-            UPDATE audio_files SET imported_at = REPLACE(SUBSTR(imported_at, 1, 19), 'T', ' ')
-            WHERE imported_at LIKE '%T%';
-
-            UPDATE audio_files SET file_created_at = REPLACE(SUBSTR(file_created_at, 1, 19), 'T', ' ')
-            WHERE file_created_at LIKE '%T%';
-
-            UPDATE audio_files SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
-            WHERE modified_at LIKE '%T%';
-
-            UPDATE audio_files SET deleted_at = REPLACE(SUBSTR(deleted_at, 1, 19), 'T', ' ')
-            WHERE deleted_at LIKE '%T%';
-            "#,
-        )?;
-
-        // Normalize note_attachments timestamps
-        self.conn.execute_batch(
-            r#"
-            UPDATE note_attachments SET created_at = REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
-            WHERE created_at LIKE '%T%';
-
-            UPDATE note_attachments SET modified_at = REPLACE(SUBSTR(modified_at, 1, 19), 'T', ' ')
-            WHERE modified_at LIKE '%T%';
-
-            UPDATE note_attachments SET deleted_at = REPLACE(SUBSTR(deleted_at, 1, 19), 'T', ' ')
-            WHERE deleted_at LIKE '%T%';
-            "#,
-        )?;
-
-        Ok(())
-    }
-
-    /// Migrate existing databases to add sync_received_at column.
-    ///
-    /// This column stores Unix timestamp (seconds since epoch) of when the server
-    /// received a sync change. It's used to correctly track which changes need to
-    /// be sent to clients, avoiding the bug where changes made before a client's
-    /// last sync but pushed to server after are never sent.
-    ///
-    /// This is idempotent - it checks if the column exists before adding it.
-    fn migrate_add_sync_received_at(&mut self) -> VoiceResult<()> {
-        // Helper to check if a column exists in a table
-        fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-            let sql = format!("PRAGMA table_info({})", table);
-            let mut stmt = conn.prepare(&sql).unwrap();
-            let rows = stmt.query_map([], |row| {
-                let name: String = row.get(1)?;
-                Ok(name)
-            }).unwrap();
-            for row in rows {
-                if let Ok(name) = row {
-                    if name == column {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-
-        let tables = ["notes", "tags", "note_tags", "note_attachments", "audio_files", "transcriptions"];
-
-        for table in tables {
-            if !column_exists(&self.conn, table, "sync_received_at") {
-                let sql = format!("ALTER TABLE {} ADD COLUMN sync_received_at INTEGER", table);
-                self.conn.execute(&sql, [])?;
-
-                // Create index for the new column
-                let index_sql = format!(
-                    "CREATE INDEX IF NOT EXISTS idx_{}_sync_received_at ON {}(sync_received_at)",
-                    table, table
-                );
-                self.conn.execute(&index_sql, [])?;
+    /// Every syncable table's `seq`: stamped on insert, and on an update that
+    /// changes one of the listed columns, so the row goes out again. An echo
+    /// that writes the same values stamps nothing.
+    fn create_sequence_triggers(&self) -> VoiceResult<()> {
+        // (table, columns whose change means "publish again")
+        let tables: [(&str, &[&str]); 10] = [
+            ("field_versions", &["published"]),
+            ("notes", &["content", "modified_at", "deleted_at", "primary_attachment_id"]),
+            ("tags", &["name", "parent_id", "modified_at", "deleted_at"]),
+            ("note_tags", &["modified_at", "deleted_at"]),
+            ("note_attachments", &["modified_at", "deleted_at"]),
+            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256", "storage_encrypted", "disk_name", "waveform_levels", "size_bytes"]),
+            ("transcriptions", &["content", "content_segments", "service_response", "state", "modified_at", "deleted_at"]),
+            ("file_storage_config", &["provider", "config", "modified_at"]),
+            ("file_locations", &["present", "changed_at", "changed_by"]),
+            // A purge is written once and never changed: the insert trigger only
+            ("purges", &[]),
+        ];
+        for (table, cols) in tables {
+            let bump = format!(
+                "UPDATE sync_sequence SET value = value + 1 WHERE id = 1; \
+                 UPDATE {t} SET seq = (SELECT value FROM sync_sequence WHERE id = 1) WHERE rowid = NEW.rowid;",
+                t = table
+            );
+            self.conn.execute_batch(&format!(
+                "CREATE INDEX IF NOT EXISTS idx_{t}_seq ON {t}(seq); \
+                 CREATE TRIGGER IF NOT EXISTS trg_{t}_seq_insert AFTER INSERT ON {t} BEGIN {bump} END;",
+                t = table,
+                bump = bump
+            ))?;
+            if !cols.is_empty() {
+                let when = cols.iter().map(|c| format!("NEW.{c} IS NOT OLD.{c}", c = c)).collect::<Vec<_>>().join(" OR ");
+                self.conn.execute_batch(&format!(
+                    "CREATE TRIGGER IF NOT EXISTS trg_{t}_seq_update AFTER UPDATE OF {of} ON {t} WHEN {when} BEGIN {bump} END;",
+                    t = table,
+                    of = cols.join(", "),
+                    when = when,
+                    bump = bump
+                ))?;
             }
         }
-
         Ok(())
     }
 
-    /// Add `audio_files.local_origin` (Q1 of 2026-09-14): "imported" or
-    /// "recorded" when this device made the row, empty for a row received by
-    /// sync. Kept on this device only: never in the feed, never in a trigger.
-    fn migrate_add_local_origin(&mut self) -> VoiceResult<()> {
-        let exists: bool = {
-            let mut stmt = self.conn.prepare("PRAGMA table_info(audio_files)")?;
-            let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let mut found = false;
-            for name in names.flatten() {
-                if name == "local_origin" {
-                    found = true;
-                }
-            }
-            found
-        };
-        if !exists {
-            self.conn.execute("ALTER TABLE audio_files ADD COLUMN local_origin TEXT", [])?;
-        }
-        Ok(())
-    }
-
-    /// Migrate existing databases from TEXT datetime columns to INTEGER Unix timestamps.
-    ///
-    /// This converts all timestamp columns from "YYYY-MM-DD HH:MM:SS" TEXT format
-    /// to Unix seconds INTEGER format. This is a one-way migration.
-    ///
-    /// The migration recreates each table with the new schema because SQLite doesn't
-    /// support ALTER COLUMN to change types.
-    fn migrate_timestamps_to_unix(&mut self) -> VoiceResult<()> {
-        // Helper to check if a column is TEXT type (needs migration)
-        fn column_is_text(conn: &Connection, table: &str, column: &str) -> bool {
-            let sql = format!("PRAGMA table_info({})", table);
-            if let Ok(mut stmt) = conn.prepare(&sql) {
-                let rows = stmt.query_map([], |row| {
-                    let name: String = row.get(1)?;
-                    let col_type: String = row.get(2)?;
-                    Ok((name, col_type))
-                });
-                if let Ok(rows) = rows {
-                    for row in rows.flatten() {
-                        if row.0 == column {
-                            // Check if type contains TEXT, DATETIME, or similar string types
-                            let type_upper = row.1.to_uppercase();
-                            return type_upper.contains("TEXT")
-                                || type_upper.contains("DATETIME")
-                                || type_upper.contains("CHAR");
-                        }
-                    }
-                }
-            }
-            false
-        }
-
-        // Check if migration is needed by looking at notes.created_at type
-        if !column_is_text(&self.conn, "notes", "created_at") {
-            // Already migrated or new database with INTEGER columns
-            return Ok(());
-        }
-
-        tracing::info!("Migrating timestamps from TEXT to INTEGER (Unix seconds)...");
-
-        // Migrate each table in a transaction
-        let tx = self.conn.transaction()?;
-
-        // --- notes table ---
-        tx.execute_batch(r#"
-            CREATE TABLE notes_new (
-                id BLOB PRIMARY KEY,
-                created_at INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                modified_at INTEGER,
-                deleted_at INTEGER,
-                sync_received_at INTEGER,
-                di_cache_note_pane_display TEXT,
-                di_cache_note_list_pane_display TEXT
-            );
-            INSERT INTO notes_new SELECT
-                id,
-                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
-                content,
-                CAST(strftime('%s', modified_at) AS INTEGER),
-                CAST(strftime('%s', deleted_at) AS INTEGER),
-                sync_received_at,
-                di_cache_note_pane_display,
-                di_cache_note_list_pane_display
-            FROM notes;
-            DROP TABLE notes;
-            ALTER TABLE notes_new RENAME TO notes;
-        "#)?;
-
-        // --- tags table ---
-        tx.execute_batch(r#"
-            CREATE TABLE tags_new (
-                id BLOB PRIMARY KEY,
-                name TEXT NOT NULL,
-                parent_id BLOB,
-                created_at INTEGER NOT NULL,
-                modified_at INTEGER,
-                deleted_at INTEGER,
-                sync_received_at INTEGER,
-                FOREIGN KEY (parent_id) REFERENCES tags_new (id) ON DELETE CASCADE
-            );
-            INSERT INTO tags_new SELECT
-                id,
-                name,
-                parent_id,
-                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
-                CAST(strftime('%s', modified_at) AS INTEGER),
-                CAST(strftime('%s', deleted_at) AS INTEGER),
-                sync_received_at
-            FROM tags;
-            DROP TABLE tags;
-            ALTER TABLE tags_new RENAME TO tags;
-        "#)?;
-
-        // --- note_tags table ---
-        tx.execute_batch(r#"
-            CREATE TABLE note_tags_new (
-                note_id BLOB NOT NULL,
-                tag_id BLOB NOT NULL,
-                created_at INTEGER NOT NULL,
-                modified_at INTEGER,
-                deleted_at INTEGER,
-                sync_received_at INTEGER,
-                FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE,
-                FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE,
-                PRIMARY KEY (note_id, tag_id)
-            );
-            INSERT INTO note_tags_new SELECT
-                note_id,
-                tag_id,
-                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
-                CAST(strftime('%s', modified_at) AS INTEGER),
-                CAST(strftime('%s', deleted_at) AS INTEGER),
-                sync_received_at
-            FROM note_tags;
-            DROP TABLE note_tags;
-            ALTER TABLE note_tags_new RENAME TO note_tags;
-        "#)?;
-
-        // --- sync_peers table ---
-        tx.execute_batch(r#"
-            CREATE TABLE sync_peers_new (
-                peer_id BLOB PRIMARY KEY,
-                peer_name TEXT,
-                peer_url TEXT NOT NULL,
-                last_sync_at INTEGER,
-                last_received_timestamp INTEGER,
-                last_sent_timestamp INTEGER,
-                certificate_fingerprint BLOB
-            );
-            INSERT INTO sync_peers_new SELECT
-                peer_id,
-                peer_name,
-                peer_url,
-                CAST(strftime('%s', last_sync_at) AS INTEGER),
-                CAST(strftime('%s', last_received_timestamp) AS INTEGER),
-                CAST(strftime('%s', last_sent_timestamp) AS INTEGER),
-                certificate_fingerprint
-            FROM sync_peers;
-            DROP TABLE sync_peers;
-            ALTER TABLE sync_peers_new RENAME TO sync_peers;
-        "#)?;
-
-        // --- note_attachments table ---
-        tx.execute_batch(r#"
-            CREATE TABLE note_attachments_new (
-                id BLOB PRIMARY KEY,
-                note_id BLOB NOT NULL,
-                attachment_id BLOB NOT NULL,
-                attachment_type TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                device_id BLOB NOT NULL,
-                modified_at INTEGER,
-                deleted_at INTEGER,
-                sync_received_at INTEGER,
-                FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE
-            );
-            INSERT INTO note_attachments_new SELECT
-                id,
-                note_id,
-                attachment_id,
-                attachment_type,
-                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
-                device_id,
-                CAST(strftime('%s', modified_at) AS INTEGER),
-                CAST(strftime('%s', deleted_at) AS INTEGER),
-                sync_received_at
-            FROM note_attachments;
-            DROP TABLE note_attachments;
-            ALTER TABLE note_attachments_new RENAME TO note_attachments;
-        "#)?;
-
-        // --- audio_files table ---
-        tx.execute_batch(r#"
-            CREATE TABLE audio_files_new (
-                id BLOB PRIMARY KEY,
-                imported_at INTEGER NOT NULL,
-                filename TEXT NOT NULL,
-                file_created_at INTEGER,
-                duration_seconds INTEGER,
-                summary TEXT,
-                device_id BLOB NOT NULL,
-                modified_at INTEGER,
-                deleted_at INTEGER,
-                sync_received_at INTEGER
-            );
-            INSERT INTO audio_files_new SELECT
-                id,
-                COALESCE(CAST(strftime('%s', imported_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
-                filename,
-                CAST(strftime('%s', file_created_at) AS INTEGER),
-                duration_seconds,
-                summary,
-                device_id,
-                CAST(strftime('%s', modified_at) AS INTEGER),
-                CAST(strftime('%s', deleted_at) AS INTEGER),
-                sync_received_at
-            FROM audio_files;
-            DROP TABLE audio_files;
-            ALTER TABLE audio_files_new RENAME TO audio_files;
-        "#)?;
-
-        // --- transcriptions table ---
-        tx.execute_batch(r#"
-            CREATE TABLE transcriptions_new (
-                id BLOB PRIMARY KEY,
-                audio_file_id BLOB NOT NULL,
-                content TEXT NOT NULL,
-                content_segments TEXT,
-                service TEXT NOT NULL,
-                service_arguments TEXT,
-                service_response TEXT,
-                state TEXT NOT NULL DEFAULT 'original !verified !verbatim !cleaned !polished',
-                device_id BLOB NOT NULL,
-                created_at INTEGER NOT NULL,
-                modified_at INTEGER,
-                deleted_at INTEGER,
-                sync_received_at INTEGER,
-                FOREIGN KEY (audio_file_id) REFERENCES audio_files (id) ON DELETE CASCADE
-            );
-            INSERT INTO transcriptions_new SELECT
-                id,
-                audio_file_id,
-                content,
-                content_segments,
-                service,
-                service_arguments,
-                service_response,
-                state,
-                device_id,
-                COALESCE(CAST(strftime('%s', created_at) AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER)),
-                CAST(strftime('%s', modified_at) AS INTEGER),
-                CAST(strftime('%s', deleted_at) AS INTEGER),
-                sync_received_at
-            FROM transcriptions;
-            DROP TABLE transcriptions;
-            ALTER TABLE transcriptions_new RENAME TO transcriptions;
-        "#)?;
-
-        // --- Conflict tables ---
-        // Conflict tables are temporary data that gets regenerated during sync.
-        // Drop and recreate them with the current schema rather than trying to migrate data.
-        // This avoids issues with schema changes over time.
-
-        // conflicts_note_content
-        tx.execute_batch(r#"
-            DROP TABLE IF EXISTS conflicts_note_content;
-            CREATE TABLE conflicts_note_content (
-                id BLOB PRIMARY KEY,
-                note_id BLOB NOT NULL,
-                local_content TEXT NOT NULL,
-                local_modified_at INTEGER NOT NULL,
-                local_device_id BLOB,
-                local_device_name TEXT,
-                remote_content TEXT NOT NULL,
-                remote_modified_at INTEGER NOT NULL,
-                remote_device_id BLOB,
-                remote_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (note_id) REFERENCES notes(id)
-            );
-        "#)?;
-
-        // conflicts_note_delete
-        tx.execute_batch(r#"
-            DROP TABLE IF EXISTS conflicts_note_delete;
-            CREATE TABLE conflicts_note_delete (
-                id BLOB PRIMARY KEY,
-                note_id BLOB NOT NULL,
-                surviving_content TEXT NOT NULL,
-                surviving_modified_at INTEGER NOT NULL,
-                surviving_device_id BLOB,
-                surviving_device_name TEXT,
-                deleted_content TEXT,
-                deleted_at INTEGER NOT NULL,
-                deleting_device_id BLOB,
-                deleting_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (note_id) REFERENCES notes(id)
-            );
-        "#)?;
-
-        // conflicts_tag_rename
-        tx.execute_batch(r#"
-            DROP TABLE IF EXISTS conflicts_tag_rename;
-            CREATE TABLE conflicts_tag_rename (
-                id BLOB PRIMARY KEY,
-                tag_id BLOB NOT NULL,
-                local_name TEXT NOT NULL,
-                local_modified_at INTEGER NOT NULL,
-                local_device_id BLOB,
-                local_device_name TEXT,
-                remote_name TEXT NOT NULL,
-                remote_modified_at INTEGER NOT NULL,
-                remote_device_id BLOB,
-                remote_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (tag_id) REFERENCES tags(id)
-            );
-        "#)?;
-
-        // conflicts_tag_parent
-        tx.execute_batch(r#"
-            DROP TABLE IF EXISTS conflicts_tag_parent;
-            CREATE TABLE conflicts_tag_parent (
-                id BLOB PRIMARY KEY,
-                tag_id BLOB NOT NULL,
-                local_parent_id BLOB,
-                local_modified_at INTEGER NOT NULL,
-                local_device_id BLOB,
-                local_device_name TEXT,
-                remote_parent_id BLOB,
-                remote_modified_at INTEGER NOT NULL,
-                remote_device_id BLOB,
-                remote_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (tag_id) REFERENCES tags(id)
-            );
-        "#)?;
-
-        // conflicts_tag_delete
-        tx.execute_batch(r#"
-            DROP TABLE IF EXISTS conflicts_tag_delete;
-            CREATE TABLE conflicts_tag_delete (
-                id BLOB PRIMARY KEY,
-                tag_id BLOB NOT NULL,
-                surviving_name TEXT NOT NULL,
-                surviving_parent_id BLOB,
-                surviving_modified_at INTEGER NOT NULL,
-                surviving_device_id BLOB,
-                surviving_device_name TEXT,
-                deleted_at INTEGER NOT NULL,
-                deleting_device_id BLOB,
-                deleting_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (tag_id) REFERENCES tags(id)
-            );
-        "#)?;
-
-        // conflicts_note_tag
-        tx.execute_batch(r#"
-            DROP TABLE IF EXISTS conflicts_note_tag;
-            CREATE TABLE conflicts_note_tag (
-                id BLOB PRIMARY KEY,
-                note_id BLOB NOT NULL,
-                tag_id BLOB NOT NULL,
-                local_created_at INTEGER,
-                local_modified_at INTEGER,
-                local_deleted_at INTEGER,
-                local_device_id BLOB,
-                local_device_name TEXT,
-                remote_created_at INTEGER,
-                remote_modified_at INTEGER,
-                remote_deleted_at INTEGER,
-                remote_device_id BLOB,
-                remote_device_name TEXT,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (note_id) REFERENCES notes(id),
-                FOREIGN KEY (tag_id) REFERENCES tags(id)
-            );
-        "#)?;
-
-        // sync_failures
-        tx.execute_batch(r#"
-            CREATE TABLE sync_failures_new (
-                id BLOB PRIMARY KEY,
-                peer_id BLOB NOT NULL,
-                peer_name TEXT,
-                entity_type TEXT NOT NULL,
-                entity_id BLOB,
-                operation TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                error_message TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                FOREIGN KEY (peer_id) REFERENCES sync_peers(peer_id)
-            );
-            INSERT INTO sync_failures_new SELECT
-                id, peer_id, peer_name, entity_type, entity_id, operation, payload, error_message,
-                CAST(strftime('%s', created_at) AS INTEGER),
-                CAST(strftime('%s', resolved_at) AS INTEGER)
-            FROM sync_failures;
-            DROP TABLE sync_failures;
-            ALTER TABLE sync_failures_new RENAME TO sync_failures;
-        "#)?;
-
-        // Recreate all indexes
-        tx.execute_batch(r#"
-            CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at);
-            CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_notes_modified_at ON notes(modified_at);
-            CREATE INDEX IF NOT EXISTS idx_notes_sync_received_at ON notes(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_tags_parent_id ON tags(parent_id);
-            CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(LOWER(name));
-            CREATE INDEX IF NOT EXISTS idx_tags_modified_at ON tags(modified_at);
-            CREATE INDEX IF NOT EXISTS idx_tags_sync_received_at ON tags(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_note_tags_note ON note_tags(note_id);
-            CREATE INDEX IF NOT EXISTS idx_note_tags_tag ON note_tags(tag_id);
-            CREATE INDEX IF NOT EXISTS idx_note_tags_created_at ON note_tags(created_at);
-            CREATE INDEX IF NOT EXISTS idx_note_tags_deleted_at ON note_tags(deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_note_tags_modified_at ON note_tags(modified_at);
-            CREATE INDEX IF NOT EXISTS idx_note_tags_search ON note_tags(note_id, tag_id, deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_note_tags_by_tag ON note_tags(tag_id, note_id, deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_note_tags_sync_received_at ON note_tags(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_note_attachments_note_id ON note_attachments(note_id);
-            CREATE INDEX IF NOT EXISTS idx_note_attachments_attachment_id ON note_attachments(attachment_id);
-            CREATE INDEX IF NOT EXISTS idx_note_attachments_type ON note_attachments(attachment_type);
-            CREATE INDEX IF NOT EXISTS idx_note_attachments_modified_at ON note_attachments(modified_at);
-            CREATE INDEX IF NOT EXISTS idx_note_attachments_deleted_at ON note_attachments(deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_note_attachments_sync_received_at ON note_attachments(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_audio_files_modified_at ON audio_files(modified_at);
-            CREATE INDEX IF NOT EXISTS idx_audio_files_deleted_at ON audio_files(deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_audio_files_sync_received_at ON audio_files(sync_received_at);
-            CREATE INDEX IF NOT EXISTS idx_transcriptions_audio_file_id ON transcriptions(audio_file_id);
-            CREATE INDEX IF NOT EXISTS idx_transcriptions_service ON transcriptions(service);
-            CREATE INDEX IF NOT EXISTS idx_transcriptions_created_at ON transcriptions(created_at);
-            CREATE INDEX IF NOT EXISTS idx_transcriptions_modified_at ON transcriptions(modified_at);
-            CREATE INDEX IF NOT EXISTS idx_transcriptions_deleted_at ON transcriptions(deleted_at);
-            CREATE INDEX IF NOT EXISTS idx_transcriptions_sync_received_at ON transcriptions(sync_received_at);
-        "#)?;
-
-        tx.commit()?;
-
-        tracing::info!("Timestamp migration completed successfully");
-        Ok(())
-    }
-
-    /// Migrate existing databases to add cloud storage columns to audio_files.
-    ///
-    /// This adds three columns for tracking cloud storage state:
-    /// - storage_provider: "s3", "backblaze", etc. (NULL = local only)
-    /// - storage_key: Object key/path in cloud storage
-    /// - storage_uploaded_at: Unix timestamp when file was uploaded
-    ///
-    /// This is idempotent - it checks if columns exist before adding them.
-    fn migrate_add_storage_columns(&mut self) -> VoiceResult<()> {
-        // Helper to check if a column exists in a table
-        fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-            let sql = format!("PRAGMA table_info({})", table);
-            let mut stmt = conn.prepare(&sql).unwrap();
-            let rows = stmt.query_map([], |row| {
-                let name: String = row.get(1)?;
-                Ok(name)
-            }).unwrap();
-            for row in rows {
-                if let Ok(name) = row {
-                    if name == column {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-
-        // Add storage_provider column if it doesn't exist
-        if !column_exists(&self.conn, "audio_files", "storage_provider") {
+    /// The database's own id, and the account it belongs to (ACCT-1): minted
+    /// with the database; a device that is paired later takes the account's
+    /// id instead (ACCT-4).
+    fn create_identity(&self) -> VoiceResult<()> {
+        for key in ["database_id", "account_id"] {
             self.conn.execute(
-                "ALTER TABLE audio_files ADD COLUMN storage_provider TEXT",
-                [],
+                "INSERT OR IGNORE INTO sync_meta (key, value) VALUES (?, ?)",
+                params![key, Uuid::now_v7().simple().to_string()],
             )?;
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_audio_files_storage_provider ON audio_files(storage_provider)",
-                [],
-            )?;
-            tracing::info!("Added storage_provider column to audio_files");
         }
-
-        // Add storage_key column if it doesn't exist
-        if !column_exists(&self.conn, "audio_files", "storage_key") {
-            self.conn.execute(
-                "ALTER TABLE audio_files ADD COLUMN storage_key TEXT",
-                [],
-            )?;
-            tracing::info!("Added storage_key column to audio_files");
-        }
-
-        // Add storage_uploaded_at column if it doesn't exist
-        if !column_exists(&self.conn, "audio_files", "storage_uploaded_at") {
-            self.conn.execute(
-                "ALTER TABLE audio_files ADD COLUMN storage_uploaded_at INTEGER",
-                [],
-            )?;
-            tracing::info!("Added storage_uploaded_at column to audio_files");
-        }
-
         Ok(())
     }
 
-    /// Migrate existing databases to add file_storage_config table.
-    ///
-    /// This table stores cloud file storage configuration that syncs between devices.
-    /// Uses a single row with id="default".
-    ///
-    /// This is idempotent - it checks if the table exists before creating it.
-    fn migrate_add_file_storage_config_table(&mut self) -> VoiceResult<()> {
-        // Check if table already exists
-        let table_exists: bool = self.conn.query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='file_storage_config'",
-            [],
-            |_| Ok(true),
-        ).unwrap_or(false);
-
-        if !table_exists {
-            self.conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS file_storage_config (
-                    id TEXT PRIMARY KEY DEFAULT 'default',
-                    provider TEXT NOT NULL DEFAULT 'none',
-                    config TEXT,
-                    modified_at INTEGER,
-                    device_id BLOB,
-                    sync_received_at INTEGER
-                );
-                CREATE INDEX IF NOT EXISTS idx_file_storage_config_sync_received_at ON file_storage_config(sync_received_at);
-                "#,
+    /// The system tags, with ids that are the same on every device, and their
+    /// name and parent as hash roots, so two devices made apart merge them
+    /// without a conflict.
+    fn create_system_tags(&self) -> VoiceResult<()> {
+        let now = Utc::now().timestamp();
+        let tags = [
+            (SYSTEM_TAG_UUID, SYSTEM_TAG_NAME, None),
+            (MARKED_TAG_UUID, MARKED_TAG_NAME, Some(SYSTEM_TAG_UUID)),
+            (NONSYNCED_TAG_UUID, NONSYNCED_TAG_NAME, Some(SYSTEM_TAG_UUID)),
+            (TOO_BIG_TAG_UUID, TOO_BIG_TAG_NAME, Some(NONSYNCED_TAG_UUID)),
+        ];
+        for (id, name, parent) in tags {
+            let id = Uuid::parse_str(id).map_err(|e| VoiceError::Other(format!("Invalid system tag id {}: {}", id, e)))?;
+            let parent = parent
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|e| VoiceError::Other(format!("Invalid system tag parent: {}", e)))?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO tags (id, name, parent_id, created_at) VALUES (?, ?, ?, ?)",
+                params![id.as_bytes().to_vec(), name, parent.map(|p| p.as_bytes().to_vec()), now],
             )?;
-            tracing::info!("Created file_storage_config table");
+            let id_hex = id.simple().to_string();
+            let parent_hex = parent.map(|p| p.simple().to_string()).unwrap_or_default();
+            self.ensure_root_version(ENTITY_TAG, &id_hex, FIELD_NAME, name, now)?;
+            self.ensure_root_version(ENTITY_TAG, &id_hex, FIELD_PARENT, &parent_hex, now)?;
         }
-
         Ok(())
     }
 
@@ -3406,15 +2780,6 @@ impl Database {
         Ok(())
     }
 
-    /// Get all changes since a timestamp (for sync)
-    /// The `since` parameter is a Unix timestamp (seconds since epoch).
-    /// Returns changes where: sync_received_at >= since OR modified_at >= since OR created_at >= since
-    /// Each entity type gets its own `limit` (one busy type must not starve the others).
-    pub fn get_changes_since(&self, since: Option<i64>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<i64>)> {
-        let feed = self.collect_changes(&FeedFilter::Since(since), limit)?;
-        Ok((feed.changes, feed.latest_timestamp))
-    }
-
     /// Changes in write order: every row and version whose `seq` is greater
     /// than `cursor` (and at most `upto`, when given), oldest first, at most
     /// `limit` in total. This is the primary feed: exact, resumable, and
@@ -4100,24 +3465,25 @@ impl Database {
         Ok(hash)
     }
 
-    /// Whether this device imported the recording, no place is known to hold it,
-    /// and its file is not in `audio_dir` under the name its row stores (Q1 of
-    /// 2026-09-14): the import made the row and the file is not there.
-    pub fn imported_here_but_missing(&self, audio_id: &str, audio_dir: &Path) -> VoiceResult<bool> {
-        let row: Option<(Option<String>, Option<String>, i64)> = self
+    /// How this device made a recording ([`ORIGIN_RECORDED`] or
+    /// [`ORIGIN_IMPORTED`]) when `here` made it, no place is known to hold it,
+    /// and its file is not in the audio folder under the name the row stores;
+    /// None otherwise. The origin is the synced one (FILE-25).
+    pub fn made_here_but_missing(&self, audio_id: &str, audio_dir: &Path, here: &str) -> VoiceResult<Option<String>> {
+        let row: Option<(Option<Vec<u8>>, Option<String>, Option<String>, i64)> = self
             .conn
             .query_row(
-                "SELECT a.local_origin, a.disk_name, (SELECT COUNT(*) FROM file_locations l WHERE l.audio_id = a.id) FROM audio_files a WHERE a.id = ?",
+                "SELECT a.origin_device_id, a.origin_kind, a.disk_name, (SELECT COUNT(*) FROM file_locations l WHERE l.audio_id = a.id) FROM audio_files a WHERE a.id = ?",
                 [audio_id_bytes(audio_id)?],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        Ok(match row {
-            Some((Some(origin), disk_name, 0)) if origin == "imported" => {
-                !disk_name.filter(|n| !n.is_empty()).is_some_and(|n| crate::models::audio_local_path(audio_dir, &n).is_file())
-            }
-            _ => false,
-        })
+        let Some((Some(device), Some(kind), disk_name, 0)) = row else { return Ok(None) };
+        if uuid_bytes_to_hex(&device).as_deref() != Some(here) {
+            return Ok(None);
+        }
+        let present = disk_name.filter(|n| !n.is_empty()).is_some_and(|n| crate::models::audio_local_path(audio_dir, &n).is_file());
+        Ok(if present { None } else { Some(kind) })
     }
 
     /// The live recording imported under this file name with these bytes, if
@@ -4561,17 +3927,15 @@ impl Database {
         Ok(())
     }
 
-    /// Build the feed. `Since` keeps the historical per-type timestamp
-    /// filter (used by the `since` query parameter and by tools); `AfterSeq`
-    /// is the cursor feed used by the sync client. The cursor feed reads the
+    /// Build the feed. `AfterSeq` is the cursor feed used by the sync client;
+    /// `Ids` names recordings a collision renamed. The cursor feed reads the
     /// sequence in small ranges so memory stays bounded by one page even when
     /// every change is a long transcription.
     fn collect_changes(&self, filter: &FeedFilter, limit: i64) -> VoiceResult<ChangeFeed> {
         let mut out = ChangeFeed { changes: Vec::new(), latest_timestamp: None, next_cursor: 0, is_complete: true };
         match filter {
-            FeedFilter::Since(_) | FeedFilter::Ids(_) => {
+            FeedFilter::Ids(_) => {
                 let (items, saturated) = self.collect_items(filter, limit)?;
-                // Historical behaviour: per-type order, per-type limits.
                 for (_, timestamp, c) in items {
                     if out.latest_timestamp.map_or(true, |t| timestamp > t) {
                         out.latest_timestamp = Some(timestamp);
@@ -4679,8 +4043,6 @@ impl Database {
         {
             let rows: Vec<(Vec<u8>, i64, String, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>)> = self.feed_query(
                 "id, created_at, content, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_attachment_id", "notes",
-                "sync_received_at >= ?1 OR modified_at >= ?1 OR created_at >= ?1",
-                "COALESCE(sync_received_at, modified_at, created_at)", "COALESCE(modified_at, created_at)",
                 filter, limit,
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, Option<i64>>(12)?.unwrap_or(0), read_zone_pairs(row, 5, 3)?, row.get(11)?)),
             )?;
@@ -4707,8 +4069,6 @@ impl Database {
         {
             let rows: Vec<(Vec<u8>, String, Option<Vec<u8>>, i64, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>)> = self.feed_query(
                 "id, name, parent_id, created_at, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone", "tags",
-                "sync_received_at >= ?1 OR modified_at >= ?1 OR created_at >= ?1",
-                "COALESCE(sync_received_at, modified_at, created_at)", "COALESCE(modified_at, created_at)",
                 filter, limit,
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(12)?.unwrap_or(0), read_zone_pairs(row, 6, 3)?)),
             )?;
@@ -4732,8 +4092,6 @@ impl Database {
         {
             let rows: Vec<(Vec<u8>, Vec<u8>, i64, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>)> = self.feed_query(
                 "note_id, tag_id, created_at, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone", "note_tags",
-                "sync_received_at >= ?1 OR modified_at >= ?1 OR deleted_at >= ?1 OR created_at >= ?1",
-                "COALESCE(sync_received_at, modified_at, deleted_at, created_at)", "COALESCE(modified_at, deleted_at, created_at)",
                 filter, limit,
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, Option<i64>>(11)?.unwrap_or(0), read_zone_pairs(row, 5, 3)?)),
             )?;
@@ -4755,16 +4113,14 @@ impl Database {
 
         // Audio files
         {
-            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64, String, Option<String>, Option<i64>);
+            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64, String, Option<String>, Option<i64>, Option<Vec<u8>>, Option<String>);
             let rows: Vec<AudioRow> = self.feed_query(
-                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes", "audio_files",
-                "sync_received_at >= ?1 OR modified_at >= ?1 OR imported_at >= ?1",
-                "COALESCE(sync_received_at, modified_at, imported_at)", "COALESCE(modified_at, imported_at)",
+                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes, origin_device_id, origin_kind", "audio_files",
                 filter, limit,
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(24)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), row.get::<_, Option<String>>(21)?.unwrap_or_default(), row.get::<_, Option<String>>(22)?, row.get::<_, Option<i64>>(23)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(26)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), row.get::<_, Option<String>>(21)?.unwrap_or_default(), row.get::<_, Option<String>>(22)?, row.get::<_, Option<i64>>(23)?, row.get(24)?, row.get(25)?)),
             )?;
             saturated |= rows.len() as i64 >= limit;
-            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes) in rows {
+            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes, origin_device, origin_kind) in rows {
                 let timestamp = modified_at.unwrap_or(imported_at);
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
                 let mut data = serde_json::Map::new();
@@ -4783,6 +4139,8 @@ impl Database {
                 data.insert("disk_name".to_string(), serde_json::Value::String(disk_name));
                 data.insert("waveform_levels".to_string(), str_val(waveform_levels));
                 data.insert("size_bytes".to_string(), size_bytes.map_or(serde_json::Value::Null, |n| serde_json::Value::Number(n.into())));
+                data.insert("origin_device_id".to_string(), str_val(origin_device.and_then(|b| uuid_bytes_to_hex(&b))));
+                data.insert("origin_kind".to_string(), str_val(origin_kind));
                 data.insert(
                     "primary_transcription_id".to_string(),
                     str_val(primary_transcription.and_then(|b| uuid_bytes_to_hex(&b))),
@@ -4796,8 +4154,6 @@ impl Database {
         {
             let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, String, i64, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>)> = self.feed_query(
                 "id, note_id, attachment_id, attachment_type, created_at, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone", "note_attachments",
-                "sync_received_at >= ?1 OR modified_at >= ?1 OR deleted_at >= ?1 OR created_at >= ?1",
-                "COALESCE(sync_received_at, modified_at, deleted_at, created_at)", "COALESCE(modified_at, deleted_at, created_at)",
                 filter, limit,
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get::<_, Option<i64>>(13)?.unwrap_or(0), read_zone_pairs(row, 7, 3)?)),
             )?;
@@ -4823,8 +4179,6 @@ impl Database {
             type TrRow = (Vec<u8>, Vec<u8>, String, Option<String>, String, Option<String>, Option<String>, String, Vec<u8>, i64, Option<i64>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>);
             let rows: Vec<TrRow> = self.feed_query(
                 "id, audio_file_id, content, content_segments, service, service_arguments, service_response, state, device_id, created_at, modified_at, deleted_at, created_at_offset, created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone", "transcriptions",
-                "sync_received_at >= ?1 OR modified_at >= ?1 OR created_at >= ?1",
-                "COALESCE(sync_received_at, modified_at, created_at)", "COALESCE(modified_at, created_at)",
                 filter, limit,
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<i64>>(18)?.unwrap_or(0), read_zone_pairs(row, 12, 3)?)),
             )?;
@@ -4854,8 +4208,6 @@ impl Database {
         {
             let rows: Vec<(String, Option<String>, Option<i64>, Option<Vec<u8>>, i64)> = self.feed_query(
                 "provider, config, modified_at, device_id", "file_storage_config",
-                "id = 'default' AND (sync_received_at >= ?1 OR modified_at >= ?1)",
-                "modified_at", "modified_at",
                 filter, limit,
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, Option<i64>>(4)?.unwrap_or(0))),
             )?;
@@ -4882,7 +4234,6 @@ impl Database {
         // before entity rows on the receiving side (see apply order).
         {
             let versions = match filter {
-                FeedFilter::Since(since) => self.get_versions_since(*since, limit)?.into_iter().map(|v| (0i64, v)).collect::<Vec<_>>(),
                 FeedFilter::AfterSeq { cursor, upto } => self.get_versions_after_seq(*cursor, *upto, limit)?,
                 FeedFilter::Ids(_) => Vec::new(),
             };
@@ -4906,7 +4257,6 @@ impl Database {
         {
             let rows: Vec<(String, Vec<u8>, i64, Option<i32>, Option<String>, i64)> = self.feed_query(
                 "entity_type, entity_id, purged_at, purged_at_offset, purged_at_zone", "purges",
-                "purged_at >= ?1", "purged_at", "purged_at",
                 filter, limit,
                 |row| Ok((
                     row.get(0)?,
@@ -4940,7 +4290,6 @@ impl Database {
         {
             let rows: Vec<(Vec<u8>, String, i64, i64, Option<Vec<u8>>, i64)> = self.feed_query(
                 "audio_id, place, present, changed_at, changed_by", "file_locations",
-                "changed_at >= ?1 * 1000", "changed_at", "changed_at",
                 filter, limit,
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, Option<i64>>(5)?.unwrap_or(0))),
             )?;
@@ -4970,9 +4319,6 @@ impl Database {
         &self,
         cols: &str,
         table: &str,
-        since_where: &str,
-        since_order: &str,
-        all_order: &str,
         filter: &FeedFilter,
         limit: i64,
         map: F,
@@ -4981,14 +4327,6 @@ impl Database {
         F: Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     {
         let (sql, values): (String, Vec<rusqlite::types::Value>) = match filter {
-            FeedFilter::Since(Some(ts)) => (
-                format!("SELECT {}, seq FROM {} WHERE {} ORDER BY {} LIMIT ?2", cols, table, since_where, since_order),
-                vec![(*ts).into(), limit.into()],
-            ),
-            FeedFilter::Since(None) => (
-                format!("SELECT {}, seq FROM {} ORDER BY {} LIMIT ?1", cols, table, all_order),
-                vec![limit.into()],
-            ),
             FeedFilter::AfterSeq { cursor, upto } => (
                 format!("SELECT {}, seq FROM {} WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3", cols, table),
                 vec![(*cursor).into(), upto.unwrap_or(i64::MAX).into(), limit.into()],
@@ -5006,33 +4344,6 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| map(row))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    /// Get changes since a timestamp using exclusive comparison (>)
-    /// This is used for checking unsynced changes where we want to exclude
-    /// items that were synced at exactly the sync timestamp.
-    pub fn get_changes_since_exclusive(&self, since: Option<i64>, limit: i64) -> VoiceResult<(Vec<HashMap<String, serde_json::Value>>, Option<i64>)> {
-        // For exclusive comparison (>), we use get_changes_since with since + 1
-        // This is equivalent to > since (i.e., >= since + 1)
-        let adjusted_since = since.map(|ts| ts + 1);
-        self.get_changes_since(adjusted_since, limit)
-    }
-
-    /// Get changes since a timestamp, returning SyncChange structs.
-    /// Uses exclusive comparison (>) for incremental sync.
-    /// This is the primary method for sync_server to use.
-    pub fn get_changes_since_as_sync_changes(
-        &self,
-        since: Option<i64>,
-        limit: i64,
-    ) -> VoiceResult<(Vec<SyncChange>, Option<i64>)> {
-        // Use exclusive comparison (>) for incremental sync
-        let (changes, latest_timestamp) = if since.is_some() {
-            self.get_changes_since_exclusive(since, limit)?
-        } else {
-            self.get_changes_since(None, limit)?
-        };
-        Ok((Self::feed_to_sync_changes(changes), latest_timestamp))
     }
 
     /// Cursor feed as `SyncChange`s: (changes, next_cursor, is_complete).
@@ -5069,192 +4380,6 @@ impl Database {
             })
             .collect()
     }
-
-    /// Get full dataset for initial sync
-    pub fn get_full_dataset(&self) -> VoiceResult<HashMap<String, Vec<HashMap<String, serde_json::Value>>>> {
-        let mut result = HashMap::new();
-
-        // Get all notes
-        let mut stmt = self.conn.prepare(
-            r#"SELECT id, created_at, content, modified_at, deleted_at FROM notes"#
-        )?;
-        let note_rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        })?;
-
-        let mut notes = Vec::new();
-        for row in note_rows {
-            let (id_bytes, created_at, content, modified_at, deleted_at) = row?;
-            let mut note = HashMap::new();
-            note.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
-            note.insert("created_at".to_string(), serde_json::json!(created_at));
-            note.insert("content".to_string(), serde_json::Value::String(content));
-            note.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            note.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            notes.push(note);
-        }
-        result.insert("notes".to_string(), notes);
-
-        // Get all tags
-        let mut stmt = self.conn.prepare(
-            r#"SELECT id, name, parent_id, created_at, modified_at, deleted_at FROM tags"#
-        )?;
-        let tag_rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<Vec<u8>>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-            ))
-        })?;
-
-        let mut tags = Vec::new();
-        for row in tag_rows {
-            let (id_bytes, name, parent_id_bytes, created_at, modified_at, deleted_at) = row?;
-            let mut tag = HashMap::new();
-            tag.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
-            tag.insert("name".to_string(), serde_json::Value::String(name));
-            tag.insert("parent_id".to_string(), parent_id_bytes.and_then(|b| uuid_bytes_to_hex(&b)).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            tag.insert("created_at".to_string(), serde_json::json!(created_at));
-            tag.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            tag.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            tags.push(tag);
-        }
-        result.insert("tags".to_string(), tags);
-
-        // Get all note_tags
-        let mut stmt = self.conn.prepare(
-            r#"SELECT note_id, tag_id, created_at, modified_at, deleted_at FROM note_tags"#
-        )?;
-        let nt_rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        })?;
-
-        let mut note_tags = Vec::new();
-        for row in nt_rows {
-            let (note_id_bytes, tag_id_bytes, created_at, modified_at, deleted_at) = row?;
-            let mut nt = HashMap::new();
-            nt.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default()));
-            nt.insert("tag_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&tag_id_bytes).unwrap_or_default()));
-            nt.insert("created_at".to_string(), serde_json::json!(created_at));
-            nt.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            nt.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            note_tags.push(nt);
-        }
-        result.insert("note_tags".to_string(), note_tags);
-
-        // Get all audio_files
-        let mut stmt = self.conn.prepare(
-            r#"SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
-                      storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name, waveform_levels FROM audio_files"#
-        )?;
-        let af_rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<f64>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Vec<u8>>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, Option<i64>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<i64>>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, Option<i64>>(13)?.unwrap_or(0),
-                row.get::<_, Option<String>>(14)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(15)?,
-            ))
-        })?;
-
-        let mut audio_files = Vec::new();
-        for row in af_rows {
-            let (id_bytes, imported_at, filename, file_created_at, duration_seconds, summary, device_id_bytes, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name, waveform_levels) = row?;
-            let mut af = HashMap::new();
-            af.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
-            af.insert("imported_at".to_string(), serde_json::json!(imported_at));
-            af.insert("filename".to_string(), serde_json::Value::String(filename));
-            af.insert("file_created_at".to_string(), file_created_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            af.insert("duration_seconds".to_string(), duration_seconds.map_or(serde_json::Value::Null, |d| serde_json::json!(d)));
-            af.insert("summary".to_string(), summary.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            af.insert("device_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default()));
-            af.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            af.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            af.insert("storage_provider".to_string(), storage_provider.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            af.insert("storage_key".to_string(), storage_key.map_or(serde_json::Value::Null, |s| serde_json::Value::String(s)));
-            af.insert("storage_uploaded_at".to_string(), storage_uploaded_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            af.insert("content_sha256".to_string(), content_sha256.map_or(serde_json::Value::Null, serde_json::Value::String));
-            af.insert("storage_encrypted".to_string(), serde_json::Value::Bool(storage_encrypted != 0));
-            af.insert("disk_name".to_string(), serde_json::Value::String(disk_name));
-            af.insert("waveform_levels".to_string(), waveform_levels.map_or(serde_json::Value::Null, serde_json::Value::String));
-            audio_files.push(af);
-        }
-        result.insert("audio_files".to_string(), audio_files);
-
-        // Get all note_attachments
-        let mut stmt = self.conn.prepare(
-            r#"SELECT id, note_id, attachment_id, attachment_type, created_at, device_id, modified_at, deleted_at FROM note_attachments"#
-        )?;
-        let na_rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-            ))
-        })?;
-
-        let mut note_attachments = Vec::new();
-        for row in na_rows {
-            let (id_bytes, note_id_bytes, attachment_id_bytes, attachment_type, created_at, device_id_bytes, modified_at, deleted_at) = row?;
-            let mut na = HashMap::new();
-            na.insert("id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&id_bytes).unwrap_or_default()));
-            na.insert("note_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&note_id_bytes).unwrap_or_default()));
-            na.insert("attachment_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&attachment_id_bytes).unwrap_or_default()));
-            na.insert("attachment_type".to_string(), serde_json::Value::String(attachment_type));
-            na.insert("created_at".to_string(), serde_json::json!(created_at));
-            na.insert("device_id".to_string(), serde_json::Value::String(uuid_bytes_to_hex(&device_id_bytes).unwrap_or_default()));
-            na.insert("modified_at".to_string(), modified_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            na.insert("deleted_at".to_string(), deleted_at.map_or(serde_json::Value::Null, |v| serde_json::json!(v)));
-            note_attachments.push(na);
-        }
-        result.insert("note_attachments".to_string(), note_attachments);
-
-        // Every version: the complete history travels with the full dataset
-        let mut field_versions = Vec::new();
-        for v in self.get_versions_since(None, i64::MAX)? {
-            if let serde_json::Value::Object(map) = v.to_json() {
-                field_versions.push(map.into_iter().collect::<HashMap<String, serde_json::Value>>());
-            }
-        }
-        result.insert("field_versions".to_string(), field_versions);
-
-        Ok(result)
-    }
-
-    // ============================================================================
-    // Sync apply methods
-    // ============================================================================
 
     /// Apply a sync change (used by sync server to apply remote changes)
     pub fn apply_sync_note(
@@ -5764,8 +4889,8 @@ impl Database {
 
         self.conn.execute(
             r#"
-            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, device_id)
-            VALUES (?, strftime('%s', 'now'), ?, ?, ?, ?)
+            INSERT INTO audio_files (id, imported_at, filename, file_created_at, duration_seconds, device_id, origin_device_id, origin_kind)
+            VALUES (?, strftime('%s', 'now'), ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 uuid_bytes,
@@ -5773,6 +4898,8 @@ impl Database {
                 file_created_at,
                 duration_seconds,
                 device_id.as_bytes().to_vec(),
+                device_id.as_bytes().to_vec(),
+                origin.as_str(),
             ],
         )?;
 
@@ -5792,11 +4919,7 @@ impl Database {
             }
             crate::models::FileOrigin::Imported => filename.to_string(),
         };
-        let local_origin = match origin {
-            crate::models::FileOrigin::Recorded => "recorded",
-            crate::models::FileOrigin::Imported => "imported",
-        };
-        self.conn.execute("UPDATE audio_files SET disk_name = ?, local_origin = ? WHERE id = ?", params![wanted, local_origin, uuid_bytes])?;
+        self.conn.execute("UPDATE audio_files SET disk_name = ? WHERE id = ?", params![wanted, uuid_bytes])?;
         // Two recordings with identical names both take their suffix; the new
         // one has no file yet, so only the other's file waits to be renamed
         self.resolve_name_collision(&id_hex, false)?;
@@ -5823,7 +4946,7 @@ impl Database {
             SELECT id, imported_at, filename, file_created_at, duration_seconds, summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted, origin_device_id, origin_kind
             FROM audio_files
             WHERE id = ?
             "#,
@@ -5854,7 +4977,7 @@ impl Database {
                    af.summary, af.device_id, af.modified_at, af.deleted_at,
                    af.storage_provider, af.storage_key, af.storage_uploaded_at,
                    af.imported_at_offset, af.imported_at_zone, af.file_created_at_offset, af.file_created_at_zone,
-                   af.modified_at_offset, af.modified_at_zone, af.deleted_at_offset, af.deleted_at_zone, af.disk_name, af.content_sha256, af.storage_encrypted
+                   af.modified_at_offset, af.modified_at_zone, af.deleted_at_offset, af.deleted_at_zone, af.disk_name, af.content_sha256, af.storage_encrypted, af.origin_device_id, af.origin_kind
             FROM audio_files af
             INNER JOIN note_attachments na ON af.id = na.attachment_id
             WHERE na.note_id = ?
@@ -5916,7 +5039,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted, origin_device_id, origin_kind
             FROM audio_files
             ORDER BY imported_at DESC
             "#,
@@ -6040,7 +5163,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted, origin_device_id, origin_kind
             FROM audio_files
             WHERE duration_seconds IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -6093,6 +5216,8 @@ impl Database {
             disk_name: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
             content_sha256: row.get(21)?,
             storage_encrypted: row.get::<_, Option<i64>>(22)?.unwrap_or(0) != 0,
+            origin_device_id: row.get::<_, Option<Vec<u8>>>(23)?.and_then(|b| uuid_bytes_to_hex(&b)).unwrap_or_default(),
+            origin_kind: row.get::<_, Option<String>>(24)?.unwrap_or_default(),
         })
     }
 
@@ -6111,7 +5236,7 @@ impl Database {
                    summary, device_id, modified_at, deleted_at,
                    storage_provider, storage_key, storage_uploaded_at,
                    imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone,
-                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted
+                   modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, disk_name, content_sha256, storage_encrypted, origin_device_id, origin_kind
             FROM audio_files
             WHERE storage_provider IS NULL AND deleted_at IS NULL
             ORDER BY imported_at DESC
@@ -6485,7 +5610,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, imported_at, filename, file_created_at, summary, device_id, modified_at, deleted_at,
-                   storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name, waveform_levels
+                   storage_provider, storage_key, storage_uploaded_at, content_sha256, storage_encrypted, disk_name, waveform_levels,
+                   origin_device_id, origin_kind
             FROM audio_files
             WHERE id = ?
             "#,
@@ -6507,6 +5633,8 @@ impl Database {
             let storage_encrypted: Option<i64> = row.get(12)?;
             let disk_name: Option<String> = row.get(13)?;
             let waveform_levels: Option<String> = row.get(14)?;
+            let origin_device_id: Option<Vec<u8>> = row.get(15)?;
+            let origin_kind: Option<String> = row.get(16)?;
 
             Ok(serde_json::json!({
                 "id": uuid_bytes_to_hex(&id_bytes).unwrap_or_default(),
@@ -6524,6 +5652,8 @@ impl Database {
                 "storage_encrypted": storage_encrypted.unwrap_or(0) != 0,
                 "disk_name": disk_name,
                 "waveform_levels": waveform_levels,
+                "origin_device_id": origin_device_id.and_then(|b| uuid_bytes_to_hex(&b)),
+                "origin_kind": origin_kind,
             }))
         });
 
@@ -6532,6 +5662,23 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(VoiceError::Database(e)),
         }
+    }
+
+    /// The installation that made a recording and how, as a synced row names
+    /// them (FILE-25): written the first time a row names them, never changed
+    /// by a later row. A row that names none, or names something malformed,
+    /// writes nothing.
+    pub fn apply_sync_audio_file_origin(&self, id: &str, origin_device_id: Option<&str>, origin_kind: Option<&str>) -> VoiceResult<()> {
+        let device = origin_device_id
+            .filter(|d| d.len() == 32 && d.chars().all(|c| c.is_ascii_hexdigit()))
+            .and_then(|d| Uuid::parse_str(d).ok());
+        let kind = origin_kind.filter(|k| *k == ORIGIN_RECORDED || *k == ORIGIN_IMPORTED);
+        let (Some(device), Some(kind)) = (device, kind) else { return Ok(()) };
+        self.conn.execute(
+            "UPDATE audio_files SET origin_device_id = ?, origin_kind = ? WHERE id = ? AND origin_device_id IS NULL",
+            params![device.as_bytes().to_vec(), kind, audio_id_bytes(id)?],
+        )?;
+        Ok(())
     }
 
     /// Apply an audio file from sync
@@ -7997,32 +7144,6 @@ mod tests {
             let _ = b;
         }
 
-        /// FILE-22: an older database keeps what it knew; the bucket holds what
-        /// a row says was uploaded, a peer what it was seen to hold. Nothing
-        /// on disk is read for it.
-        #[test]
-        fn an_older_database_knows_the_copies_its_rows_recorded() {
-            let temp = tempfile::TempDir::new().unwrap();
-            let path = temp.path().join("older.db");
-            let (uploaded, sent) = {
-                let db = Database::new(&path).unwrap();
-                let uploaded = db.create_audio_file("בענן.ogg", None, None, FileOrigin::Imported, None).unwrap();
-                let sent = db.create_audio_file("אצל עמית.ogg", None, None, FileOrigin::Imported, None).unwrap();
-                // The state of a database written before locations existed
-                db.conn.execute_batch("DROP TABLE file_locations; DROP TRIGGER IF EXISTS trg_file_locations_seq_insert; DROP TRIGGER IF EXISTS trg_file_locations_seq_update;").unwrap();
-                db.conn.execute("UPDATE audio_files SET storage_provider = 's3', storage_key = 'k.ogg', storage_uploaded_at = 1735689600 WHERE id = ?", params![Uuid::parse_str(&uploaded).unwrap().as_bytes().to_vec()]).unwrap();
-                db.conn.execute("INSERT INTO audio_file_copies (audio_id, peer_id, at) VALUES (?, ?, 1735689700)", params![Uuid::parse_str(&sent).unwrap().as_bytes().to_vec(), Uuid::parse_str(PHONE).unwrap().as_bytes().to_vec()]).unwrap();
-                (uploaded, sent)
-            };
-            let db = Database::new(&path).unwrap();
-            assert_eq!(stated(&db, &uploaded), vec![("cloud".to_string(), true)]);
-            assert_eq!(db.file_locations(&uploaded).unwrap()[0].changed_at, 1_735_689_600_000);
-            assert_eq!(stated(&db, &sent), vec![(PHONE.to_string(), true)]);
-            assert_eq!(db.copies_of(&sent, HERE).unwrap()[0].peer_id, PHONE);
-            let (changes, _, _) = db.get_changes_after_seq_as_sync_changes(0, None, 1000).unwrap();
-            assert_eq!(changes.iter().filter(|c| c.entity_type == "file_location").count(), 2, "what it knew is published");
-        }
-
         /// FILE-23: the upload limit is the account's, in the synced storage
         /// configuration, 100 MB until it is set.
         #[test]
@@ -8176,52 +7297,6 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(&aside[0])).unwrap(), b"no row names me");
     }
 
-    /// FILE-15 and the change feed: a database from before the rename keeps
-    /// its names under `disk_name`, and a trigger built before a column
-    /// joined the synced list is rebuilt, so a change to that column publishes.
-    #[test]
-    fn an_older_database_keeps_its_names_and_publishes_every_synced_column() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("older.db");
-        let id = {
-            let db = Database::new(&path).unwrap();
-            let id = db.create_audio_file("ישן.ogg", None, None, crate::models::FileOrigin::Imported, None).unwrap();
-            // The state of a database written before these changes
-            db.conn.execute_batch(
-                "ALTER TABLE audio_files RENAME COLUMN disk_name TO local_name;
-                 DROP TRIGGER IF EXISTS trg_audio_files_seq_update;
-                 CREATE TRIGGER trg_audio_files_seq_update AFTER UPDATE OF filename, modified_at ON audio_files
-                 WHEN NEW.filename IS NOT OLD.filename OR NEW.modified_at IS NOT OLD.modified_at
-                 BEGIN UPDATE sync_sequence SET value = value + 1 WHERE id = 1;
-                       UPDATE audio_files SET seq = (SELECT value FROM sync_sequence WHERE id = 1) WHERE rowid = NEW.rowid; END;",
-            ).unwrap();
-            id
-        };
-        let db = Database::new(&path).unwrap();
-        assert_eq!(db.get_audio_file(&id).unwrap().unwrap().disk_name, "ישן.ogg");
-        let seq = |db: &Database| -> i64 { db.conn.query_row("SELECT seq FROM audio_files", [], |r| r.get(0)).unwrap() };
-        let before = seq(&db);
-        db.conn.execute("UPDATE audio_files SET content_sha256 = 'aa'", []).unwrap();
-        assert!(seq(&db) > before, "a change to the content hash alone is published");
-    }
-
-    /// FILE-15: a row from before the name column keeps the name its file
-    /// has, `<id>.<ext>`; the migration invents no other.
-    #[test]
-    fn a_row_from_before_the_name_column_keeps_the_name_its_file_has() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("old.db");
-        let id = {
-            let db = Database::new(&path).unwrap();
-            let id = db.create_audio_file("הקלטה ישנה.OGG", Some(1735689600), None, crate::models::FileOrigin::Imported, None).unwrap();
-            // The state of a database written before the column existed
-            db.conn.execute("UPDATE audio_files SET disk_name = NULL", []).unwrap();
-            id
-        };
-        let db = Database::new(&path).unwrap();
-        assert_eq!(db.get_audio_file(&id).unwrap().unwrap().disk_name, format!("{}.ogg", id));
-    }
-
     /// D31: a recording is found by its file name and its bytes together; a
     /// copy under another name, other bytes under the same name and a deleted
     /// recording are not "already imported".
@@ -8295,7 +7370,6 @@ mod tests {
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()), "an older row does not replace it");
         b.apply_sync_audio_file(&id, 1735689600, "שיחה.ogg", Some(1735689600), None, None, Some(1735689800), None, Some(1735689703), None, None, None, None, Some(&other), None, None, None).unwrap();
         assert_eq!(b.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(other.as_str()), "a newer row does");
-        assert!(b.get_full_dataset().unwrap()["audio_files"][0]["content_sha256"].is_string());
     }
 
     mod account_identity {
@@ -8822,15 +7896,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_changes_since_includes_storage_fields() {
+    fn the_feed_carries_the_bucket_fields() {
         let db = Database::new_in_memory().unwrap();
 
         // Create audio file with storage info
         let audio_id = db.create_audio_file("test.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         db.update_audio_file_storage(&audio_id, "s3", "audio/test.mp3", false).unwrap();
 
-        // Get changes
-        let (changes, _) = db.get_changes_since(None, 100).unwrap();
+        let changes = db.get_changes_after_seq(0, None, 100).unwrap().changes;
 
         // Find the audio_file change
         let audio_change = changes.iter().find(|c| {
@@ -8961,326 +8034,12 @@ mod tests {
 // ============================================================================
 
 impl Database {
-    /// The pre-versioning conflict tables are replaced by `field_conflicts`,
-    /// which is derived from the version graph on every device.
-    /// Write-order sequence for the change feed (see `get_changes_after_seq`).
-    ///
-    /// Every syncable table gets a `seq` column; triggers stamp the next
-    /// value on insert and on any change of a synced column. Cache columns
-    /// and `sync_received_at` do not bump it, so applying an echo of our own
-    /// data from a peer does not re-publish it. Idempotent.
-    fn migrate_add_sync_sequence(&mut self) -> VoiceResult<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS sync_sequence (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                value INTEGER NOT NULL
-            );
-            INSERT OR IGNORE INTO sync_sequence (id, value) VALUES (1, 0);
-            CREATE TABLE IF NOT EXISTS sync_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            "#,
-        )?;
-        let has_id: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sync_meta WHERE key = 'database_id'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_id == 0 {
-            self.conn.execute(
-                "INSERT INTO sync_meta (key, value) VALUES ('database_id', ?)",
-                params![Uuid::now_v7().simple().to_string()],
-            )?;
-        }
-        // The account this database belongs to (ACCT-1). Minted here so that
-        // every database has one from its first moment; a device that is
-        // paired later takes the account's id instead (ACCT-4).
-        let has_account: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sync_meta WHERE key = 'account_id'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_account == 0 {
-            self.conn.execute(
-                "INSERT INTO sync_meta (key, value) VALUES ('account_id', ?)",
-                params![Uuid::now_v7().simple().to_string()],
-            )?;
-        }
-        // Pairing offers (PAIR-2): the hash of a token shown in a code, until
-        // it is spent, expired or guessed at too often. Local, never synced.
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS pairing_offers (
-                token_hash TEXT PRIMARY KEY,
-                expires_at INTEGER NOT NULL,
-                failures INTEGER NOT NULL DEFAULT 0
-            );
-            "#,
-        )?;
-        // The recording's file name on disk (FILE-15): synced, the same on every device
-        if !self.column_exists("audio_files", "disk_name")? {
-            if self.column_exists("audio_files", "local_name")? {
-                self.conn.execute("ALTER TABLE audio_files RENAME COLUMN local_name TO disk_name", [])?;
-            } else {
-                self.conn.execute("ALTER TABLE audio_files ADD COLUMN disk_name TEXT", [])?;
-            }
-        }
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_audio_files_disk_name ON audio_files(disk_name)", [])?;
-        // The content hash (Stage 13): synced metadata, merged per column
-        if !self.column_exists("audio_files", "content_sha256")? {
-            self.conn.execute("ALTER TABLE audio_files ADD COLUMN content_sha256 TEXT", [])?;
-        }
-        // Whether the object is encrypted (Stage 15): travels with the storage key
-        if !self.column_exists("audio_files", "storage_encrypted")? {
-            self.conn.execute("ALTER TABLE audio_files ADD COLUMN storage_encrypted INTEGER NOT NULL DEFAULT 0", [])?;
-        }
-        // The levels a waveform is drawn from (FILE-20): synced, kept by the first device that decodes
-        if !self.column_exists("audio_files", "waveform_levels")? {
-            self.conn.execute("ALTER TABLE audio_files ADD COLUMN waveform_levels TEXT", [])?;
-        }
-        {
-            // A row from before this column names no file, but its file is
-            // where the code of that time put it, `<id>.<ext>`. That name is
-            // written down as it is: a migration never changes a name that
-            // refers to a file outside the database (FILE-15).
-            let unnamed: Vec<(Vec<u8>, String)> = {
-                let mut stmt = self.conn.prepare("SELECT id, filename FROM audio_files WHERE disk_name IS NULL OR disk_name = ''")?;
-                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                rows.collect::<Result<Vec<_>, _>>()?
-            };
-            for (id, filename) in unnamed {
-                let id_hex = uuid_bytes_to_hex(&id).unwrap_or_default();
-                let name = format!("{}.{}", id_hex, crate::models::audio_file_extension(&filename));
-                self.conn.execute("UPDATE audio_files SET disk_name = ? WHERE id = ?", params![name, id])?;
-            }
-        }
-
-        // Which peers hold a copy of which recording (Stage 10): written by a
-        // send, by a fetch, by a receive, and by a peer's missing-list
-        // request. Local, never synced; it answers "is this one safe".
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS purged_objects (
-                storage_key TEXT PRIMARY KEY,
-                at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pending_file_renames (
-                audio_id BLOB PRIMARY KEY,
-                from_name TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS upload_parts (
-                audio_id BLOB NOT NULL,
-                storage_key TEXT NOT NULL,
-                upload_id TEXT NOT NULL,
-                part_size INTEGER NOT NULL,
-                part_number INTEGER NOT NULL,
-                etag TEXT NOT NULL,
-                PRIMARY KEY (audio_id, part_number)
-            );
-            CREATE TABLE IF NOT EXISTS audio_file_copies (
-                audio_id BLOB NOT NULL,
-                peer_id BLOB NOT NULL,
-                at INTEGER NOT NULL,
-                PRIMARY KEY (audio_id, peer_id)
-            );
-            "#,
-        )?;
-        // Where each copy of a recording is (FILE-22): synced, one row per
-        // recording and place, the newest statement about a place wins
-        let locations_are_new: bool = self
-            .conn
-            .query_row("SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table' AND name = 'file_locations'", [], |r| r.get(0))?;
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS file_locations (
-                audio_id BLOB NOT NULL,
-                place TEXT NOT NULL,
-                present INTEGER NOT NULL,
-                changed_at INTEGER NOT NULL,
-                changed_by BLOB,
-                sync_received_at INTEGER,
-                PRIMARY KEY (audio_id, place)
-            );
-            CREATE INDEX IF NOT EXISTS idx_file_locations_place ON file_locations(place, present);
-            "#,
-        )?;
-        if locations_are_new {
-            // What this database already knew, from its own rows: the bucket
-            // holds what a row says was uploaded, and a peer holds what it was
-            // seen to hold. Nothing on disk is read or changed here.
-            self.conn.execute(
-                "INSERT OR IGNORE INTO file_locations (audio_id, place, present, changed_at, changed_by)
-                 SELECT id, 'cloud', 1, COALESCE(storage_uploaded_at, modified_at, imported_at) * 1000, device_id
-                 FROM audio_files WHERE storage_key IS NOT NULL AND storage_provider IS NOT NULL",
-                [],
-            )?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO file_locations (audio_id, place, present, changed_at, changed_by)
-                 SELECT audio_id, lower(hex(peer_id)), 1, at * 1000, NULL FROM audio_file_copies",
-                [],
-            )?;
-        }
-        // The size of the file in bytes (FILE-23): synced, so every device
-        // can say that a recording is over the account's upload limit
-        if !self.column_exists("audio_files", "size_bytes")? {
-            self.conn.execute("ALTER TABLE audio_files ADD COLUMN size_bytes INTEGER", [])?;
-        }
-        for col in ["last_received_cursor INTEGER", "last_sent_seq INTEGER", "peer_database_id TEXT", "peer_account_id TEXT", "last_operation TEXT", "peer_entity_types TEXT"] {
-            let name = col.split(' ').next().unwrap_or_default();
-            if !self.column_exists("sync_peers", name)? {
-                self.conn.execute(&format!("ALTER TABLE sync_peers ADD COLUMN {}", col), [])?;
-            }
-        }
-
-        if !self.column_exists("field_versions", "published")? {
-            self.conn.execute("ALTER TABLE field_versions ADD COLUMN published INTEGER NOT NULL DEFAULT 0", [])?;
-        }
-        // Which attachment stands for a note, and which transcription for a
-        // recording. Empty until the user chooses one, and then it is the
-        // one played and the one shown in the list.
-        for (table, column) in [
-            ("notes", "primary_attachment_id"),
-            ("audio_files", "primary_transcription_id"),
-        ] {
-            if !self.column_exists(table, column)? {
-                self.conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} BLOB"), [])?;
-            }
-        }
-
-        // The trash bin's floor: what has been removed for good, and must
-        // not come back from a peer that has not heard yet. The rows are
-        // kept for ever, which costs 40 bytes per purged entity.
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS purges (
-                entity_type TEXT NOT NULL,
-                entity_id BLOB NOT NULL,
-                purged_at INTEGER NOT NULL,
-                purged_at_offset INTEGER,
-                purged_at_zone TEXT,
-                device_id BLOB,
-                seq INTEGER,
-                PRIMARY KEY (entity_type, entity_id)
-            );
-            "#,
-        )?;
-
-        // (table, columns whose change means "publish again")
-        let tables: [(&str, &[&str]); 10] = [
-            ("field_versions", &["published"]),
-            ("notes", &["content", "modified_at", "deleted_at", "primary_attachment_id"]),
-            ("tags", &["name", "parent_id", "modified_at", "deleted_at"]),
-            ("note_tags", &["modified_at", "deleted_at"]),
-            ("note_attachments", &["modified_at", "deleted_at"]),
-            ("audio_files", &["filename", "file_created_at", "duration_seconds", "summary", "modified_at", "deleted_at", "storage_provider", "storage_key", "storage_uploaded_at", "primary_transcription_id", "content_sha256", "storage_encrypted", "disk_name", "waveform_levels", "size_bytes"]),
-            ("transcriptions", &["content", "content_segments", "service_response", "state", "modified_at", "deleted_at"]),
-            ("file_storage_config", &["provider", "config", "modified_at"]),
-            ("file_locations", &["present", "changed_at", "changed_by"]),
-            // A purge is written once and never changed, so it only needs
-            // the insert trigger.
-            ("purges", &[]),
-        ];
-        for (table, cols) in tables {
-            let fresh = !self.column_exists(table, "seq")?;
-            if fresh {
-                self.conn.execute(&format!("ALTER TABLE {} ADD COLUMN seq INTEGER", table), [])?;
-            }
-            self.conn.execute(
-                &format!("CREATE INDEX IF NOT EXISTS idx_{}_seq ON {}(seq)", table, table),
-                [],
-            )?;
-            if fresh {
-                // Existing rows: versions first so that they precede their rows
-                self.conn.execute(
-                    &format!(
-                        "UPDATE {t} SET seq = (SELECT value FROM sync_sequence WHERE id = 1) + rowid WHERE seq IS NULL",
-                        t = table
-                    ),
-                    [],
-                )?;
-                self.conn.execute(
-                    &format!(
-                        "UPDATE sync_sequence SET value = COALESCE((SELECT MAX(seq) FROM {t}), value) WHERE id = 1",
-                        t = table
-                    ),
-                    [],
-                )?;
-            }
-            let bump = format!(
-                "UPDATE sync_sequence SET value = value + 1 WHERE id = 1; \
-                 UPDATE {t} SET seq = (SELECT value FROM sync_sequence WHERE id = 1) WHERE rowid = NEW.rowid;",
-                t = table
-            );
-            self.conn.execute_batch(&format!(
-                "CREATE TRIGGER IF NOT EXISTS trg_{t}_seq_insert AFTER INSERT ON {t} BEGIN {bump} END;",
-                t = table, bump = bump
-            ))?;
-            if !cols.is_empty() {
-                let of = cols.join(", ");
-                let when = cols
-                    .iter()
-                    .map(|c| format!("NEW.{c} IS NOT OLD.{c}", c = c))
-                    .collect::<Vec<_>>()
-                    .join(" OR ");
-                // A database made before a column joined this list keeps a
-                // trigger that never publishes that column: rebuilt then, and
-                // only then, inside a write transaction that checks again, so
-                // several processes opening one database never race to rebuild it
-                let name = format!("trg_{}_seq_update", table);
-                let current = format!("AFTER UPDATE OF {} ON {}", of, table);
-                if !self.trigger_mentions(&name, &current)? {
-                    self.conn.execute_batch("BEGIN IMMEDIATE")?;
-                    let rebuilt = (|| -> VoiceResult<()> {
-                        if !self.trigger_mentions(&name, &current)? {
-                            self.conn.execute_batch(&format!(
-                                "DROP TRIGGER IF EXISTS {name}; CREATE TRIGGER IF NOT EXISTS {name} AFTER UPDATE OF {of} ON {t} WHEN {when} BEGIN {bump} END;",
-                                name = name, t = table, of = of, when = when, bump = bump
-                            ))?;
-                        }
-                        Ok(())
-                    })();
-                    match rebuilt {
-                        Ok(()) => self.conn.execute_batch("COMMIT")?,
-                        Err(e) => {
-                            let _ = self.conn.execute_batch("ROLLBACK");
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether a trigger exists and its definition holds `text`.
-    fn trigger_mentions(&self, name: &str, text: &str) -> VoiceResult<bool> {
-        let sql: Option<String> = self
-            .conn
-            .query_row("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", [name], |r| r.get(0))
-            .optional()?;
-        Ok(sql.is_some_and(|sql| sql.contains(text)))
-    }
-
-    fn column_exists(&self, table: &str, column: &str) -> VoiceResult<bool> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", table))?;
-        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
-        for n in names {
-            if n? == column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Attach the timezone that came with a row from a peer to each timestamp
     /// that actually took the peer's value.
     ///
     /// The `WHERE <stamp> = ?` clause is what makes this safe: when the upsert
     /// kept a value of its own, the peer's zone is not recorded against it.
-    /// A peer that predates the timezone fields sends none, and the row keeps
-    /// whatever it had.
+    /// A row that names no zone for a timestamp leaves that timestamp's zone as it is.
     pub fn apply_zones_by_id(&self, table: &str, id_hex: &str, stamps: &[&str], data: &serde_json::Value) -> VoiceResult<()> {
         let id = Uuid::parse_str(id_hex)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?
@@ -9353,60 +8112,6 @@ impl Database {
             "UPDATE {table} SET seq = (SELECT value FROM sync_sequence WHERE id = 1) WHERE id = ?"
         );
         self.conn.execute(&sql, params![id.to_vec()])?;
-        Ok(())
-    }
-
-    /// Whether a table already has a column.
-    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
-        let sql = format!("PRAGMA table_info({})", table);
-        let Ok(mut stmt) = conn.prepare(&sql) else { return false };
-        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else { return false };
-        let found = rows.filter_map(|r| r.ok()).any(|name| name == column);
-        found
-    }
-
-    /// Put the timezone of the action next to every user-visible timestamp.
-    ///
-    /// A Unix timestamp is an instant and cannot say what the clock read where
-    /// the action happened, so each one is followed by `<stamp>_offset`
-    /// (seconds east of UTC at that moment) and `<stamp>_zone` (the IANA name
-    /// when the device knew it). A note recorded at 15:20 in Jerusalem is then
-    /// still shown as 15:20 from New York.
-    ///
-    /// Sync bookkeeping (`sync_received_at`, `last_sync_at`, `seq`) and the
-    /// cloud upload time deliberately get none: no screen shows them, and they
-    /// are machine events rather than something a person did.
-    ///
-    /// Rows written before this migration keep NULL, and a reader shows those
-    /// in its own timezone, exactly as it did before.
-    fn migrate_add_timezone_columns(&mut self) -> VoiceResult<()> {
-        for (table, stamps) in STAMPED_COLUMNS {
-            for stamp in stamps.iter() {
-                for (suffix, kind) in [("offset", "INTEGER"), ("zone", "TEXT")] {
-                    let column = format!("{}_{}", stamp, suffix);
-                    if !Self::has_column(&self.conn, table, &column) {
-                        self.conn.execute_batch(&format!(
-                            "ALTER TABLE {} ADD COLUMN {} {}",
-                            table, column, kind
-                        ))?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn migrate_drop_legacy_conflict_tables(&mut self) -> VoiceResult<()> {
-        self.conn.execute_batch(
-            r#"
-            DROP TABLE IF EXISTS conflicts_note_content;
-            DROP TABLE IF EXISTS conflicts_note_delete;
-            DROP TABLE IF EXISTS conflicts_tag_rename;
-            DROP TABLE IF EXISTS conflicts_tag_parent;
-            DROP TABLE IF EXISTS conflicts_tag_delete;
-            DROP TABLE IF EXISTS conflicts_note_tag;
-            "#,
-        )?;
         Ok(())
     }
 
