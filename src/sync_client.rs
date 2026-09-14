@@ -493,11 +493,16 @@ impl SyncClient {
             addresses: String::new(),
             application: crate::auth::APPLICATION_VOICE.to_string(),
         };
-        let client = build_client(&setup.certificate_fingerprint, &setup.urls[0])?;
         let mut last_error = String::new();
         let mut reply: Option<(String, crate::sync_protocol::PairClaimResponse)> = None;
+        // Every address of the code in turn (LISTEN-4): the showing device may
+        // not know which of its addresses this device reaches
         for url in &setup.urls {
-            check_scheme(url)?;
+            if let Err(e) = check_scheme(url) {
+                last_error = format!("{}: {}", url, e);
+                continue;
+            }
+            let client = build_client(&setup.certificate_fingerprint, url)?;
             match client.post(format!("{}/pair/claim", url.trim_end_matches('/'))).json(&request).send().await {
                 Ok(response) if response.status().is_success() => {
                     let body: crate::sync_protocol::PairClaimResponse = response
@@ -706,15 +711,15 @@ impl SyncClient {
             None => return self.failed(format!("Unknown peer: {}", peer_id)),
         };
 
-        let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
         result.request_id = self.request_id();
 
         // Step 1: Handshake, and find where we stand with this peer
-        let handshake = match self.handshake(peer_url).await {
-            Ok(h) => h,
+        let (reached, handshake) = match self.reach(peer_id, &peer.peer_url).await {
+            Ok(r) => r,
             Err(e) => return self.failed(format!("Handshake failed: {}", e)),
         };
+        let peer_url = &reached;
         if let Err(sentence) = self.check_account(peer_id, &handshake) {
             return self.failed(sentence);
         }
@@ -931,14 +936,14 @@ impl SyncClient {
             None => return self.failed(format!("Unknown peer: {}", peer_id)),
         };
 
-        let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
         result.request_id = self.request_id();
 
-        let handshake = match self.handshake(peer_url).await {
-            Ok(h) => h,
+        let (reached, handshake) = match self.reach(peer_id, &peer.peer_url).await {
+            Ok(r) => r,
             Err(e) => return self.failed(format!("Handshake failed: {}", e)),
         };
+        let peer_url = &reached;
         if let Err(sentence) = self.check_account(peer_id, &handshake) {
             return self.failed(sentence);
         }
@@ -974,14 +979,14 @@ impl SyncClient {
             None => return self.failed(format!("Unknown peer: {}", peer_id)),
         };
 
-        let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
         result.request_id = self.request_id();
 
-        let handshake = match self.handshake(peer_url).await {
-            Ok(h) => h,
+        let (reached, handshake) = match self.reach(peer_id, &peer.peer_url).await {
+            Ok(r) => r,
             Err(e) => return self.failed(format!("Handshake failed: {}", e)),
         };
+        let peer_url = &reached;
         if let Err(sentence) = self.check_account(peer_id, &handshake) {
             return self.failed(sentence);
         }
@@ -1021,15 +1026,15 @@ impl SyncClient {
             None => return self.failed(format!("Unknown peer: {}", peer_id)),
         };
 
-        let peer_url = &peer.peer_url;
         let mut result = SyncResult::success();
         result.request_id = self.request_id();
 
         // Step 1: Handshake
-        let handshake = match self.handshake(peer_url).await {
-            Ok(h) => h,
+        let (reached, handshake) = match self.reach(peer_id, &peer.peer_url).await {
+            Ok(r) => r,
             Err(e) => return self.failed(format!("Handshake failed: {}", e)),
         };
+        let peer_url = &reached;
         if let Err(sentence) = self.check_account(peer_id, &handshake) {
             return self.failed(sentence);
         }
@@ -1419,6 +1424,59 @@ impl SyncClient {
     // Internal methods
 
     async fn handshake(&self, peer_url: &str) -> VoiceResult<HandshakeResponse> {
+        let client = self.client_for(peer_url)?;
+        self.handshake_with(&client, peer_url).await
+    }
+
+    /// The handshake with a peer, at its remembered address, and when that
+    /// address does not answer, at each address the peer's card names, in
+    /// turn, through a client pinned to the peer's certificate (LISTEN-4). An
+    /// address that answers for this peer becomes the remembered one. Returns
+    /// the address that answered and the handshake.
+    async fn reach(&self, peer_id: &str, remembered: &str) -> VoiceResult<(String, HandshakeResponse)> {
+        let first = self.handshake(remembered).await;
+        if !matches!(first, Err(VoiceError::Network(_))) {
+            return first.map(|h| (remembered.to_string(), h));
+        }
+        let card = self.db.lock().ok().and_then(|db| db.get_device_card(peer_id).ok().flatten());
+        let addresses: Vec<String> = card
+            .as_ref()
+            .and_then(|c| serde_json::from_str::<Vec<String>>(&c.addresses).ok())
+            .unwrap_or_default();
+        let (name, pin) = {
+            let config = self.config.lock().unwrap();
+            let peer = config.get_peer(peer_id);
+            (
+                peer.map(|p| p.peer_name.clone()).unwrap_or_default(),
+                peer.and_then(|p| p.certificate_fingerprint.clone())
+                    .or_else(|| card.as_ref().map(|c| c.certificate_fingerprint.clone()).filter(|f| !f.is_empty()))
+                    .unwrap_or_default(),
+            )
+        };
+        for url in addresses.iter().filter(|u| u.trim_end_matches('/') != remembered.trim_end_matches('/')) {
+            if check_scheme(url).is_err() {
+                continue;
+            }
+            let Ok(client) = build_client(&pin, url) else { continue };
+            match self.handshake_with(&client, url).await {
+                Ok(handshake) if handshake.device_id == peer_id => {
+                    {
+                        let mut config = self.config.lock().unwrap();
+                        let pin = if pin.is_empty() { None } else { Some(pin.as_str()) };
+                        config.add_peer(peer_id, &name, url, pin, true)?;
+                    }
+                    self.clients.lock().unwrap().clear();
+                    tracing::info!("{} answered at {}; {} did not", short_id(peer_id), url, remembered);
+                    return Ok((url.clone(), handshake));
+                }
+                Ok(_) => tracing::debug!("Another device answers at {}", url),
+                Err(e) => tracing::debug!("{} did not answer at {}: {}", short_id(peer_id), url, e),
+            }
+        }
+        first.map(|h| (remembered.to_string(), h))
+    }
+
+    async fn handshake_with(&self, client: &Client, peer_url: &str) -> VoiceResult<HandshakeResponse> {
         let request = HandshakeRequest {
             device_id: self.device_id.clone(),
             device_name: self.device_name.clone(),
@@ -1430,7 +1488,7 @@ impl SyncClient {
         };
 
         let response = self
-            .authed(self.client_for(peer_url)?.post(format!("{}/sync/handshake", peer_url)))
+            .authed(client.post(format!("{}/sync/handshake", peer_url)))
             .json(&request)
             .send()
             .await

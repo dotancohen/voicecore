@@ -141,6 +141,17 @@ pub struct AudioFileData {
     pub origin_kind: String,
 }
 
+/// Where this phone's listener can be reached (LISTEN-4): the address found
+/// through the phone's route (`detected`), or every candidate with the
+/// sentence saying that only one is correct; `urls` is what a code carries.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ListenAddressesData {
+    pub detected: bool,
+    pub shown: Vec<String>,
+    pub urls: Vec<String>,
+    pub sentence: String,
+}
+
 /// A note-attachment association from the database
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct NoteAttachmentData {
@@ -735,9 +746,17 @@ impl VoiceClient {
         Ok(fingerprint)
     }
 
-    /// Where this phone would be reachable at `port`, for the sync screen.
+    /// Where this phone would be reachable at `port`, in the order another
+    /// device tries the addresses.
     pub fn listen_urls(&self, port: u16) -> Vec<String> {
         crate::sync_server::listen_urls("0.0.0.0", port, false)
+    }
+
+    /// Where this phone would be reachable at `port`, for the sync screen and
+    /// a code (LISTEN-4).
+    pub fn listen_addresses(&self, port: u16) -> ListenAddressesData {
+        let a = crate::sync_server::listen_addresses("0.0.0.0", port, false);
+        ListenAddressesData { detected: a.detected, shown: a.shown, urls: a.urls, sentence: a.sentence }
     }
 
     /// Every device of the account, by its card (CARD-1).
@@ -2293,12 +2312,13 @@ impl VoiceClient {
             let dir = self.config.lock().unwrap().audiofile_directory().map(std::path::PathBuf::from)
                 .ok_or_else(|| VoiceCoreError::Sync { msg: "No audio directory is configured".to_string() })?;
             let key = self.config.lock().ok().and_then(|c| c.recording_key());
+            let here = self.config.lock().unwrap().device_id_hex().to_string();
             let sink: Option<Arc<dyn crate::sync_client::ProgressSink>> = progress.map(|p| Arc::new(ProgressBridge(p)) as Arc<dyn crate::sync_client::ProgressSink>);
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
                 .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
             self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
             let db = self.db.lock().unwrap();
-            let result = rt.block_on(crate::file_storage::reupload_encrypted(&db, &dir, Some(self.cancel.clone()), sink, key.as_ref()));
+            let result = rt.block_on(crate::file_storage::reupload_encrypted(&db, &dir, Some(self.cancel.clone()), sink, key.as_ref(), &here));
             match result {
                 Ok(r) => Ok(UploadResultData { uploaded: r.uploaded as i32, skipped: r.skipped as i32, failed: r.failed as i32, deferred: r.deferred as i32, too_large: r.too_large as i32, errors: r.errors }),
                 Err(e) => Err(VoiceCoreError::Sync { msg: e.to_string() }),
@@ -2316,9 +2336,9 @@ impl VoiceClient {
     pub fn upload(&self) -> Result<UploadResultData, VoiceCoreError> {
         #[cfg(feature = "file-storage")]
         {
-            let dir = {
+            let (dir, here) = {
                 let cfg = self.config.lock().unwrap();
-                cfg.audiofile_directory().map(std::path::PathBuf::from)
+                (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
             };
             let dir = dir.ok_or_else(|| VoiceCoreError::Sync {
                 msg: "No audio directory is configured".to_string(),
@@ -2329,7 +2349,7 @@ impl VoiceClient {
                 .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
             let db = self.db.lock().unwrap();
             let key = self.config.lock().ok().and_then(|c| c.recording_key());
-            let result = rt.block_on(crate::file_storage::upload_pending_audio_files(&db, &dir, None, None, key.as_ref()));
+            let result = rt.block_on(crate::file_storage::upload_pending_audio_files(&db, &dir, None, None, key.as_ref(), &here));
             match result {
                 Ok(r) => Ok(UploadResultData {
                     uploaded: r.uploaded as i32,

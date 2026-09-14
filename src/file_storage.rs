@@ -409,6 +409,8 @@ pub async fn upload_pending_audio_files(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
     recording_key: Option<&crate::crypto::RecordingKey>,
+    // This device's id, from its configuration: hashing a file states that it holds it (FILE-22)
+    here: &str,
 ) -> Result<UploadPendingResult, FileStorageError> {
     let storage = create_storage_service(db)?.ok_or_else(|| {
         FileStorageError::Config(
@@ -418,7 +420,7 @@ pub async fn upload_pending_audio_files(
     let pending_files = db
         .get_audio_files_pending_upload()
         .map_err(|e| FileStorageError::Config(format!("Failed to get pending files: {}", e)))?;
-    upload_files_with(&storage, db, audiofile_directory, pending_files, cancel, sink, recording_key).await
+    upload_files_with(&storage, db, audiofile_directory, pending_files, cancel, sink, recording_key, here).await
 }
 
 /// The sentence when encryption is on and this device holds no key.
@@ -435,6 +437,8 @@ pub async fn upload_files_with<S: FileStorageService>(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
     recording_key: Option<&crate::crypto::RecordingKey>,
+    // This device's id, from its configuration: hashing a file states that it holds it (FILE-22)
+    here: &str,
 ) -> Result<UploadPendingResult, FileStorageError> {
     let encrypt = db.encryption_on().map_err(|e| FileStorageError::Config(e.to_string()))?;
     if encrypt && recording_key.is_none() {
@@ -492,7 +496,7 @@ pub async fn upload_files_with<S: FileStorageService>(
         // The hash first (Stage 13): the key is by it, and a fetch verifies by it
         let hash = match &audio_file.content_sha256 {
             Some(h) => Some(h.clone()),
-            None => match db.store_content_hash(&audio_file.id, audiofile_directory, &crate::database::get_local_device_id().simple().to_string()) {
+            None => match db.store_content_hash(&audio_file.id, audiofile_directory, here) {
                 Ok(h) => Some(h),
                 Err(e) => {
                     tracing::warn!("Could not hash {}: {}", audio_file.id, e);
@@ -636,9 +640,11 @@ pub async fn reupload_encrypted(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
     recording_key: Option<&crate::crypto::RecordingKey>,
+    // This device's id, from its configuration: hashing a file states that it holds it (FILE-22)
+    here: &str,
 ) -> Result<UploadPendingResult, FileStorageError> {
     let storage = create_storage_service(db)?.ok_or_else(|| FileStorageError::Config("Cloud storage is not enabled.".to_string()))?;
-    reupload_encrypted_with(&storage, db, audiofile_directory, cancel, sink, recording_key).await
+    reupload_encrypted_with(&storage, db, audiofile_directory, cancel, sink, recording_key, here).await
 }
 
 #[cfg(feature = "file-storage")]
@@ -649,6 +655,8 @@ pub async fn reupload_encrypted_with<S: FileStorageService>(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     sink: Option<std::sync::Arc<dyn crate::sync_client::ProgressSink>>,
     recording_key: Option<&crate::crypto::RecordingKey>,
+    // This device's id, from its configuration: hashing a file states that it holds it (FILE-22)
+    here: &str,
 ) -> Result<UploadPendingResult, FileStorageError> {
     if !db.encryption_on().map_err(|e| FileStorageError::Config(e.to_string()))? {
         return Err(FileStorageError::Config("Encryption is off; turn it on first".to_string()));
@@ -660,7 +668,7 @@ pub async fn reupload_encrypted_with<S: FileStorageService>(
         .filter(|row| row.deleted_at.is_none() && row.storage_key.is_some() && !row.storage_encrypted)
         .collect();
     let old_keys: Vec<(String, String)> = plain_in_bucket.iter().filter_map(|r| r.storage_key.clone().map(|k| (r.id.clone(), k))).collect();
-    let result = upload_files_with(storage, db, audiofile_directory, plain_in_bucket, cancel, sink, recording_key).await?;
+    let result = upload_files_with(storage, db, audiofile_directory, plain_in_bucket, cancel, sink, recording_key, here).await?;
     for (id, old_key) in old_keys {
         if let Ok(Some(row)) = db.get_audio_file(&id) {
             if row.storage_encrypted && row.storage_key.as_deref() != Some(old_key.as_str()) {
@@ -1361,7 +1369,7 @@ mod tests {
             std::fs::write(audio_local_path(&dir, &small.disk_name), vec![2u8; 1024 * 1024]).unwrap();
             let storage = FakeStorage { objects: Default::default(), downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
             let pending = db.get_audio_files_pending_upload().unwrap();
-            let result = upload_files_with(&storage, &db, &dir, pending, None, None, None).await.unwrap();
+            let result = upload_files_with(&storage, &db, &dir, pending, None, None, None, "01a09526bbbb70808f15a84d31aaa8d2").await.unwrap();
             assert_eq!((result.uploaded, result.too_large, result.failed), (1, 1, 0), "{:?}", result.errors);
             assert!(db.get_audio_file(&big.id).unwrap().unwrap().storage_key.is_none());
             assert!(db.get_audio_file(&small.id).unwrap().unwrap().storage_key.is_some(), "exactly the limit is allowed");
@@ -1552,10 +1560,10 @@ mod tests {
             let key = crate::crypto::RecordingKey::generate();
             let storage = FakeStorage { objects: Default::default(), downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
 
-            let without = upload_files_with(&storage, &db, &dir, vec![db.get_audio_file(&row.id).unwrap().unwrap()], None, None, None).await;
+            let without = upload_files_with(&storage, &db, &dir, vec![db.get_audio_file(&row.id).unwrap().unwrap()], None, None, None, "01a09526bbbb70808f15a84d31aaa8d2").await;
             assert!(matches!(&without, Err(FileStorageError::Config(m)) if m == NO_RECORDING_KEY), "{:?}", without.err());
 
-            let result = upload_files_with(&storage, &db, &dir, vec![db.get_audio_file(&row.id).unwrap().unwrap()], None, None, Some(&key)).await.unwrap();
+            let result = upload_files_with(&storage, &db, &dir, vec![db.get_audio_file(&row.id).unwrap().unwrap()], None, None, Some(&key), "01a09526bbbb70808f15a84d31aaa8d2").await.unwrap();
             assert_eq!((result.uploaded, result.failed), (1, 0), "{:?}", result.errors);
             let after = db.get_audio_file(&row.id).unwrap().unwrap();
             let object_key = after.storage_key.clone().unwrap();
@@ -1601,9 +1609,9 @@ mod tests {
             let plain_elsewhere = row(&db, "elsewhere.ogg", true);
             let key = crate::crypto::RecordingKey::generate();
             let storage = FakeStorage { objects: Default::default(), downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
-            assert!(reupload_encrypted_with(&storage, &db, &dir, None, None, Some(&key)).await.is_err(), "encryption is off");
+            assert!(reupload_encrypted_with(&storage, &db, &dir, None, None, Some(&key), "01a09526bbbb70808f15a84d31aaa8d2").await.is_err(), "encryption is off");
             db.set_encryption_on(true).unwrap();
-            let result = reupload_encrypted_with(&storage, &db, &dir, None, None, Some(&key)).await.unwrap();
+            let result = reupload_encrypted_with(&storage, &db, &dir, None, None, Some(&key), "01a09526bbbb70808f15a84d31aaa8d2").await.unwrap();
             assert_eq!((result.uploaded, result.skipped, result.failed), (1, 1, 0), "{:?}", result.errors);
             let after = db.get_audio_file(&plain_here.id).unwrap().unwrap();
             assert!(after.storage_encrypted && after.storage_key.as_deref().unwrap().ends_with(".enc"));
@@ -1621,7 +1629,7 @@ mod tests {
             row(&db, "elsewhere.mp3", false);
 
             // Storage not configured -> Config error for the explicit call
-            match upload_pending_audio_files(&db, &dir, None, None, None).await {
+            match upload_pending_audio_files(&db, &dir, None, None, None, "01a09526bbbb70808f15a84d31aaa8d2").await {
                 Err(FileStorageError::Config(_)) => {}
                 other => panic!("expected Config error, got {:?}", other.map(|_| ())),
             }
@@ -1633,7 +1641,7 @@ mod tests {
                 "access_key_id": "k", "secret_access_key": "s"
             });
             db.set_file_storage_config("s3", Some(&cfg)).unwrap();
-            let result = upload_pending_audio_files(&db, &dir, None, None, None).await.unwrap();
+            let result = upload_pending_audio_files(&db, &dir, None, None, None, "01a09526bbbb70808f15a84d31aaa8d2").await.unwrap();
             assert_eq!(result.skipped, 1);
             assert_eq!(result.uploaded, 0);
             assert_eq!(result.failed, 0);

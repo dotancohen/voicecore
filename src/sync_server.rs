@@ -1268,31 +1268,125 @@ pub fn create_router_for(accounts: Arc<dyn AccountSource>, machine: Arc<Mutex<Co
         .with_state(state)
 }
 
-/// Where a listener is reachable, for its own card, for a code and for a
-/// person typing the address: `https://<host>:<port>`. A listener bound to
-/// one address reports that address; one bound to every address reports
-/// this machine's host name.
-pub fn listen_urls(host: &str, port: u16, plain_http: bool) -> Vec<String> {
+/// Where a listener can be reached (LISTEN-4), for its own card, for a code and
+/// for a screen. `urls` is every address another device should try, in order;
+/// `shown` is what a screen shows: the one address this device found through
+/// its route to the network (`detected`), or, when it could not tell, every
+/// candidate, with `sentence` saying that only one of them is correct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenAddresses {
+    pub detected: bool,
+    pub shown: Vec<String>,
+    pub urls: Vec<String>,
+    pub sentence: String,
+}
+
+/// What a screen says beside the candidates when the address was not found (LISTEN-4).
+pub const CANDIDATES_SENTENCE: &str =
+    "Only one of these addresses is correct; this device could not tell which. Another device tries each of them in turn.";
+
+/// What a screen says when no address on a local network was found (LISTEN-4).
+pub const NO_ADDRESS_SENTENCE: &str = "No address on a local network was found. Is this device on a network?";
+
+/// Interfaces that never carry the local network another device is on:
+/// containers, virtual machines, tunnels and VPNs, a phone's mobile data.
+const VIRTUAL_INTERFACE_PREFIXES: &[&str] = &[
+    "docker", "br-", "veth", "virbr", "vmnet", "vboxnet", "tun", "tap", "wg", "zt", "tailscale", "lxc", "lxdbr", "cni",
+    "flannel", "podman", "kube", "dummy", "rmnet", "ccmni", "p2p", "utun", "ipsec",
+];
+
+/// Where a listener bound to `host` is reachable (LISTEN-4). A listener bound
+/// to one address reports that address; one bound to every address reports
+/// this machine's addresses on a local network, the one its route uses first.
+pub fn listen_addresses(host: &str, port: u16, plain_http: bool) -> ListenAddresses {
     let scheme = if plain_http { "http" } else { "https" };
     if host != "0.0.0.0" && host != "::" && !host.is_empty() {
-        return vec![format!("{}://{}:{}", scheme, host, port)];
+        let url = format!("{}://{}:{}", scheme, host, port);
+        return ListenAddresses { detected: true, shown: vec![url.clone()], urls: vec![url], sentence: String::new() };
     }
-    let mut urls: Vec<String> = if_addrs::get_if_addrs()
-        .map(|ifs| {
-            ifs.into_iter()
-                .filter(|i| !i.is_loopback())
-                .filter_map(|i| match i.ip() {
-                    std::net::IpAddr::V4(v4) if v4.is_private() || v4.is_link_local() => Some(format!("{}://{}:{}", scheme, v4, port)),
-                    _ => None,
-                })
-                .collect()
-        })
+    let interfaces: Vec<(String, std::net::IpAddr)> = if_addrs::get_if_addrs()
+        .map(|ifs| ifs.into_iter().map(|i| (i.name.clone(), i.ip())).collect())
         .unwrap_or_default();
-    urls.sort();
-    if let Some(name) = hostname_of_this_machine() {
+    choose_addresses(&interfaces, route_source(), hostname_of_this_machine().as_deref(), scheme, port)
+}
+
+/// Every address another device should try, in order (see [`listen_addresses`]).
+pub fn listen_urls(host: &str, port: u16, plain_http: bool) -> Vec<String> {
+    listen_addresses(host, port, plain_http).urls
+}
+
+/// The source address of this machine's route to the wider network: the
+/// address a device on the same network reaches it at. A UDP socket chooses
+/// its route when it connects, and nothing is sent. None without a route.
+fn route_source() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // TEST-NET-1 (RFC 5737): routed like any address beyond the network, and never reached
+    socket.connect("192.0.2.1:9").ok()?;
+    socket.local_addr().ok().map(|a| a.ip())
+}
+
+/// The addresses of a listener, from this machine's interfaces, the route's
+/// source address and its host name: the seam the tests drive. Candidates are
+/// the private IPv4 addresses of interfaces that can carry a local network
+/// (a link-local one only when there is nothing else). The route's address is
+/// the one found when it is a candidate, and so is a single candidate; the
+/// host name is tried last, where a network resolves names.
+fn choose_addresses(
+    interfaces: &[(String, std::net::IpAddr)],
+    route: Option<std::net::IpAddr>,
+    hostname: Option<&str>,
+    scheme: &str,
+    port: u16,
+) -> ListenAddresses {
+    use std::net::{IpAddr, Ipv4Addr};
+    let rank = |ip: &Ipv4Addr| -> u8 {
+        match ip.octets() {
+            [192, 168, ..] => 0,
+            [10, ..] => 1,
+            [172, b, ..] if (16..32).contains(&b) => 2,
+            _ => 3,
+        }
+    };
+    let mut candidates: Vec<Ipv4Addr> = Vec::new();
+    for (name, ip) in interfaces {
+        let IpAddr::V4(v4) = ip else { continue };
+        if v4.is_loopback() || !(v4.is_private() || v4.is_link_local()) {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if VIRTUAL_INTERFACE_PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
+            continue;
+        }
+        if !candidates.contains(v4) {
+            candidates.push(*v4);
+        }
+    }
+    if candidates.iter().any(|ip| rank(ip) < 3) {
+        candidates.retain(|ip| rank(ip) < 3);
+    }
+    candidates.sort_by_key(|ip| (rank(ip), ip.octets()));
+    let on_route = match route {
+        Some(IpAddr::V4(v4)) => candidates.iter().position(|ip| *ip == v4),
+        _ => None,
+    };
+    if let Some(index) = on_route {
+        let ip = candidates.remove(index);
+        candidates.insert(0, ip);
+    }
+    let detected = on_route.is_some() || candidates.len() == 1;
+    let mut urls: Vec<String> = candidates.iter().map(|ip| format!("{}://{}:{}", scheme, ip, port)).collect();
+    let shown: Vec<String> = if detected { urls.iter().take(1).cloned().collect() } else { urls.clone() };
+    let sentence = if shown.is_empty() {
+        NO_ADDRESS_SENTENCE.to_string()
+    } else if detected {
+        String::new()
+    } else {
+        CANDIDATES_SENTENCE.to_string()
+    };
+    if let Some(name) = hostname.map(str::trim).filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost")) {
         urls.push(format!("{}://{}:{}", scheme, name, port));
     }
-    urls
+    ListenAddresses { detected, shown, urls, sentence }
 }
 
 /// Say on this device's own card that it listens at `urls`, or that it
@@ -1945,6 +2039,30 @@ mod tests {
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(phone.db.lock().unwrap().get_all_notes().unwrap().len(), 2);
             assert_eq!(desk.db.lock().unwrap().get_all_notes().unwrap().len(), 2);
+            task.abort();
+        }
+
+        /// LISTEN-4: a code names every address the showing device has, and the
+        /// reading device tries each in turn: one that does not answer costs
+        /// only its own attempt, and the address that answered is remembered.
+        #[tokio::test]
+        async fn a_code_whose_first_address_does_not_answer_is_claimed_at_the_next() {
+            let desk = device("Desk");
+            let (url, task) = serve_tls(&desk);
+            let dead = {
+                let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                format!("https://127.0.0.1:{}", gone.local_addr().unwrap().port())
+            };
+            let setup = {
+                let db = desk.db.lock().unwrap();
+                let cfg = desk.config.lock().unwrap();
+                crate::pairing::offer(&db, &cfg, vec![dead.clone(), url.clone()]).unwrap()
+            };
+            let phone = device("Phone");
+            let client = SyncClient::new(phone.db.clone(), phone.config.clone()).unwrap();
+            let joined = client.join(&setup.to_text()).await.unwrap();
+            assert_eq!(joined.peer_url, url);
+            assert_eq!(phone.config.lock().unwrap().get_peer(&desk.id).unwrap().peer_url, url);
             task.abort();
         }
 
@@ -2636,6 +2754,44 @@ mod tests {
             d.db.lock().unwrap().get_device_card(&d.id).unwrap().unwrap()
         }
 
+        /// LISTEN-4: a peer whose remembered address no longer answers is
+        /// reached at the addresses its card names, in turn, and the address
+        /// that answered is remembered.
+        #[tokio::test]
+        async fn a_peer_that_moved_is_reached_at_an_address_its_card_names() {
+            let a = device("A");
+            let b = device("B");
+            let account = a.db.lock().unwrap().account_id().unwrap();
+            b.db.lock().unwrap().move_to_account(&account).unwrap();
+            a.db.lock().unwrap().admit_device_card(&card_of(&b)).unwrap();
+            b.db.lock().unwrap().admit_device_card(&card_of(&a)).unwrap();
+            let dead = {
+                let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                format!("http://127.0.0.1:{}", gone.local_addr().unwrap().port())
+            };
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            {
+                let db = b.db.lock().unwrap();
+                let mut cfg = b.config.lock().unwrap();
+                record_listening(&db, &mut cfg, &[dead.clone(), url.clone()], true).unwrap();
+            }
+            let router = create_router(b.db.clone(), b.config.clone()).into_make_service_with_connect_info::<SocketAddr>();
+            let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
+            let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
+            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            let first = client.sync_with_peer(&b.id).await;
+            assert!(first.success, "{:?}", first.errors);
+
+            // B's address changed: A remembers one that no longer answers
+            a.config.lock().unwrap().add_peer(&b.id, "B", &dead, None, true).unwrap();
+            let again = client.sync_with_peer(&b.id).await;
+            assert!(again.success, "{:?}", again.errors);
+            assert_eq!(a.config.lock().unwrap().get_peer(&b.id).unwrap().peer_url, url, "the address that answered is remembered");
+            task.abort();
+        }
+
         #[tokio::test]
         async fn after_a_sync_every_card_is_a_peer_a_revoked_one_goes_and_a_forgotten_one_stays_away() {
             let a = device("A");
@@ -3172,6 +3328,46 @@ mod tests {
                 let card = db.lock().unwrap().get_device_card(&device_id).unwrap().unwrap();
                 assert_eq!(card.listens, "0", "round {}: the card says the listener stopped", round);
             }
+        }
+
+        /// LISTEN-4: the address on this machine's route is shown alone and
+        /// tried first; containers, tunnels and a phone's "localhost" are left
+        /// out; without a route every candidate is shown with the sentence
+        /// that only one is correct.
+        #[test]
+        fn the_address_on_the_route_is_shown_alone_and_virtual_interfaces_are_left_out() {
+            let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+            let interfaces = vec![
+                ("lo".to_string(), ip("127.0.0.1")),
+                ("docker0".to_string(), ip("172.17.0.1")),
+                ("br-5f2a".to_string(), ip("172.18.0.1")),
+                ("tailscale0".to_string(), ip("100.101.102.103")),
+                ("wlp3s0".to_string(), ip("192.168.1.23")),
+                ("enp2s0".to_string(), ip("10.0.0.5")),
+                ("wlp3s0".to_string(), ip("fe80::1")),
+            ];
+            let found = choose_addresses(&interfaces, Some(ip("10.0.0.5")), Some("שולחן"), "https", 8384);
+            assert!(found.detected);
+            assert_eq!(found.shown, vec!["https://10.0.0.5:8384"]);
+            assert_eq!(found.urls, vec!["https://10.0.0.5:8384", "https://192.168.1.23:8384", "https://שולחן:8384"], "the others are still tried, after it");
+            assert!(found.sentence.is_empty());
+
+            let unsure = choose_addresses(&interfaces, None, Some("localhost"), "https", 8384);
+            assert!(!unsure.detected);
+            assert_eq!(unsure.shown, vec!["https://192.168.1.23:8384", "https://10.0.0.5:8384"]);
+            assert_eq!(unsure.urls, unsure.shown, "a phone's host name, localhost, is no address");
+            assert_eq!(unsure.sentence, CANDIDATES_SENTENCE);
+
+            let one = choose_addresses(&interfaces[..5], Some(ip("100.101.102.103")), None, "https", 1);
+            assert!(one.detected, "a single candidate is the address");
+            assert_eq!(one.shown, vec!["https://192.168.1.23:1"]);
+
+            let none = choose_addresses(&interfaces[..4], None, None, "https", 1);
+            assert!(none.shown.is_empty() && none.urls.is_empty());
+            assert_eq!(none.sentence, NO_ADDRESS_SENTENCE);
+
+            let link_local = vec![("eth0".to_string(), ip("169.254.3.4")), ("wlan0".to_string(), ip("192.168.0.9"))];
+            assert_eq!(choose_addresses(&link_local, None, None, "http", 1).urls, vec!["http://192.168.0.9:1"], "link-local only when nothing better");
         }
 
         #[test]
