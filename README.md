@@ -34,7 +34,7 @@ src/
 ├── database.rs           # SQLite data access, the change feed, snapshots and backups
 ├── error.rs              # Error types
 ├── validation.rs         # Input validation
-├── config.rs             # config.json: device identity, peers, storage, backup, keys
+├── config.rs             # config.json: device identity, peers, backup, keys
 ├── accounts.rs           # Several accounts on one installation (feature "server")
 ├── auth.rs               # Device keys, device cards, request verification
 ├── pairing.rs            # Setup texts, pairing tokens, admission by token
@@ -83,8 +83,8 @@ none: no screen shows them (TZ-1, TZ-2).
 
 This is what lets a note recorded at 15:20 in Jerusalem still read 15:20 after
 its author flies to New York. A reader renders the instant at the recorded
-offset; only a row with no offset, written before these columns existed or by
-a device that never reported one, falls back to the reader's own timezone.
+offset; only a row with no offset, written by a device that never reported one,
+falls back to the reader's own timezone.
 
 The offset cannot be recovered from the instant afterwards, so the platform
 tells the core its timezone with `timezone::set_local_timezone(offset, name)`
@@ -98,16 +98,16 @@ reading, not to the event, and each interface applies its own.
 | Module | Purpose |
 |--------|---------|
 | `models` | Core data structures with UUID7 identifiers; `audio_local_path`, `audio_file_extension`, `AUDIO_FILE_FORMATS` (FILE-21) |
-| `database` | SQLite persistence: CRUD, queries, the cursor feed (`get_changes_after_seq`), the timestamp feed (`get_changes_since`), row-apply upserts, snapshots (`snapshot`, `restore_snapshot`), backups (`backup_to`), account identity (`account_id`, `move_to_account`) |
+| `database` | SQLite persistence: the schema (`create_schema`, `SCHEMA_VERSION`), CRUD, queries, the cursor feed (`get_changes_after_seq`), row-apply upserts, where each copy of a recording is (`set_file_location`, `check_files_here`, `store_content_hash`, `made_here_but_missing`), the removal of a copy (`promise_to_keep`, `begin_removal`, `finish_removal`, `abandon_removal`, FILE-26), snapshots (`snapshot`, `restore_snapshot`), backups (`backup_to`), account identity (`account_id`, `move_to_account`) |
 | `error` | `VoiceError` and `ValidationError` |
-| `validation` | UUID, datetime text, tag name, tag path, note content and search query validation |
-| `config` | `config.json`: device id and name, device key and recording key (wrapped by a `SecretWrapper` on the phone, AUTH-9), peers, sync settings, bucket settings, backup settings, public URL |
+| `validation` | UUID, audio extension, tag name, tag path, note content and search query validation |
+| `config` | `config.json`: device id and name, device key and recording key (wrapped by a `SecretWrapper` on the phone, AUTH-9), peers, sync settings, backup settings, public URL. The bucket's configuration is not here: it is in the database, synced (`file_storage_config`) |
 | `accounts` | The account index `accounts.db` of an installation root, hosting offers, and `resolve` (ACCT-6..ACCT-9); compiled with feature `server` |
 | `auth` | Device keys, key hashes, the device's own card, and `verify_request` (AUTH-1..AUTH-6, CARD-1, CARD-2) |
 | `pairing` | Setup texts (`voice://pair?...`), tokens, `offer`, `offer_hosting`, `admit_by_token`, `check_can_join` (PAIR-1..PAIR-5) |
 | `sync_protocol` | Request and response types, `PROTOCOL_VERSION`, refusal codes, header names, one definition for both sides |
-| `sync_client` | `SyncClient`: `sync_with_peer`, `pull_from_peer`, `push_to_peer`, `initial_sync`, `send_to_peer`, `fetch_from_peer`, `deliver`, `exchange`, `join`, `grant_host`, `move_to`, `check`, `adopt_peers_from_cards`, cancel and progress (FILE-17) |
-| `sync_server` | The listener: routes, the device-key middleware, the LAN gate, refusal delays, hosting several accounts (`IndexedAccounts`), the request log per hosted account, the periodic backup, the idle stop |
+| `sync_client` | `SyncClient`: `sync_with_peer`, `pull_from_peer`, `push_to_peer`, `initial_sync`, `send_to_peer`, `fetch_from_peer`, `deliver`, `exchange`, `join`, `grant_host`, `move_to`, `check`, `adopt_peers_from_cards`, `remove_local_copy` (FILE-26), a peer reached at the addresses on its card (LISTEN-4), cancel and progress (FILE-17) |
+| `sync_server` | The listener: routes, the device-key middleware, the LAN gate, refusal delays, hosting several accounts (`IndexedAccounts`), the request log per hosted account, the periodic backup, the idle stop (LISTEN-5), where the listener can be reached (`listen_addresses`, LISTEN-4) |
 | `sync_apply` | Applying incoming changes in dependency order, with retry of failures and the purge check |
 | `versions` | Field version graph, three-way merge, conflict records, synced settings, device cards |
 | `conflicts` | Thin conflict layer over `versions` |
@@ -402,9 +402,17 @@ pub struct SyncResult {
 
 ## Database Schema
 
-VoiceCore uses SQLite with UUID7 as BLOB primary keys. The schema is created in
-`Database::init_database()` and extended by the `migrate_*` functions called
-after it.
+VoiceCore uses SQLite with UUID7 as BLOB primary keys. The schema is made in one
+place, `Database::create_schema()` in `database.rs`, in one write transaction:
+`create_tables`, `create_version_tables`, `create_sequence_triggers` (the `seq`
+column's triggers of every syncable table), `create_identity` (`database_id` and
+`account_id`) and `create_system_tags`. The file is then stamped
+`PRAGMA user_version = SCHEMA_VERSION` (1).
+
+Nothing converts a database written by another build. A database that has
+tables and another schema number is refused, and not opened, with the sentence:
+
+> This database was written by another version of Voice (schema N; this version reads schema 1) and is not opened. Start with an empty data directory.
 
 ### Core Tables
 
@@ -414,7 +422,7 @@ after it.
 | `tags` | Hierarchical tag definitions |
 | `note_tags` | Many-to-many note-tag associations |
 | `note_attachments` | Recordings attached to notes |
-| `audio_files` | Recording metadata: `disk_name`, `content_sha256`, `size_bytes`, `waveform_levels`, bucket location, `storage_encrypted` |
+| `audio_files` | Recording metadata: `disk_name`, `content_sha256`, `size_bytes`, `waveform_levels`, bucket location, `storage_encrypted`, `origin_device_id` and `origin_kind` (FILE-25) |
 | `transcriptions` | Transcriptions of recordings, with their flags (`state`) |
 | `devices` | Denormalised device cards (CARD-1) |
 
@@ -433,15 +441,12 @@ after it.
 | `file_storage_config` | The single-row bucket configuration, synced |
 | `file_locations` | Where each copy of a recording is, synced (FILE-22) |
 | `sync_sequence`, `sync_meta` | Write-order counter, `database_id` and `account_id`; every syncable table has a `seq` column stamped by triggers |
-| `audio_file_copies` | Which peers hold a recording, local (PROOF-2) |
 | `upload_parts` | Journal of multipart uploads to the bucket (FILE-19) |
 | `purged_objects` | Bucket objects waiting for their purge tag (BUCKET-2) |
 | `pending_file_renames` | Renames of recordings waiting for a caller that knows the audio folder (FILE-15) |
+| `file_holds` | Promises this device gave a peer to keep its copy of a recording until a time, while that peer removes its own (FILE-26); local, never synced |
+| `file_removals` | Removals of this device's copy of a recording that are under way (FILE-26); local, never synced |
 | `pairing_offers` | Hashes of the tokens of shown codes, local (PAIR-2) |
-
-The conflict tables of the first sync design (`conflicts_note_content` and the
-others) are still created and are dropped again by a migration; `field_conflicts`
-replaced them.
 
 The account index `accounts.db` (tables `accounts` and `hosting_offers`) is a
 separate file in the installation root, not part of an account's database.
@@ -561,7 +566,9 @@ token withdraws it (PAIR-1, PAIR-2).
   fingerprint in the text. The shower (`pairing::admit_by_token`) makes a device
   key for the reader, writes the reader's card with the key's hash, and answers
   with the account id, the key, its own card and, when it holds one, the
-  account's recording key (ENC-1).
+  account's recording key (ENC-1). A code's `u=` carries every address of the
+  showing device; the reading device tries each in turn, each with its own
+  client, and remembers as the peer's address the one that answered (LISTEN-4).
 - **Grant** (PAIR-5): a server that holds no account shows a grant text (`g=1`,
   no account id; `pairing::offer_hosting`, token hashed in the root's
   `hosting_offers`). The holder (`SyncClient::grant_host`) makes a key for the
@@ -569,6 +576,39 @@ token withdraws it (PAIR-1, PAIR-2).
   label and the recording key when it has one. The server registers the account
   as hosted, stores the key, admits the holder's card, writes its own card and
   answers with it.
+
+### Where a listener can be reached
+
+`sync_server::listen_addresses(host, port, plain_http)` (LISTEN-4) returns
+`ListenAddresses` with four fields, used for the device's own card, for a code
+and for a screen:
+
+| Field | Meaning |
+|-------|---------|
+| `detected` | Whether this device found its address |
+| `shown` | What a screen shows: the address found alone, or every candidate |
+| `urls` | Every URL another device tries, in order |
+| `sentence` | What a screen says beside `shown`; empty when the address was found |
+
+A listener bound to one address reports that address. A listener bound to every
+address takes as candidates the private IPv4 addresses of interfaces that can
+carry a local network; interfaces whose names start with `docker`, `br-`,
+`veth`, `virbr`, `vmnet`, `vboxnet`, `tun`, `tap`, `wg`, `zt`, `tailscale`,
+`lxc`, `lxdbr`, `cni`, `flannel`, `podman`, `kube`, `dummy`, `rmnet`, `ccmni`,
+`p2p`, `utun` and `ipsec` are left out, and a link-local address is a candidate
+only when there is nothing else. The source address of this machine's route (a
+UDP socket connected to `192.0.2.1`, nothing sent) is the address found, shown
+alone and tried first; a single candidate is also the address found. Otherwise
+every candidate is shown with the sentence "Only one of these addresses is
+correct; this device could not tell which. Another device tries each of them in
+turn." With no candidate the sentence is "No address on a local network was
+found. Is this device on a network?". The host name, when it is not
+`localhost`, is the last of `urls`.
+
+When a peer's remembered address does not answer (a network error, not a
+refusal), the sync client tries each address on the peer's device card in turn,
+with the peer's pinned certificate, and remembers for that device the one that
+answers. Sync, pull, push and the initial sync all reach a peer this way.
 
 ## Sync Protocol
 
@@ -599,13 +639,12 @@ by **send** and **fetch** (a peer); **deliver** is sync then send, and
 | Method | Path | Authentication | Description |
 |--------|------|----------------|-------------|
 | `POST` | `/sync/handshake` | device key | Identity, account and protocol check; `database_id` and cursor |
-| `GET` | `/sync/changes?cursor=<n>&limit=<m>&types=<a,b>` | device key | One page of the cursor feed (primary) |
-| `GET` | `/sync/changes?since=<unix seconds>&limit=<m>` | device key | Timestamp feed, kept for tools |
+| `GET` | `/sync/changes?cursor=<n>&limit=<m>&types=<a,b>` | device key | One page of the cursor feed |
 | `POST` | `/sync/apply` | device key | Apply a batch of the caller's changes |
-| `GET` | `/sync/full` | device key | The whole dataset as one document, kept for tools |
 | `POST` | `/sync/audio/missing` | device key | Of the recording ids the caller names, the ones this instance lacks (FILE-12) |
 | `GET` | `/sync/audio/<audio_id>/file` | device key | Fetch a recording's file from this peer, resumable with `Range` (FILE-12, FILE-13) |
 | `POST` | `/sync/audio/<audio_id>/file` | device key | Send a recording's file to this peer, resumable with `Content-Range` (FILE-12, FILE-13) |
+| `POST` | `/sync/audio/<audio_id>/keep` | device key | The caller is removing its copy of a recording; this device promises to keep its own for 10 minutes, or says why not (FILE-26) |
 | `GET` | `/sync/status` | none | Health check and identity |
 | `POST` | `/pair/claim` | token | A reading device claims a key with a code's token (PAIR-3) |
 | `POST` | `/pair/grant` | token | A holder gives an empty server the account (PAIR-5) |
@@ -642,7 +681,6 @@ for the caller (`set_peer_entity_types`).
     "protocol_version": "2.0",
     "account_id": "0199bbbbbbbb7000800000000000000b",
     "application": "voice",
-    "last_sync_timestamp": 1705314600,
     "server_timestamp": 1705320000,
     "supports_audiofiles": true,
     "free_bytes": 52341234567,
@@ -656,7 +694,8 @@ The checks, in the order the handler runs them after the device-key middleware:
 `PROTOCOL_TOO_OLD`), an `X-Device-ID` header naming another device than the body
 (400 `DEVICE_MISMATCH`), an empty `account_id` (400 `ACCOUNT_MISSING`), an
 `account_id` other than the server's (403 `ACCOUNT_MISMATCH`). The server then
-takes a snapshot (SNAP-3) and records the caller's account.
+takes a snapshot (SNAP-3), records the caller's account, and compares its audio
+folder with what it has stated about its own copies (FILE-22).
 
 `database_id` identifies the database; when a peer sees it change it forgets its
 cursors and exchanges everything again (PROTO-9). `cursor` is the end of the
@@ -667,33 +706,25 @@ difference past one minute is reported (DIAG-3).
 
 #### GET /sync/changes
 
-Two modes:
-
-**Cursor mode (primary):** `?cursor=<n>&limit=<m>` returns every row and every
-authored or published version whose write-order sequence number is greater than
-`cursor`, oldest first, at most `limit` changes and about 4 MB of JSON in total
+`?cursor=<n>&limit=<m>` returns every row and every authored or published
+version whose write-order sequence number is greater than `cursor`, oldest
+first, at most `limit` changes and about 4 MB of JSON in total
 (`FEED_BYTE_BUDGET`; at least one change), plus `next_cursor` (pass it back to
-continue) and `is_complete`. Exact, resumable, and independent of clocks. The
-Rust client uses only this mode and loops until `is_complete`; an initial sync is
-the same loop from cursor 0 (FLOW-1, FLOW-4).
-
-**Timestamp mode (tools):** `?since=<unix seconds>&limit=<m>` returns changes
-with a timestamp greater than `since`, `limit` per entity type (PROTO-7). If
-`since` is omitted, returns all changes. `is_complete` is `false` when the number
-of changes returned reaches `limit`.
+continue) and `is_complete`. `limit` counts the changes of every entity type
+together; there is no limit per type, and nothing is skipped, because the next
+page continues from `next_cursor`. Exact, resumable, and independent of clocks.
+The Rust client loops until `is_complete`; an initial sync is the same loop from
+cursor 0 (FLOW-1, FLOW-4).
 
 **Query Parameters** (`ChangesQuery`):
-- `cursor` (optional): write-order position; takes precedence over `since`.
-- `since` (optional): Unix timestamp (seconds).
-- `limit` (optional): default 1000, maximum 10000.
+- `cursor` (optional): write-order position; absent is the start of the feed.
+- `limit` (optional): default 1000, maximum 10000, every entity type together.
 - `types` (optional): comma-separated entity types; only those are returned, while the cursor still walks the whole feed (PROTO-13).
 
 **Response** (`ChangesResponse`):
 ```json
 {
     "changes": [ /* array of change objects */ ],
-    "from_timestamp": null,
-    "to_timestamp": 1705320000,
     "next_cursor": 5321,
     "database_id": "0193...",
     "device_id": "0199cccccccc70008000000000000002",
@@ -702,8 +733,7 @@ of changes returned reaches `limit`.
 }
 ```
 
-`from_timestamp` is the `since` of the request; `to_timestamp` is the latest
-timestamp among the returned changes; `next_cursor` is `null` in timestamp mode.
+A client that receives no `next_cursor` fails the sync with a sentence (FLOW-7).
 
 #### POST /sync/apply
 
@@ -732,17 +762,6 @@ answers 200 with this body whenever the batch ran; an error that escapes the
 batch is 500. The server records the time of the sync with the caller
 (`update_peer_sync_time`).
 
-#### GET /sync/full
-
-The whole dataset as one JSON document, for tools; the Rust client does not use
-it (FLOW-4). Keys: `notes`, `tags`, `note_tags`, `note_attachments`,
-`audio_files`, `transcriptions`, `file_storage_config`, `field_versions`, plus
-`device_id`, `device_name`, `timestamp`, `database_id` and `cursor` (the end of
-the feed when the document was assembled). Its rows carry fewer columns than the
-feed's: no timezone columns, and for audio files `id`, `imported_at`,
-`filename`, `file_created_at`, `duration_seconds`, `summary`, `modified_at`,
-`deleted_at`, `storage_provider`, `storage_key` and `storage_uploaded_at`.
-
 #### GET /sync/status
 
 Health check; needs no key.
@@ -770,7 +789,7 @@ recordings the sender holds.
 **Response** (`MissingFilesResponse`): `{"missing": ["<hex id>", ...], "partial": {"<hex id>": <bytes>}}`,
 the ids the receiver lacks and, for those it holds a part of, how many bytes it
 has. An id with no row on the receiver is left out (its sync has not arrived).
-The receiver records that the caller holds every id it named (PROOF-2).
+The receiver states that the caller holds every id it named (FILE-22).
 
 #### GET /sync/audio/<audio_id>/file
 
@@ -791,7 +810,31 @@ length is 409. At the start of a file the receiver refuses (507) a file that
 would leave less than 64 MB free (`transfer::FREE_SPACE_MARGIN`). When all bytes
 are there, the part is verified against `X-File-SHA256` and renamed (200 `OK`);
 a part of the file that is not the end answers 202 `PART` (FILE-13). The receiver
-states that it holds the file (FILE-22) and that the sender holds it (PROOF-2).
+states that it holds the file and that the sender holds it (FILE-22).
+
+#### POST /sync/audio/<audio_id>/keep
+
+The caller is removing its own copy of a recording (FILE-26) and asks this device
+to promise to keep its copy meanwhile. No body.
+
+**Response** (`KeepResponse`), 200 whether or not the device promises; 400 when
+`audio_id` is not a UUID:
+```json
+{
+    "holds": true,
+    "until_ms": 1705320600000,
+    "reason": ""
+}
+```
+
+`holds` is `true` when this device holds the whole file and promises to keep it
+until `until_ms` (milliseconds since the epoch, `HOLD_MS`, ten minutes, from
+now; kept in `file_holds`); it also states that it holds the file (FILE-22).
+`holds` is `false`, with `reason` saying why, when no audio folder is set on this
+device, when the recording or its file is not here, when the copy here is not whole, or when this device is removing its
+own copy ("this device is removing its own copy"). While a promise lasts, this
+device refuses to remove that copy itself (`begin_removal`), so two devices that
+count on each other never both remove the file.
 
 #### POST /pair/claim and POST /pair/grant
 
@@ -804,7 +847,7 @@ single-account listener refuses a grant with 409.
 ### Entity Types
 
 The feed carries these entity types (`sync_apply::ALL_SYNC_ENTITY_TYPES`,
-PROTO-1); the server test `test_get_changes_since_returns_all_entity_types` fails
+PROTO-1); the server test `test_get_changes_after_seq_returns_all_entity_types` fails
 if the feed omits any of them:
 
 | Entity Type | Description | Apply order |
@@ -916,7 +959,9 @@ the first.
     "disk_name": "2024_01_15_10_30_00-0000abcd.m4a",
     "waveform_levels": "AAECAwQF...",
     "size_bytes": 482133,
-    "primary_transcription_id": null
+    "primary_transcription_id": null,
+    "origin_device_id": "0199aaaaaaaa70008000000000000001",
+    "origin_kind": "recorded"
 }
 ```
 
@@ -932,14 +977,19 @@ erased by a row without one, and the versioned columns (summary, deletion,
 primary transcription) are never written from a row (FILE-9, DM-4).
 `content_sha256` is never erased by a row without one (FILE-18); `size_bytes` is
 never changed once known (FILE-23); `waveform_levels` is replaced only by a
-newer row that has levels (FILE-20).
+newer row that has levels (FILE-20). `origin_device_id` (the installation that
+made the row) and `origin_kind` (`"recorded"` by this application's recorder or
+`"imported"` from a file that already existed) are written by the installation
+that makes the row, set once on a receiver that has none, and never changed by a
+later row; a row that names a malformed device or another kind changes nothing
+(FILE-25).
 
 The local file is named by the row's `disk_name` (FILE-15): a recording made by
 Voice is `YYYY_MM_DD_HH_MM_SS-<last eight of the id>.<ext>`, an imported file
 keeps its own name, and a collision adds `-<last eight of the id>`. Find a file
 with `audio_local_path()` in `models.rs`, never from the id. The bucket object
-is `<content hash>.<ext>` (FILE-18), with `.enc` added when encrypted (ENC-3) and
-`<id>.<ext>` only while the row has no hash (`storage_key_for` in
+is `<content hash>.<ext>` (FILE-18), with `.enc` added when encrypted (ENC-3);
+a row with no hash has no key and is not uploaded (`storage_key_for` in
 `file_storage.rs`); `ext` is from `audio_file_extension()` in `models.rs`
 (lowercase, last dot wins, `bin` when absent).
 
@@ -1056,11 +1106,15 @@ A sync moves no file. Each of these is an action the user starts
   here are skipped: another device holds them. A file larger than one part (8 MiB)
   goes up in parts, journalled in `upload_parts` (FILE-19). A pending row whose
   object is already in the bucket gets its `storage_key` from one request
-  (BUCKET-5). After the first remote failure in a batch the batch stops.
+  (BUCKET-5); an object that is there but carries the purge tag, or whose tag
+  cannot be read, is uploaded again. After the first remote failure in a batch
+  the batch stops.
 - **Download** (`download_audio_file`, `download_audio_files_for_note`,
   `download_missing_audio_files`): copies a file from the bucket to
   `<file>.part`, verifies it by size and, when the row has one, content hash,
-  then renames it (FILE-7, FILE-18). `download_missing_audio_files` copies every
+  then renames it (FILE-7, FILE-18). A download, single or in a batch, that
+  finds no object, or an object whose hash is not the recording's, states that
+  the bucket does not hold the recording (FILE-22). `download_missing_audio_files` copies every
   missing file. The core stores the local setting `sync.mirror_audio_files`
   (`Config::mirror_audio_files`, never synced) for the application that runs this
   after a sync (FILE-5); `sync_with_peer` itself never calls it.
@@ -1072,20 +1126,51 @@ A sync moves no file. Each of these is an action the user starts
 - **Deliver** (`SyncClient::deliver`) is sync then send; **exchange**
   (`SyncClient::exchange`) is sync then send and fetch.
 
+Where each copy is travels in `file_locations` (FILE-22). Hashing a file
+(`Database::store_content_hash(audio_id, audio_dir, here)`, right after an import
+or a recording copies it into the folder) states that this device, `here`, holds
+it. Every recording names the installation that made it and how
+(`origin_device_id`, `origin_kind`, FILE-25); `made_here_but_missing(audio_id,
+audio_dir, here)` returns that kind when this device made the recording, no
+place is known to hold it, and its file is not in the audio folder.
+
+**Removing this device's copy** (`SyncClient::remove_local_copy`, FILE-26) deletes
+the file only when another place confirms at that moment that it holds it:
+
+1. `begin_removal` marks the removal in `file_removals`; it is refused while this
+   device has promised a peer to keep the copy ("this device promised <device>
+   to keep its copy until <time>, while <device> removes its own").
+2. The bucket is asked directly, when the row has a storage key: the object must
+   exist and not carry the `voice-purged` tag. A bucket that does not hold it is
+   stated so.
+3. Otherwise each device stated to hold the file is asked with
+   `POST /sync/audio/<audio_id>/keep`; the first that answers `holds: true`
+   confirms.
+4. On a confirmation `finish_removal` deletes the file, states that this device no
+   longer holds it and clears the mark; the sentence is "Removed <disk name> from
+   this device; <place> holds it". Without one, `abandon_removal` clears the mark
+   and the refusal names what each place answered, for example "no other place is
+   known to hold it", "the bucket does not hold it", "<device> could not be
+   reached: …" or "no bucket is set up on this device".
+
+When the bucket does not hold a file, removing a copy therefore needs a device
+that holds it to be reachable at that moment.
+
 "Cloud storage not configured" is a silent no-op for automatic paths and a clear
 error for the ones the user starts (FILE-10). Recordings in the bucket can be
 encrypted (`crypto.rs`): one recording key per account, chunks of one MiB under
 AES-256-GCM, objects with the suffix `.enc`; a device without the key refuses to
 upload while encryption is on (ENC-1..ENC-4). The bucket key may delete an object, and
 nothing assumes it: a purged recording's object is tagged `voice-purged=1` and
-the bucket's lifecycle rule deletes it a day later (BUCKET-2, BUCKET-4).
+the bucket's lifecycle rule deletes it a day later (BUCKET-2, BUCKET-4). An
+object that another recording which stays also uses is not tagged.
 
 ### Sync Flow
 
 `SyncClient::sync_with_peer` (FLOW-1):
 
-1. `POST /sync/handshake`: refuse a responder of another account or of protocol 1.x; compare `database_id` with the stored one and restart both cursors from zero when it changed (PROTO-9); report clock skew (DIAG-3)
-2. State this device's own copies of recordings (FILE-22)
+1. State this device's own copies of recordings: compare the audio folder with what this device has stated (FILE-22)
+2. `POST /sync/handshake` at the remembered address, and when it does not answer, at each address on the peer's card (LISTEN-4): refuse a responder of another account or of protocol 1.x; compare `database_id` with the stored one and restart both cursors from zero when it changed (PROTO-9); report clock skew (DIAG-3)
 3. Note `local_end = current_seq()`: only what existed before the pull is pushed (FLOW-6)
 4. Take a snapshot (SNAP-3)
 5. Pull: `GET /sync/changes?cursor=<stored>` page by page until `is_complete`, applying each page and saving `next_cursor` after it (DIAG-1)
@@ -1145,7 +1230,9 @@ failing statement rolls back only itself (APPLY-9).
   before the first pull, on the responder's side at the handshake), before
   `move_to_account` and before a restore. `restore_snapshot(name)` snapshots the
   current state first, so a restore can itself be undone. An in-memory database
-  has no snapshots and skips them silently.
+  has no snapshots and skips them silently. The phone's restore
+  (`VoiceClient::restore_snapshot`) compares the audio folder with the restored
+  rows afterwards (FILE-22).
 - **Periodic backup** (SNAP-5): `Database::backup_to(dir, keep)` holds the write
   lock, checkpoints and truncates the write-ahead log, copies the database with
   the backup API to `dir/notes-<time>.db`, and keeps the newest `keep`. The
@@ -1158,8 +1245,10 @@ failing statement rolls back only itself (APPLY-9).
 
 `issues::issues(db, audio_dir, here)` computes, at every call and without
 storing anything (ISSUE-1): recordings not in the bucket, each with its reason
-(no bucket, over the account's upload limit, waiting for the devices that hold
-it, no copy known); transcriptions whose recording row is not there; attachments
+(`no_bucket`, `too_large`, `waiting_for_upload` with the devices that hold it,
+`no_copy_known`, and `imported_here_file_missing` or `recorded_here_file_missing`
+when no place is known to hold it, this device made it, and its file is not in
+the audio folder, FILE-25); transcriptions whose recording row is not there; attachments
 whose note or recording row is not there; recordings no note holds (a note in the
 trash still holds its recordings); tags whose names contain whitespace.
 
@@ -1168,7 +1257,6 @@ trash still holds its recordings); tags whose names contain whitespace.
 | Field | Rule |
 |-------|------|
 | UUID | Parsed by `uuid`; hyphens are removed first, so 32 hex characters or the hyphenated form |
-| Datetime text | `validate_datetime`: exactly `YYYY-MM-DD HH:MM:SS`, zero-padded (stored and synced timestamps are integers) |
 | Tag name | Not empty after trimming, at most 100 bytes, no `/` |
 | Tag path | Not empty, at most 500 bytes, at most 50 levels, each name at most 100 bytes |
 | Note content | Not empty after trimming, at most 100,000 bytes |
@@ -1265,6 +1353,16 @@ cargo test database::tests
 
 Tests use `:memory:` databases and temporary directories, never
 `~/.config/voice` (`TECHNICAL-DECISIONS.md` 7.6).
+
+Some tests by the rule they cover:
+
+| Rule | Tests |
+|------|-------|
+| The schema | `database.rs::tests::schema`: `a_new_database_has_this_build_s_schema_and_its_system_tags_are_in_the_feed`, `a_database_of_another_schema_is_refused_in_words` |
+| FILE-25 | `database.rs::tests::origin`: `a_recording_names_the_installation_that_made_it_and_how`, `a_recording_made_here_whose_file_is_gone_is_named_with_how_it_was_made` |
+| FILE-26 | `database.rs::tests::file_locations::two_devices_that_count_on_each_other_never_both_remove`, `sync_server.rs::tests::files_between_instances::a_copy_goes_only_when_a_peer_promises_to_keep_its_own` |
+| LISTEN-4 | `sync_server.rs::tests::listener::the_address_on_the_route_is_shown_alone_and_virtual_interfaces_are_left_out`, `sync_server.rs::tests::peers_from_cards::a_peer_that_moved_is_reached_at_an_address_its_card_names`, `sync_server.rs::tests::pairing::a_code_whose_first_address_does_not_answer_is_claimed_at_the_next` |
+| PROTO-1 | `sync_server.rs`: `test_get_changes_after_seq_returns_all_entity_types` |
 
 ### Convergence tests
 

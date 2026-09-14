@@ -37,11 +37,13 @@ error string (AUTH-3).
 
 ## Database
 
-The schema is created in `Database::init_database()` in `src/database.rs`, and
-later columns and tables by the `migrate_*` functions called after it. The
-conflict tables of the first sync design (`conflicts_note_content` and the
-others) are still created there and dropped again by a migration; `field_conflicts`
-replaced them.
+The schema is created in one place, `create_schema()` in `src/database.rs`:
+`create_tables()`, `create_version_tables()`, `create_sequence_triggers()`,
+`create_identity()` and `create_system_tags()`, in one write transaction, and
+the file is stamped `PRAGMA user_version = SCHEMA_VERSION` (1). A database that
+has tables and another number is refused with a sentence that says so; nothing
+converts it, and there are no `migrate_*` functions (SCHEMA-1, SCHEMA-2;
+`../TECHNICAL-DECISIONS.md` 1.6).
 
 ### Transcription flags (the `state` field)
 
@@ -96,18 +98,17 @@ entity, touches all of these:
    merge kind. A field written with plain SQL is a bug: writes go through
    `set_field`, `set_deleted` and `init_field`, and `apply_head_to_entity`
    copies the head into the entity row.
-2. **`database.rs`, `migrate_add_sync_sequence`**: give the table a `seq` column
-   and its triggers, or the entity never appears in the cursor feed. Adding a
-   synced column means adding it to that table's column list; an existing
-   database's update trigger is rebuilt at its next open when its stored
-   definition lacks the column.
-3. **`database.rs`, `collect_changes`** (behind `get_changes_after_seq` and
-   `get_changes_since`) and **`get_full_dataset`**: add the entity's rows to the
-   feed and to the whole-dataset document.
+2. **`database.rs`, `create_tables`** and **`create_sequence_triggers`**: the
+   table goes into `create_tables` with a `seq` column, and into the list of
+   `create_sequence_triggers` with the columns whose change publishes the row
+   again, or the entity never appears in the feed. A new synced column goes into
+   both.
+3. **`database.rs`, `collect_changes`** (behind `get_changes_after_seq`): add the
+   entity's rows to the feed.
 4. **`sync_apply.rs`, `ALL_SYNC_ENTITY_TYPES`** and **`apply_changes`**: add the
    type to the list and a match arm that applies it. The server's
-   `test_get_changes_since_returns_all_entity_types` fails if a listed type is
-   missing from the feed.
+   `test_get_changes_after_seq_returns_all_entity_types` fails if a listed type
+   is missing from the feed.
 5. **`android.rs`** and **`Voice/rust/voice-python/src/lib.rs`**: expose what the
    applications need.
 
@@ -140,13 +141,27 @@ only when the user starts an action (`../TECHNICAL-DECISIONS.md` 4.5):
   an imported file keeps its own name, and a collision adds
   `-<last eight of the id>`. Find a file with `audio_local_path()` (`models.rs`),
   never from the id. The bucket object is `<content hash>.<ext>` (FILE-18), with
-  `.enc` added when encrypted and `<id>.<ext>` only while no hash is known
-  (`storage_key_for()` in `file_storage.rs`). `ext` comes from
+  `.enc` added when encrypted, and a row with no hash has no key and is not
+  uploaded (`storage_key_for()` in `file_storage.rs`). `ext` comes from
   `audio_file_extension()` in `models.rs`: lowercase, last dot wins, `bin` when
   there is none. Never derive the extension by hand.
 - Where each copy is travels in `file_locations` (FILE-22); the upload limit is
   the account's (FILE-23); what the user should know is computed by `issues.rs`
-  (ISSUE-1).
+  (ISSUE-1). Hashing a file (`store_content_hash(audio_id, audio_dir, here)`)
+  states that `here` holds it, so an import or a recording states this device's
+  copy at once.
+- Every recording names the installation that made it and how
+  (`origin_device_id`, `origin_kind`: `recorded` or `imported`), written once by
+  that installation and never changed by a later row (FILE-25);
+  `made_here_but_missing()` reads it.
+- **Removing this device's copy** goes through `SyncClient::remove_local_copy`
+  and nowhere else (FILE-26): the file is deleted only when the bucket, asked
+  directly, or a device stated to hold it confirms at that moment. A device
+  confirms through `POST /sync/audio/:audio_id/keep` and promises to keep its
+  copy for `HOLD_MS` (ten minutes). `promise_to_keep`, `begin_removal`,
+  `finish_removal` and `abandon_removal` in `database.rs`, with the local tables
+  `file_holds` and `file_removals`, stop two devices that count on each other
+  from both removing the file. Never delete a copy any other way.
 - Every incoming `audio_file` row is applied through one upsert that merges per
   column: the newer row wins a metadata column, an older row only fills in
   NULLs, the cloud location is never erased by a row without one and only
@@ -170,9 +185,10 @@ Every editable value is a field with a Git-like history in `field_versions`
 - **Write path:** every mutation goes through `set_field()` / `set_deleted()`
   (never `UPDATE notes SET content` directly).
 - **Sync:** the feed carries `field_version` changes; `sync_apply.rs` applies
-  versions first, rows second, links last, then `recompute_heads()`. Rows
-  without history get a deterministic hash root (`ensure_root_version`), so
-  data from before versioning merges cleanly.
+  versions first, rows second, links last, then `recompute_heads()`. A row that
+  arrives before its versions gets a deterministic hash root
+  (`ensure_root_version`), so every device builds the same graph whichever
+  arrives first (VER-3, VER-4).
 - **Merge rules:** Text = diff3 (markers `<<<<<<< VERSION A` /
   `>>>>>>> VERSION B`, the same on every device); Scalar = later wins + flag;
   Flags = per flag; Membership and Deleted = disagreement keeps the link or the
@@ -189,8 +205,8 @@ Every editable value is a field with a Git-like history in `field_versions`
 - **Synced settings:** `synced_settings` is a versioned key/value store
   (`get_setting` / `set_setting`).
 - **First edit of a field** (for example the first tombstone) has no parent but
-  has a `device_id`; only hash roots (no parent, no device) are treated as data
-  from before versioning, with timestamp 0.
+  has a `device_id`; only hash roots (no parent, no device) are applied with
+  timestamp 0 (VER-7).
 - **Authored and derived:** merges and resurrections (a parent, no device) are
   derived and are not synced; every device recomputes them. Heads are folded
   from the *authored* leaves only (`authored_leaves`), so arrival order and page
@@ -200,7 +216,7 @@ Every editable value is a field with a Git-like history in `field_versions`
   published.
 - **Cursor feed:** `get_changes_after_seq(cursor, upto, limit)` is the sync
   feed. Every syncable table has a `seq` column stamped by triggers
-  (`migrate_add_sync_sequence`): on insert, and on update of a synced column
+  (`create_sequence_triggers`): on insert, and on update of a synced column
   *when the value changed*. Row updates on the apply path use
   `NULLIF(MAX(...), 0)` forms so an echo of our own data writes nothing
   (otherwise rows ping-pong between peers for ever). `recompute_head` writes the
@@ -224,25 +240,14 @@ Every editable value is a field with a Git-like history in `field_versions`
   limit; keep it that way.
 - **Batches and pages:** feed pages are bounded by `FEED_BYTE_BUDGET` (4 MB) in
   both directions; keep any new feed content under it rather than raising the
-  server's body limit. The client pages an initial sync from cursor zero;
-  `/sync/full` is for tools only.
+  server's body limit. The feed's `limit` counts every entity type together
+  (PROTO-7). The client pages an initial sync from cursor zero.
 
 ## History
 
-Two defects of January 2026, kept because the rules they left behind still
-hold. Timestamps were then text (`YYYY-MM-DD HH:MM:SS`) compared as strings;
-since `migrate_timestamps_to_unix` every timestamp is an `INTEGER` of Unix
-seconds (`SYNC_SPECIFICATION.md` 3.4), and `validate_datetime()` in
-`validation.rs` checks them at the sync boundary.
-
-- **A shared limit starved entity types** (fixed 2026-01-09). The timestamp
-  feed took one limit for every entity type together, so a device with a
-  thousand changed notes never sent its tags, links, recordings or
-  transcriptions. `get_changes_since` now gives each entity type its own limit
-  (PROTO-7). The cursor feed, which the clients use, has one global limit and
-  loses nothing because it resumes.
-- **A NULL `modified_at` hid rows from the timestamp feed** (fixed 2026-01-09).
-  A row created on one device had `modified_at` NULL; a peer that stored it so,
-  and whose other peers' `since` was later than its `created_at`, never offered
-  it again. A row received by sync never keeps `modified_at` NULL when the
-  incoming row had a timestamp (PROTO-6).
+Every timestamp is an `INTEGER` of Unix seconds (`SYNC_SPECIFICATION.md` 3.4).
+The timestamp feed (`?since=`, `get_changes_since`), `/sync/full` and every
+migration were removed on 2026-09-14; the two defects of January 2026 that were
+recorded here happened in that feed. The rule one of them left behind still
+holds: a row received by sync never keeps `modified_at` NULL when the incoming
+row had a timestamp (PROTO-6).

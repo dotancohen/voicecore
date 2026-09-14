@@ -4249,14 +4249,14 @@ impl Database {
 
         // Audio files
         {
-            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64, String, Option<String>, Option<i64>, Option<Vec<u8>>, Option<String>);
+            type AudioRow = (Vec<u8>, i64, String, Option<i64>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Vec<(Option<i32>, Option<String>)>, Option<Vec<u8>>, Option<String>, i64, String, Option<String>, Option<i64>, Option<Vec<u8>>, Option<String>, Option<i64>);
             let rows: Vec<AudioRow> = self.feed_query(
-                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes, origin_device_id, origin_kind", "audio_files",
+                "id, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, imported_at_offset, imported_at_zone, file_created_at_offset, file_created_at_zone, modified_at_offset, modified_at_zone, deleted_at_offset, deleted_at_zone, primary_transcription_id, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes, origin_device_id, origin_kind, duration_seconds", "audio_files",
                 filter, limit,
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(26)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), row.get::<_, Option<String>>(21)?.unwrap_or_default(), row.get::<_, Option<String>>(22)?, row.get::<_, Option<i64>>(23)?, row.get(24)?, row.get(25)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get::<_, Option<i64>>(27)?.unwrap_or(0), read_zone_pairs(row, 10, 4)?, row.get(18)?, row.get(19)?, row.get::<_, Option<i64>>(20)?.unwrap_or(0), row.get::<_, Option<String>>(21)?.unwrap_or_default(), row.get::<_, Option<String>>(22)?, row.get::<_, Option<i64>>(23)?, row.get(24)?, row.get(25)?, row.get(26)?)),
             )?;
             saturated |= rows.len() as i64 >= limit;
-            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes, origin_device, origin_kind) in rows {
+            for (id_bytes, imported_at, filename, file_created_at, summary, modified_at, deleted_at, storage_provider, storage_key, storage_uploaded_at, seq, zones, primary_transcription, content_sha256, storage_encrypted, disk_name, waveform_levels, size_bytes, origin_device, origin_kind, duration_seconds) in rows {
                 let timestamp = modified_at.unwrap_or(imported_at);
                 let id_hex = uuid_bytes_to_hex(&id_bytes).unwrap_or_default();
                 let mut data = serde_json::Map::new();
@@ -4264,6 +4264,7 @@ impl Database {
                 data.insert("imported_at".to_string(), serde_json::Value::Number(imported_at.into()));
                 data.insert("filename".to_string(), serde_json::Value::String(filename));
                 data.insert("file_created_at".to_string(), ts_val(file_created_at));
+                data.insert("duration_seconds".to_string(), duration_seconds.map_or(serde_json::Value::Null, |n| serde_json::Value::Number(n.into())));
                 data.insert("summary".to_string(), str_val(summary));
                 data.insert("modified_at".to_string(), ts_val(modified_at));
                 data.insert("deleted_at".to_string(), ts_val(deleted_at));
@@ -7106,6 +7107,22 @@ mod tests {
             let (again, _, _) = b.get_changes_after_seq_as_sync_changes(0, None, 10_000).unwrap();
             crate::sync_apply::apply_changes(&a, &again, PHONE, None, 1_800_000_001).unwrap();
             assert_eq!(a.get_audio_file(&imported).unwrap().unwrap().origin_kind, ORIGIN_IMPORTED, "an echo changes nothing");
+        }
+
+        /// LIM-16: a recording's length travels with its row in the feed, so a
+        /// device that never held the file knows how long the recording is.
+        #[test]
+        fn a_recording_s_length_travels_with_it() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let a = Database::new(temp.path().join("a.db")).unwrap();
+            let b = Database::new(temp.path().join("b.db")).unwrap();
+            let id = a.create_audio_file("שיעור של שעה.ogg", None, None, FileOrigin::Imported, None).unwrap();
+            a.update_audio_file_duration(&id, 3_605).unwrap();
+            let (changes, _, _) = a.get_changes_after_seq_as_sync_changes(0, None, 10_000).unwrap();
+            let row = changes.iter().find(|c| c.entity_type == "audio_file" && c.entity_id == id).unwrap();
+            assert_eq!(row.data["duration_seconds"], 3_605);
+            crate::sync_apply::apply_changes(&b, &changes, PHONE, None, 1_800_000_000).unwrap();
+            assert_eq!(b.get_audio_file(&id).unwrap().unwrap().duration_seconds, Some(3_605));
         }
 
         /// FILE-25: "made here but missing" names how this device made a
