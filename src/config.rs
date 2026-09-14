@@ -319,19 +319,205 @@ fn generate_device_id() -> String {
     Uuid::now_v7().simple().to_string()
 }
 
-fn get_default_device_name() -> String {
+/// The name a phone's configuration starts with. The phone application
+/// replaces it on its first start with the name Android gives the phone
+/// (UI-11): the core, compiled for Android, cannot read Android's settings.
+pub const PHONE_PLACEHOLDER_DEVICE_NAME: &str = "Voice Mobile";
+
+/// What a computer says about itself, each part absent when it says nothing.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct NameSources {
+    /// The name the user gave the computer in its settings: the pretty
+    /// hostname on Linux, the Computer Name on macOS
+    pub set_name: Option<String>,
+    /// The hostname, also a name its user gave it
+    pub hostname: Option<String>,
+    /// The system: "Ubuntu", "Fedora Linux", "Mac", "Windows"
+    pub system: Option<String>,
+    /// "desktop", "laptop", "tablet" or "server"
+    pub kind: Option<&'static str>,
+    pub ipv4: Option<std::net::Ipv4Addr>,
+    pub ipv6: Option<std::net::Ipv6Addr>,
+}
+
+/// The animals a device is named after when nothing names it (UI-11).
+pub const CUTE_ANIMALS: &[&str] = &[
+    "Wombat", "Otter", "Quokka", "Panda", "Koala", "Hedgehog", "Penguin", "Fox", "Owl", "Seal", "Lemur", "Capybara",
+    "Alpaca", "Hamster", "Rabbit", "Squirrel", "Dolphin", "Puffin", "Sloth", "Meerkat", "Raccoon", "Chinchilla",
+    "Fennec", "Duckling",
+];
+
+/// Whether a name tells the user which device this is: never empty and never
+/// "localhost" (Android's hostname, and a Linux machine's when unset).
+pub fn usable_host_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty() && !name.to_ascii_lowercase().starts_with("localhost")
+}
+
+/// A new installation's device name (UI-11), the first of: the name the user
+/// gave the device (set in the system, or its hostname); its type ("Ubuntu
+/// desktop"); an animal with the ends of its addresses ("Wombat 81:4c 7.21").
+/// `animal` chooses the animal. Never "localhost".
+pub fn device_name_from(sources: &NameSources, animal: usize) -> String {
+    for given in [&sources.set_name, &sources.hostname] {
+        if let Some(name) = given.as_deref().map(str::trim).filter(|n| usable_host_name(n)) {
+            return name.to_string();
+        }
+    }
+    if let Some(kind) = sources.kind {
+        return match sources.system.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(system) => format!("{} {}", system, kind),
+            None => format!("{}{}", kind[..1].to_uppercase(), &kind[1..]),
+        };
+    }
+    animal_name(animal, sources.ipv6, sources.ipv4)
+}
+
+/// An animal followed by the last two bytes of the IPv6 address in hex and the
+/// last two numbers of the IPv4 address: "Wombat 81:4c 7.21". A missing
+/// address is left out.
+pub fn animal_name(animal: usize, ipv6: Option<std::net::Ipv6Addr>, ipv4: Option<std::net::Ipv4Addr>) -> String {
+    let mut name = CUTE_ANIMALS[animal % CUTE_ANIMALS.len()].to_string();
+    if let Some(v6) = ipv6 {
+        let o = v6.octets();
+        name.push_str(&format!(" {:02x}:{:02x}", o[14], o[15]));
+    }
+    if let Some(v4) = ipv4 {
+        let o = v4.octets();
+        name.push_str(&format!(" {}.{}", o[2], o[3]));
+    }
+    name
+}
+
+/// The addresses a name ends with, from this device's interface addresses:
+/// never a loopback address; a link-local one only when there is no other.
+pub fn addresses_for_name(ips: &[std::net::IpAddr]) -> (Option<std::net::Ipv6Addr>, Option<std::net::Ipv4Addr>) {
+    use std::net::IpAddr;
+    let v6: Vec<_> = ips.iter().filter_map(|ip| match ip { IpAddr::V6(a) if !a.is_loopback() && !a.is_unspecified() => Some(*a), _ => None }).collect();
+    let v4: Vec<_> = ips.iter().filter_map(|ip| match ip { IpAddr::V4(a) if !a.is_loopback() && !a.is_unspecified() => Some(*a), _ => None }).collect();
+    let v6_link_local = |a: &std::net::Ipv6Addr| (a.segments()[0] & 0xffc0) == 0xfe80;
+    let ipv6 = v6.iter().find(|a| !v6_link_local(a)).or_else(|| v6.first()).copied();
+    let ipv4 = v4.iter().find(|a| !a.is_link_local()).or_else(|| v4.first()).copied();
+    (ipv6, ipv4)
+}
+
+/// This device's interface addresses, as `if_addrs` finds them.
+fn this_device_addresses() -> (Option<std::net::Ipv6Addr>, Option<std::net::Ipv4Addr>) {
+    let ips: Vec<std::net::IpAddr> = if_addrs::get_if_addrs().map(|ifs| ifs.into_iter().map(|i| i.ip()).collect()).unwrap_or_default();
+    addresses_for_name(&ips)
+}
+
+/// A choice of animal that differs between installations.
+fn random_animal() -> usize {
+    // The last bytes of a UUIDv7 are random
+    let bytes = Uuid::now_v7();
+    let b = bytes.as_bytes();
+    usize::from(b[14]) << 8 | usize::from(b[15])
+}
+
+/// The animal name of this device, for a phone whose Android settings name
+/// nothing (UI-11).
+pub fn fallback_device_name() -> String {
+    let (ipv6, ipv4) = this_device_addresses();
+    animal_name(random_animal(), ipv6, ipv4)
+}
+
+/// The kind of computer from the SMBIOS chassis type Linux shows in
+/// /sys/class/dmi/id/chassis_type; None for a number that says nothing useful.
+pub fn chassis_kind(chassis_type: &str) -> Option<&'static str> {
+    match chassis_type.trim().parse::<u32>().ok()? {
+        3 | 4 | 5 | 6 | 7 | 13 | 15 | 16 | 24 | 35 | 36 => Some("desktop"),
+        8 | 9 | 10 | 14 | 31 | 32 => Some("laptop"),
+        11 | 30 => Some("tablet"),
+        17 | 23 | 25 | 28 | 29 => Some("server"),
+        _ => None,
+    }
+}
+
+/// A value from a KEY=value file such as /etc/os-release or /etc/machine-info,
+/// its quotes removed; None when the key is absent or empty.
+pub fn key_value_of(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let value = line.trim().strip_prefix(key)?.strip_prefix('=')?.trim();
+        let value = value.trim_matches(|c| c == '"' || c == '\'').trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+fn this_host_name() -> Option<String> {
     #[cfg(feature = "desktop")]
     {
-        // The hostname alone (Stage 5): a card should read "desk", not
-        // "Voice on desk"
-        match hostname::get() {
-            Ok(name) if !name.is_empty() => name.to_string_lossy().to_string(),
-            _ => "Voice Device".to_string(),
-        }
+        hostname::get().ok().map(|h| h.to_string_lossy().to_string())
     }
     #[cfg(not(feature = "desktop"))]
     {
-        "Voice Mobile".to_string()
+        std::fs::read_to_string("/proc/sys/kernel/hostname").ok()
+    }
+}
+
+/// The output of a command, trimmed; None when it cannot run or says nothing.
+#[cfg(target_os = "macos")]
+fn output_of(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program).args(args).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// Everything this computer says about itself.
+#[cfg(not(target_os = "android"))]
+fn name_sources() -> NameSources {
+    let (ipv6, ipv4) = this_device_addresses();
+    #[cfg(target_os = "linux")]
+    {
+        let read = |path: &str| std::fs::read_to_string(path).ok();
+        NameSources {
+            set_name: read("/etc/machine-info").and_then(|t| key_value_of(&t, "PRETTY_HOSTNAME")),
+            system: Some(read("/etc/os-release").and_then(|t| key_value_of(&t, "NAME")).unwrap_or_else(|| "Linux".to_string())),
+            kind: read("/sys/class/dmi/id/chassis_type").and_then(|t| chassis_kind(&t)),
+            hostname: this_host_name(),
+            ipv6,
+            ipv4,
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let model = output_of("sysctl", &["-n", "hw.model"]).unwrap_or_default();
+        NameSources {
+            set_name: output_of("scutil", &["--get", "ComputerName"]),
+            system: Some("Mac".to_string()),
+            // Older models say "MacBookPro16,1"; newer ones ("Mac14,2") do not say
+            kind: model.starts_with("MacBook").then_some("laptop"),
+            hostname: this_host_name(),
+            ipv6,
+            ipv4,
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        NameSources {
+            set_name: None,
+            system: Some("Windows".to_string()),
+            kind: None,
+            hostname: std::env::var("COMPUTERNAME").ok().or_else(this_host_name),
+            ipv6,
+            ipv4,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        NameSources { hostname: this_host_name(), ipv6, ipv4, ..NameSources::default() }
+    }
+}
+
+fn get_default_device_name() -> String {
+    #[cfg(target_os = "android")]
+    {
+        PHONE_PLACEHOLDER_DEVICE_NAME.to_string()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        device_name_from(&name_sources(), random_animal())
     }
 }
 
@@ -979,11 +1165,77 @@ mod tests {
 
     }
 
+    fn sources(set_name: Option<&str>, hostname: Option<&str>, system: Option<&str>, kind: Option<&'static str>) -> NameSources {
+        NameSources { set_name: set_name.map(str::to_string), hostname: hostname.map(str::to_string), system: system.map(str::to_string), kind, ..NameSources::default() }
+    }
+
     #[test]
-    fn the_default_device_name_is_the_hostname_alone() {
-        let name = get_default_device_name();
-        assert!(!name.starts_with("Voice on"), "{}", name);
-        assert!(!name.is_empty());
+    fn a_name_the_user_gave_is_the_device_name() {
+        assert_eq!(device_name_from(&sources(Some(" המחשב של דותן "), Some("teva-2025"), Some("Ubuntu"), Some("desktop")), 0), "המחשב של דותן");
+        assert_eq!(device_name_from(&sources(None, Some("teva-2025"), Some("Ubuntu"), Some("desktop")), 0), "teva-2025");
+        assert_eq!(device_name_from(&sources(None, Some("DESKTOP-7Q3K2LM"), Some("Windows"), None), 0), "DESKTOP-7Q3K2LM");
+    }
+
+    #[test]
+    fn without_a_given_name_the_device_type_names_it() {
+        assert_eq!(device_name_from(&sources(None, None, Some("Ubuntu"), Some("desktop")), 0), "Ubuntu desktop");
+        assert_eq!(device_name_from(&sources(None, Some("localhost"), Some("Mac"), Some("laptop")), 0), "Mac laptop");
+        assert_eq!(device_name_from(&sources(Some(""), None, None, Some("laptop")), 0), "Laptop");
+    }
+
+    #[test]
+    fn without_a_name_or_a_type_an_animal_and_the_ends_of_the_addresses_name_it() {
+        let v6: std::net::Ipv6Addr = "2a0d:6fc0:12:3400::814c".parse().unwrap();
+        let v4: std::net::Ipv4Addr = "192.168.7.21".parse().unwrap();
+        let unnamed = NameSources { hostname: Some("localhost".to_string()), system: Some("Windows".to_string()), ipv6: Some(v6), ipv4: Some(v4), ..NameSources::default() };
+        assert_eq!(device_name_from(&unnamed, 0), "Wombat 81:4c 7.21");
+        assert_eq!(animal_name(1, None, Some(v4)), "Otter 7.21");
+        assert_eq!(animal_name(2, Some("fe80::1:7".parse().unwrap()), None), "Quokka 00:07");
+        assert_eq!(animal_name(CUTE_ANIMALS.len(), None, None), "Wombat", "the choice goes round the list");
+    }
+
+    #[test]
+    fn localhost_is_never_the_device_name() {
+        for given in ["localhost", "LOCALHOST", "localhost.localdomain", "  ", ""] {
+            let name = device_name_from(&sources(Some(given), Some(given), None, None), 3);
+            assert!(name.starts_with("Panda"), "{:?} gave {:?}", given, name);
+        }
+        let here = get_default_device_name();
+        assert!(usable_host_name(&here), "this machine's default name is {:?}", here);
+    }
+
+    #[test]
+    fn a_name_ends_with_real_addresses_and_link_local_only_when_there_is_nothing_else() {
+        use std::net::IpAddr;
+        let ips: Vec<IpAddr> = ["127.0.0.1", "::1", "fe80::aa:1", "169.254.3.4", "10.0.5.9", "2a0d:6fc0::beef"].iter().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(addresses_for_name(&ips), (Some("2a0d:6fc0::beef".parse().unwrap()), Some("10.0.5.9".parse().unwrap())));
+        let only_link_local: Vec<IpAddr> = ["::1", "fe80::aa:1", "169.254.3.4"].iter().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(addresses_for_name(&only_link_local), (Some("fe80::aa:1".parse().unwrap()), Some("169.254.3.4".parse().unwrap())));
+        assert_eq!(addresses_for_name(&["127.0.0.1".parse().unwrap()]), (None, None));
+    }
+
+    #[test]
+    fn the_chassis_type_says_desktop_laptop_tablet_or_server() {
+        assert_eq!(chassis_kind("6\n"), Some("desktop"));
+        assert_eq!(chassis_kind("3"), Some("desktop"));
+        assert_eq!(chassis_kind("10"), Some("laptop"));
+        assert_eq!(chassis_kind("31"), Some("laptop"));
+        assert_eq!(chassis_kind("30"), Some("tablet"));
+        assert_eq!(chassis_kind("23"), Some("server"));
+        assert_eq!(chassis_kind("1"), None, "Other");
+        assert_eq!(chassis_kind("2"), None, "Unknown");
+        assert_eq!(chassis_kind("שולחני"), None);
+        assert_eq!(chassis_kind(""), None);
+    }
+
+    #[test]
+    fn a_value_is_read_from_os_release_and_machine_info_without_its_quotes() {
+        let os_release = "PRETTY_NAME=\"Ubuntu 24.04.4 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\n";
+        assert_eq!(key_value_of(os_release, "NAME").as_deref(), Some("Ubuntu"));
+        assert_eq!(key_value_of(os_release, "PRETTY_NAME").as_deref(), Some("Ubuntu 24.04.4 LTS"));
+        assert_eq!(key_value_of("PRETTY_HOSTNAME='המחשב של דותן'\n", "PRETTY_HOSTNAME").as_deref(), Some("המחשב של דותן"));
+        assert_eq!(key_value_of("PRETTY_HOSTNAME=\n", "PRETTY_HOSTNAME"), None);
+        assert_eq!(key_value_of("ICON_NAME=computer-desktop\n", "PRETTY_HOSTNAME"), None);
     }
 
     #[test]

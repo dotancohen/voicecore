@@ -2635,6 +2635,13 @@ pub struct SnapshotData {
     pub note_count: i64,
 }
 
+/// An animal with the ends of this phone's addresses, "Wombat 81:4c 7.21": the
+/// phone's name when Android's settings name nothing (UI-11).
+#[uniffi::export]
+pub fn fallback_device_name() -> String {
+    crate::config::fallback_device_name()
+}
+
 /// Every audio format a recording may be imported in, by extension: the one
 /// list, kept in the core.
 #[uniffi::export]
