@@ -143,7 +143,7 @@ pub fn offer(db: &Database, config: &Config, urls: Vec<String>) -> VoiceResult<S
         account_id: db.account_id()?,
         grant: false,
         token,
-        device_id: config.device_id_hex().to_string(),
+        device_id: config.this_device_id_hex().to_string(),
         urls,
         certificate_fingerprint,
     })
@@ -168,7 +168,7 @@ pub fn offer_hosting(index: &crate::accounts::AccountIndex, config: &Config, lab
         account_id: String::new(),
         grant: true,
         token,
-        device_id: config.device_id_hex().to_string(),
+        device_id: config.this_device_id_hex().to_string(),
         urls,
         certificate_fingerprint,
     })

@@ -1,6 +1,6 @@
 # VoiceCore: The Rust Core Library for Voice
 
-- **Purpose**: VoiceCore is the shared core of the Voice Family: notes with hierarchical tags, recordings and their transcriptions, versioned fields, accounts, pairing and peer-to-peer sync.
+- **Purpose**: VoiceCore is the shared core of the Voice Family: notes with hierarchical tags, recordings and their transcriptions, versioned fields, accounts, pairing and device-to-device sync.
 - **Architecture**: one Rust library used by the desktop and server (Python, through PyO3 in `Voice/rust/voice-python`) and by the Android application (Kotlin, through UniFFI in `src/android.rs`).
 - **No system libraries**: SQLite is bundled and TLS is pure Rust (rustls), so no OpenSSL or other native library is needed.
 
@@ -18,8 +18,8 @@ The numbered rules this code implements (for example `PROTO-12`) are in
 - **Accounts**: every database belongs to one account; one installation can hold several (ACCT-1..ACCT-10).
 - **Device keys and cards**: every request between devices is authenticated by a device key whose hash is on the device's card (AUTH-1..AUTH-9, CARD-1..CARD-3).
 - **Pairing**: a fresh device joins an account by reading a code (PAIR-1..PAIR-5).
-- **Sync**: database changes exchanged with a peer through a resumable cursor feed, protocol version 2.0 (PROTO-12, PROTO-13).
-- **Recording files**: uploaded to and downloaded from a bucket (S3 or S3-compatible), or sent to and fetched from a peer; a sync never moves a file (FILE-12, `TECHNICAL-DECISIONS.md` 4.5).
+- **Sync**: database changes exchanged with a device through a resumable cursor feed, protocol version 2.0 (PROTO-12, PROTO-13).
+- **Recording files**: uploaded to and downloaded from a bucket (S3 or S3-compatible), or sent to and fetched from a device; a sync never moves a file (FILE-12, `TECHNICAL-DECISIONS.md` 4.5).
 - **Encryption of recordings in the bucket**: optional, AES-256-GCM in chunks (ENC-1..ENC-4).
 - **Snapshots and backups**: a copy of the database before anything that rewrites it in one step, and a periodic backup (SNAP-1..SNAP-5).
 - **Issues**: what the user should know about, computed on request (ISSUE-1).
@@ -34,7 +34,7 @@ src/
 ├── database.rs           # SQLite data access, the change feed, snapshots and backups
 ├── error.rs              # Error types
 ├── validation.rs         # Input validation
-├── config.rs             # config.json: device identity, peers, backup, keys
+├── config.rs             # config.json: device identity, devices, backup, keys
 ├── accounts.rs           # Several accounts on one installation (feature "server")
 ├── auth.rs               # Device keys, device cards, request verification
 ├── pairing.rs            # Setup texts, pairing tokens, admission by token
@@ -101,12 +101,12 @@ reading, not to the event, and each interface applies its own.
 | `database` | SQLite persistence: the schema (`create_schema`, `SCHEMA_VERSION`), CRUD, queries, the cursor feed (`get_changes_after_seq`), row-apply upserts, where each copy of a recording is (`set_file_location`, `check_files_here`, `store_content_hash`, `made_here_but_missing`), the removal of a copy (`promise_to_keep`, `begin_removal`, `finish_removal`, `abandon_removal`, FILE-26), snapshots (`snapshot`, `restore_snapshot`), backups (`backup_to`), account identity (`account_id`, `move_to_account`) |
 | `error` | `VoiceError` and `ValidationError` |
 | `validation` | UUID, audio extension, tag name, tag path, note content and search query validation |
-| `config` | `config.json`: device id and name, device key and recording key (wrapped by a `SecretWrapper` on the phone, AUTH-9), peers, sync settings, backup settings, public URL. The bucket's configuration is not here: it is in the database, synced (`file_storage_config`) |
+| `config` | `config.json`: device id and name, device key and recording key (wrapped by a `SecretWrapper` on the phone, AUTH-9), devices, sync settings, backup settings, public URL. The bucket's configuration is not here: it is in the database, synced (`file_storage_config`) |
 | `accounts` | The account index `accounts.db` of an installation root, hosting offers, and `resolve` (ACCT-6..ACCT-9); compiled with feature `server` |
 | `auth` | Device keys, key hashes, the device's own card, and `verify_request` (AUTH-1..AUTH-6, CARD-1, CARD-2) |
 | `pairing` | Setup texts (`voice://pair?...`), tokens, `offer`, `offer_hosting`, `admit_by_token`, `check_can_join` (PAIR-1..PAIR-5) |
 | `sync_protocol` | Request and response types, `PROTOCOL_VERSION`, refusal codes, header names, one definition for both sides |
-| `sync_client` | `SyncClient`: `sync_with_peer`, `pull_from_peer`, `push_to_peer`, `initial_sync`, `send_to_peer`, `fetch_from_peer`, `deliver`, `exchange`, `join`, `grant_host`, `move_to`, `check`, `adopt_peers_from_cards`, `remove_local_copy` (FILE-26), a peer reached at the addresses on its card (LISTEN-4), cancel and progress (FILE-17) |
+| `sync_client` | `SyncClient`: `sync_with_device`, `pull_from_device`, `push_to_device`, `initial_sync`, `send_to_device`, `fetch_from_device`, `deliver`, `exchange`, `join`, `grant_host`, `move_to`, `check`, `adopt_devices_from_cards`, `remove_local_copy` (FILE-26), a device reached at the addresses on its card (LISTEN-4), cancel and progress (FILE-17) |
 | `sync_server` | The listener: routes, the device-key middleware, the LAN gate, refusal delays, hosting several accounts (`IndexedAccounts`), the request log per hosted account, the periodic backup, the idle stop (LISTEN-5), where the listener can be reached (`listen_addresses`, LISTEN-4) |
 | `sync_apply` | Applying incoming changes in dependency order, with retry of failures and the purge check |
 | `versions` | Field version graph, three-way merge, conflict records, synced settings, device cards |
@@ -228,16 +228,16 @@ let db = Arc::new(Mutex::new(Database::new(&db_path)?));
 let config = Arc::new(Mutex::new(Config::new(None, None)?));
 let client = SyncClient::new(db.clone(), config.clone())?;
 
-// Sync with a peer: database changes only, both directions
-let result = client.sync_with_peer("peer_device_id").await;
+// Sync with a device: database changes only, both directions
+let result = client.sync_with_device("from_device_id").await;
 println!("Pulled: {}, Pushed: {}, Conflicts: {}, Request {}",
     result.pulled, result.pushed, result.conflicts, result.request_id);
 
 // Deliver (sync, then send) and exchange (sync, then send and fetch)
-let result = client.deliver("peer_device_id").await;
-let result = client.exchange("peer_device_id").await;
+let result = client.deliver("from_device_id").await;
+let result = client.exchange("from_device_id").await;
 
-// Listen for peers: HTTPS on this device's certificate; the last argument is plain_http,
+// Listen for devices: HTTPS on this device's certificate; the last argument is plain_http,
 // which is allowed only on a loopback address (AUTH-7)
 voicecore::sync_server::start_server(db, config, "0.0.0.0", 8384, false).await?;
 ```
@@ -292,8 +292,8 @@ let mut config = Config::new(Some(PathBuf::from("/path/to/config/dir")), None)?;
 println!("Device ID: {}", config.device_id_hex());
 println!("Device Name: {}", config.device_name());
 
-// Add a sync peer: id, name, URL, pinned certificate fingerprint, whether an existing entry may be replaced
-config.add_peer(
+// Add a sync device: id, name, URL, pinned certificate fingerprint, whether an existing entry may be replaced
+config.add_device(
     "0199aaaaaaaa70008000000000000001",
     "HomeServer",
     "https://192.168.1.20:8384",
@@ -301,11 +301,11 @@ config.add_peer(
     false,
 )?;
 
-// List configured peers
-let peers = config.peers();
+// List configured devices
+let devices = config.devices();
 
-// Remove a peer (returns whether one was removed)
-config.remove_peer("0199aaaaaaaa70008000000000000001")?;
+// Remove a device (returns whether one was removed)
+config.remove_device("0199aaaaaaaa70008000000000000001")?;
 ```
 
 ## API Reference
@@ -387,16 +387,16 @@ A refusal between devices carries, besides its sentence, one of the codes in
 ```rust
 pub struct SyncResult {
     pub success: bool,
-    pub pulled: i64,              // Changes received from the peer
-    pub pushed: i64,              // Changes sent to the peer
+    pub pulled: i64,              // Changes received from the device
+    pub pushed: i64,              // Changes sent to the device
     pub conflicts: i64,           // Conflicts flagged
-    pub sent: i64,                // Recordings sent to the peer (deliver, exchange, send)
-    pub fetched: i64,             // Recordings fetched from the peer (exchange, fetch)
+    pub sent: i64,                // Recordings sent to the device (deliver, exchange, send)
+    pub fetched: i64,             // Recordings fetched from the device (exchange, fetch)
     pub bytes_moved: u64,         // Bytes of recordings moved in either direction
     pub errors: Vec<String>,      // Problems that made the operation incomplete
     pub warnings: Vec<String>,    // Problems that did not affect the database changes
     pub request_id: String,       // The operation's id, on every request and log line (DIAG-2)
-    pub clock_skew_seconds: i64,  // The peer's clock minus this device's, past one minute (DIAG-3)
+    pub clock_skew_seconds: i64,  // The device's clock minus this device's, past one minute (DIAG-3)
 }
 ```
 
@@ -430,21 +430,21 @@ tables and another schema number is refused, and not opened, with the sentence:
 
 | Table | Purpose |
 |-------|---------|
-| `sync_peers` | Known peers: cursors, last sync time and operation (PROOF-3), the remembered address, the account at the last agreeing handshake (ACCT-3), the entity types the peer declared (PROTO-13) |
+| `sync_devices` | Known devices: cursors, last sync time and operation (PROOF-3), the remembered address, the account at the last agreeing handshake (ACCT-3), the entity types the device declared (PROTO-13) |
 | `sync_failures` | Changes that could not be applied, kept for retry |
 | `field_versions` | Append-only version graph of every editable field |
 | `field_heads` | Current head version per field |
 | `field_conflicts` | Merges that need a human, with the two versions and devices |
 | `field_deferred` | Fields whose row could not be written yet (HEAD-7) |
 | `synced_settings` | Settings shared by every device (denormalised heads) |
-| `purges` | What was removed for good, so that no peer can bring it back |
+| `purges` | What was removed for good, so that no device can bring it back |
 | `file_storage_config` | The single-row bucket configuration, synced |
 | `file_locations` | Where each copy of a recording is, synced (FILE-22) |
 | `sync_sequence`, `sync_meta` | Write-order counter, `database_id` and `account_id`; every syncable table has a `seq` column stamped by triggers |
 | `upload_parts` | Journal of multipart uploads to the bucket (FILE-19) |
 | `purged_objects` | Bucket objects waiting for their purge tag (BUCKET-2) |
 | `pending_file_renames` | Renames of recordings waiting for a caller that knows the audio folder (FILE-15) |
-| `file_holds` | Promises this device gave a peer to keep its copy of a recording until a time, while that peer removes its own (FILE-26); local, never synced |
+| `file_holds` | Promises this device gave a device to keep its copy of a recording until a time, while that device removes its own (FILE-26); local, never synced |
 | `file_removals` | Removals of this device's copy of a recording that are under way (FILE-26); local, never synced |
 | `pairing_offers` | Hashes of the tokens of shown codes, local (PAIR-2) |
 
@@ -459,7 +459,7 @@ authoritative for its own account: `Database::new_for_account(path, id)` gives a
 fresh, unused database the id, and a database that holds notes or has synced
 under another id is refused with `ACCOUNT_DISAGREES` (ACCT-4). The only way a
 database changes account is `move_to_account`, which takes a snapshot first,
-rewrites the id and forgets every peer (ACCT-5).
+rewrites the id and forgets every device (ACCT-5).
 
 One installation root can hold several accounts (`accounts.rs`, ACCT-6..ACCT-9):
 
@@ -492,8 +492,8 @@ URLs), `listens` (`"0"` / `"1"`), `key_hash`, `revoked` and `application`. The
 cards travel in the feed as `field_version` changes, so every device of the
 account knows every other (CARD-1). A device writes its own card at every start
 (`auth::ensure_own_device_card`); `revoked` can be set by any device and cleared
-by none (CARD-2). After every sync the cards become the peer list (CARD-3,
-`SyncClient::adopt_peers_from_cards`).
+by none (CARD-2). After every sync the cards become the device list (CARD-3,
+`SyncClient::adopt_devices_from_cards`).
 
 ### Request headers
 
@@ -544,11 +544,11 @@ empty for an error that has none. The codes (`sync_protocol::codes`):
 | `KEY_WRONG` | The key does not hash to the card's key hash (401) |
 | `DEVICE_MISMATCH` | The handshake body names a device other than the headers do (400) |
 | `TLS_REQUIRED` | Plain http to or on an address that is not this machine |
-| `CERTIFICATE_MISMATCH` | The peer's certificate is not the pinned one |
+| `CERTIFICATE_MISMATCH` | The device's certificate is not the pinned one |
 | `TOKEN_INVALID` | The pairing or grant token is unknown, spent, expired or mistyped (403) |
 | `SETUP_TEXT_INVALID` | The setup text, or a grant, could not be read |
 | `DEVICE_HOLDS_NOTES` | This device holds notes of another account and will not be paired over them |
-| `PROTOCOL_TOO_OLD` | The peer speaks a protocol version below 2 (426) |
+| `PROTOCOL_TOO_OLD` | The device speaks a protocol version below 2 (426) |
 | `NOT_ON_LAN` | The caller is not on a private network and this listener has no public address (403) |
 
 ## Pairing
@@ -568,7 +568,7 @@ token withdraws it (PAIR-1, PAIR-2).
   with the account id, the key, its own card and, when it holds one, the
   account's recording key (ENC-1). A code's `u=` carries every address of the
   showing device; the reading device tries each in turn, each with its own
-  client, and remembers as the peer's address the one that answered (LISTEN-4).
+  client, and remembers as the device's address the one that answered (LISTEN-4).
 - **Grant** (PAIR-5): a server that holds no account shows a grant text (`g=1`,
   no account id; `pairing::offer_hosting`, token hashed in the root's
   `hosting_offers`). The holder (`SyncClient::grant_host`) makes a key for the
@@ -605,10 +605,10 @@ turn." With no candidate the sentence is "No address on a local network was
 found. Is this device on a network?". The host name, when it is not
 `localhost`, is the last of `urls`.
 
-When a peer's remembered address does not answer (a network error, not a
-refusal), the sync client tries each address on the peer's device card in turn,
-with the peer's pinned certificate, and remembers for that device the one that
-answers. Sync, pull, push and the initial sync all reach a peer this way.
+When a device's remembered address does not answer (a network error, not a
+refusal), the sync client tries each address on the device's device card in turn,
+with the device's pinned certificate, and remembers for that device the one that
+answers. Sync, pull, push and the initial sync all reach a device this way.
 
 ## Sync Protocol
 
@@ -617,21 +617,21 @@ This section documents the sync protocol for implementing new clients.
 ### Protocol Overview
 
 Transport is HTTPS. A listener serves its own self-signed certificate
-(`certs/server.crt`, made when missing); a caller verifies a peer by its pinned
+(`certs/server.crt`, made when missing); a caller verifies a device by its pinned
 fingerprint, or against the system's root certificates when no fingerprint is
 pinned. Plain http is accepted only to and on a loopback address (AUTH-7). All
 timestamps are Unix seconds as JSON integers.
 
 The protocol version is `2.0` (`sync_protocol::PROTOCOL_VERSION`). A handshake
-from a peer whose major version is below 2 is refused with HTTP 426 and
+from a device whose major version is below 2 is refused with HTTP 426 and
 `PROTOCOL_TOO_OLD`, "Update Voice on <device name>"; nothing negotiates with
 version 1 (PROTO-12). The handshake carries `application` and `entity_types`,
 so another application can share the account's tags without ever seeing a note
 (PROTO-13).
 
-A **sync** exchanges database changes with a peer, both directions, and moves no
+A **sync** exchanges database changes with a device, both directions, and moves no
 file. Recording files move only by **upload** and **download** (the bucket) and
-by **send** and **fetch** (a peer); **deliver** is sync then send, and
+by **send** and **fetch** (a device); **deliver** is sync then send, and
 **exchange** is sync then send and fetch (`TECHNICAL-DECISIONS.md` 4.5).
 
 ### Endpoints
@@ -642,8 +642,8 @@ by **send** and **fetch** (a peer); **deliver** is sync then send, and
 | `GET` | `/sync/changes?cursor=<n>&limit=<m>&types=<a,b>` | device key | One page of the cursor feed |
 | `POST` | `/sync/apply` | device key | Apply a batch of the caller's changes |
 | `POST` | `/sync/audio/missing` | device key | Of the recording ids the caller names, the ones this instance lacks (FILE-12) |
-| `GET` | `/sync/audio/<audio_id>/file` | device key | Fetch a recording's file from this peer, resumable with `Range` (FILE-12, FILE-13) |
-| `POST` | `/sync/audio/<audio_id>/file` | device key | Send a recording's file to this peer, resumable with `Content-Range` (FILE-12, FILE-13) |
+| `GET` | `/sync/audio/<audio_id>/file` | device key | Fetch a recording's file from this device, resumable with `Range` (FILE-12, FILE-13) |
+| `POST` | `/sync/audio/<audio_id>/file` | device key | Send a recording's file to this device, resumable with `Content-Range` (FILE-12, FILE-13) |
 | `POST` | `/sync/audio/<audio_id>/keep` | device key | The caller is removing its copy of a recording; this device promises to keep its own for 10 minutes, or says why not (FILE-26) |
 | `GET` | `/sync/status` | none | Health check and identity |
 | `POST` | `/pair/claim` | token | A reading device claims a key with a code's token (PAIR-3) |
@@ -671,7 +671,7 @@ limit (`sync.max_sync_file_size_mb`) applies to the JSON routes; a file sent to
 ```
 
 `entity_types` empty means every type. The server remembers the declared types
-for the caller (`set_peer_entity_types`).
+for the caller (`set_device_entity_types`).
 
 **Response** (`HandshakeResponse`):
 ```json
@@ -697,7 +697,7 @@ The checks, in the order the handler runs them after the device-key middleware:
 takes a snapshot (SNAP-3), records the caller's account, and compares its audio
 folder with what it has stated about its own copies (FILE-22).
 
-`database_id` identifies the database; when a peer sees it change it forgets its
+`database_id` identifies the database; when a device sees it change it forgets its
 cursors and exchanges everything again (PROTO-9). `cursor` is the end of the
 feed at handshake time. `supports_audiofiles` is `true` when the account has an
 audio directory configured. `free_bytes` is the free space on the responder's
@@ -760,7 +760,7 @@ are not applied, and a sentence in `errors` says how many (PROTO-13). A
 `device_id` that is not 32 hex characters is refused with 400. The handler
 answers 200 with this body whenever the batch ran; an error that escapes the
 batch is 500. The server records the time of the sync with the caller
-(`update_peer_sync_time`).
+(`update_device_sync_time`).
 
 #### GET /sync/status
 
@@ -1117,8 +1117,8 @@ A sync moves no file. Each of these is an action the user starts
   the bucket does not hold the recording (FILE-22). `download_missing_audio_files` copies every
   missing file. The core stores the local setting `sync.mirror_audio_files`
   (`Config::mirror_audio_files`, never synced) for the application that runs this
-  after a sync (FILE-5); `sync_with_peer` itself never calls it.
-- **Send** and **fetch** (`SyncClient::send_to_peer`, `fetch_from_peer`,
+  after a sync (FILE-5); `sync_with_device` itself never calls it.
+- **Send** and **fetch** (`SyncClient::send_to_device`, `fetch_from_device`,
   `transfer.rs`, the file routes above): move a file between two instances of the
   account, streamed and never held in memory, resumable, verified by SHA-256
   (FILE-12, FILE-13). A sender first posts `/sync/audio/missing` with the ids it
@@ -1138,7 +1138,7 @@ place is known to hold it, and its file is not in the audio folder.
 the file only when another place confirms at that moment that it holds it:
 
 1. `begin_removal` marks the removal in `file_removals`; it is refused while this
-   device has promised a peer to keep the copy ("this device promised <device>
+   device has promised a device to keep the copy ("this device promised <device>
    to keep its copy until <time>, while <device> removes its own").
 2. The bucket is asked directly, when the row has a storage key: the object must
    exist and not carry the `voice-purged` tag. A bucket that does not hold it is
@@ -1167,20 +1167,20 @@ object that another recording which stays also uses is not tagged.
 
 ### Sync Flow
 
-`SyncClient::sync_with_peer` (FLOW-1):
+`SyncClient::sync_with_device` (FLOW-1):
 
 1. State this device's own copies of recordings: compare the audio folder with what this device has stated (FILE-22)
-2. `POST /sync/handshake` at the remembered address, and when it does not answer, at each address on the peer's card (LISTEN-4): refuse a responder of another account or of protocol 1.x; compare `database_id` with the stored one and restart both cursors from zero when it changed (PROTO-9); report clock skew (DIAG-3)
+2. `POST /sync/handshake` at the remembered address, and when it does not answer, at each address on the device's card (LISTEN-4): refuse a responder of another account or of protocol 1.x; compare `database_id` with the stored one and restart both cursors from zero when it changed (PROTO-9); report clock skew (DIAG-3)
 3. Note `local_end = current_seq()`: only what existed before the pull is pushed (FLOW-6)
 4. Take a snapshot (SNAP-3)
 5. Pull: `GET /sync/changes?cursor=<stored>` page by page until `is_complete`, applying each page and saving `next_cursor` after it (DIAG-1)
 6. Push: pages of this device's changes with `last_sent_seq < seq <= local_end` to `POST /sync/apply`, saving the high-water mark after each accepted page
 7. Push the rows of recordings the pull renamed (FILE-15)
-8. Record the peer's sync time and the last operation (PROOF-3)
-9. Add, re-pin or remove peers from the device cards (CARD-3)
+8. Record the device's sync time and the last operation (PROOF-3)
+9. Add, re-pin or remove devices from the device cards (CARD-3)
 
 `initial_sync` is the same flow from cursor zero in both directions (FLOW-4).
-`pull_from_peer` and `push_to_peer` run one direction (FLOW-3).
+`pull_from_device` and `push_to_device` run one direction (FLOW-3).
 
 ### Conflicts
 
@@ -1213,11 +1213,11 @@ failing statement rolls back only itself (APPLY-9).
 ### Implementing a New Client
 
 1. **Identity:** a UUID7 `device_id` and a `device_name`; a device key for the account, obtained by pairing (PAIR-3) or made when the device created the account (AUTH-1)
-2. **Headers:** send `X-Account-ID`, `X-Device-ID` and `Authorization: Bearer <key>` on every authenticated request, over HTTPS with the peer's pinned fingerprint
+2. **Headers:** send `X-Account-ID`, `X-Device-ID` and `Authorization: Bearer <key>` on every authenticated request, over HTTPS with the device's pinned fingerprint
 3. **Handshake:** announce protocol `2.0`, the account, the application and the entity types; refuse a responder of another account or a lower major version
-4. **Sync state:** store `database_id`, the received cursor and the sent high-water mark per peer; save each after every page
+4. **Sync state:** store `database_id`, the received cursor and the sent high-water mark per device; save each after every page
 5. **All entity types:** apply every type in `ALL_SYNC_ENTITY_TYPES` in dependency order, versions before rows, and recompute heads afterwards; drop changes about purged entities
-6. **Recording files:** move them only by upload and download (bucket) or send and fetch (peer), as the user asks
+6. **Recording files:** move them only by upload and download (bucket) or send and fetch (device), as the user asks
 7. **Conflicts:** never pick a winner; merge the version graph and record conflicts for the user to resolve
 8. **Timestamps:** Unix seconds as integers, each user-visible one with its offset and zone
 
@@ -1226,7 +1226,7 @@ failing statement rolls back only itself (APPLY-9).
 - **Snapshots** (SNAP-1..SNAP-4): `Database::snapshot` copies the whole database
   with SQLite's backup API into `snapshots/` beside the file, named
   `notes-<UTC time>.db`; the newest five are kept (`SNAPSHOTS_KEPT`). A snapshot
-  is taken before this device applies anything from a peer (on the caller's side
+  is taken before this device applies anything from a device (on the caller's side
   before the first pull, on the responder's side at the handshake), before
   `move_to_account` and before a restore. `restore_snapshot(name)` snapshots the
   current state first, so a restore can itself be undone. An in-memory database
@@ -1360,8 +1360,8 @@ Some tests by the rule they cover:
 |------|-------|
 | The schema | `database.rs::tests::schema`: `a_new_database_has_this_build_s_schema_and_its_system_tags_are_in_the_feed`, `a_database_of_another_schema_is_refused_in_words` |
 | FILE-25 | `database.rs::tests::origin`: `a_recording_names_the_installation_that_made_it_and_how`, `a_recording_made_here_whose_file_is_gone_is_named_with_how_it_was_made` |
-| FILE-26 | `database.rs::tests::file_locations::two_devices_that_count_on_each_other_never_both_remove`, `sync_server.rs::tests::files_between_instances::a_copy_goes_only_when_a_peer_promises_to_keep_its_own` |
-| LISTEN-4 | `sync_server.rs::tests::listener::the_address_on_the_route_is_shown_alone_and_virtual_interfaces_are_left_out`, `sync_server.rs::tests::peers_from_cards::a_peer_that_moved_is_reached_at_an_address_its_card_names`, `sync_server.rs::tests::pairing::a_code_whose_first_address_does_not_answer_is_claimed_at_the_next` |
+| FILE-26 | `database.rs::tests::file_locations::two_devices_that_count_on_each_other_never_both_remove`, `sync_server.rs::tests::files_between_instances::a_copy_goes_only_when_a_device_promises_to_keep_its_own` |
+| LISTEN-4 | `sync_server.rs::tests::listener::the_address_on_the_route_is_shown_alone_and_virtual_interfaces_are_left_out`, `sync_server.rs::tests::devices_from_cards::a_device_that_moved_is_reached_at_an_address_its_card_names`, `sync_server.rs::tests::pairing::a_code_whose_first_address_does_not_answer_is_claimed_at_the_next` |
 | PROTO-1 | `sync_server.rs`: `test_get_changes_after_seq_returns_all_entity_types` |
 
 ### Convergence tests

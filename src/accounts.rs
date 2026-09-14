@@ -402,12 +402,12 @@ mod tests {
         let b = index.create(Some("b"), false).unwrap();
         let mut config_a = Config::open_account(dir.path(), &index.directory(&a.account_id)).unwrap();
         let config_b = Config::open_account(dir.path(), &index.directory(&b.account_id)).unwrap();
-        assert_eq!(config_a.device_id_hex(), config_b.device_id_hex(), "one device");
+        assert_eq!(config_a.this_device_id_hex(), config_b.this_device_id_hex(), "one device");
         assert_eq!(config_a.certs_dir().unwrap(), config_b.certs_dir().unwrap(), "one set of certificates");
         assert_eq!(config_a.root(), dir.path());
-        config_a.set_device_name("Desk").unwrap();
+        config_a.set_this_device_name("Desk").unwrap();
         let reopened = Config::open_account(dir.path(), &index.directory(&b.account_id)).unwrap();
-        assert_eq!(reopened.device_name(), "Desk", "a rename reaches every account through the machine's file");
+        assert_eq!(reopened.this_device_name(), "Desk", "a rename reaches every account through the machine's file");
         assert_ne!(config_a.audiofile_directory(), config_b.audiofile_directory(), "recordings never shared");
     }
 }

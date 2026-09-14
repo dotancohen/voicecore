@@ -167,7 +167,7 @@ only when the user starts an action (`../TECHNICAL-DECISIONS.md` 4.5):
   NULLs, the cloud location is never erased by a row without one and only
   replaced by a newer row that has one, and versioned columns (summary,
   deletion) are never written from a row. Do not reintroduce "skip older rows":
-  it left a peer that edited the summary first without the `storage_key`.
+  it left a device that edited the summary first without the `storage_key`.
 - rust-s3 must stay at 0.37 or newer (FILE-24): older versions load TLS roots
   from the operating system's certificate directory, which Android does not
   have. Its `put_object` keeps only the ETag of an answer, so requests whose
@@ -211,7 +211,7 @@ Every editable value is a field with a Git-like history in `field_versions`
   derived and are not synced; every device recomputes them. Heads are folded
   from the *authored* leaves only (`authored_leaves`), so arrival order and page
   size cannot change the result. An authored version written on top of a derived
-  one publishes it (`publish_derived_ancestors`) so peers can complete the
+  one publishes it (`publish_derived_ancestors`) so devices can complete the
   child. Never make a derived version a fold input; never sync one that is not
   published.
 - **Cursor feed:** `get_changes_after_seq(cursor, upto, limit)` is the sync
@@ -219,7 +219,7 @@ Every editable value is a field with a Git-like history in `field_versions`
   (`create_sequence_triggers`): on insert, and on update of a synced column
   *when the value changed*. Row updates on the apply path use
   `NULLIF(MAX(...), 0)` forms so an echo of our own data writes nothing
-  (otherwise rows ping-pong between peers for ever). `recompute_head` writes the
+  (otherwise rows ping-pong between devices for ever). `recompute_head` writes the
   entity row exactly once.
 - **Property tests:** `cargo test convergence` runs random multi-device fleets
   (`src/convergence_tests.rs`): every entity type, pages down to 1, duplicate

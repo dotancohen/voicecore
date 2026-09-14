@@ -74,13 +74,13 @@ fn entity_order(entity_type: &str) -> u8 {
     }
 }
 
-/// Apply a batch from `peer_device_id`. `sync_received_at` is stamped on every
+/// Apply a batch from `from_device_id`. `sync_received_at` is stamped on every
 /// row and version so that this device relays them onward.
 pub fn apply_changes(
     db: &Database,
     changes: &[SyncChange],
-    peer_device_id: &str,
-    peer_device_name: Option<&str>,
+    from_device_id: &str,
+    from_device_name: Option<&str>,
     sync_received_at: i64,
 ) -> VoiceResult<ApplyOutcome> {
     // One write transaction per batch: thousands of statements, one fsync.
@@ -88,7 +88,7 @@ pub fn apply_changes(
     // independent-change semantics below are kept. Any error that escapes
     // rolls the batch back; the sender keeps its cursor and retries the page.
     db.begin_batch()?;
-    match apply_changes_in_batch(db, changes, peer_device_id, peer_device_name, sync_received_at) {
+    match apply_changes_in_batch(db, changes, from_device_id, from_device_name, sync_received_at) {
         Ok(outcome) => {
             db.commit_batch()?;
             Ok(outcome)
@@ -103,8 +103,8 @@ pub fn apply_changes(
 fn apply_changes_in_batch(
     db: &Database,
     changes: &[SyncChange],
-    peer_device_id: &str,
-    peer_device_name: Option<&str>,
+    from_device_id: &str,
+    from_device_name: Option<&str>,
     sync_received_at: i64,
 ) -> VoiceResult<ApplyOutcome> {
     let mut outcome = ApplyOutcome::default();
@@ -152,7 +152,7 @@ fn apply_changes_in_batch(
                 tracing::warn!("{}", msg);
                 // Queue known types for retry; an unknown type can never apply here.
                 if ALL_SYNC_ENTITY_TYPES.contains(&change.entity_type.as_str()) {
-                    if let Err(record_err) = db.record_sync_failure(peer_device_id, peer_device_name, change, &e.to_string()) {
+                    if let Err(record_err) = db.record_sync_failure(from_device_id, from_device_name, change, &e.to_string()) {
                         tracing::error!("Could not queue failed change for retry: {}", record_err);
                         outcome.errors.push(format!("Could not queue failed change for retry: {}", record_err));
                     }
@@ -180,7 +180,7 @@ fn apply_changes_in_batch(
 /// Whether this change is about something that was removed for good.
 ///
 /// A version is judged by the entity it belongs to, not by its own id: the
-/// history of a purged note is gone with it, and a copy arriving from a peer
+/// history of a purged note is gone with it, and a copy arriving from a device
 /// would put part of it back.
 fn purged_already(db: &Database, change: &SyncChange) -> VoiceResult<bool> {
     // What this change is about, and what it hangs on. A transcription of a
@@ -250,7 +250,7 @@ pub fn apply_one(
         tracing::warn!("Skipping change with unknown operation '{}' for {} {}", change.operation, change.entity_type, change.entity_id);
         return Ok(ApplyResult::Skipped);
     }
-    // Nothing brings back what was removed for good. A peer that has not
+    // Nothing brings back what was removed for good. A device that has not
     // heard of the purge yet keeps sending the rows it still has, and every
     // one of them is dropped here rather than resurrecting the entity.
     if purged_already(db, change)? {
@@ -359,7 +359,7 @@ pub fn apply_one(
             // Every copy is applied: the upsert keeps the newer value per
             // metadata column, never erases a cloud location, and never
             // touches the versioned columns. Skipping older rows (as before)
-            // left a peer that had edited the summary first without the
+            // left a device that had edited the summary first without the
             // storage key, unable to download the file until the uploader
             // happened to change the record again.
             db.apply_sync_audio_file(

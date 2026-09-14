@@ -227,7 +227,7 @@ mod tests {
 
     const HERE: &str = "01a09526bbbb70808f15a84d31aaa8d2";
     const PHONE: &str = "01a0952602bc70808f15a84d31aaa8d2";
-    const PEER: &str = "01a09526cccc70808f15a84d31aaa8d2";
+    const DEVICE: &str = "01a09526cccc70808f15a84d31aaa8d2";
 
     fn open() -> (Database, tempfile::TempDir) {
         let temp = tempfile::TempDir::new().unwrap();
@@ -238,10 +238,10 @@ mod tests {
         db.set_file_storage_config("s3", Some(&serde_json::json!({"bucket": "voice-abc", "region": "eu-central-1", "access_key_id": "k", "secret_access_key": "s"}))).unwrap();
     }
 
-    /// A change as a peer's sync delivers it.
-    fn from_peer(db: &Database, entity_type: &str, entity_id: &str, data: serde_json::Value) {
-        let change = SyncChange { entity_type: entity_type.to_string(), entity_id: entity_id.to_string(), operation: "create".to_string(), data, timestamp: 1_735_689_600, device_id: PEER.to_string(), device_name: None };
-        let outcome = crate::sync_apply::apply_changes(db, &[change], PEER, None, 1_735_689_700).unwrap();
+    /// A change as a device's sync delivers it.
+    fn from_device(db: &Database, entity_type: &str, entity_id: &str, data: serde_json::Value) {
+        let change = SyncChange { entity_type: entity_type.to_string(), entity_id: entity_id.to_string(), operation: "create".to_string(), data, timestamp: 1_735_689_600, device_id: DEVICE.to_string(), device_name: None };
+        let outcome = crate::sync_apply::apply_changes(db, &[change], DEVICE, None, 1_735_689_700).unwrap();
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
     }
 
@@ -251,19 +251,19 @@ mod tests {
 
     /// Q1 of 2026-09-14: a recording this device imported, no place known to
     /// hold it, and its file not in the folder is told apart from a recording
-    /// nobody is known to hold; a peer's recording is not.
+    /// nobody is known to hold; a device's recording is not.
     #[test]
     fn a_recording_imported_here_whose_file_is_gone_has_its_own_reason() {
         let (db, temp) = open();
         let dir = temp.path().join("audio");
         std::fs::create_dir_all(&dir).unwrap();
         with_bucket(&db);
-        let here = crate::database::get_local_device_id().simple().to_string();
+        let here = crate::database::get_this_device_id().simple().to_string();
         let note = db.create_note("").unwrap();
         let gone = db.create_audio_file("נעלם.mp3", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
         db.attach_to_note(&note, &gone, "audio_file").unwrap();
         let elsewhere = uuid::Uuid::now_v7().simple().to_string();
-        from_peer(&db, "audio_file", &elsewhere, serde_json::json!({"imported_at": 1_735_689_600, "filename": "אצל מישהו.3gp", "disk_name": "אצל מישהו.3gp", "modified_at": 1_735_689_600}));
+        from_device(&db, "audio_file", &elsewhere, serde_json::json!({"imported_at": 1_735_689_600, "filename": "אצל מישהו.3gp", "disk_name": "אצל מישהו.3gp", "modified_at": 1_735_689_600}));
 
         let found = issues(&db, Some(&dir), &here).unwrap();
         let reason_of = |id: &str| found.recordings_not_in_cloud.iter().find(|r| r.audio_id == id).map(|r| r.reason);
@@ -306,14 +306,14 @@ mod tests {
         db.update_audio_file_storage(&uploaded, "s3", "k.ogg", false).unwrap();
         // A recording known only by its row: a device that holds it said nothing
         let elsewhere = uuid::Uuid::now_v7().simple().to_string();
-        from_peer(&db, "audio_file", &elsewhere, serde_json::json!({"imported_at": 1_735_689_600, "filename": "אצל מישהו.3gp", "disk_name": "אצל מישהו.3gp", "modified_at": 1_735_689_600}));
+        from_device(&db, "audio_file", &elsewhere, serde_json::json!({"imported_at": 1_735_689_600, "filename": "אצל מישהו.3gp", "disk_name": "אצל מישהו.3gp", "modified_at": 1_735_689_600}));
         // A deleted recording is not an issue
         let gone = recording("נמחק.ogg", 10);
         db.delete_audio_file(&gone).unwrap();
 
         let now = issues(&db, Some(&dir), HERE).unwrap();
         assert_eq!(now.max_upload_bytes, 1024 * 1024);
-        // In import order: the peer's recording was imported in 2025, before these
+        // In import order: the device's recording was imported in 2025, before these
         assert_eq!(reasons(&now), vec![
             ("אצל מישהו.3gp".to_string(), NotInCloudReason::NoCopyKnown),
             ("הרצאה ארוכה.wav".to_string(), NotInCloudReason::TooLarge),
@@ -344,19 +344,19 @@ mod tests {
         db.connection().execute_batch("PRAGMA foreign_keys = OFF").unwrap();
         let missing_recording = uuid::Uuid::now_v7().simple().to_string();
         let transcription = uuid::Uuid::now_v7().simple().to_string();
-        from_peer(&db, "transcription", &transcription, serde_json::json!({
+        from_device(&db, "transcription", &transcription, serde_json::json!({
             "audio_file_id": missing_recording, "content": "שלום, זה תמלול בלי הקלטה", "service": "whisper",
-            "device_id": PEER, "created_at": 1_735_689_600,
+            "device_id": DEVICE, "created_at": 1_735_689_600,
         }));
         let note = db.create_note("פתק").unwrap();
         let attachment_without_recording = uuid::Uuid::now_v7().simple().to_string();
-        from_peer(&db, "note_attachment", &attachment_without_recording, serde_json::json!({
+        from_device(&db, "note_attachment", &attachment_without_recording, serde_json::json!({
             "note_id": note, "attachment_id": missing_recording, "attachment_type": "audio_file", "created_at": 1_735_689_600,
         }));
         let recording = db.create_audio_file("קיים.ogg", None, None, FileOrigin::Imported, None).unwrap();
         let missing_note = uuid::Uuid::now_v7().simple().to_string();
         let attachment_without_note = uuid::Uuid::now_v7().simple().to_string();
-        from_peer(&db, "note_attachment", &attachment_without_note, serde_json::json!({
+        from_device(&db, "note_attachment", &attachment_without_note, serde_json::json!({
             "note_id": missing_note, "attachment_id": recording, "attachment_type": "audio_file", "created_at": 1_735_689_601,
         }));
 
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(found.orphaned_recordings.iter().map(|r| r.audio_id.clone()).collect::<Vec<_>>(), vec![recording.clone()], "held only by a note that is not there");
 
         // When the missing recording arrives, its transcription and attachment are orphans no more
-        from_peer(&db, "audio_file", &missing_recording, serde_json::json!({"imported_at": 1_735_689_600, "filename": "הגיע.ogg", "disk_name": "הגיע.ogg", "modified_at": 1_735_689_600}));
+        from_device(&db, "audio_file", &missing_recording, serde_json::json!({"imported_at": 1_735_689_600, "filename": "הגיע.ogg", "disk_name": "הגיע.ogg", "modified_at": 1_735_689_600}));
         let later = issues(&db, None, HERE).unwrap();
         assert!(later.orphaned_transcriptions.is_empty());
         assert_eq!(later.orphaned_attachments.iter().map(|a| a.attachment_id.clone()).collect::<Vec<_>>(), vec![attachment_without_note]);

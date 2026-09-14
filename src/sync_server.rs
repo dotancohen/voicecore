@@ -3,9 +3,9 @@
 //! This module provides the server side of the sync protocol:
 //! - /sync/handshake - Exchange device info
 //! - /sync/changes - Get changes since timestamp
-//! - /sync/apply - Apply changes from peer
+//! - /sync/apply - Apply changes from device
 //! - /sync/status - Health check
-//! - /sync/audio/:id/file - One recording's bytes: GET serves it to a fetching peer, POST receives it from a sending peer
+//! - /sync/audio/:id/file - One recording's bytes: GET serves it to a fetching device, POST receives it from a sending device
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -623,7 +623,7 @@ async fn handshake(
             .into_response();
     }
 
-    // A peer of an older protocol is refused, in words (Stage 16)
+    // A device of an older protocol is refused, in words (Stage 16)
     if crate::sync_protocol::protocol_major(&request.protocol_version).unwrap_or(0) < crate::sync_protocol::PROTOCOL_MAJOR {
         tracing::warn!("Refused device {}: protocol {} is older than {}", short(&request.device_id), request.protocol_version, PROTOCOL_VERSION);
         return (
@@ -690,19 +690,19 @@ async fn handshake(
             .into_response();
     }
 
-    // A handshake starts a peer's operation, and what it applies afterwards
+    // A handshake starts a device's operation, and what it applies afterwards
     // must be undoable (SNAP-3).
     {
         let db = account.db.lock().unwrap();
         if let Err(e) = db.snapshot_before("handshake") {
             tracing::warn!("Could not take a snapshot before the handshake: {}", e);
         }
-        if let Err(e) = db.set_peer_account_id(&request.device_id, Some(&request.device_name), &request.account_id) {
-            tracing::warn!("Could not record the peer's account: {}", e);
+        if let Err(e) = db.set_device_account_id(&request.device_id, Some(&request.device_name), &request.account_id) {
+            tracing::warn!("Could not record the other device's account: {}", e);
         }
     }
 
-    // What this device holds is stated before the peer reads the feed (FILE-22):
+    // What this device holds is stated before the device reads the feed (FILE-22):
     // a device that only serves syncs compares its folder too
     {
         let dir = account.config.lock().ok().and_then(|c| c.audiofile_directory().map(std::path::PathBuf::from));
@@ -725,9 +725,9 @@ async fn handshake(
         (db.database_id().unwrap_or_default(), db.current_seq().unwrap_or(0))
     };
 
-    // What the peer wants and understands (Stage 16): apply accepts only that
+    // What the device wants and understands (Stage 16): apply accepts only that
     if let Ok(db) = account.db.lock() {
-        if let Err(e) = db.set_peer_entity_types(&request.device_id, Some(&request.device_name), &request.entity_types) {
+        if let Err(e) = db.set_device_entity_types(&request.device_id, Some(&request.device_name), &request.entity_types) {
             tracing::warn!("Could not remember the entity types of {}: {}", short(&request.device_id), e);
         }
     }
@@ -766,7 +766,7 @@ async fn get_changes(
         // phone pulling from this listener counts as much as a push to it.
         if let (Some(cursor), Some(Extension(CallerDevice(device)))) = (query.cursor, caller.as_ref()) {
             if !device.is_empty() {
-                if let Err(e) = db.set_peer_cursors(device, None, None, Some(cursor), None) {
+                if let Err(e) = db.set_device_cursors(device, None, None, Some(cursor), None) {
                     tracing::warn!("Could not note what {} holds: {}", device, e);
                 }
             }
@@ -831,8 +831,8 @@ async fn apply_changes(
         request.changes.len()
     );
 
-    // Only the types the peer declared in its handshake (Stage 16)
-    let declared = account.db.lock().ok().and_then(|db| db.peer_entity_types(&request.device_id).ok()).unwrap_or_default();
+    // Only the types the device declared in its handshake (Stage 16)
+    let declared = account.db.lock().ok().and_then(|db| db.device_entity_types(&request.device_id).ok()).unwrap_or_default();
     let mut request = request;
     let mut undeclared = 0usize;
     if !declared.is_empty() {
@@ -890,9 +890,9 @@ async fn apply_changes(
         tracing::warn!("  Error: {}", err);
     }
 
-    // Update sync_peers to track when we last synced with this peer
+    // Update sync_devices to track when we last synced with this device
     if let Ok(db) = account.db.lock() {
-        let _ = db.update_peer_sync_time(&request.device_id, Some(&request.device_name));
+        let _ = db.update_device_sync_time(&request.device_id, Some(&request.device_name));
     }
 
     let mut errors = errors;
@@ -954,9 +954,9 @@ fn audio_path_for(account: &AccountHandle, audio_id: &str, for_writing: bool) ->
     Ok(audio_local_path(dir, &found(&db)?.disk_name))
 }
 
-/// `GET /sync/audio/:id/file`: stream one recording to a fetching peer
+/// `GET /sync/audio/:id/file`: stream one recording to a fetching device
 /// (FILE-12), from the byte a `Range: bytes=N-` header asks for, with the
-/// whole file's size and SHA-256 in headers so the peer can verify.
+/// whole file's size and SHA-256 in headers so the device can verify.
 async fn serve_audio_file(
     Extension(account): Extension<AccountHandle>,
     Path(audio_id): Path<String>,
@@ -1011,7 +1011,7 @@ async fn serve_audio_file(
     Ok(response)
 }
 
-/// `POST /sync/audio/:id/file`: receive one recording sent by a peer
+/// `POST /sync/audio/:id/file`: receive one recording sent by a device
 /// (FILE-12), streamed into `<file>.part`, continuing from the part's
 /// length when a `Content-Range: bytes N-M/total` says so, verified by the
 /// `X-File-SHA256` header before the rename (FILE-13).
@@ -1172,37 +1172,37 @@ async fn missing_audio_files(
 fn apply_sync_changes(
     db: &Arc<Mutex<Database>>,
     changes: &[SyncChange],
-    peer_device_id: &str,
-    peer_device_name: Option<&str>,
-    _local_device_id: Option<&str>,
-    _local_device_name: Option<&str>,
+    from_device_id: &str,
+    from_device_name: Option<&str>,
+    _this_device_id: Option<&str>,
+    _this_device_name: Option<&str>,
 ) -> VoiceResult<(i64, i64, Vec<String>)> {
     let db = db.lock().unwrap();
     let sync_received_at = Utc::now().timestamp();
-    let outcome = crate::sync_apply::apply_changes(&db, changes, peer_device_id, peer_device_name, sync_received_at)?;
+    let outcome = crate::sync_apply::apply_changes(&db, changes, from_device_id, from_device_name, sync_received_at)?;
     if outcome.retried_ok > 0 {
         tracing::info!("Applied {} previously failed changes", outcome.retried_ok);
     }
-    // Update peer's last sync timestamp
-    db.update_peer_sync_time(peer_device_id, peer_device_name)?;
+    // Update device's last sync timestamp
+    db.update_device_sync_time(from_device_id, from_device_name)?;
     Ok((outcome.applied, outcome.conflicts, outcome.errors))
 }
 
-/// Apply sync changes from a peer to the local database.
+/// Apply sync changes from a device to the local database.
 ///
 /// This is the public API for applying changes, suitable for testing.
 /// Returns (applied_count, conflict_count, errors).
-pub fn apply_changes_from_peer(
+pub fn apply_changes_from_device(
     db: &Database,
     changes: &[SyncChange],
-    peer_device_id: &str,
-    peer_device_name: Option<&str>,
-    _local_device_id: Option<&str>,
-    _local_device_name: Option<&str>,
+    from_device_id: &str,
+    from_device_name: Option<&str>,
+    _this_device_id: Option<&str>,
+    _this_device_name: Option<&str>,
 ) -> VoiceResult<(i64, i64, Vec<String>)> {
     let sync_received_at = Utc::now().timestamp();
-    let outcome = crate::sync_apply::apply_changes(db, changes, peer_device_id, peer_device_name, sync_received_at)?;
-    db.update_peer_sync_time(peer_device_id, peer_device_name)?;
+    let outcome = crate::sync_apply::apply_changes(db, changes, from_device_id, from_device_name, sync_received_at)?;
+    db.update_device_sync_time(from_device_id, from_device_name)?;
     Ok((outcome.applied, outcome.conflicts, outcome.errors))
 }
 
@@ -1222,8 +1222,8 @@ pub fn create_router_for(accounts: Arc<dyn AccountSource>, machine: Arc<Mutex<Co
     let (device_id, device_name, max_body_size) = {
         let cfg = machine.lock().unwrap();
         (
-            cfg.device_id_hex().to_string(),
-            cfg.device_name().to_string(),
+            cfg.this_device_id_hex().to_string(),
+            cfg.this_device_name().to_string(),
             cfg.max_sync_file_size_bytes() as usize,
         )
     };
@@ -1412,7 +1412,7 @@ fn hostname_of_this_machine() -> Option<String> {
 /// under `certs/` if missing), or plain HTTP when `plain_http` is set, which
 /// is allowed only on a loopback address, for a reverse proxy in front or a
 /// test on this machine (AUTH-7). The listener's certificate fingerprint is
-/// written to its own device card so peers can pin it from the card.
+/// written to its own device card so devices can pin it from the card.
 pub async fn start_server(
     db: Arc<Mutex<Database>>,
     config: Arc<Mutex<Config>>,
@@ -1619,7 +1619,7 @@ mod tests {
 
         fn state_for(db: Database, dir: &TempDir) -> (AppState, AccountHandle) {
             let config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
-            let device_id = config.device_id_hex().to_string();
+            let device_id = config.this_device_id_hex().to_string();
             let account_id = db.account_id().unwrap();
             let handle = AccountHandle { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)) };
             let state = AppState {
@@ -1658,8 +1658,8 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["account_id"], account);
             let db = handle.db.lock().unwrap();
-            assert_eq!(db.get_peer_account_id("00000000000070008000000000000099").unwrap(), Some(account));
-            assert_eq!(db.list_snapshots().unwrap().len(), 1, "a snapshot before the peer's operation");
+            assert_eq!(db.get_device_account_id("00000000000070008000000000000099").unwrap(), Some(account));
+            assert_eq!(db.list_snapshots().unwrap().len(), 1, "a snapshot before the other device's operation");
         }
 
         #[tokio::test]
@@ -1672,7 +1672,7 @@ mod tests {
             assert_eq!(body["code"], codes::ACCOUNT_MISMATCH);
             assert!(body["error"].as_str().unwrap().contains("nothing was exchanged"));
             let db = handle.db.lock().unwrap();
-            assert_eq!(db.get_peer_account_id("00000000000070008000000000000099").unwrap(), None);
+            assert_eq!(db.get_device_account_id("00000000000070008000000000000099").unwrap(), None);
             assert!(db.list_snapshots().unwrap().is_empty());
         }
 
@@ -1694,7 +1694,7 @@ mod tests {
             server_db.create_note("של השרת").unwrap();
             let server_state_db = Arc::new(Mutex::new(server_db));
             let server_config = Arc::new(Mutex::new(Config::new(Some(server_dir.path().to_path_buf()), None).unwrap()));
-            let server_device = server_config.lock().unwrap().device_id_hex().to_string();
+            let server_device = server_config.lock().unwrap().this_device_id_hex().to_string();
             let router = create_router(server_state_db.clone(), server_config);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1707,10 +1707,10 @@ mod tests {
             client_db.create_note("של הלקוח").unwrap();
             let client_db = Arc::new(Mutex::new(client_db));
             let mut client_config = Config::new(Some(client_dir.path().to_path_buf()), None).unwrap();
-            client_config.add_peer(&server_device, "Server", &url, None, true).unwrap();
+            client_config.add_device(&server_device, "Server", &url, None, true).unwrap();
             let client = SyncClient::new(client_db.clone(), Arc::new(Mutex::new(client_config))).unwrap();
 
-            let result = client.sync_with_peer(&server_device).await;
+            let result = client.sync_with_device(&server_device).await;
 
             assert!(!result.success);
             // The headers name an account the server does not hold, so the
@@ -1720,7 +1720,7 @@ mod tests {
             assert_eq!(result.pushed, 0);
             assert_eq!(server_state_db.lock().unwrap().get_all_notes().unwrap().len(), 1, "the server kept only its own note");
             assert_eq!(client_db.lock().unwrap().get_all_notes().unwrap().len(), 1, "the client kept only its own note");
-            assert_eq!(client_db.lock().unwrap().get_peer_cursors(&server_device).unwrap(), (0, 0, None));
+            assert_eq!(client_db.lock().unwrap().get_device_cursors(&server_device).unwrap(), (0, 0, None));
             serving.abort();
         }
     }
@@ -1744,9 +1744,9 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
             let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
-            config.set_device_name(name).unwrap();
+            config.set_this_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
-            let id = config.device_id_hex().to_string();
+            let id = config.this_device_id_hex().to_string();
             Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
         }
 
@@ -1783,7 +1783,7 @@ mod tests {
         }
 
         fn client(caller: &Device, server: &Device, url: &str, pin: Option<&str>) -> SyncClient {
-            caller.config.lock().unwrap().add_peer(&server.id, "Server", url, pin, true).unwrap();
+            caller.config.lock().unwrap().add_device(&server.id, "Server", url, pin, true).unwrap();
             SyncClient::new(caller.db.clone(), caller.config.clone()).unwrap()
         }
 
@@ -1832,17 +1832,17 @@ mod tests {
             server.db.lock().unwrap().create_note("על השרת").unwrap();
             let (url, _, task) = serve(&server, false);
 
-            let result = client(&phone, &server, &url, None).sync_with_peer(&server.id).await;
+            let result = client(&phone, &server, &url, None).sync_with_device(&server.id).await;
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(phone.db.lock().unwrap().get_all_notes().unwrap().len(), 1);
 
-            let result = client(&stranger, &server, &url, None).sync_with_peer(&server.id).await;
+            let result = client(&stranger, &server, &url, None).sync_with_device(&server.id).await;
             assert!(!result.success);
             assert!(result.errors.iter().any(|e| e.contains(codes::DEVICE_UNKNOWN)), "{:?}", result.errors);
             assert!(stranger.db.lock().unwrap().get_all_notes().unwrap().is_empty());
 
             server.db.lock().unwrap().revoke_device(&phone.id).unwrap();
-            let result = client(&phone, &server, &url, None).sync_with_peer(&server.id).await;
+            let result = client(&phone, &server, &url, None).sync_with_device(&server.id).await;
             assert!(!result.success);
             assert!(result.errors.iter().any(|e| e.contains(codes::DEVICE_REVOKED)), "{:?}", result.errors);
             task.abort();
@@ -1919,19 +1919,19 @@ mod tests {
             let (url, fingerprint, task) = serve(&server, true);
             assert!(fingerprint.starts_with("SHA256:"));
 
-            let result = client(&phone, &server, &url, Some(&fingerprint)).sync_with_peer(&server.id).await;
+            let result = client(&phone, &server, &url, Some(&fingerprint)).sync_with_device(&server.id).await;
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(phone.db.lock().unwrap().get_all_notes().unwrap().len(), 1);
 
             let wrong = fingerprint.replace(|c: char| c.is_ascii_hexdigit(), "0");
-            let result = client(&phone, &server, &url, Some(&wrong)).sync_with_peer(&server.id).await;
+            let result = client(&phone, &server, &url, Some(&wrong)).sync_with_device(&server.id).await;
             assert!(!result.success);
             assert!(result.errors.iter().any(|e| e.contains(codes::CERTIFICATE_MISMATCH)), "{:?}", result.errors);
 
             // No pin: the self-signed certificate is checked against the
             // system roots and fails, because verification is never off.
-            phone.config.lock().unwrap().remove_peer(&server.id).unwrap();
-            let result = client(&phone, &server, &url, None).sync_with_peer(&server.id).await;
+            phone.config.lock().unwrap().remove_device(&server.id).unwrap();
+            let result = client(&phone, &server, &url, None).sync_with_device(&server.id).await;
             assert!(!result.success, "an unpinned self-signed certificate must not be accepted");
             task.abort();
         }
@@ -1941,7 +1941,7 @@ mod tests {
             let phone = device("Phone");
             let server = device("Server");
             let client = client(&phone, &server, "http://10.255.255.1:8384", None);
-            let result = client.sync_with_peer(&server.id).await;
+            let result = client.sync_with_device(&server.id).await;
             assert!(!result.success);
             assert!(result.errors.iter().any(|e| e.contains(codes::TLS_REQUIRED)), "{:?}", result.errors);
 
@@ -1968,9 +1968,9 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
             let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
-            config.set_device_name(name).unwrap();
+            config.set_this_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
-            let id = config.device_id_hex().to_string();
+            let id = config.this_device_id_hex().to_string();
             Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
         }
 
@@ -2018,15 +2018,15 @@ mod tests {
             let joined = client.join(&text).await.unwrap();
 
             assert_eq!(joined.account_id, setup.account_id);
-            assert_eq!(joined.peer_id, desk.id);
+            assert_eq!(joined.device_id, desk.id);
             assert_eq!(phone.db.lock().unwrap().account_id().unwrap(), setup.account_id, "the phone took the account");
             let key = phone.config.lock().unwrap().device_key().to_string();
             assert_eq!(key.len(), 43);
             let card_on_desk = desk.db.lock().unwrap().get_device_card(&phone.id).unwrap().unwrap();
             assert_eq!(card_on_desk.key_hash, auth::key_hash(&key), "the desk holds the phone's key hash");
-            let peers = phone.config.lock().unwrap().peers().to_vec();
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].certificate_fingerprint.as_deref(), Some(setup.certificate_fingerprint.as_str()), "the fingerprint is pinned");
+            let devices = phone.config.lock().unwrap().devices().to_vec();
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].certificate_fingerprint.as_deref(), Some(setup.certificate_fingerprint.as_str()), "the fingerprint is pinned");
 
             // The token is spent
             let again = device("Another");
@@ -2035,7 +2035,7 @@ mod tests {
 
             // And now an ordinary sync works, with the key and the pin
             phone.db.lock().unwrap().create_note("מהטלפון").unwrap();
-            let result = client.sync_with_peer(&desk.id).await;
+            let result = client.sync_with_device(&desk.id).await;
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(phone.db.lock().unwrap().get_all_notes().unwrap().len(), 2);
             assert_eq!(desk.db.lock().unwrap().get_all_notes().unwrap().len(), 2);
@@ -2061,8 +2061,8 @@ mod tests {
             let phone = device("Phone");
             let client = SyncClient::new(phone.db.clone(), phone.config.clone()).unwrap();
             let joined = client.join(&setup.to_text()).await.unwrap();
-            assert_eq!(joined.peer_url, url);
-            assert_eq!(phone.config.lock().unwrap().get_peer(&desk.id).unwrap().peer_url, url);
+            assert_eq!(joined.device_url, url);
+            assert_eq!(phone.config.lock().unwrap().get_device(&desk.id).unwrap().device_url, url);
             task.abort();
         }
 
@@ -2161,9 +2161,9 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
             let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
-            config.set_device_name(name).unwrap();
+            config.set_this_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
-            let id = config.device_id_hex().to_string();
+            let id = config.this_device_id_hex().to_string();
             Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
         }
 
@@ -2174,7 +2174,7 @@ mod tests {
             let root = TempDir::new().unwrap();
             crate::accounts::AccountIndex::open(root.path()).unwrap();
             let mut machine = Config::new(Some(root.path().to_path_buf()), None).unwrap();
-            machine.set_device_name("Server").unwrap();
+            machine.set_this_device_name("Server").unwrap();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -2202,9 +2202,9 @@ mod tests {
             let desk_client = SyncClient::new(desk.db.clone(), desk.config.clone()).unwrap();
             let granted = desk_client.grant_host(&text, "").await.unwrap();
             assert_eq!(granted.account_id, account);
-            assert_eq!(granted.peer_name, "Server");
-            let server_id = machine.lock().unwrap().device_id_hex().to_string();
-            assert_eq!(granted.peer_id, server_id);
+            assert_eq!(granted.device_name, "Server");
+            let server_id = machine.lock().unwrap().this_device_id_hex().to_string();
+            assert_eq!(granted.device_id, server_id);
 
             let listed = index.list().unwrap();
             assert_eq!(listed.len(), 1);
@@ -2225,7 +2225,7 @@ mod tests {
             assert!(refused.unwrap_err().to_string().contains(codes::TOKEN_INVALID));
 
             // The holder delivers to the server
-            let result = desk_client.sync_with_peer(&server_id).await;
+            let result = desk_client.sync_with_device(&server_id).await;
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(result.request_id.len(), 16, "the operation has an id");
             assert_eq!(hosted.db.lock().unwrap().get_all_notes().unwrap().len(), 1);
@@ -2244,12 +2244,12 @@ mod tests {
             let phone = device("Phone");
             let phone_client = SyncClient::new(phone.db.clone(), phone.config.clone()).unwrap();
             let joined = phone_client.join(&setup.to_text()).await.unwrap();
-            assert_eq!(joined.peer_id, server_id);
+            assert_eq!(joined.device_id, server_id);
             phone.db.lock().unwrap().create_note("מהטלפון").unwrap();
-            let result = phone_client.sync_with_peer(&server_id).await;
+            let result = phone_client.sync_with_device(&server_id).await;
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(phone.db.lock().unwrap().get_all_notes().unwrap().len(), 2, "the phone has the desk's note through the server");
-            let result = desk_client.sync_with_peer(&server_id).await;
+            let result = desk_client.sync_with_device(&server_id).await;
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(desk.db.lock().unwrap().get_all_notes().unwrap().len(), 2, "and the desk has the phone's");
 
@@ -2404,9 +2404,9 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
             let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
-            config.set_device_name(name).unwrap();
+            config.set_this_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
-            let id = config.device_id_hex().to_string();
+            let id = config.this_device_id_hex().to_string();
             Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
         }
 
@@ -2425,7 +2425,7 @@ mod tests {
             let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
             let router = create_router(b.db.clone(), b.config.clone()).into_make_service_with_connect_info::<SocketAddr>();
             let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
-            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            a.config.lock().unwrap().add_device(&b.id, "B", &url, None, true).unwrap();
             let key = a.config.lock().unwrap().device_key().to_string();
             let headers = vec![
                 (auth::HEADER_ACCOUNT.to_string(), account),
@@ -2443,7 +2443,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_peer_of_version_one_is_refused_in_words_and_version_two_is_let_in() {
+        async fn a_device_of_version_one_is_refused_in_words_and_version_two_is_let_in() {
             let (a, _b, url, http, headers, task) = pair().await;
             let account = a.db.lock().unwrap().account_id().unwrap();
             let mut request = HandshakeRequest {
@@ -2516,7 +2516,7 @@ mod tests {
 
             // Voice, declaring nothing, gets everything as before
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
-            let result = client.sync_with_peer(&b.id).await;
+            let result = client.sync_with_device(&b.id).await;
             assert!(result.success, "{:?}", result.errors);
             assert!(b.db.lock().unwrap().get_all_notes().unwrap().iter().any(|n| n.content == "מהתמונות"));
             task.abort();
@@ -2557,9 +2557,9 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
             let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
-            config.set_device_name(name).unwrap();
+            config.set_this_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
-            let id = config.device_id_hex().to_string();
+            let id = config.this_device_id_hex().to_string();
             Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
         }
 
@@ -2579,7 +2579,7 @@ mod tests {
             let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
             let router = wrap(create_router(b.db.clone(), b.config.clone())).into_make_service_with_connect_info::<SocketAddr>();
             let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
-            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            a.config.lock().unwrap().add_device(&b.id, "B", &url, None, true).unwrap();
             (a, b, url, task)
         }
 
@@ -2613,15 +2613,15 @@ mod tests {
             }
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
             client.set_page_size(page as i64);
-            let first = client.sync_with_peer(&b.id).await;
+            let first = client.sync_with_device(&b.id).await;
             assert!(!first.success, "the cut is an error, not silence");
             assert!(first.pulled > 0, "the first page was applied");
             let notes_after_cut = a.db.lock().unwrap().get_all_notes().unwrap().len();
             assert!(notes_after_cut > 0 && notes_after_cut < total, "{} of {} notes arrived before the cut", notes_after_cut, total);
-            let (received, _sent, _) = a.db.lock().unwrap().get_peer_cursors(&b.id).unwrap();
+            let (received, _sent, _) = a.db.lock().unwrap().get_device_cursors(&b.id).unwrap();
             assert!(received > 0, "the first page's cursor was saved");
 
-            let second = client.sync_with_peer(&b.id).await;
+            let second = client.sync_with_device(&b.id).await;
             assert!(second.success, "{:?}", second.errors);
             assert_eq!(a.db.lock().unwrap().get_all_notes().unwrap().len(), total, "nothing was lost");
 
@@ -2636,7 +2636,7 @@ mod tests {
                 (notes.len(), after.iter().filter(|c| c.device_id != a.id).count() as i64)
             };
             assert_eq!(notes_after_cut, notes_before, "the page before the cut was applied whole, and nothing past it");
-            let (final_cursor, _, _) = a.db.lock().unwrap().get_peer_cursors(&b.id).unwrap();
+            let (final_cursor, _, _) = a.db.lock().unwrap().get_device_cursors(&b.id).unwrap();
             assert!(final_cursor > received, "the cursor moved on");
             let requests = feed_requests.load(Ordering::SeqCst) as i64;
             let whole_feed_pages = (received + after + page as i64 - 1) / page as i64 + 1;
@@ -2687,7 +2687,7 @@ mod tests {
 
             // The ordinary client understands it: a sync brings every note
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
-            let result = client.sync_with_peer(&b.id).await;
+            let result = client.sync_with_device(&b.id).await;
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(a.db.lock().unwrap().get_all_notes().unwrap().len(), 200);
             task.abort();
@@ -2712,14 +2712,14 @@ mod tests {
             let stranger = device("Stranger");
             let account = a.db.lock().unwrap().account_id().unwrap();
             stranger.db.lock().unwrap().move_to_account(&account).unwrap();
-            stranger.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            stranger.config.lock().unwrap().add_device(&b.id, "B", &url, None, true).unwrap();
             let rows = SyncClient::new(stranger.db.clone(), stranger.config.clone()).unwrap().check(&b.id).await;
             let key = rows.iter().find(|r| r.name == "Key").unwrap();
             assert!(!key.passed);
             assert_eq!(key.code, codes::DEVICE_UNKNOWN);
 
             // Nobody at the address
-            stranger.config.lock().unwrap().add_peer("00000000000070008000000000000001", "Nobody", "http://127.0.0.1:1", None, true).unwrap();
+            stranger.config.lock().unwrap().add_device("00000000000070008000000000000001", "Nobody", "http://127.0.0.1:1", None, true).unwrap();
             let rows = SyncClient::new(stranger.db.clone(), stranger.config.clone()).unwrap().check("00000000000070008000000000000001").await;
             assert_eq!(rows.len(), 1);
             assert!(!rows[0].passed && rows[0].name == "Reachable", "{:?}", rows);
@@ -2727,7 +2727,7 @@ mod tests {
         }
     }
 
-    mod peers_from_cards {
+    mod devices_from_cards {
         use super::*;
         use crate::auth;
         use crate::config::Config;
@@ -2744,9 +2744,9 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
             let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
-            config.set_device_name(name).unwrap();
+            config.set_this_device_name(name).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
-            let id = config.device_id_hex().to_string();
+            let id = config.this_device_id_hex().to_string();
             Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, _dir: dir }
         }
 
@@ -2754,11 +2754,11 @@ mod tests {
             d.db.lock().unwrap().get_device_card(&d.id).unwrap().unwrap()
         }
 
-        /// LISTEN-4: a peer whose remembered address no longer answers is
+        /// LISTEN-4: a device whose remembered address no longer answers is
         /// reached at the addresses its card names, in turn, and the address
         /// that answered is remembered.
         #[tokio::test]
-        async fn a_peer_that_moved_is_reached_at_an_address_its_card_names() {
+        async fn a_device_that_moved_is_reached_at_an_address_its_card_names() {
             let a = device("A");
             let b = device("B");
             let account = a.db.lock().unwrap().account_id().unwrap();
@@ -2780,20 +2780,20 @@ mod tests {
             let router = create_router(b.db.clone(), b.config.clone()).into_make_service_with_connect_info::<SocketAddr>();
             let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
-            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
-            let first = client.sync_with_peer(&b.id).await;
+            a.config.lock().unwrap().add_device(&b.id, "B", &url, None, true).unwrap();
+            let first = client.sync_with_device(&b.id).await;
             assert!(first.success, "{:?}", first.errors);
 
             // B's address changed: A remembers one that no longer answers
-            a.config.lock().unwrap().add_peer(&b.id, "B", &dead, None, true).unwrap();
-            let again = client.sync_with_peer(&b.id).await;
+            a.config.lock().unwrap().add_device(&b.id, "B", &dead, None, true).unwrap();
+            let again = client.sync_with_device(&b.id).await;
             assert!(again.success, "{:?}", again.errors);
-            assert_eq!(a.config.lock().unwrap().get_peer(&b.id).unwrap().peer_url, url, "the address that answered is remembered");
+            assert_eq!(a.config.lock().unwrap().get_device(&b.id).unwrap().device_url, url, "the address that answered is remembered");
             task.abort();
         }
 
         #[tokio::test]
-        async fn after_a_sync_every_card_is_a_peer_a_revoked_one_goes_and_a_forgotten_one_stays_away() {
+        async fn after_a_sync_every_card_is_a_device_a_revoked_one_goes_and_a_forgotten_one_stays_away() {
             let a = device("A");
             let b = device("B");
             let c = device("C");
@@ -2821,45 +2821,45 @@ mod tests {
             }
             let router = create_router(b.db.clone(), b.config.clone()).into_make_service_with_connect_info::<SocketAddr>();
             let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
-            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            a.config.lock().unwrap().add_device(&b.id, "B", &url, None, true).unwrap();
 
             // C's card, with its address, reaches B when C syncs; a card
             // admitted by hand carries no address (the owner's fields travel)
             c.db.lock().unwrap().admit_device_card(&card_of(&b)).unwrap();
-            c.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
-            let from_c = SyncClient::new(c.db.clone(), c.config.clone()).unwrap().sync_with_peer(&b.id).await;
+            c.config.lock().unwrap().add_device(&b.id, "B", &url, None, true).unwrap();
+            let from_c = SyncClient::new(c.db.clone(), c.config.clone()).unwrap().sync_with_device(&b.id).await;
             assert!(from_c.success, "{:?}", from_c.errors);
 
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
-            let result = client.sync_with_peer(&b.id).await;
+            let result = client.sync_with_device(&b.id).await;
             assert!(result.success, "{:?}", result.errors);
 
-            let peers = a.config.lock().unwrap().peers().to_vec();
-            assert_eq!(peers.len(), 2, "B, and C from its card: {:?}", peers);
-            let c_peer = peers.iter().find(|p| p.peer_id == c.id).expect("C is a peer now");
-            assert_eq!(c_peer.peer_name, "C");
-            assert_eq!(c_peer.peer_url, "https://192.168.1.7:8384", "the card's first address");
-            assert_eq!(a.config.lock().unwrap().last_peer().map(|p| p.peer_id.clone()), Some(b.id.clone()), "the last peer is B");
-            assert!(!peers.iter().any(|p| p.peer_id == a.id), "never itself");
+            let devices = a.config.lock().unwrap().devices().to_vec();
+            assert_eq!(devices.len(), 2, "B, and C from its card: {:?}", devices);
+            let c_device = devices.iter().find(|p| p.device_id == c.id).expect("C is a device now");
+            assert_eq!(c_device.device_name, "C");
+            assert_eq!(c_device.device_url, "https://192.168.1.7:8384", "the card's first address");
+            assert_eq!(a.config.lock().unwrap().last_device().map(|p| p.device_id.clone()), Some(b.id.clone()), "the last device is B");
+            assert!(!devices.iter().any(|p| p.device_id == a.id), "never itself");
 
             // Forgotten on A: gone, and the next sync does not bring it back
-            assert!(a.config.lock().unwrap().forget_peer(&c.id).unwrap());
-            let result = client.sync_with_peer(&b.id).await;
+            assert!(a.config.lock().unwrap().forget_device(&c.id).unwrap());
+            let result = client.sync_with_device(&b.id).await;
             assert!(result.success, "{:?}", result.errors);
-            assert!(!a.config.lock().unwrap().peers().iter().any(|p| p.peer_id == c.id), "forgotten stays forgotten");
+            assert!(!a.config.lock().unwrap().devices().iter().any(|p| p.device_id == c.id), "forgotten stays forgotten");
             // Added again by hand: no longer forgotten
-            a.config.lock().unwrap().add_peer(&c.id, "C again", "https://192.168.1.7:8384", None, true).unwrap();
+            a.config.lock().unwrap().add_device(&c.id, "C again", "https://192.168.1.7:8384", None, true).unwrap();
             assert!(!a.config.lock().unwrap().is_forgotten(&c.id));
-            assert!(a.config.lock().unwrap().rename_peer(&c.id, "Meirav's phone").unwrap());
-            let result = client.sync_with_peer(&b.id).await;
+            assert!(a.config.lock().unwrap().rename_device(&c.id, "Meirav's phone").unwrap());
+            let result = client.sync_with_device(&b.id).await;
             assert!(result.success);
-            assert_eq!(a.config.lock().unwrap().get_peer(&c.id).unwrap().peer_name, "Meirav's phone", "the local name stays over the card's");
+            assert_eq!(a.config.lock().unwrap().get_device(&c.id).unwrap().device_name, "Meirav's phone", "the local name stays over the card's");
 
-            // Revoked on B: after the next sync it is no peer of A's
+            // Revoked on B: after the next sync it is no device of A's
             b.db.lock().unwrap().revoke_device(&c.id).unwrap();
-            let result = client.sync_with_peer(&b.id).await;
+            let result = client.sync_with_device(&b.id).await;
             assert!(result.success, "{:?}", result.errors);
-            assert!(!a.config.lock().unwrap().peers().iter().any(|p| p.peer_id == c.id), "a revoked card's peer goes");
+            assert!(!a.config.lock().unwrap().devices().iter().any(|p| p.device_id == c.id), "a revoked card's device goes");
             task.abort();
         }
     }
@@ -2882,12 +2882,12 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Database::new(dir.path().join("notes.db")).unwrap();
             let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
-            config.set_device_name(name).unwrap();
+            config.set_this_device_name(name).unwrap();
             let audio = dir.path().join("audio");
             std::fs::create_dir_all(&audio).unwrap();
             config.set_audiofile_directory(audio.to_str().unwrap()).unwrap();
             auth::ensure_own_device_card(&db, &mut config).unwrap();
-            let id = config.device_id_hex().to_string();
+            let id = config.this_device_id_hex().to_string();
             Device { db: Arc::new(Mutex::new(db)), config: Arc::new(Mutex::new(config)), id, audio, _dir: dir }
         }
 
@@ -2907,7 +2907,7 @@ mod tests {
             let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
             let router = create_router(b.db.clone(), b.config.clone()).into_make_service_with_connect_info::<SocketAddr>();
             let task = tokio::spawn(async move { axum_server::from_tcp(listener).serve(router).await.unwrap() });
-            a.config.lock().unwrap().add_peer(&b.id, "B", &url, None, true).unwrap();
+            a.config.lock().unwrap().add_device(&b.id, "B", &url, None, true).unwrap();
             (a, b, url, task)
         }
 
@@ -3001,17 +3001,17 @@ mod tests {
             assert!(!crate::transfer::part_path(&on_a).exists());
 
             // Both sides now know where the copies are (Stage 10)
-            let a_knows = |id: &str| a.db.lock().unwrap().copies_of(id, &a.id).unwrap().iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>();
-            let b_knows = |id: &str| b.db.lock().unwrap().copies_of(id, &b.id).unwrap().iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>();
+            let a_knows = |id: &str| a.db.lock().unwrap().copies_of(id, &a.id).unwrap().iter().map(|c| c.device_id.clone()).collect::<Vec<_>>();
+            let b_knows = |id: &str| b.db.lock().unwrap().copies_of(id, &b.id).unwrap().iter().map(|c| c.device_id.clone()).collect::<Vec<_>>();
             assert_eq!(a_knows(&id_a), vec![b.id.clone()], "A sent its recording to B");
             assert_eq!(a_knows(&id_b), vec![b.id.clone()], "A fetched B's, so B holds it");
             assert_eq!(b_knows(&id_a), vec![a.id.clone()], "B received A's, so A holds it");
             assert_eq!(b_knows(&id_b), vec![a.id.clone()], "B served its own to A");
             assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 0 }, "everything of A's is somewhere else too");
-            let peers = a.db.lock().unwrap().peer_summaries().unwrap();
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].last_operation.as_deref(), Some("exchange"));
-            assert!(peers[0].last_reached_at.is_some());
+            let devices = a.db.lock().unwrap().device_summaries().unwrap();
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].last_operation.as_deref(), Some("exchange"));
+            assert!(devices[0].last_reached_at.is_some());
 
             let again = client.exchange(&b.id).await;
             assert!(again.success);
@@ -3054,8 +3054,8 @@ mod tests {
             assert!(!on_b.is_file(), "the file did not arrive whole");
 
             // Without the cancelling sink, the next deliver sends only the
-            // rest: what reached the peer before the cut stays as a part
-            // (the peer finishes writing it after the client gave up, so it
+            // rest: what reached the device before the cut stays as a part
+            // (the device finishes writing it after the client gave up, so it
             // is measured by the second send, not by looking at the disk)
             client.set_progress_sink(None);
             let again = client.deliver(&b.id).await;
@@ -3078,7 +3078,7 @@ mod tests {
             assert_eq!(a.db.lock().unwrap().not_duplicated(None, &a.id).unwrap(), crate::database::NotDuplicated { notes: 1, recordings: 0 }, "without an audio directory no recording is counted");
 
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
-            let synced = client.sync_with_peer(&b.id).await;
+            let synced = client.sync_with_device(&b.id).await;
             assert!(synced.success, "{:?}", synced.errors);
             assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap(), crate::database::NotDuplicated { notes: 0, recordings: 1 }, "the note was sent; the file was not");
 
@@ -3088,7 +3088,7 @@ mod tests {
 
             // A note that came from B is not "on this device only"; an edit of it here is, until sent
             b.db.lock().unwrap().create_note("מ-B").unwrap();
-            let synced = client.sync_with_peer(&b.id).await;
+            let synced = client.sync_with_device(&b.id).await;
             assert!(synced.success);
             assert_eq!(a.db.lock().unwrap().not_duplicated(Some(&a.audio), &a.id).unwrap().notes, 0);
             let from_b = a.db.lock().unwrap().get_all_notes().unwrap().into_iter().find(|n| n.content == "מ-B").unwrap();
@@ -3097,10 +3097,10 @@ mod tests {
             task.abort();
         }
 
-        /// FILE-18: a send stores the sender's hash once and the peer receives
+        /// FILE-18: a send stores the sender's hash once and the device receives
         /// it with the row at the next sync; the fetched bytes match it.
         #[tokio::test]
-        async fn a_send_stores_the_hash_once_and_the_peer_learns_it_by_sync() {
+        async fn a_send_stores_the_hash_once_and_the_device_learns_it_by_sync() {
             let (a, b, _url, task) = pair();
             let (id, path) = recording(&a, 1000);
             assert!(a.db.lock().unwrap().get_audio_file(&id).unwrap().unwrap().content_sha256.is_none());
@@ -3111,7 +3111,7 @@ mod tests {
             assert_eq!(a.db.lock().unwrap().get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(expected.as_str()), "the sender stored its hash");
             let result = client.deliver(&b.id).await;
             assert!(result.success, "{:?}", result.errors);
-            assert_eq!(b.db.lock().unwrap().get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(expected.as_str()), "the peer received it with the row");
+            assert_eq!(b.db.lock().unwrap().get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(expected.as_str()), "the receiving device got the hash with the row");
             assert_eq!(crate::transfer::file_sha256(&path_of(&b, &id)).unwrap(), expected);
             task.abort();
         }
@@ -3138,8 +3138,8 @@ mod tests {
             assert!(result.success, "{:?}", result.errors);
             assert_eq!((result.sent, result.fetched), (1, 1));
             assert_eq!(holding(&b, &id_a), both, "the receiver states its copy, and the sender's");
-            assert_eq!(holding(&a, &id_b), both, "the fetcher states its copy, and the peer's");
-            let synced = client.sync_with_peer(&b.id).await;
+            assert_eq!(holding(&a, &id_b), both, "the fetcher states its copy, and the holder's");
+            let synced = client.sync_with_device(&b.id).await;
             assert!(synced.success, "{:?}", synced.errors);
             for id in [&id_a, &id_b] {
                 assert_eq!(holding(&a, id), both);
@@ -3151,12 +3151,12 @@ mod tests {
             assert!(removed.contains("B holds it"), "{}", removed);
             assert!(!path_a.exists());
             std::fs::remove_file(path_of(&b, &id_b)).unwrap();
-            let synced = client.sync_with_peer(&b.id).await;
+            let synced = client.sync_with_device(&b.id).await;
             assert!(synced.success, "{:?}", synced.errors);
             let b_client = {
                 // B learns A's removal from A's push; A learns B's deletion when B states it
                 b.db.lock().unwrap().check_files_here(&b.audio, &b.id).unwrap();
-                client.sync_with_peer(&b.id).await
+                client.sync_with_device(&b.id).await
             };
             assert!(b_client.success, "{:?}", b_client.errors);
             assert_eq!(holding(&b, &id_a), vec![b.id.clone()], "B knows A removed its copy");
@@ -3171,7 +3171,7 @@ mod tests {
         /// own removal is refused while the promise lasts; a device that is
         /// removing its copy promises nothing, and the refusal says so.
         #[tokio::test]
-        async fn a_copy_goes_only_when_a_peer_promises_to_keep_its_own() {
+        async fn a_copy_goes_only_when_a_device_promises_to_keep_its_own() {
             let (a, b, _url, task) = pair();
             let (id, path_a) = recording(&a, 5000);
             let (id2, path2_a) = recording(&a, 3000);
@@ -3210,7 +3210,7 @@ mod tests {
             assert!(path_of(&b, &id_a).is_file());
             assert!(!path_of(&a, &id_b).is_file(), "deliver fetches nothing");
 
-            let fetched = client.fetch_from_peer(&b.id).await;
+            let fetched = client.fetch_from_device(&b.id).await;
             assert!(fetched.success, "{:?}", fetched.errors);
             assert_eq!(fetched.fetched, 1);
             assert!(path_of(&a, &id_b).is_file());
@@ -3224,7 +3224,7 @@ mod tests {
             let (id_b, path_b) = recording(&b, 100_000);
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
             // The rows must be on both sides before files can move
-            assert!(client.sync_with_peer(&b.id).await.success);
+            assert!(client.sync_with_device(&b.id).await.success);
 
             // B already holds the first 40,000 bytes of A's recording: a send continues from there
             let on_b = path_of(&b, &id_a);
@@ -3246,13 +3246,13 @@ mod tests {
             let (a, b, _url, task) = pair();
             let (id_b, path_b) = recording(&b, 50_000);
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
-            assert!(client.sync_with_peer(&b.id).await.success);
+            assert!(client.sync_with_device(&b.id).await.success);
             let on_a = path_of(&a, &id_b);
             std::fs::write(crate::transfer::part_path(&on_a), vec![0u8; 10_000]).unwrap();
 
             // The first attempt assembles a wrong file, finds the hash does not agree and discards the part;
             // the retry fetches it whole.
-            let result = client.fetch_from_peer(&b.id).await;
+            let result = client.fetch_from_device(&b.id).await;
             assert!(result.success, "{:?}", result.errors);
             assert_eq!(std::fs::read(&on_a).unwrap(), std::fs::read(&path_b).unwrap());
             assert_eq!(result.bytes_moved, 50_000, "only the attempt that succeeded counts");
@@ -3265,7 +3265,7 @@ mod tests {
             let (id_a, _) = recording(&a, 100);
             let (id_b, _) = recording(&b, 100);
             let client = SyncClient::new(a.db.clone(), a.config.clone()).unwrap();
-            assert!(client.sync_with_peer(&b.id).await.success);
+            assert!(client.sync_with_device(&b.id).await.success);
             let account = a.db.lock().unwrap().account_id().unwrap();
             let key = a.config.lock().unwrap().device_key().to_string();
             let resp = reqwest::Client::new()
@@ -3308,7 +3308,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let db = Arc::new(Mutex::new(Database::new(dir.path().join("notes.db")).unwrap()));
             let config = Arc::new(Mutex::new(Config::new(Some(dir.path().to_path_buf()), None).unwrap()));
-            let device_id = config.lock().unwrap().device_id_hex().to_string();
+            let device_id = config.lock().unwrap().this_device_id_hex().to_string();
             let port = free_port();
             let url = format!("http://127.0.0.1:{}", port);
 
@@ -3374,7 +3374,7 @@ mod tests {
         fn listen_urls_name_private_addresses_and_the_host() {
             let urls = listen_urls("0.0.0.0", 8384, false);
             assert!(urls.iter().all(|u| u.starts_with("https://") && u.ends_with(":8384")), "{:?}", urls);
-            assert!(!urls.iter().any(|u| u.contains("127.0.0.1")), "loopback is not an address for a peer");
+            assert!(!urls.iter().any(|u| u.contains("127.0.0.1")), "loopback is not an address for a device");
             assert_eq!(listen_urls("192.168.1.10", 1, true), vec!["http://192.168.1.10:1"]);
         }
     }
@@ -4150,7 +4150,7 @@ mod tests {
                 c
             })
             .collect();
-        apply_changes_from_peer(to, &changes, from_device, None, None, None).unwrap()
+        apply_changes_from_device(to, &changes, from_device, None, None, None).unwrap()
     }
 
     const DEV_A: &str = "00000000000070008000000000000aaa";
@@ -4346,7 +4346,7 @@ mod tests {
     }
 
     /// The purge travels, and nothing brings the note back afterwards: the
-    /// peer that still had it stops offering it.
+    /// device that still had it stops offering it.
     #[test]
     fn a_purge_travels_and_the_note_does_not_come_back() {
         let (a, _ta) = create_test_db();
@@ -4655,13 +4655,13 @@ mod tests {
             }),
             DEV_A,
         );
-        let (applied, _, errors) = apply_changes_from_peer(&db, &[bad], DEV_A, None, None, None).unwrap();
+        let (applied, _, errors) = apply_changes_from_device(&db, &[bad], DEV_A, None, None, None).unwrap();
         assert_eq!(applied, 0);
         assert_eq!(errors.len(), 1, "{:?}", errors);
         assert_eq!(db.count_pending_sync_failures().unwrap(), 1, "kept for retry, not dropped");
 
         // Next batch retries it (still failing) and keeps it queued
-        let (_, _, errors) = apply_changes_from_peer(&db, &[], DEV_A, None, None, None).unwrap();
+        let (_, _, errors) = apply_changes_from_device(&db, &[], DEV_A, None, None, None).unwrap();
         assert!(errors.is_empty());
         assert_eq!(db.count_pending_sync_failures().unwrap(), 1);
     }
@@ -4683,7 +4683,7 @@ mod tests {
     }
 
     #[test]
-    fn test_files_storage_key_reaches_peer_that_edited_summary_first() {
+    fn test_files_storage_key_reaches_device_that_edited_summary_first() {
         // A imports and uploads; B, unaware, edits the summary (a newer row);
         // after the exchange both know the cloud location and the summary.
         let (a, _ta) = create_test_db();
@@ -4707,7 +4707,7 @@ mod tests {
         let (a, _ta) = create_test_db();
         let audio = a.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         a.update_audio_file_storage(&audio, "s3", &format!("audio/{}.mp3", audio), false).unwrap();
-        // An older copy of the row (from a peer that never saw the upload)
+        // An older copy of the row (from a device that never saw the upload)
         a.apply_sync_audio_file(&audio, 1735689600, "הקלטה.mp3", None, None, None, Some(1735689600), None, Some(1735689601), None, None, None, None, None, None, None, None).unwrap();
         let row = a.get_audio_file_raw(&audio).unwrap().unwrap();
         assert_eq!(row["storage_key"].as_str().unwrap(), format!("audio/{}.mp3", audio));

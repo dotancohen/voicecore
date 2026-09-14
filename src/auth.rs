@@ -68,10 +68,10 @@ pub fn ensure_own_device_card(db: &Database, config: &mut Config) -> VoiceResult
         .filter(|p| p.is_file())
         .and_then(|p| crate::tls::compute_fingerprint(&p).ok())
         .unwrap_or_default();
-    let existing = db.get_device_card(config.device_id_hex())?;
+    let existing = db.get_device_card(config.this_device_id_hex())?;
     let card = DeviceCard {
-        device_id: config.device_id_hex().to_string(),
-        name: config.device_name().to_string(),
+        device_id: config.this_device_id_hex().to_string(),
+        name: config.this_device_name().to_string(),
         certificate_fingerprint,
         addresses: existing.as_ref().map(|c| c.addresses.clone()).unwrap_or_default(),
         listens: existing.as_ref().map(|c| c.listens.clone()).unwrap_or_else(|| "0".to_string()),
@@ -239,7 +239,7 @@ mod tests {
         assert_eq!(first.application, "voice");
         let key = config.device_key().to_string();
 
-        config.set_device_name("Desk").unwrap();
+        config.set_this_device_name("Desk").unwrap();
         let second = ensure_own_device_card(&db, &mut config).unwrap();
         assert_eq!(config.device_key(), key, "the key is made once");
         assert_eq!(second.name, "Desk");

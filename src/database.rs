@@ -39,10 +39,10 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 use crate::models::SyncChange;
 
-/// A peer known to hold a copy of a recording (Stage 10).
+/// A device known to hold a copy of a recording (Stage 10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyRow {
-    pub peer_id: String,
+    pub device_id: String,
     pub at: i64,
 }
 
@@ -63,12 +63,12 @@ pub struct NotDuplicated {
     pub recordings: i64,
 }
 
-/// A peer as `sync_peers` remembers it: when it was last reached, and by
+/// A device as `sync_devices` remembers it: when it was last reached, and by
 /// which operation (Stage 10).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerSummary {
-    pub peer_id: String,
-    pub peer_name: Option<String>,
+pub struct DeviceSummary {
+    pub device_id: String,
+    pub device_name: Option<String>,
     pub last_reached_at: Option<i64>,
     pub last_operation: Option<String>,
 }
@@ -82,19 +82,19 @@ use crate::validation::{
 };
 
 // Global device ID for local operations
-static LOCAL_DEVICE_ID: OnceLock<Uuid> = OnceLock::new();
-static LOCAL_DEVICE_NAME: Mutex<Option<String>> = Mutex::new(None);
+static THIS_DEVICE_ID: OnceLock<Uuid> = OnceLock::new();
+static THIS_DEVICE_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 /// Set the human-readable name of this device, recorded on every version it creates.
-pub fn set_local_device_name(name: &str) {
-    if let Ok(mut n) = LOCAL_DEVICE_NAME.lock() {
+pub fn set_this_device_name(name: &str) {
+    if let Ok(mut n) = THIS_DEVICE_NAME.lock() {
         *n = Some(name.to_string());
     }
 }
 
 /// Name of this device, if configured.
-pub fn get_local_device_name() -> Option<String> {
-    LOCAL_DEVICE_NAME.lock().ok().and_then(|n| n.clone())
+pub fn get_this_device_name() -> Option<String> {
+    THIS_DEVICE_NAME.lock().ok().and_then(|n| n.clone())
 }
 
 /// System tag name - parent of all hidden system tags (e.g., _marked)
@@ -165,13 +165,13 @@ pub struct CacheRebuildSummary {
 }
 
 /// Set the local device ID for database operations.
-pub fn set_local_device_id(device_id: Uuid) {
-    let _ = LOCAL_DEVICE_ID.set(device_id);
+pub fn set_this_device_id(device_id: Uuid) {
+    let _ = THIS_DEVICE_ID.set(device_id);
 }
 
 /// Get the local device ID, generating one if not set.
-pub fn get_local_device_id() -> Uuid {
-    *LOCAL_DEVICE_ID.get_or_init(Uuid::now_v7)
+pub fn get_this_device_id() -> Uuid {
+    *THIS_DEVICE_ID.get_or_init(Uuid::now_v7)
 }
 
 
@@ -382,7 +382,7 @@ pub struct Database {
 /// The place in `file_locations` that stands for the account's bucket (FILE-22).
 pub const PLACE_CLOUD: &str = "cloud";
 
-/// How long a device keeps a copy it promised a peer, and how long a removal
+/// How long a device keeps a copy it promised a device, and how long a removal
 /// under way refuses such promises (FILE-26), in milliseconds.
 pub const HOLD_MS: i64 = 10 * 60 * 1000;
 
@@ -493,9 +493,9 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Whether this database has ever exchanged anything with a peer.
+    /// Whether this database has ever exchanged anything with a device.
     fn has_synced(&self) -> VoiceResult<bool> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM sync_peers", [], |r| r.get(0))?;
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM sync_devices", [], |r| r.get(0))?;
         Ok(n > 0)
     }
 
@@ -609,25 +609,25 @@ impl Database {
                 PRIMARY KEY (note_id, tag_id)
             );
 
-            -- The peers this database has exchanged with, and where each feed stands
-            CREATE TABLE IF NOT EXISTS sync_peers (
-                peer_id BLOB PRIMARY KEY,
-                peer_name TEXT,
-                peer_url TEXT NOT NULL,
+            -- The devices this database has exchanged with, and where each feed stands
+            CREATE TABLE IF NOT EXISTS sync_devices (
+                device_id BLOB PRIMARY KEY,
+                device_name TEXT,
+                device_url TEXT NOT NULL,
                 last_sync_at INTEGER,
                 certificate_fingerprint BLOB,
                 last_received_cursor INTEGER,
                 last_sent_seq INTEGER,
-                peer_database_id TEXT,
-                peer_account_id TEXT,
+                device_database_id TEXT,
+                device_account_id TEXT,
                 last_operation TEXT,
-                peer_entity_types TEXT
+                device_entity_types TEXT
             );
 
             CREATE TABLE IF NOT EXISTS sync_failures (
                 id BLOB PRIMARY KEY,
-                peer_id BLOB NOT NULL,
-                peer_name TEXT,
+                device_id BLOB NOT NULL,
+                device_name TEXT,
                 entity_type TEXT NOT NULL,
                 entity_id BLOB,
                 operation TEXT NOT NULL,
@@ -635,7 +635,7 @@ impl Database {
                 error_message TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 resolved_at INTEGER,
-                FOREIGN KEY (peer_id) REFERENCES sync_peers(peer_id)
+                FOREIGN KEY (device_id) REFERENCES sync_devices(device_id)
             );
 
             -- A note's attachments (polymorphic: `attachment_type` names the table)
@@ -778,8 +778,8 @@ impl Database {
                 PRIMARY KEY (audio_id, part_number)
             );
 
-            -- A promise this device gave a peer to keep its copy of a recording
-            -- while that peer removes its own (FILE-26). Local, never synced.
+            -- A promise this device gave a device to keep its copy of a recording
+            -- while that device removes its own (FILE-26). Local, never synced.
             CREATE TABLE IF NOT EXISTS file_holds (
                 audio_id BLOB NOT NULL,
                 for_device TEXT NOT NULL,
@@ -805,7 +805,7 @@ impl Database {
                 PRIMARY KEY (audio_id, place)
             );
 
-            -- What has been removed for good and must not come back from a peer
+            -- What has been removed for good and must not come back from a device
             -- that has not heard yet (PURGE-1). Kept for ever.
             CREATE TABLE IF NOT EXISTS purges (
                 entity_type TEXT NOT NULL,
@@ -1452,7 +1452,7 @@ impl Database {
     /// the recordings that hung on this note alone are removed from the
     /// database, and a `purges` row is written for each of them. Those rows
     /// travel to the other devices, which remove the same entities, and they
-    /// stay for ever so that a peer which has not synced yet cannot bring
+    /// stay for ever so that a device which has not synced yet cannot bring
     /// any of it back.
     ///
     /// Returns the ids of the audio files that were removed, so the caller
@@ -1595,7 +1595,7 @@ impl Database {
                 purged_at,
                 crate::timezone::stamp_offset(),
                 crate::timezone::stamp_zone(),
-                get_local_device_id().as_bytes().to_vec(),
+                get_this_device_id().as_bytes().to_vec(),
             ],
         )?;
         Ok(())
@@ -2755,17 +2755,17 @@ impl Database {
     // Sync methods
     // ============================================================================
 
-    /// Get the last sync timestamp for a peer
-    pub fn get_peer_last_sync(&self, peer_device_id: &str) -> VoiceResult<Option<i64>> {
-        let peer_uuid = Uuid::parse_str(peer_device_id)
-            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
-        let peer_bytes = peer_uuid.as_bytes().to_vec();
+    /// Get the last sync timestamp for a device
+    pub fn get_device_last_sync(&self, from_device_id: &str) -> VoiceResult<Option<i64>> {
+        let from_device_uuid = Uuid::parse_str(from_device_id)
+            .map_err(|e| VoiceError::validation("from_device_id", e.to_string()))?;
+        let from_device_bytes = from_device_uuid.as_bytes().to_vec();
 
         let result: Option<Option<i64>> = self
             .conn
             .query_row(
-                "SELECT last_sync_at FROM sync_peers WHERE peer_id = ?",
-                params![peer_bytes],
+                "SELECT last_sync_at FROM sync_devices WHERE device_id = ?",
+                params![from_device_bytes],
                 |row| row.get(0),
             )
             .optional()?;
@@ -2773,38 +2773,38 @@ impl Database {
         Ok(result.flatten())
     }
 
-    /// Update the last sync timestamp for a peer
-    pub fn update_peer_sync_time(&self, peer_device_id: &str, peer_name: Option<&str>) -> VoiceResult<()> {
-        let peer_uuid = Uuid::parse_str(peer_device_id)
-            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
-        let peer_bytes = peer_uuid.as_bytes().to_vec();
+    /// Update the last sync timestamp for a device
+    pub fn update_device_sync_time(&self, from_device_id: &str, device_name: Option<&str>) -> VoiceResult<()> {
+        let from_device_uuid = Uuid::parse_str(from_device_id)
+            .map_err(|e| VoiceError::validation("from_device_id", e.to_string()))?;
+        let from_device_bytes = from_device_uuid.as_bytes().to_vec();
 
-        // Upsert the peer record (peer_url is NOT NULL, so we use empty string as default)
+        // Upsert the device record (device_url is NOT NULL, so we use empty string as default)
         self.conn.execute(
             r#"
-            INSERT INTO sync_peers (peer_id, peer_name, peer_url, last_sync_at)
+            INSERT INTO sync_devices (device_id, device_name, device_url, last_sync_at)
             VALUES (?, ?, '', strftime('%s', 'now'))
-            ON CONFLICT(peer_id) DO UPDATE SET
-                peer_name = COALESCE(excluded.peer_name, peer_name),
+            ON CONFLICT(device_id) DO UPDATE SET
+                device_name = COALESCE(excluded.device_name, device_name),
                 last_sync_at = strftime('%s', 'now')
             "#,
-            params![peer_bytes, peer_name],
+            params![from_device_bytes, device_name],
         )?;
 
         Ok(())
     }
 
-    /// Clear all sync peer records to force a full re-sync
-    pub fn clear_sync_peers(&self) -> VoiceResult<()> {
-        self.conn.execute("DELETE FROM sync_peers", [])?;
+    /// Clear all sync device records to force a full re-sync
+    pub fn clear_sync_devices(&self) -> VoiceResult<()> {
+        self.conn.execute("DELETE FROM sync_devices", [])?;
         Ok(())
     }
 
     /// Reset sync timestamps to NULL to force re-fetching all data
-    /// Unlike clear_sync_peers, this preserves peer configuration
+    /// Unlike clear_sync_devices, this preserves device configuration
     pub fn reset_sync_timestamps(&self) -> VoiceResult<()> {
         self.conn.execute(
-            "UPDATE sync_peers SET last_sync_at = NULL, last_received_cursor = NULL, last_sent_seq = NULL",
+            "UPDATE sync_devices SET last_sync_at = NULL, last_received_cursor = NULL, last_sent_seq = NULL",
             [],
         )?;
         Ok(())
@@ -2829,7 +2829,7 @@ impl Database {
     }
 
     /// Random id of this database, minted when the sequence was created.
-    /// A peer that sees a different id knows the database was reset and its
+    /// A device that sees a different id knows the database was reset and its
     /// cursors are void.
     pub fn database_id(&self) -> VoiceResult<String> {
         Ok(self
@@ -2863,43 +2863,43 @@ impl Database {
     ///
     /// The deliberate way to merge two accounts, never reached by pairing:
     /// a snapshot is taken first, the account id is rewritten, and every
-    /// peer's cursors are forgotten so that the next sync exchanges
+    /// device's cursors are forgotten so that the next sync exchanges
     /// everything. The notes stay; their ids cannot collide.
     pub fn move_to_account(&self, account_id: &str) -> VoiceResult<()> {
         validate_account_id(account_id)?;
         self.snapshot_before("account move")?;
         self.set_account_id(account_id)?;
-        self.conn.execute("DELETE FROM sync_peers", [])?;
+        self.conn.execute("DELETE FROM sync_devices", [])?;
         Ok(())
     }
 
-    /// The account a known peer held at its last handshake, if recorded.
-    pub fn get_peer_account_id(&self, peer_device_id: &str) -> VoiceResult<Option<String>> {
-        let peer_uuid = Uuid::parse_str(peer_device_id)
-            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+    /// The account a known device held at its last handshake, if recorded.
+    pub fn get_device_account_id(&self, from_device_id: &str) -> VoiceResult<Option<String>> {
+        let from_device_uuid = Uuid::parse_str(from_device_id)
+            .map_err(|e| VoiceError::validation("from_device_id", e.to_string()))?;
         Ok(self
             .conn
             .query_row(
-                "SELECT peer_account_id FROM sync_peers WHERE peer_id = ?",
-                params![peer_uuid.as_bytes().to_vec()],
+                "SELECT device_account_id FROM sync_devices WHERE device_id = ?",
+                params![from_device_uuid.as_bytes().to_vec()],
                 |r| r.get::<_, Option<String>>(0),
             )
             .optional()?
             .flatten())
     }
 
-    /// Record the account a peer holds, after a handshake that agreed.
-    pub fn set_peer_account_id(&self, peer_device_id: &str, peer_name: Option<&str>, account_id: &str) -> VoiceResult<()> {
-        let peer_uuid = Uuid::parse_str(peer_device_id)
-            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
-        let peer_bytes = peer_uuid.as_bytes().to_vec();
+    /// Record the account a device holds, after a handshake that agreed.
+    pub fn set_device_account_id(&self, from_device_id: &str, device_name: Option<&str>, account_id: &str) -> VoiceResult<()> {
+        let from_device_uuid = Uuid::parse_str(from_device_id)
+            .map_err(|e| VoiceError::validation("from_device_id", e.to_string()))?;
+        let from_device_bytes = from_device_uuid.as_bytes().to_vec();
         self.conn.execute(
-            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, '')",
-            params![peer_bytes, peer_name],
+            "INSERT OR IGNORE INTO sync_devices (device_id, device_name, device_url) VALUES (?, ?, '')",
+            params![from_device_bytes, device_name],
         )?;
         self.conn.execute(
-            "UPDATE sync_peers SET peer_account_id = ?, peer_name = COALESCE(?, peer_name) WHERE peer_id = ?",
-            params![account_id, peer_name, peer_bytes],
+            "UPDATE sync_devices SET device_account_id = ?, device_name = COALESCE(?, device_name) WHERE device_id = ?",
+            params![account_id, device_name, from_device_bytes],
         )?;
         Ok(())
     }
@@ -3164,16 +3164,16 @@ impl Database {
         Ok(())
     }
 
-    /// Per-peer cursor state: (cursor into the peer's feed, our own seq last
-    /// pushed to the peer, the peer's database id we last saw).
-    pub fn get_peer_cursors(&self, peer_device_id: &str) -> VoiceResult<(i64, i64, Option<String>)> {
-        let peer_uuid = Uuid::parse_str(peer_device_id)
-            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+    /// Per-device cursor state: (cursor into the device's feed, our own seq last
+    /// pushed to the device, the device's database id we last saw).
+    pub fn get_device_cursors(&self, from_device_id: &str) -> VoiceResult<(i64, i64, Option<String>)> {
+        let from_device_uuid = Uuid::parse_str(from_device_id)
+            .map_err(|e| VoiceError::validation("from_device_id", e.to_string()))?;
         let row: Option<(Option<i64>, Option<i64>, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT last_received_cursor, last_sent_seq, peer_database_id FROM sync_peers WHERE peer_id = ?",
-                params![peer_uuid.as_bytes().to_vec()],
+                "SELECT last_received_cursor, last_sent_seq, device_database_id FROM sync_devices WHERE device_id = ?",
+                params![from_device_uuid.as_bytes().to_vec()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -3181,28 +3181,28 @@ impl Database {
         Ok((c.unwrap_or(0), s.unwrap_or(0), d))
     }
 
-    /// The entity types a peer declared in its handshake (Stage 16): apply
+    /// The entity types a device declared in its handshake (Stage 16): apply
     /// accepts only those. Empty means every type.
-    pub fn set_peer_entity_types(&self, peer_device_id: &str, peer_name: Option<&str>, types: &[String]) -> VoiceResult<()> {
-        let peer_uuid = Uuid::parse_str(peer_device_id).map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
-        let peer_bytes = peer_uuid.as_bytes().to_vec();
+    pub fn set_device_entity_types(&self, from_device_id: &str, device_name: Option<&str>, types: &[String]) -> VoiceResult<()> {
+        let from_device_uuid = Uuid::parse_str(from_device_id).map_err(|e| VoiceError::validation("from_device_id", e.to_string()))?;
+        let from_device_bytes = from_device_uuid.as_bytes().to_vec();
         self.conn.execute(
-            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, '')",
-            params![peer_bytes, peer_name],
+            "INSERT OR IGNORE INTO sync_devices (device_id, device_name, device_url) VALUES (?, ?, '')",
+            params![from_device_bytes, device_name],
         )?;
         self.conn.execute(
-            "UPDATE sync_peers SET peer_entity_types = ? WHERE peer_id = ?",
-            params![serde_json::to_string(types).unwrap_or_default(), peer_bytes],
+            "UPDATE sync_devices SET device_entity_types = ? WHERE device_id = ?",
+            params![serde_json::to_string(types).unwrap_or_default(), from_device_bytes],
         )?;
         Ok(())
     }
 
-    /// The entity types a peer declared, or empty for every type.
-    pub fn peer_entity_types(&self, peer_device_id: &str) -> VoiceResult<Vec<String>> {
-        let peer_uuid = Uuid::parse_str(peer_device_id).map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
+    /// The entity types a device declared, or empty for every type.
+    pub fn device_entity_types(&self, from_device_id: &str) -> VoiceResult<Vec<String>> {
+        let from_device_uuid = Uuid::parse_str(from_device_id).map_err(|e| VoiceError::validation("from_device_id", e.to_string()))?;
         let text: Option<Option<String>> = self
             .conn
-            .query_row("SELECT peer_entity_types FROM sync_peers WHERE peer_id = ?", params![peer_uuid.as_bytes().to_vec()], |r| r.get(0))
+            .query_row("SELECT device_entity_types FROM sync_devices WHERE device_id = ?", params![from_device_uuid.as_bytes().to_vec()], |r| r.get(0))
             .optional()?;
         Ok(text.flatten().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default())
     }
@@ -3644,12 +3644,12 @@ impl Database {
         Ok(())
     }
 
-    /// A peer holds a copy of a recording (Stage 10): this device saw it
+    /// A device holds a copy of a recording (Stage 10): this device saw it
     /// send the file, receive it whole, or say that it holds it (FILE-22).
-    /// The peer's own statement replaces this one when it is newer.
-    pub fn record_copy(&self, audio_id: &str, peer_id: &str) -> VoiceResult<()> {
-        let peer = Uuid::parse_str(peer_id).map_err(|e| VoiceError::validation("peer_id", e.to_string()))?;
-        self.set_file_location(audio_id, &peer.simple().to_string(), true)?;
+    /// The device's own statement replaces this one when it is newer.
+    pub fn record_copy(&self, audio_id: &str, device_id: &str) -> VoiceResult<()> {
+        let device = Uuid::parse_str(device_id).map_err(|e| VoiceError::validation("device_id", e.to_string()))?;
+        self.set_file_location(audio_id, &device.simple().to_string(), true)?;
         Ok(())
     }
 
@@ -3661,7 +3661,7 @@ impl Database {
             .file_locations(audio_id)?
             .into_iter()
             .filter(|l| l.present && l.place != PLACE_CLOUD && l.place != here)
-            .map(|l| CopyRow { peer_id: l.place, at: l.changed_at / 1000 })
+            .map(|l| CopyRow { device_id: l.place, at: l.changed_at / 1000 })
             .collect())
     }
 
@@ -3697,12 +3697,12 @@ impl Database {
             "INSERT INTO file_locations (audio_id, place, present, changed_at, changed_by, sync_received_at)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL)
              ON CONFLICT(audio_id, place) DO UPDATE SET present = ?3, changed_at = ?4, changed_by = ?5, sync_received_at = NULL",
-            params![audio.as_bytes().to_vec(), place, present as i64, changed_at, get_local_device_id().as_bytes().to_vec()],
+            params![audio.as_bytes().to_vec(), place, present as i64, changed_at, get_this_device_id().as_bytes().to_vec()],
         )?;
         Ok(true)
     }
 
-    /// A location statement from a peer (FILE-22): kept when it is newer
+    /// A location statement from a device (FILE-22): kept when it is newer
     /// than the one here, by time and then by the id of the device that
     /// made it, so every device keeps the same statement whatever the order
     /// the statements arrive in.
@@ -3865,8 +3865,8 @@ impl Database {
     }
 
     /// Begin removing this device's copy of a recording (FILE-26): refused,
-    /// with the reason, while this device has promised a peer to keep it;
-    /// otherwise marked, so that a peer asking this device to keep its copy is
+    /// with the reason, while this device has promised a device to keep it;
+    /// otherwise marked, so that a device asking this device to keep its copy is
     /// refused until the removal is finished or abandoned.
     pub fn begin_removal(&self, audio_id: &str) -> VoiceResult<Result<(), String>> {
         let id = audio_id_bytes(audio_id)?;
@@ -3917,7 +3917,7 @@ impl Database {
         })
     }
 
-    /// Give up a removal (FILE-26): the copy stays, and peers may be promised it again.
+    /// Give up a removal (FILE-26): the copy stays, and devices may be promised it again.
     pub fn abandon_removal(&self, audio_id: &str) -> VoiceResult<()> {
         self.conn.execute("DELETE FROM file_removals WHERE audio_id = ?", params![audio_id_bytes(audio_id)?])?;
         Ok(())
@@ -3951,7 +3951,7 @@ impl Database {
         self.set_file_storage_config(&provider, Some(&config))
     }
 
-    /// The size of a recording's file, from a peer's row (FILE-23): a file's
+    /// The size of a recording's file, from a device's row (FILE-23): a file's
     /// bytes never change, so a size already here is kept.
     pub fn apply_sync_size_bytes(&self, audio_id: &str, size_bytes: i64) -> VoiceResult<()> {
         let id = Uuid::parse_str(audio_id).map_err(|e| VoiceError::validation("audio_id", e.to_string()))?;
@@ -3963,17 +3963,17 @@ impl Database {
     }
 
     /// What is on this device only (Stage 10): notes whose head version was
-    /// written here and never sent to any peer, and recordings whose file
-    /// is here, not in the bucket, and on no peer that this device knows of.
+    /// written here and never sent to any device, and recordings whose file
+    /// is here, not in the bucket, and on no device that this device knows of.
     /// A note's head content version is here only when it was not received
     /// by sync, it is either authored (it has a device) or a root made for a
     /// note row that was itself written here, and its `seq` is above every
-    /// peer's sent cursor. `audio_dir` is where the files are, and without
+    /// device's sent cursor. `audio_dir` is where the files are, and without
     /// it no recording counts.
     pub fn not_duplicated(&self, audio_dir: Option<&Path>, here: &str) -> VoiceResult<NotDuplicated> {
         let max_sent: i64 = self
             .conn
-            .query_row("SELECT COALESCE(MAX(last_sent_seq), 0) FROM sync_peers", [], |r| r.get(0))?;
+            .query_row("SELECT COALESCE(MAX(last_sent_seq), 0) FROM sync_devices", [], |r| r.get(0))?;
         let notes: i64 = self.conn.query_row(
             r#"SELECT COUNT(*) FROM notes n
                JOIN field_heads h ON h.entity_type = 'note' AND h.entity_id = lower(hex(n.id)) AND h.field = 'content'
@@ -4003,31 +4003,31 @@ impl Database {
         Ok(NotDuplicated { notes, recordings })
     }
 
-    /// Record that an operation with a peer ran now (Stage 10): the peer's
+    /// Record that an operation with a device ran now (Stage 10): the device's
     /// row gets the time and the operation's name.
-    pub fn set_peer_last_operation(&self, peer_device_id: &str, peer_name: Option<&str>, peer_url: Option<&str>, operation: &str) -> VoiceResult<()> {
-        let peer_uuid = Uuid::parse_str(peer_device_id).map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
-        let peer_bytes = peer_uuid.as_bytes().to_vec();
+    pub fn set_device_last_operation(&self, from_device_id: &str, device_name: Option<&str>, device_url: Option<&str>, operation: &str) -> VoiceResult<()> {
+        let from_device_uuid = Uuid::parse_str(from_device_id).map_err(|e| VoiceError::validation("from_device_id", e.to_string()))?;
+        let from_device_bytes = from_device_uuid.as_bytes().to_vec();
         self.conn.execute(
-            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, ?)",
-            params![peer_bytes, peer_name, peer_url.unwrap_or("")],
+            "INSERT OR IGNORE INTO sync_devices (device_id, device_name, device_url) VALUES (?, ?, ?)",
+            params![from_device_bytes, device_name, device_url.unwrap_or("")],
         )?;
         self.conn.execute(
-            "UPDATE sync_peers SET last_sync_at = ?, last_operation = ?, peer_name = COALESCE(?, peer_name) WHERE peer_id = ?",
-            params![Utc::now().timestamp(), operation, peer_name, peer_bytes],
+            "UPDATE sync_devices SET last_sync_at = ?, last_operation = ?, device_name = COALESCE(?, device_name) WHERE device_id = ?",
+            params![Utc::now().timestamp(), operation, device_name, from_device_bytes],
         )?;
         Ok(())
     }
 
-    /// Every peer this device has dealt with: when it was last reached and
+    /// Every device this device has dealt with: when it was last reached and
     /// what the last operation was (Stage 10).
-    pub fn peer_summaries(&self) -> VoiceResult<Vec<PeerSummary>> {
-        let mut stmt = self.conn.prepare("SELECT peer_id, peer_name, last_sync_at, last_operation FROM sync_peers ORDER BY last_sync_at DESC")?;
+    pub fn device_summaries(&self) -> VoiceResult<Vec<DeviceSummary>> {
+        let mut stmt = self.conn.prepare("SELECT device_id, device_name, last_sync_at, last_operation FROM sync_devices ORDER BY last_sync_at DESC")?;
         let rows = stmt.query_map([], |r| {
-            let peer: Vec<u8> = r.get(0)?;
-            Ok(PeerSummary {
-                peer_id: Uuid::from_slice(&peer).map(|u| u.simple().to_string()).unwrap_or_default(),
-                peer_name: r.get(1)?,
+            let device: Vec<u8> = r.get(0)?;
+            Ok(DeviceSummary {
+                device_id: Uuid::from_slice(&device).map(|u| u.simple().to_string()).unwrap_or_default(),
+                device_name: r.get(1)?,
                 last_reached_at: r.get(2)?,
                 last_operation: r.get(3)?,
             })
@@ -4035,30 +4035,30 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Store cursor state for a peer (any `None` leaves that value alone).
-    pub fn set_peer_cursors(
+    /// Store cursor state for a device (any `None` leaves that value alone).
+    pub fn set_device_cursors(
         &self,
-        peer_device_id: &str,
-        peer_name: Option<&str>,
+        from_device_id: &str,
+        device_name: Option<&str>,
         received_cursor: Option<i64>,
         sent_seq: Option<i64>,
-        peer_database_id: Option<&str>,
+        device_database_id: Option<&str>,
     ) -> VoiceResult<()> {
-        let peer_uuid = Uuid::parse_str(peer_device_id)
-            .map_err(|e| VoiceError::validation("peer_device_id", e.to_string()))?;
-        let peer_bytes = peer_uuid.as_bytes().to_vec();
+        let from_device_uuid = Uuid::parse_str(from_device_id)
+            .map_err(|e| VoiceError::validation("from_device_id", e.to_string()))?;
+        let from_device_bytes = from_device_uuid.as_bytes().to_vec();
         self.conn.execute(
-            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, '')",
-            params![peer_bytes, peer_name],
+            "INSERT OR IGNORE INTO sync_devices (device_id, device_name, device_url) VALUES (?, ?, '')",
+            params![from_device_bytes, device_name],
         )?;
         self.conn.execute(
-            r#"UPDATE sync_peers SET
+            r#"UPDATE sync_devices SET
                  last_received_cursor = COALESCE(?, last_received_cursor),
                  last_sent_seq = COALESCE(?, last_sent_seq),
-                 peer_database_id = COALESCE(?, peer_database_id),
-                 peer_name = COALESCE(?, peer_name)
-               WHERE peer_id = ?"#,
-            params![received_cursor, sent_seq, peer_database_id, peer_name, peer_bytes],
+                 device_database_id = COALESCE(?, device_database_id),
+                 device_name = COALESCE(?, device_name)
+               WHERE device_id = ?"#,
+            params![received_cursor, sent_seq, device_database_id, device_name, from_device_bytes],
         )?;
         Ok(())
     }
@@ -4095,7 +4095,7 @@ impl Database {
                     for item in chunk {
                         // A page is bounded in bytes as well as in count, so that
                         // thousands of long transcriptions never produce a body
-                        // that exceeds the peer's limit or its timeout. At least
+                        // that exceeds the device's limit or its timeout. At least
                         // one change always goes out, and the cursor stays exact.
                         let size = serde_json::to_string(&item.2).map(|s| s.len()).unwrap_or(0);
                         if !items.is_empty() && (bytes + size > FEED_BYTE_BUDGET || items.len() as i64 >= limit) {
@@ -4861,7 +4861,7 @@ impl Database {
             .map_err(|e| VoiceError::validation("attachment_id", e.to_string()))?;
         let association_id = Uuid::now_v7();
 
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
         let note_bytes = note_uuid.as_bytes().to_vec();
 
         self.conn.execute(
@@ -5022,7 +5022,7 @@ impl Database {
         }
         let audio_file_id = Uuid::now_v7();
         let uuid_bytes = audio_file_id.as_bytes().to_vec();
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
 
         self.conn.execute(
             r#"
@@ -5236,7 +5236,7 @@ impl Database {
         let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
 
         let updated = self.conn.execute(
             r#"
@@ -5273,7 +5273,7 @@ impl Database {
         let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
 
         let updated = self.conn.execute(
             r#"
@@ -5406,7 +5406,7 @@ impl Database {
         let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
 
         let updated = self.conn.execute(
             r#"
@@ -5439,7 +5439,7 @@ impl Database {
         let uuid = Uuid::parse_str(&resolved_id)
             .map_err(|e| VoiceError::validation("audio_file_id", e.to_string()))?;
         let uuid_bytes = uuid.as_bytes().to_vec();
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
 
         let updated = self.conn.execute(
             r#"
@@ -5505,7 +5505,7 @@ impl Database {
         provider: &str,
         config: Option<&serde_json::Value>,
     ) -> VoiceResult<()> {
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
         let config_json = config.map(|c| c.to_string());
 
         self.conn.execute(
@@ -5666,7 +5666,7 @@ impl Database {
         let note_uuid = validate_note_id(note_id)?;
         let attachment_uuid = Uuid::parse_str(attachment_id)
             .map_err(|e| VoiceError::validation("attachment_id", e.to_string()))?;
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
         let id_hex = id_uuid.simple().to_string();
 
         // The link's target columns are not versioned (they only change when
@@ -5677,7 +5677,7 @@ impl Database {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 -- The target changes only when notes are merged; an older row
-                -- (an echo from a peer that has not seen the merge) must not
+                -- (an echo from a device that has not seen the merge) must not
                 -- move the attachment back. Two devices that merge the same
                 -- attachment onto different notes within one second would
                 -- otherwise each keep whichever row arrived last, so the tie
@@ -5847,7 +5847,7 @@ impl Database {
     ) -> VoiceResult<()> {
         let id_uuid = Uuid::parse_str(id)
             .map_err(|e| VoiceError::validation("id", e.to_string()))?;
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
         // The name: the newer row's, as for the other metadata; a row that names
         // no file keeps the name here, or is named by its own file name
         let here: Option<(Option<String>, Option<i64>)> = self
@@ -5898,7 +5898,7 @@ impl Database {
                                           OR (excluded.duration_seconds IS NOT NULL AND COALESCE(excluded.modified_at, 0) >= COALESCE(audio_files.modified_at, 0))
                                         THEN excluded.duration_seconds ELSE audio_files.duration_seconds END,
                 -- The cloud location is set once by the uploading device. It is
-                -- never erased by a row without one (an echo, or a peer that
+                -- never erased by a row without one (an echo, or a device that
                 -- edited the summary before receiving the upload), and only
                 -- replaced by a newer row that has one (a re-upload).
                 storage_provider = CASE WHEN excluded.storage_key IS NOT NULL
@@ -5988,7 +5988,7 @@ impl Database {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 -- Service metadata is not versioned: a newer row replaces it,
-                -- an older row (an echo, or a peer that has not received a
+                -- an older row (an echo, or a device that has not received a
                 -- re-run yet) only fills in what is missing here.
                 audio_file_id = excluded.audio_file_id,
                 content_segments = CASE WHEN transcriptions.content_segments IS NULL
@@ -6101,7 +6101,7 @@ impl Database {
         state: Option<&str>,
     ) -> VoiceResult<String> {
         let id = Uuid::now_v7();
-        let device_id = get_local_device_id();
+        let device_id = get_this_device_id();
         let now = Utc::now().timestamp();
         let state = state.unwrap_or(DEFAULT_TRANSCRIPTION_STATE);
 
@@ -6331,7 +6331,7 @@ impl Database {
 
         // Non-versioned service metadata: None leaves a value alone (a state
         // toggle from the UI must not erase the segments or the service
-        // response), and a real change stamps modified_at so that peers take
+        // response), and a real change stamps modified_at so that devices take
         // the newer value over an older echo.
         let count = self.conn.execute(
             r#"
@@ -7082,7 +7082,7 @@ mod tests {
             let temp = tempfile::TempDir::new().unwrap();
             let a = Database::new(temp.path().join("a.db")).unwrap();
             let b = Database::new(temp.path().join("b.db")).unwrap();
-            let here = get_local_device_id().simple().to_string();
+            let here = get_this_device_id().simple().to_string();
             let imported = a.create_audio_file("שיחה עם סבתא.ogg", None, None, FileOrigin::Imported, None).unwrap();
             let recorded = a.create_audio_file("הקלטה.ogg", Some(1735689600), None, FileOrigin::Recorded, None).unwrap();
             let row = a.get_audio_file(&imported).unwrap().unwrap();
@@ -7135,7 +7135,7 @@ mod tests {
             let dir = temp.path().join("audio");
             std::fs::create_dir_all(&dir).unwrap();
             let db = Database::new(temp.path().join("a.db")).unwrap();
-            let here = get_local_device_id().simple().to_string();
+            let here = get_this_device_id().simple().to_string();
             let imported = db.create_audio_file("נעלם.mp3", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
             let recorded = db.create_audio_file("הקלטה.ogg", Some(1735689600), None, FileOrigin::Recorded, Some(&dir)).unwrap();
             assert_eq!(db.made_here_but_missing(&imported, &dir, &here).unwrap().as_deref(), Some(ORIGIN_IMPORTED));
@@ -7226,7 +7226,7 @@ mod tests {
             assert!(db.set_file_location(&id, PHONE, true).unwrap());
             assert!(!db.set_file_location(&id, PHONE, true).unwrap(), "the same statement again changes nothing");
             let first = db.file_locations(&id).unwrap()[0].changed_at;
-            // A statement from the future, as a peer with a fast clock would send
+            // A statement from the future, as a device with a fast clock would send
             db.apply_sync_file_location(&id, PHONE, true, first + 60_000, Some(LAPTOP), 1).unwrap();
             assert!(db.set_file_location(&id, PHONE, false).unwrap());
             let after = &db.file_locations(&id).unwrap()[0];
@@ -7413,7 +7413,7 @@ mod tests {
             assert_eq!(other.file_locations(&id).unwrap(), db.file_locations(&id).unwrap(), "every statement travels");
         }
 
-        /// FILE-22: locations go with a purged recording, and a peer's
+        /// FILE-22: locations go with a purged recording, and a device's
         /// statement about a purged recording is dropped.
         #[test]
         fn locations_go_with_a_purged_recording_and_do_not_come_back() {
@@ -7426,7 +7426,7 @@ mod tests {
             a.delete_note(&note).unwrap();
             a.purge_note(&note).unwrap();
             assert!(a.file_locations(&id).unwrap().is_empty());
-            // A peer that has not heard of the purge sends the old statement
+            // A device that has not heard of the purge sends the old statement
             crate::sync_apply::apply_changes(&a, &before, LAPTOP, None, 1).unwrap();
             assert!(a.file_locations(&id).unwrap().is_empty(), "a purged recording's location does not come back");
             let _ = b;
@@ -7597,7 +7597,7 @@ mod tests {
         let id = db.create_audio_file("הקלטה.mp3", None, None, crate::models::FileOrigin::Imported, None).unwrap();
         let disk = db.get_audio_file(&id).unwrap().unwrap().disk_name;
         std::fs::write(dir.join(&disk), b"the bytes of one recording").unwrap();
-        let hash = db.store_content_hash(&id, &dir, &crate::database::get_local_device_id().simple().to_string()).unwrap();
+        let hash = db.store_content_hash(&id, &dir, &crate::database::get_this_device_id().simple().to_string()).unwrap();
 
         assert_eq!(db.find_imported_audio_file("הקלטה.mp3", &hash).unwrap(), Some(id.clone()));
         assert_eq!(db.find_imported_audio_file("הקלטה.mp3", &hash.to_uppercase()).unwrap(), Some(id.clone()));
@@ -7609,7 +7609,7 @@ mod tests {
         assert_eq!(db.find_imported_audio_file("הקלטה.mp3", &hash).unwrap(), None, "a deleted recording is not held");
     }
 
-    /// FILE-15: a synced row with no usable name, from the peer or here, is
+    /// FILE-15: a synced row with no usable name, from the device or here, is
     /// named like a new recording (its start and the tail of its id), never
     /// `<id>.<ext>`.
     #[test]
@@ -7637,7 +7637,7 @@ mod tests {
         let row = a.get_audio_file(&id).unwrap().unwrap();
         assert!(row.content_sha256.is_none(), "not hashed before the file is there");
         std::fs::write(crate::models::audio_local_path(&dir, &row.disk_name), b"bytes of the recording").unwrap();
-        let hash = a.store_content_hash(&id, &dir, &crate::database::get_local_device_id().simple().to_string()).unwrap();
+        let hash = a.store_content_hash(&id, &dir, &crate::database::get_this_device_id().simple().to_string()).unwrap();
         assert_eq!(hash, crate::transfer::file_sha256(&crate::models::audio_local_path(&dir, &row.disk_name)).unwrap());
         assert_eq!(a.get_audio_file(&id).unwrap().unwrap().content_sha256.as_deref(), Some(hash.as_str()));
 
@@ -7711,30 +7711,30 @@ mod tests {
         }
 
         #[test]
-        fn moving_to_another_account_keeps_the_notes_and_forgets_the_peers() {
+        fn moving_to_another_account_keeps_the_notes_and_forgets_the_devices() {
             let dir = TempDir::new().unwrap();
             let db = Database::new_for_account(dir.path().join("notes.db"), ACCOUNT_A).unwrap();
             let note = db.create_note("נשאר").unwrap();
-            let peer = "00000000000070008000000000000099";
-            db.set_peer_cursors(peer, Some("Desk"), Some(7), Some(9), Some("db1")).unwrap();
-            db.set_peer_account_id(peer, None, ACCOUNT_A).unwrap();
+            let device = "00000000000070008000000000000099";
+            db.set_device_cursors(device, Some("Desk"), Some(7), Some(9), Some("db1")).unwrap();
+            db.set_device_account_id(device, None, ACCOUNT_A).unwrap();
 
             db.move_to_account(ACCOUNT_B).unwrap();
 
             assert_eq!(db.account_id().unwrap(), ACCOUNT_B);
             assert!(db.get_note(&note).unwrap().is_some());
-            assert_eq!(db.get_peer_cursors(peer).unwrap(), (0, 0, None));
-            assert_eq!(db.get_peer_account_id(peer).unwrap(), None);
+            assert_eq!(db.get_device_cursors(device).unwrap(), (0, 0, None));
+            assert_eq!(db.get_device_account_id(device).unwrap(), None);
             assert_eq!(db.list_snapshots().unwrap().len(), 1, "the move was snapshotted first");
         }
 
         #[test]
-        fn a_peer_s_account_is_remembered() {
+        fn a_device_s_account_is_remembered() {
             let db = Database::new_in_memory().unwrap();
-            let peer = "00000000000070008000000000000099";
-            assert_eq!(db.get_peer_account_id(peer).unwrap(), None);
-            db.set_peer_account_id(peer, Some("Phone"), ACCOUNT_A).unwrap();
-            assert_eq!(db.get_peer_account_id(peer).unwrap(), Some(ACCOUNT_A.to_string()));
+            let device = "00000000000070008000000000000099";
+            assert_eq!(db.get_device_account_id(device).unwrap(), None);
+            db.set_device_account_id(device, Some("Phone"), ACCOUNT_A).unwrap();
+            assert_eq!(db.get_device_account_id(device).unwrap(), Some(ACCOUNT_A.to_string()));
         }
     }
 
@@ -8322,11 +8322,11 @@ mod tests {
 // ============================================================================
 
 impl Database {
-    /// Attach the timezone that came with a row from a peer to each timestamp
-    /// that actually took the peer's value.
+    /// Attach the timezone that came with a row from a device to each timestamp
+    /// that actually took the device's value.
     ///
     /// The `WHERE <stamp> = ?` clause is what makes this safe: when the upsert
-    /// kept a value of its own, the peer's zone is not recorded against it.
+    /// kept a value of its own, the device's zone is not recorded against it.
     /// A row that names no zone for a timestamp leaves that timestamp's zone as it is.
     pub fn apply_zones_by_id(&self, table: &str, id_hex: &str, stamps: &[&str], data: &serde_json::Value) -> VoiceResult<()> {
         let id = Uuid::parse_str(id_hex)
@@ -8390,9 +8390,9 @@ impl Database {
     /// Send a row again although none of its values changed.
     ///
     /// The sequence triggers only fire when something is written, so a device
-    /// that rejects a peer's value has nothing to send and the peer would keep
+    /// that rejects a device's value has nothing to send and the device would keep
     /// its losing value for ever. Giving the row a new sequence number puts it
-    /// back in the feed; the peer adopts the winning value, and because its own
+    /// back in the feed; the device adopts the winning value, and because its own
     /// value then matches, the exchange stops there.
     fn republish(&self, table: &str, id: &[u8]) -> VoiceResult<()> {
         self.conn.execute("UPDATE sync_sequence SET value = value + 1 WHERE id = 1", [])?;
@@ -8423,39 +8423,39 @@ impl Database {
         }
     }
 
-    /// Remember a change from a peer that could not be applied, so it is
+    /// Remember a change from a device that could not be applied, so it is
     /// retried on the next sync instead of being silently dropped.
     pub fn record_sync_failure(
         &self,
-        peer_device_id: &str,
-        peer_device_name: Option<&str>,
+        from_device_id: &str,
+        from_device_name: Option<&str>,
         change: &SyncChange,
         error: &str,
     ) -> VoiceResult<()> {
-        let peer_bytes = Uuid::parse_str(peer_device_id)
+        let from_device_bytes = Uuid::parse_str(from_device_id)
             .map(|u| u.as_bytes().to_vec())
             .unwrap_or_else(|_| vec![0u8; 16]);
         let payload = serde_json::to_string(change)?;
-        // The peer row may not exist yet on the first exchange (it is upserted
+        // The device row may not exist yet on the first exchange (it is upserted
         // after the batch); the failure must still be queued.
         self.conn.execute(
-            "INSERT OR IGNORE INTO sync_peers (peer_id, peer_name, peer_url) VALUES (?, ?, '')",
-            params![peer_bytes, peer_device_name],
+            "INSERT OR IGNORE INTO sync_devices (device_id, device_name, device_url) VALUES (?, ?, '')",
+            params![from_device_bytes, from_device_name],
         )?;
-        // One pending row per (peer, entity, operation): replace an older failure of the same change.
+        // One pending row per (device, entity, operation): replace an older failure of the same change.
         self.conn.execute(
-            "DELETE FROM sync_failures WHERE peer_id = ? AND entity_type = ? AND operation = ? AND resolved_at IS NULL AND payload = ?",
-            params![peer_bytes, change.entity_type, change.operation, payload],
+            "DELETE FROM sync_failures WHERE device_id = ? AND entity_type = ? AND operation = ? AND resolved_at IS NULL AND payload = ?",
+            params![from_device_bytes, change.entity_type, change.operation, payload],
         )?;
         self.conn.execute(
             r#"
-            INSERT INTO sync_failures (id, peer_id, peer_name, entity_type, entity_id, operation, payload, error_message, created_at)
+            INSERT INTO sync_failures (id, device_id, device_name, entity_type, entity_id, operation, payload, error_message, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             "#,
             params![
                 Uuid::now_v7().as_bytes().to_vec(),
-                peer_bytes,
-                peer_device_name,
+                from_device_bytes,
+                from_device_name,
                 change.entity_type,
                 Uuid::parse_str(&change.entity_id).ok().map(|u| u.as_bytes().to_vec()),
                 change.operation,

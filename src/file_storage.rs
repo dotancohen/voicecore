@@ -1519,7 +1519,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let remote = row(&db, "הקלטה.ogg", true);
             std::fs::write(audio_local_path(&dir, &remote.disk_name), b"the recording").unwrap();
-            let hash = db.store_content_hash(&remote.id, &dir, &crate::database::get_local_device_id().simple().to_string()).unwrap();
+            let hash = db.store_content_hash(&remote.id, &dir, &crate::database::get_this_device_id().simple().to_string()).unwrap();
             assert_eq!(hash.len(), 64);
             std::fs::remove_file(audio_local_path(&dir, &remote.disk_name)).unwrap();
             let remote = db.get_audio_file(&remote.id).unwrap().unwrap();
@@ -1556,7 +1556,7 @@ mod tests {
             let row = row(&db, "שיר.ogg", false);
             let plain: Vec<u8> = (0..(crate::crypto::CHUNK_PLAIN + 777)).map(|i| (i % 253) as u8).collect();
             std::fs::write(audio_local_path(&dir, &row.disk_name), &plain).unwrap();
-            let hash = db.store_content_hash(&row.id, &dir, &crate::database::get_local_device_id().simple().to_string()).unwrap();
+            let hash = db.store_content_hash(&row.id, &dir, &crate::database::get_this_device_id().simple().to_string()).unwrap();
             let key = crate::crypto::RecordingKey::generate();
             let storage = FakeStorage { objects: Default::default(), downloads: Mutex::new(0), fail_after: None, uploaded: Mutex::new(Default::default()) };
 

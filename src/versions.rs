@@ -33,7 +33,7 @@ use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::database::{get_local_device_id, get_local_device_name, Database};
+use crate::database::{get_this_device_id, get_this_device_name, Database};
 use crate::error::{VoiceError, VoiceResult};
 use crate::validation::uuid_bytes_to_hex;
 
@@ -226,7 +226,7 @@ pub struct VersionRow {
     pub created_at_zone: Option<String>,
     pub sync_received_at: Option<i64>,
     /// Derived version that an authored version builds on: travels in the
-    /// feed (VER-10). Carried through relays so every peer can complete the
+    /// feed (VER-10). Carried through relays so every device can complete the
     /// child.
     pub published: bool,
 }
@@ -305,7 +305,7 @@ impl VersionRow {
             device_id: data["device_id"].as_str().map(String::from),
             device_name: data["device_name"].as_str().map(String::from),
             created_at: data["created_at"].as_i64().unwrap_or(0),
-            // Absent from peers older than the timezone fields
+            // Absent from devices older than the timezone fields
             created_at_offset: data["created_at_offset"].as_i64().and_then(|o| i32::try_from(o).ok()),
             created_at_zone: data["created_at_zone"].as_str().map(String::from),
             sync_received_at: None,
@@ -814,7 +814,7 @@ impl Database {
 
     /// Ensure a field has at least one version; if it has none, create a
     /// hash-derived root from `content` and make it the head. Used by the
-    /// system tags and by entity rows that arrive from a peer before their versions.
+    /// system tags and by entity rows that arrive from a device before their versions.
     pub fn ensure_root_version(
         &self,
         entity_type: &str,
@@ -825,7 +825,7 @@ impl Database {
     ) -> VoiceResult<bool> {
         if self.head_id(entity_type, entity_id, field)?.is_some() {
             // The field has history: the row is only a hint (its value is, or
-            // will be, carried by a version). Peers always send versions, so
+            // will be, carried by a version). Devices always send versions, so
             // nothing is lost by ignoring the row value here.
             return Ok(false);
         }
@@ -901,7 +901,7 @@ impl Database {
             ],
         )?;
         if n == 0 && v.published {
-            // Already known here (derived locally); a peer says an authored
+            // Already known here (derived locally); a device says an authored
             // version builds on it, so it must travel onward from here too.
             self.connection().execute(
                 "UPDATE field_versions SET published = 1 WHERE id = ? AND published = 0",
@@ -1047,8 +1047,8 @@ impl Database {
             content: content.to_string(),
             context,
             conflict_kind: None,
-            device_id: Some(get_local_device_id().simple().to_string()),
-            device_name: get_local_device_name(),
+            device_id: Some(get_this_device_id().simple().to_string()),
+            device_name: get_this_device_name(),
             created_at: now,
             created_at_offset: crate::timezone::stamp_offset(),
             created_at_zone: crate::timezone::stamp_zone(),
@@ -1061,7 +1061,7 @@ impl Database {
         }
         self.recompute_head(entity_type, entity_id, field)?;
         // A delete that did not see this edit loses to it (HEAD-6), on this
-        // device just as on every peer that receives the edit.
+        // device just as on every device that receives the edit.
         if field != FIELD_DELETED && field_kind(entity_type, FIELD_DELETED).is_some() {
             self.recompute_head(entity_type, entity_id, FIELD_DELETED)?;
         }
@@ -1086,7 +1086,7 @@ impl Database {
     }
 
     /// A derived version (merge or resurrection) that an authored version
-    /// builds on must reach every peer, or the authored version could never
+    /// builds on must reach every device, or the authored version could never
     /// be completed there. Publishing bumps its `seq`, so it is sent before
     /// the child. Walks up through derived ancestors until an authored one.
     pub(crate) fn publish_derived_ancestors(&self, id: &[u8]) -> VoiceResult<()> {
@@ -1142,7 +1142,7 @@ impl Database {
             }
         }
         let context = self.entity_context(entity_type, entity_id)?;
-        // The heads the delete saw must exist on every peer for the
+        // The heads the delete saw must exist on every device for the
         // delete-versus-edit check to give the same answer everywhere
         if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&context) {
             for v in map.values() {
@@ -1412,7 +1412,7 @@ impl Database {
         }
 
         // Every version that needed a human gets a conflict record here, whether
-        // this device computed the merge or received it from a peer, so the
+        // this device computed the merge or received it from a device, so the
         // same conflict is flagged everywhere with the same id.
         outcome.new_conflicts += self.ensure_conflict_records(&graph, &head.id)?;
 
@@ -1750,7 +1750,7 @@ impl Database {
     }
 
     /// Accept a merge as-is: a new version identical to the merge, descending
-    /// from it, which resolves the conflict here and on every peer.
+    /// from it, which resolves the conflict here and on every device.
     pub fn accept_conflict(&self, conflict_id: &str) -> VoiceResult<bool> {
         let c = match self.get_conflict(conflict_id)? {
             Some(c) => c,
@@ -1780,8 +1780,8 @@ impl Database {
             content: head.content.clone(),
             context: None,
             conflict_kind: None,
-            device_id: Some(get_local_device_id().simple().to_string()),
-            device_name: get_local_device_name(),
+            device_id: Some(get_this_device_id().simple().to_string()),
+            device_name: get_this_device_name(),
             created_at: chrono::Utc::now().timestamp(),
             created_at_offset: crate::timezone::stamp_offset(),
             created_at_zone: crate::timezone::stamp_zone(),
@@ -2213,7 +2213,7 @@ impl Database {
     }
 
     /// Write or update the device's own card. A field with no history yet
-    /// gets a deterministic root (VER-3), the same one a peer that admits
+    /// gets a deterministic root (VER-3), the same one a device that admits
     /// this device writes, so the two histories are one; a field that has a
     /// history gets an authored version when the value differs and nothing
     /// otherwise (VER-1). `revoked` is never written here: see
@@ -2274,7 +2274,7 @@ impl Database {
             .optional()?)
     }
 
-    /// Set a synced setting; propagates to every peer.
+    /// Set a synced setting; propagates to every device.
     pub fn set_setting(&self, key: &str, value: &str) -> VoiceResult<()> {
         self.set_field(ENTITY_SETTING, key, FIELD_VALUE, value, None)?;
         Ok(())

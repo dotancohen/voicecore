@@ -105,9 +105,9 @@ pub fn server_config(cert_path: &Path, key_path: &Path) -> VoiceResult<std::sync
     Ok(std::sync::Arc::new(config))
 }
 
-/// Verifies a peer by the fingerprint pinned for it and nothing else
+/// Verifies a device by the fingerprint pinned for it and nothing else
 /// (AUTH-7): the certificate is self-signed, so no root could vouch for it,
-/// and the pin came over a channel that already authenticated the peer.
+/// and the pin came over a channel that already authenticated the device.
 #[derive(Debug)]
 struct PinnedVerifier {
     fingerprint: String,
@@ -128,7 +128,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(format!(
-                "The peer's certificate is {}, not the pinned {} ({})",
+                "The other device's certificate is {}, not the pinned {} ({})",
                 actual, self.fingerprint, codes::CERTIFICATE_MISMATCH
             )))
         }
@@ -249,8 +249,8 @@ pub fn ensure_server_certificate(
 
     if force_regenerate || !cert_path.exists() || !key_path.exists() {
         // Generate new certificate
-        let device_name = config.device_name();
-        let device_id = config.device_id_hex();
+        let device_name = config.this_device_name();
+        let device_id = config.this_device_id_hex();
         generate_self_signed_cert(&cert_path, &key_path, &device_name, Some(&device_id))?;
     }
 

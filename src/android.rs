@@ -217,9 +217,9 @@ pub struct SyncResultData {
     pub success: bool,
     pub notes_received: i32,
     pub notes_sent: i32,
-    /// Recordings sent to the peer (deliver, exchange, send)
+    /// Recordings sent to the device (deliver, exchange, send)
     pub files_sent: i32,
-    /// Recordings fetched from the peer (exchange, fetch)
+    /// Recordings fetched from the device (exchange, fetch)
     pub files_fetched: i32,
     /// Bytes of recordings moved either way
     pub bytes_moved: u64,
@@ -228,7 +228,7 @@ pub struct SyncResultData {
     pub warnings: Vec<String>,
     /// The id of the operation, on every request of it and in both logs
     pub request_id: String,
-    /// The peer's clock minus this phone's, in seconds, past a minute; else 0
+    /// The device's clock minus this phone's, in seconds, past a minute; else 0
     pub clock_skew_seconds: i64,
 }
 
@@ -239,10 +239,10 @@ pub struct NotDuplicatedData {
     pub recordings: i64,
 }
 
-/// A peer known to hold a copy of a recording (Stage 10)
+/// A device known to hold a copy of a recording (Stage 10)
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct CopyData {
-    pub peer_id: String,
+    pub device_id: String,
     pub at: i64,
 }
 
@@ -310,11 +310,11 @@ pub struct IssuesData {
     pub count: u32,
 }
 
-/// A peer as remembered: when it was last reached and by which operation
+/// A device as remembered: when it was last reached and by which operation
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct PeerSummaryData {
-    pub peer_id: String,
-    pub peer_name: String,
+pub struct DeviceSummaryData {
+    pub device_id: String,
+    pub device_name: String,
     pub last_reached_at: Option<i64>,
     pub last_operation: String,
 }
@@ -328,10 +328,10 @@ pub struct CheckRowData {
     pub code: String,
 }
 
-/// A peer of this phone (Stage 5)
+/// A device of this phone (Stage 5)
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct PeerData {
-    pub peer_id: String,
+pub struct SyncDeviceData {
+    pub device_id: String,
     pub name: String,
     pub url: String,
     pub certificate_fingerprint: String,
@@ -470,52 +470,52 @@ impl VoiceClient {
         Ok(notes.len() as i32)
     }
 
-    /// Every peer of this phone (Stage 5): the card's name or the local
+    /// Every device of this phone (Stage 5): the card's name or the local
     /// one, the remembered address, when it was last reached and by what,
     /// and whether it is the one the visible button names.
-    pub fn list_peers(&self) -> Result<Vec<PeerData>, VoiceCoreError> {
+    pub fn list_devices(&self) -> Result<Vec<SyncDeviceData>, VoiceCoreError> {
         let cfg = self.config.lock().unwrap();
         let db = self.db.lock().unwrap();
-        let summaries = db.peer_summaries()?;
-        let last = cfg.last_peer().map(|p| p.peer_id.clone()).unwrap_or_default();
+        let summaries = db.device_summaries()?;
+        let last = cfg.last_device().map(|p| p.device_id.clone()).unwrap_or_default();
         Ok(cfg
-            .peers()
+            .devices()
             .iter()
             .map(|p| {
-                let summary = summaries.iter().find(|s| s.peer_id == p.peer_id);
-                PeerData {
-                    peer_id: p.peer_id.clone(),
-                    name: p.peer_name.clone(),
-                    url: p.peer_url.clone(),
+                let summary = summaries.iter().find(|s| s.device_id == p.device_id);
+                SyncDeviceData {
+                    device_id: p.device_id.clone(),
+                    name: p.device_name.clone(),
+                    url: p.device_url.clone(),
                     certificate_fingerprint: p.certificate_fingerprint.clone().unwrap_or_default(),
                     last_reached_at: summary.and_then(|s| s.last_reached_at),
                     last_operation: summary.and_then(|s| s.last_operation.clone()).unwrap_or_default(),
-                    is_last: p.peer_id == last,
+                    is_last: p.device_id == last,
                 }
             })
             .collect())
     }
 
-    /// Add a peer typed by hand (Stage 7, the third way): its device id,
-    /// a name and where it listens. Pairing adds peers by itself.
-    pub fn add_peer(&self, peer_id: String, name: String, url: String) -> Result<(), VoiceCoreError> {
+    /// Add a device typed by hand (Stage 7, the third way): its device id,
+    /// a name and where it listens. Pairing adds devices by itself.
+    pub fn add_device(&self, device_id: String, name: String, url: String) -> Result<(), VoiceCoreError> {
         let mut cfg = self.config.lock().unwrap();
-        cfg.add_peer(&peer_id, name.trim(), url.trim(), None, true)?;
+        cfg.add_device(&device_id, name.trim(), url.trim(), None, true)?;
         cfg.set_sync_enabled(true)?;
         Ok(())
     }
 
-    /// Forget a peer on this phone (Stage 5): its card does not bring it
+    /// Forget a device on this phone (Stage 5): its card does not bring it
     /// back until it is added again.
-    pub fn forget_peer(&self, peer_id: String) -> Result<bool, VoiceCoreError> {
+    pub fn forget_device(&self, device_id: String) -> Result<bool, VoiceCoreError> {
         let mut cfg = self.config.lock().unwrap();
-        Ok(cfg.forget_peer(&peer_id)?)
+        Ok(cfg.forget_device(&device_id)?)
     }
 
-    /// A local name for a peer (Stage 5), shown in place of its card's.
-    pub fn rename_peer(&self, peer_id: String, name: String) -> Result<bool, VoiceCoreError> {
+    /// A local name for a device (Stage 5), shown in place of its card's.
+    pub fn rename_device(&self, device_id: String, name: String) -> Result<bool, VoiceCoreError> {
         let mut cfg = self.config.lock().unwrap();
-        Ok(cfg.rename_peer(&peer_id, &name)?)
+        Ok(cfg.rename_device(&device_id, &name)?)
     }
 
     /// Cancel the operation under way (Stage 4): it stops at its next page,
@@ -540,33 +540,33 @@ impl VoiceClient {
         Ok(())
     }
 
-    /// The peer an operation runs with: the one named, else the one of the
+    /// The device an operation runs with: the one named, else the one of the
     /// last operation, else the only one. With several and none named, the
     /// caller must choose.
-    fn chosen_peer(&self, peer_id: Option<String>) -> Result<String, VoiceCoreError> {
+    fn chosen_device(&self, device_id: Option<String>) -> Result<String, VoiceCoreError> {
         let cfg = self.config.lock().unwrap();
-        if let Some(id) = peer_id.filter(|id| !id.is_empty()) {
-            return match cfg.get_peer(&id) {
-                Some(p) => Ok(p.peer_id.clone()),
-                None => Err(VoiceCoreError::Sync { msg: format!("No peer {} on this phone", &id[..UUID_SHORT_LEN.min(id.len())]) }),
+        if let Some(id) = device_id.filter(|id| !id.is_empty()) {
+            return match cfg.get_device(&id) {
+                Some(p) => Ok(p.device_id.clone()),
+                None => Err(VoiceCoreError::Sync { msg: format!("No device {} on this phone", &id[..UUID_SHORT_LEN.min(id.len())]) }),
             };
         }
-        if cfg.peers().is_empty() {
-            return Err(VoiceCoreError::Sync { msg: "No peer yet: read a code shown by another device, or add one by its address".to_string() });
+        if cfg.devices().is_empty() {
+            return Err(VoiceCoreError::Sync { msg: "No device yet: read a code shown by another device, or add one by its address".to_string() });
         }
-        if let Some(last) = cfg.last_peer() {
-            return Ok(last.peer_id.clone());
+        if let Some(last) = cfg.last_device() {
+            return Ok(last.device_id.clone());
         }
-        if cfg.peers().len() == 1 {
-            return Ok(cfg.peers()[0].peer_id.clone());
+        if cfg.devices().len() == 1 {
+            return Ok(cfg.devices()[0].device_id.clone());
         }
-        Err(VoiceCoreError::Sync { msg: "Several peers and none used yet: choose one".to_string() })
+        Err(VoiceCoreError::Sync { msg: "Several devices and none used yet: choose one".to_string() })
     }
 
-    /// Sync with the last peer, or the only one: database changes both
-    /// ways, no files. `operate` names a peer.
+    /// Sync with the last device, or the only one: database changes both
+    /// ways, no files. `operate` names a device.
     pub fn sync(&self) -> Result<SyncResultData, VoiceCoreError> {
-        let peer_id = self.chosen_peer(None)?;
+        let device_id = self.chosen_device(None)?;
 
         // Create sync client
         let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
@@ -579,7 +579,7 @@ impl VoiceClient {
                 msg: format!("Failed to create runtime: {}", e),
             })?;
 
-        let result = rt.block_on(async { sync_client.sync_with_peer(&peer_id).await });
+        let result = rt.block_on(async { sync_client.sync_with_device(&device_id).await });
 
         Ok(SyncResultData {
             success: result.success,
@@ -633,22 +633,22 @@ impl VoiceClient {
         let joined = rt.block_on(sync_client.join(&setup_text))?;
         Ok(JoinedData {
             account_id: joined.account_id,
-            peer_id: joined.peer_id,
-            peer_name: joined.peer_name,
-            peer_url: joined.peer_url,
+            device_id: joined.device_id,
+            device_name: joined.device_name,
+            device_url: joined.device_url,
             granted: false,
         })
     }
 
-    /// Check the connection to a peer (Stage 12): one row per thing that
+    /// Check the connection to a device (Stage 12): one row per thing that
     /// can be wrong, each with its refusal code. Nothing is changed.
-    pub fn check_connection(&self, peer_id: String) -> Result<Vec<CheckRowData>, VoiceCoreError> {
+    pub fn check_connection(&self, device_id: String) -> Result<Vec<CheckRowData>, VoiceCoreError> {
         let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
-        let rows = rt.block_on(sync_client.check(&peer_id));
+        let rows = rt.block_on(sync_client.check(&device_id));
         Ok(rows.into_iter().map(|r| CheckRowData { name: r.name, passed: r.passed, detail: r.detail, code: r.code }).collect())
     }
 
@@ -667,7 +667,7 @@ impl VoiceClient {
             .build()
             .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
         let (joined, merged) = rt.block_on(sync_client.move_to(&setup_text))?;
-        Ok(MovedData { account_id: joined.account_id, peer_name: joined.peer_name, notes_moved: notes, tags_merged: merged as i64 })
+        Ok(MovedData { account_id: joined.account_id, device_name: joined.device_name, notes_moved: notes, tags_merged: merged as i64 })
     }
 
     /// Use a setup text (Stage 9): a code shown by a device that holds the
@@ -688,15 +688,15 @@ impl VoiceClient {
         };
         Ok(JoinedData {
             account_id: joined.account_id,
-            peer_id: joined.peer_id,
-            peer_name: joined.peer_name,
-            peer_url: joined.peer_url,
+            device_id: joined.device_id,
+            device_name: joined.device_name,
+            device_url: joined.device_url,
             granted: grant,
         })
     }
 
-    /// Start listening for peers (Stage 6): HTTPS with this phone's own
-    /// certificate, on a thread of its own. Returns the URLs peers can use.
+    /// Start listening for devices (Stage 6): HTTPS with this phone's own
+    /// certificate, on a thread of its own. Returns the URLs devices can use.
     /// Never started by the core itself; the application's switch starts it.
     pub fn start_listener(&self, port: u16) -> Result<Vec<String>, VoiceCoreError> {
         if crate::sync_server::server_running() {
@@ -739,7 +739,7 @@ impl VoiceClient {
     }
 
     /// The fingerprint of this phone's certificate, making the certificate
-    /// if there is none yet: what a peer pins, and what the sync screen shows.
+    /// if there is none yet: what a device pins, and what the sync screen shows.
     pub fn certificate_fingerprint(&self) -> Result<String, VoiceCoreError> {
         let cfg = self.config.lock().unwrap();
         let (_, _, fingerprint) = crate::tls::ensure_server_certificate(&cfg, false)?;
@@ -760,7 +760,7 @@ impl VoiceClient {
     }
 
     /// Every device of the account, by its card (CARD-1).
-    pub fn list_devices(&self) -> Result<Vec<DeviceCardData>, VoiceCoreError> {
+    pub fn list_device_cards(&self) -> Result<Vec<DeviceCardData>, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         Ok(db
             .list_device_cards()?
@@ -786,7 +786,7 @@ impl VoiceClient {
 
     /// Move this database, notes and all, to another account (ACCT-5). The
     /// deliberate way to merge accounts; a snapshot is taken first and every
-    /// peer is forgotten.
+    /// device is forgotten.
     pub fn move_to_account(&self, account_id: String) -> Result<(), VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.move_to_account(&account_id)?;
@@ -826,10 +826,10 @@ impl VoiceClient {
         Ok(())
     }
 
-    /// One operation with the configured peer: "sync", "deliver" (sync then
+    /// One operation with the configured device: "sync", "deliver" (sync then
     /// send), "exchange" (sync, send and fetch), "send" or "fetch".
-    pub fn operate(&self, operation: String, peer_id: Option<String>, progress: Option<Box<dyn OperationProgress>>) -> Result<SyncResultData, VoiceCoreError> {
-        let peer_id = self.chosen_peer(peer_id)?;
+    pub fn operate(&self, operation: String, device_id: Option<String>, progress: Option<Box<dyn OperationProgress>>) -> Result<SyncResultData, VoiceCoreError> {
+        let device_id = self.chosen_device(device_id)?;
         let sync_client = SyncClient::with_cancel(self.db.clone(), self.config.clone(), self.cancel.clone())?;
         if let Some(sink) = progress {
             sync_client.set_progress_sink(Some(Arc::new(ProgressBridge(sink))));
@@ -840,11 +840,11 @@ impl VoiceClient {
             .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
         let result = rt.block_on(async {
             match operation.as_str() {
-                "sync" => sync_client.sync_with_peer(&peer_id).await,
-                "deliver" => sync_client.deliver(&peer_id).await,
-                "exchange" => sync_client.exchange(&peer_id).await,
-                "send" => sync_client.send_to_peer(&peer_id).await,
-                "fetch" => sync_client.fetch_from_peer(&peer_id).await,
+                "sync" => sync_client.sync_with_device(&device_id).await,
+                "deliver" => sync_client.deliver(&device_id).await,
+                "exchange" => sync_client.exchange(&device_id).await,
+                "send" => sync_client.send_to_device(&device_id).await,
+                "fetch" => sync_client.fetch_from_device(&device_id).await,
                 other => crate::sync_client::SyncResult::failure(format!("{} is not an operation", other)),
             }
         });
@@ -864,17 +864,17 @@ impl VoiceClient {
 
     /// Clear sync state to force a full re-sync from scratch
     ///
-    /// This deletes the sync peer record, causing the next sync to start
+    /// This deletes the sync device record, causing the next sync to start
     /// from the beginning and fetch all data fresh.
     pub fn clear_sync_state(&self) -> Result<(), VoiceCoreError> {
         let db = self.db.lock().unwrap();
-        db.clear_sync_peers()?;
+        db.clear_sync_devices()?;
         Ok(())
     }
 
-    /// Reset sync timestamps to force re-fetching all data from peers
+    /// Reset sync timestamps to force re-fetching all data from devices
     ///
-    /// Unlike clear_sync_state, this preserves peer configuration but clears
+    /// Unlike clear_sync_state, this preserves device configuration but clears
     /// the last_sync_at timestamps, causing the next sync to fetch all data.
     pub fn reset_sync_timestamps(&self) -> Result<(), VoiceCoreError> {
         let db = self.db.lock().unwrap();
@@ -886,8 +886,8 @@ impl VoiceClient {
     ///
     /// Unlike sync(), this ignores timestamps and fetches all data.
     /// Use this for first-time sync or to re-fetch everything.
-    pub fn initial_sync(&self, peer_id: Option<String>) -> Result<SyncResultData, VoiceCoreError> {
-        let peer_id = self.chosen_peer(peer_id)?;
+    pub fn initial_sync(&self, device_id: Option<String>) -> Result<SyncResultData, VoiceCoreError> {
+        let device_id = self.chosen_device(device_id)?;
 
         // Create sync client
         let sync_client = SyncClient::new(self.db.clone(), self.config.clone())?;
@@ -900,7 +900,7 @@ impl VoiceClient {
                 msg: format!("Failed to create runtime: {}", e),
             })?;
 
-        let result = rt.block_on(async { sync_client.initial_sync(&peer_id).await });
+        let result = rt.block_on(async { sync_client.initial_sync(&device_id).await });
 
         Ok(SyncResultData {
             success: result.success,
@@ -921,13 +921,13 @@ impl VoiceClient {
     }
 
     /// Get the device ID
-    pub fn get_device_id(&self) -> String {
+    pub fn get_this_device_id(&self) -> String {
         let cfg = self.config.lock().unwrap();
         cfg.device_id_hex().to_string()
     }
 
     /// Set the device ID (for importing from another installation)
-    pub fn set_device_id(&self, device_id: String) -> Result<(), VoiceCoreError> {
+    pub fn set_this_device_id(&self, device_id: String) -> Result<(), VoiceCoreError> {
         // Validate the device ID format
         if device_id.len() != 32 || !device_id.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(VoiceCoreError::Validation {
@@ -941,14 +941,14 @@ impl VoiceClient {
     }
 
     /// Set the device name
-    pub fn set_device_name(&self, name: String) -> Result<(), VoiceCoreError> {
+    pub fn set_this_device_name(&self, name: String) -> Result<(), VoiceCoreError> {
         let mut cfg = self.config.lock().unwrap();
-        cfg.set_device_name(&name)?;
+        cfg.set_this_device_name(&name)?;
         Ok(())
     }
 
     /// Get the device name
-    pub fn get_device_name(&self) -> String {
+    pub fn get_this_device_name(&self) -> String {
         let cfg = self.config.lock().unwrap();
         cfg.device_name().to_string()
     }
@@ -1394,12 +1394,12 @@ impl VoiceClient {
         Ok(NotDuplicatedData { notes: counts.notes, recordings: counts.recordings })
     }
 
-    /// Where the copies of a recording are (Stage 10): the peers known to
+    /// Where the copies of a recording are (Stage 10): the devices known to
     /// hold it; the bucket is `storage_key` on the row, this phone the file.
     pub fn copies_of(&self, audio_id: String) -> Result<Vec<CopyData>, VoiceCoreError> {
         let here = self.config.lock().unwrap().device_id_hex().to_string();
         let db = self.db.lock().unwrap();
-        Ok(db.copies_of(&audio_id, &here)?.into_iter().map(|c| CopyData { peer_id: c.peer_id, at: c.at }).collect())
+        Ok(db.copies_of(&audio_id, &here)?.into_iter().map(|c| CopyData { device_id: c.device_id, at: c.at }).collect())
     }
 
     /// Every statement about where a recording's copies are (FILE-22), the
@@ -1482,13 +1482,13 @@ impl VoiceClient {
         })
     }
 
-    /// Every peer dealt with: when it was last reached and by what.
-    pub fn peer_summaries(&self) -> Result<Vec<PeerSummaryData>, VoiceCoreError> {
+    /// Every device dealt with: when it was last reached and by what.
+    pub fn device_summaries(&self) -> Result<Vec<DeviceSummaryData>, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         Ok(db
-            .peer_summaries()?
+            .device_summaries()?
             .into_iter()
-            .map(|p| PeerSummaryData { peer_id: p.peer_id, peer_name: p.peer_name.unwrap_or_default(), last_reached_at: p.last_reached_at, last_operation: p.last_operation.unwrap_or_default() })
+            .map(|p| DeviceSummaryData { device_id: p.device_id, device_name: p.device_name.unwrap_or_default(), last_reached_at: p.last_reached_at, last_operation: p.last_operation.unwrap_or_default() })
             .collect())
     }
 
@@ -1955,7 +1955,7 @@ impl VoiceClient {
     }
 
     /// Accept the merged value of a conflict as it stands. The acceptance is
-    /// a new version and reaches every peer on the next sync.
+    /// a new version and reaches every device on the next sync.
     pub fn accept_conflict(&self, conflict_id: String) -> Result<bool, VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.accept_conflict(&conflict_id)
@@ -2594,7 +2594,7 @@ fn conflict_to_data(c: crate::versions::ConflictRow) -> ConflictData {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MovedData {
     pub account_id: String,
-    pub peer_name: String,
+    pub device_name: String,
     pub notes_moved: i64,
     pub tags_merged: i64,
 }
@@ -2603,11 +2603,11 @@ pub struct MovedData {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct JoinedData {
     pub account_id: String,
-    pub peer_id: String,
-    pub peer_name: String,
-    pub peer_url: String,
-    /// True when the text was a grant: the peer now hosts this account
-    /// (PAIR-5); false when this device joined the peer's account (PAIR-4)
+    pub device_id: String,
+    pub device_name: String,
+    pub device_url: String,
+    /// True when the text was a grant: the device now hosts this account
+    /// (PAIR-5); false when this device joined the device's account (PAIR-4)
     pub granted: bool,
 }
 

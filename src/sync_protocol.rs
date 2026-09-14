@@ -10,12 +10,12 @@ use crate::models::SyncChange;
 
 /// The protocol version both sides announce in the handshake and the status
 /// (Stage 16): the headers, the device cards, pairing and the new entity
-/// types changed the exchange, so a peer that announces `1.x` is refused
+/// types changed the exchange, so a device that announces `1.x` is refused
 /// with `PROTOCOL_TOO_OLD`. Everything starts afresh; nothing negotiates
 /// with version 1.
 pub const PROTOCOL_VERSION: &str = "2.0";
 
-/// The major version this build speaks; a peer below it is refused.
+/// The major version this build speaks; a device below it is refused.
 pub const PROTOCOL_MAJOR: u32 = 2;
 
 /// The major number of a version text ("2.0" → 2), or None for nonsense.
@@ -44,11 +44,11 @@ pub mod codes {
     pub const KEY_WRONG: &str = "KEY_WRONG";
     /// The handshake body names a device other than the headers do.
     pub const DEVICE_MISMATCH: &str = "DEVICE_MISMATCH";
-    /// A peer's address is plain http and not this machine.
+    /// A device's address is plain http and not this machine.
     pub const TLS_REQUIRED: &str = "TLS_REQUIRED";
-    /// No address is known for the peer yet (its card names none, and none was given).
+    /// No address is known for the device yet (its card names none, and none was given).
     pub const NO_ADDRESS: &str = "NO_ADDRESS";
-    /// The peer's certificate is not the pinned one.
+    /// The device's certificate is not the pinned one.
     pub const CERTIFICATE_MISMATCH: &str = "CERTIFICATE_MISMATCH";
     /// The pairing token is unknown, spent, expired or mistyped.
     pub const TOKEN_INVALID: &str = "TOKEN_INVALID";
@@ -56,7 +56,7 @@ pub mod codes {
     pub const SETUP_TEXT_INVALID: &str = "SETUP_TEXT_INVALID";
     /// This device holds notes of another account and will not be paired over them.
     pub const DEVICE_HOLDS_NOTES: &str = "DEVICE_HOLDS_NOTES";
-    /// The peer speaks a protocol version below this build's (Stage 16)
+    /// The device speaks a protocol version below this build's (Stage 16)
     pub const PROTOCOL_TOO_OLD: &str = "PROTOCOL_TOO_OLD";
     /// The caller is not on a private network and this listener has no public address (LISTEN-3)
     pub const NOT_ON_LAN: &str = "NOT_ON_LAN";
@@ -103,7 +103,7 @@ pub struct HandshakeResponse {
     /// 12); 0 when unknown.
     #[serde(default)]
     pub free_bytes: u64,
-    /// Identity of the responder's database; a change means the peer must
+    /// Identity of the responder's database; a change means the device must
     /// forget its cursors.
     #[serde(default)]
     pub database_id: String,

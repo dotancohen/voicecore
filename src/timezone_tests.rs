@@ -5,7 +5,7 @@
 //! Jerusalem still reads 15:20 from New York. These tests cover the awkward
 //! parts: offsets that are not whole hours, UTC itself (which must not be
 //! mistaken for "nothing recorded"), the two hours a year that either happen
-//! twice or not at all, travel between devices, and what a peer that has never
+//! twice or not at all, travel between devices, and what a device that has never
 //! heard of any of this can and cannot overwrite.
 
 use std::sync::Mutex;
@@ -67,7 +67,7 @@ fn feed(db: &Database) -> Vec<SyncChange> {
 }
 
 fn deliver(to: &Database, changes: &[SyncChange]) {
-    apply_changes(to, changes, "01a07848cc607813973baa00457b79db", Some("Peer"), 1).unwrap();
+    apply_changes(to, changes, "01a07848cc607813973baa00457b79db", Some("Device"), 1).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +375,7 @@ fn a_zone_is_only_kept_for_the_timestamp_it_arrived_with() {
     let ours = zone_of(&db, "notes", &note, "modified_at");
     let our_modified = stamp_of(&db, &note, "modified_at").unwrap();
 
-    // A peer sends an older edit of the same note, from Nepal. The newer
+    // A device sends an older edit of the same note, from Nepal. The newer
     // modified_at wins, so the Nepali offset must not be recorded against it.
     let older = our_modified - 3600;
     let change = SyncChange {
@@ -625,7 +625,7 @@ fn a_row_without_a_zone_is_shown_on_the_reader_s_clock() {
 }
 
 #[test]
-fn the_zone_of_a_note_survives_a_round_trip_through_a_peer_and_back() {
+fn the_zone_of_a_note_survives_a_round_trip_through_a_device_and_back() {
     // A note goes out, comes back, and is not repainted by whoever returned it
     let _guard = lock();
     set_local_timezone(CHATHAM, Some("Pacific/Chatham".to_string()));

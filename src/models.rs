@@ -423,7 +423,7 @@ impl AudioFile {
     }
 }
 
-/// Represents a change to be synced between peers.
+/// Represents a change to be synced between devices.
 ///
 /// This is used by the sync protocol to describe changes (create, update, delete)
 /// to any entity type (note, tag, note_tag, audio_file, transcription, etc.).

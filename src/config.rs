@@ -6,7 +6,7 @@
 //! Includes sync-related configuration:
 //! - device_id: UUID7 identifying this device (generated on first run)
 //! - device_name: Human-readable device name
-//! - sync: Peer configuration and sync settings
+//! - sync: Device configuration and sync settings
 
 use std::collections::HashMap;
 use std::fs;
@@ -68,12 +68,12 @@ pub struct Themes {
     pub colours: ThemeColours,
 }
 
-/// Peer configuration
+/// Device configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerConfig {
-    pub peer_id: String,
-    pub peer_name: String,
-    pub peer_url: String,
+pub struct SyncDevice {
+    pub device_id: String,
+    pub device_name: String,
+    pub device_url: String,
     pub certificate_fingerprint: Option<String>,
 }
 
@@ -85,7 +85,7 @@ pub struct SyncConfig {
     #[serde(default = "default_server_port")]
     pub server_port: u16,
     #[serde(default)]
-    pub peers: Vec<PeerConfig>,
+    pub devices: Vec<SyncDevice>,
     /// Maximum file size in MB for sync uploads (default 100MB)
     /// Files larger than this will be tagged as _system/_nonsynced/_too-big
     #[serde(default = "default_max_sync_file_size_mb")]
@@ -93,7 +93,7 @@ pub struct SyncConfig {
     /// When true, every sync also downloads every audio file that is in cloud
     /// storage but missing locally, so this installation holds a complete copy
     /// of all media (a backup of the cloud bucket). Local-only setting, never
-    /// synced to peers; intended for desktop and server installations only.
+    /// synced to devices; intended for desktop and server installations only.
     #[serde(default)]
     pub mirror_audio_files: bool,
     /// This device's key for the account (AUTH-1): 43 base64url characters,
@@ -116,14 +116,14 @@ pub struct SyncConfig {
     /// encryption switch stays off until it did. Local.
     #[serde(default)]
     pub recording_key_exported: bool,
-    /// The peer of the last operation (Stage 5): the one visible button
+    /// The device of the last operation (Stage 5): the one visible button
     /// names it. Local.
     #[serde(default)]
-    pub last_peer_id: String,
-    /// Peers forgotten on this device (Stage 5): their cards do not bring
+    pub last_device_id: String,
+    /// Devices forgotten on this device (Stage 5): their cards do not bring
     /// them back to the list until the user adds them again. Local.
     #[serde(default)]
-    pub forgotten_peers: Vec<String>,
+    pub forgotten_devices: Vec<String>,
     /// Hours of silence after which the listener stops itself (Stage 6);
     /// 0, the default, means never. Stopping, not starting: it only saves
     /// the battery of a user who forgets.
@@ -144,7 +144,7 @@ impl Default for SyncConfig {
         Self {
             enabled: false,
             server_port: default_server_port(),
-            peers: Vec::new(),
+            devices: Vec::new(),
             max_sync_file_size_mb: default_max_sync_file_size_mb(),
             mirror_audio_files: false,
             device_key: String::new(),
@@ -152,8 +152,8 @@ impl Default for SyncConfig {
             recording_key: String::new(),
             recording_key_wrapped: String::new(),
             recording_key_exported: false,
-            last_peer_id: String::new(),
-            forgotten_peers: Vec::new(),
+            last_device_id: String::new(),
+            forgotten_devices: Vec::new(),
             listener_idle_stop_hours: 0,
         }
     }
@@ -292,10 +292,10 @@ pub struct ConfigData {
     pub themes: Themes,
     /// Device ID (UUID7 hex)
     #[serde(default = "generate_device_id")]
-    pub device_id: String,
+    pub this_device_id: String,
     /// Human-readable device name
     #[serde(default = "get_default_device_name")]
-    pub device_name: String,
+    pub this_device_name: String,
     /// Sync configuration
     #[serde(default)]
     pub sync: SyncConfig,
@@ -529,8 +529,8 @@ impl Default for ConfigData {
             window_geometry: None,
             implementations: HashMap::new(),
             themes: Themes::default(),
-            device_id: generate_device_id(),
-            device_name: get_default_device_name(),
+            this_device_id: generate_device_id(),
+            this_device_name: get_default_device_name(),
             sync: SyncConfig::default(),
             server_certificate_fingerprint: None,
             audiofile_directory: None,
@@ -662,9 +662,9 @@ impl Config {
         // Every version this process writes carries the device identity from
         // the config, so a conflict can name the devices that disagreed.
         if let Ok(uuid) = config.device_id() {
-            crate::database::set_local_device_id(uuid);
+            crate::database::set_this_device_id(uuid);
         }
-        crate::database::set_local_device_name(config.device_name());
+        crate::database::set_this_device_name(config.this_device_name());
 
         Ok(config)
     }
@@ -679,15 +679,15 @@ impl Config {
         let mut config = Self::new(Some(account_dir.to_path_buf()), None)?;
         config.machine_file = Some(machine.config_file.clone());
         config.certs_root = root.to_path_buf();
-        config.data.device_id = machine.data.device_id.clone();
-        config.data.device_name = machine.data.device_name.clone();
+        config.data.this_device_id = machine.data.this_device_id.clone();
+        config.data.this_device_name = machine.data.this_device_name.clone();
         config.data.sync.server_port = machine.data.sync.server_port;
         config.data.backup = machine.data.backup.clone();
         config.data.public_url = machine.data.public_url.clone();
         if let Ok(uuid) = config.device_id() {
-            crate::database::set_local_device_id(uuid);
+            crate::database::set_this_device_id(uuid);
         }
-        crate::database::set_local_device_name(config.device_name());
+        crate::database::set_this_device_name(config.this_device_name());
         Ok(config)
     }
 
@@ -750,8 +750,8 @@ impl Config {
                 .ok()
                 .and_then(|c| serde_json::from_str(&c).ok())
                 .unwrap_or_default();
-            machine.device_id = self.data.device_id.clone();
-            machine.device_name = self.data.device_name.clone();
+            machine.this_device_id = self.data.this_device_id.clone();
+            machine.this_device_name = self.data.this_device_name.clone();
             machine.sync.server_port = self.data.sync.server_port;
             machine.backup = self.data.backup.clone();
             machine.public_url = self.data.public_url.clone();
@@ -772,24 +772,24 @@ impl Config {
 
     /// Get the device ID as bytes
     pub fn device_id(&self) -> VoiceResult<Uuid> {
-        Uuid::parse_str(&self.data.device_id)
+        Uuid::parse_str(&self.data.this_device_id)
             .map_err(|e| VoiceError::Config(format!("Invalid device_id: {}", e)))
     }
 
     /// Get the device ID as hex string
-    pub fn device_id_hex(&self) -> &str {
-        &self.data.device_id
+    pub fn this_device_id_hex(&self) -> &str {
+        &self.data.this_device_id
     }
 
     /// Get the human-readable device name
-    pub fn device_name(&self) -> &str {
-        &self.data.device_name
+    pub fn this_device_name(&self) -> &str {
+        &self.data.this_device_name
     }
 
     /// Set the device name
-    pub fn set_device_name(&mut self, name: &str) -> VoiceResult<()> {
-        self.data.device_name = name.to_string();
-        crate::database::set_local_device_name(name);
+    pub fn set_this_device_name(&mut self, name: &str) -> VoiceResult<()> {
+        self.data.this_device_name = name.to_string();
+        crate::database::set_this_device_name(name);
         self.save()
     }
 
@@ -890,43 +890,43 @@ impl Config {
         self.save()
     }
 
-    /// Get list of sync peers
-    pub fn peers(&self) -> &[PeerConfig] {
-        &self.data.sync.peers
+    /// Get list of sync devices
+    pub fn devices(&self) -> &[SyncDevice] {
+        &self.data.sync.devices
     }
 
-    /// Add a new sync peer
-    pub fn add_peer(
+    /// Add a new sync device
+    pub fn add_device(
         &mut self,
-        peer_id: &str,
-        peer_name: &str,
-        peer_url: &str,
+        device_id: &str,
+        device_name: &str,
+        device_url: &str,
         certificate_fingerprint: Option<&str>,
         allow_update: bool,
     ) -> VoiceResult<()> {
-        // Validate peer_id format
-        if peer_id.len() != 32 || !peer_id.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(VoiceError::validation("peer_id", "must be 32 hex characters"));
+        // Validate device_id format
+        if device_id.len() != 32 || !device_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(VoiceError::validation("device_id", "must be 32 hex characters"));
         }
 
         // Added by hand or by pairing: no longer forgotten (Stage 5)
-        self.data.sync.forgotten_peers.retain(|p| p != peer_id);
+        self.data.sync.forgotten_devices.retain(|p| p != device_id);
 
-        // Check if peer already exists
-        if let Some(existing) = self.data.sync.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+        // Check if device already exists
+        if let Some(existing) = self.data.sync.devices.iter_mut().find(|p| p.device_id == device_id) {
             if !allow_update {
-                return Err(VoiceError::validation("peer_id", "peer already exists"));
+                return Err(VoiceError::validation("device_id", "device already exists"));
             }
-            existing.peer_name = peer_name.to_string();
-            existing.peer_url = peer_url.to_string();
+            existing.device_name = device_name.to_string();
+            existing.device_url = device_url.to_string();
             if let Some(fp) = certificate_fingerprint {
                 existing.certificate_fingerprint = Some(fp.to_string());
             }
         } else {
-            self.data.sync.peers.push(PeerConfig {
-                peer_id: peer_id.to_string(),
-                peer_name: peer_name.to_string(),
-                peer_url: peer_url.to_string(),
+            self.data.sync.devices.push(SyncDevice {
+                device_id: device_id.to_string(),
+                device_name: device_name.to_string(),
+                device_url: device_url.to_string(),
                 certificate_fingerprint: certificate_fingerprint.map(String::from),
             });
         }
@@ -934,45 +934,45 @@ impl Config {
         self.save()
     }
 
-    /// Remove a sync peer
-    pub fn remove_peer(&mut self, peer_id: &str) -> VoiceResult<bool> {
-        let original_len = self.data.sync.peers.len();
-        self.data.sync.peers.retain(|p| p.peer_id != peer_id);
-        let removed = self.data.sync.peers.len() < original_len;
+    /// Remove a sync device
+    pub fn remove_device(&mut self, device_id: &str) -> VoiceResult<bool> {
+        let original_len = self.data.sync.devices.len();
+        self.data.sync.devices.retain(|p| p.device_id != device_id);
+        let removed = self.data.sync.devices.len() < original_len;
         if removed {
             self.save()?;
         }
         Ok(removed)
     }
 
-    /// Forget a peer on this device (Stage 5): it leaves the list, and its
+    /// Forget a device on this device (Stage 5): it leaves the list, and its
     /// card does not bring it back until it is added again by hand or by
     /// pairing. Returns whether it was in the list.
-    pub fn forget_peer(&mut self, peer_id: &str) -> VoiceResult<bool> {
-        let removed = self.remove_peer(peer_id)?;
-        if !self.data.sync.forgotten_peers.iter().any(|p| p == peer_id) {
-            self.data.sync.forgotten_peers.push(peer_id.to_string());
+    pub fn forget_device(&mut self, device_id: &str) -> VoiceResult<bool> {
+        let removed = self.remove_device(device_id)?;
+        if !self.data.sync.forgotten_devices.iter().any(|p| p == device_id) {
+            self.data.sync.forgotten_devices.push(device_id.to_string());
         }
-        if self.data.sync.last_peer_id == peer_id {
-            self.data.sync.last_peer_id.clear();
+        if self.data.sync.last_device_id == device_id {
+            self.data.sync.last_device_id.clear();
         }
         self.save()?;
         Ok(removed)
     }
 
-    /// Whether a peer was forgotten here (Stage 5).
-    pub fn is_forgotten(&self, peer_id: &str) -> bool {
-        self.data.sync.forgotten_peers.iter().any(|p| p == peer_id)
+    /// Whether a device was forgotten here (Stage 5).
+    pub fn is_forgotten(&self, device_id: &str) -> bool {
+        self.data.sync.forgotten_devices.iter().any(|p| p == device_id)
     }
 
-    /// The local name of a peer (Stage 5), shown in place of its card's.
-    pub fn rename_peer(&mut self, peer_id: &str, name: &str) -> VoiceResult<bool> {
+    /// The local name of a device (Stage 5), shown in place of its card's.
+    pub fn rename_device(&mut self, device_id: &str, name: &str) -> VoiceResult<bool> {
         let name = name.trim();
         if name.is_empty() {
-            return Err(VoiceError::validation("name", "A peer's name cannot be empty"));
+            return Err(VoiceError::validation("name", "A device's name cannot be empty"));
         }
-        if let Some(peer) = self.data.sync.peers.iter_mut().find(|p| p.peer_id == peer_id) {
-            peer.peer_name = name.to_string();
+        if let Some(device) = self.data.sync.devices.iter_mut().find(|p| p.device_id == device_id) {
+            device.device_name = name.to_string();
             self.save()?;
             Ok(true)
         } else {
@@ -990,28 +990,28 @@ impl Config {
         self.save()
     }
 
-    /// The peer of the last operation (Stage 5), if it is still in the list.
-    pub fn last_peer(&self) -> Option<&PeerConfig> {
-        self.get_peer(&self.data.sync.last_peer_id.clone())
+    /// The device of the last operation (Stage 5), if it is still in the list.
+    pub fn last_device(&self) -> Option<&SyncDevice> {
+        self.get_device(&self.data.sync.last_device_id.clone())
     }
 
-    pub fn set_last_peer(&mut self, peer_id: &str) -> VoiceResult<()> {
-        if self.data.sync.last_peer_id != peer_id {
-            self.data.sync.last_peer_id = peer_id.to_string();
+    pub fn set_last_device(&mut self, device_id: &str) -> VoiceResult<()> {
+        if self.data.sync.last_device_id != device_id {
+            self.data.sync.last_device_id = device_id.to_string();
             self.save()?;
         }
         Ok(())
     }
 
-    /// Get a specific peer by ID
-    pub fn get_peer(&self, peer_id: &str) -> Option<&PeerConfig> {
-        self.data.sync.peers.iter().find(|p| p.peer_id == peer_id)
+    /// Get a specific device by ID
+    pub fn get_device(&self, device_id: &str) -> Option<&SyncDevice> {
+        self.data.sync.devices.iter().find(|p| p.device_id == device_id)
     }
 
-    /// Update a peer's certificate fingerprint
-    pub fn update_peer_certificate(&mut self, peer_id: &str, fingerprint: &str) -> VoiceResult<bool> {
-        if let Some(peer) = self.data.sync.peers.iter_mut().find(|p| p.peer_id == peer_id) {
-            peer.certificate_fingerprint = Some(fingerprint.to_string());
+    /// Update a device's certificate fingerprint
+    pub fn update_device_certificate(&mut self, device_id: &str, fingerprint: &str) -> VoiceResult<bool> {
+        if let Some(device) = self.data.sync.devices.iter_mut().find(|p| p.device_id == device_id) {
+            device.certificate_fingerprint = Some(fingerprint.to_string());
             self.save()?;
             Ok(true)
         } else {
@@ -1100,8 +1100,8 @@ impl Config {
         match key {
             "database_file" => Some(self.data.database_file.clone()),
             "default_interface" => self.data.default_interface.clone(),
-            "device_id" => Some(self.data.device_id.clone()),
-            "device_name" => Some(self.data.device_name.clone()),
+            "device_id" => Some(self.data.this_device_id.clone()),
+            "device_name" => Some(self.data.this_device_name.clone()),
             "server_certificate_fingerprint" => self.data.server_certificate_fingerprint.clone(),
             "audiofile_directory" => self.data.audiofile_directory.clone(),
             _ => None,
@@ -1113,7 +1113,7 @@ impl Config {
         match key {
             "database_file" => self.data.database_file = value.to_string(),
             "default_interface" => self.data.default_interface = Some(value.to_string()),
-            "device_name" => self.data.device_name = value.to_string(),
+            "device_name" => self.data.this_device_name = value.to_string(),
             "server_certificate_fingerprint" => {
                 self.data.server_certificate_fingerprint = Some(value.to_string())
             }
@@ -1239,25 +1239,25 @@ mod tests {
     }
 
     #[test]
-    fn a_forgotten_peer_is_remembered_as_such_until_added_again() {
+    fn a_forgotten_device_is_remembered_as_such_until_added_again() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
         let id = "0199aaaaaaaa7000800000000000000a";
-        config.add_peer(id, "Desk", "https://desk:8384", None, false).unwrap();
-        config.set_last_peer(id).unwrap();
-        assert_eq!(config.last_peer().unwrap().peer_id, id);
-        assert!(config.forget_peer(id).unwrap());
+        config.add_device(id, "Desk", "https://desk:8384", None, false).unwrap();
+        config.set_last_device(id).unwrap();
+        assert_eq!(config.last_device().unwrap().device_id, id);
+        assert!(config.forget_device(id).unwrap());
         assert!(config.is_forgotten(id));
-        assert!(config.last_peer().is_none(), "the last peer is not a forgotten one");
-        assert!(!config.forget_peer(id).unwrap(), "already gone");
+        assert!(config.last_device().is_none(), "the last device is not a forgotten one");
+        assert!(!config.forget_device(id).unwrap(), "already gone");
         let again = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
         assert!(again.is_forgotten(id), "written to the file");
-        config.add_peer(id, "Desk", "https://desk:8384", None, false).unwrap();
+        config.add_device(id, "Desk", "https://desk:8384", None, false).unwrap();
         assert!(!config.is_forgotten(id));
-        assert!(config.rename_peer(id, "Study").unwrap());
-        assert_eq!(config.get_peer(id).unwrap().peer_name, "Study");
-        assert!(config.rename_peer(id, "  ").is_err());
-        assert!(!config.rename_peer("0199aaaaaaaa7000800000000000000b", "x").unwrap());
+        assert!(config.rename_device(id, "Study").unwrap());
+        assert_eq!(config.get_device(id).unwrap().device_name, "Study");
+        assert!(config.rename_device(id, "  ").is_err());
+        assert!(!config.rename_device("0199aaaaaaaa7000800000000000000b", "x").unwrap());
     }
     use tempfile::TempDir;
 
@@ -1266,48 +1266,48 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
-        assert!(!config.device_id_hex().is_empty());
-        assert!(!config.device_name().is_empty());
+        assert!(!config.this_device_id_hex().is_empty());
+        assert!(!config.this_device_name().is_empty());
         assert!(!config.is_sync_enabled());
         assert_eq!(config.sync_server_port(), 8384);
     }
 
     #[test]
-    fn test_add_peer() {
+    fn test_add_device() {
         let temp_dir = TempDir::new().unwrap();
         let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
-        let peer_id = "0".repeat(32);
+        let device_id = "0".repeat(32);
         config
-            .add_peer(&peer_id, "Test Peer", "https://example.com:8384", None, false)
+            .add_device(&device_id, "Test Device", "https://example.com:8384", None, false)
             .unwrap();
 
-        let peer = config.get_peer(&peer_id).unwrap();
-        assert_eq!(peer.peer_name, "Test Peer");
-        assert_eq!(peer.peer_url, "https://example.com:8384");
+        let device = config.get_device(&device_id).unwrap();
+        assert_eq!(device.device_name, "Test Device");
+        assert_eq!(device.device_url, "https://example.com:8384");
     }
 
     #[test]
-    fn test_remove_peer() {
+    fn test_remove_device() {
         let temp_dir = TempDir::new().unwrap();
         let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
-        let peer_id = "0".repeat(32);
+        let device_id = "0".repeat(32);
         config
-            .add_peer(&peer_id, "Test Peer", "https://example.com:8384", None, false)
+            .add_device(&device_id, "Test Device", "https://example.com:8384", None, false)
             .unwrap();
 
-        let removed = config.remove_peer(&peer_id).unwrap();
+        let removed = config.remove_device(&device_id).unwrap();
         assert!(removed);
-        assert!(config.get_peer(&peer_id).is_none());
+        assert!(config.get_device(&device_id).is_none());
     }
 
     #[test]
-    fn test_invalid_peer_id() {
+    fn test_invalid_device_id() {
         let temp_dir = TempDir::new().unwrap();
         let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
 
-        let result = config.add_peer("invalid", "Test", "https://example.com", None, false);
+        let result = config.add_device("invalid", "Test", "https://example.com", None, false);
         assert!(result.is_err());
     }
 
@@ -1317,13 +1317,13 @@ mod tests {
 
         {
             let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
-            config.set_device_name("Test Device").unwrap();
+            config.set_this_device_name("Test Device").unwrap();
             config.set_sync_enabled(true).unwrap();
         }
 
         {
             let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
-            assert_eq!(config.device_name(), "Test Device");
+            assert_eq!(config.this_device_name(), "Test Device");
             assert!(config.is_sync_enabled());
         }
     }

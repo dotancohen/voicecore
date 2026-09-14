@@ -75,7 +75,7 @@ struct Fleet {
     dbs: Vec<Database>,
     /// cursor[(from, to)]: how far `to` has read `from`'s feed
     cursors: HashMap<(usize, usize), i64>,
-    /// database_id of `from` as last seen by `to` (peer reset detection)
+    /// database_id of `from` as last seen by `to` (device reset detection)
     known_db_ids: HashMap<(usize, usize), String>,
     /// Every value handed to a versioned field, for INV-2
     written: HashSet<(&'static str, String, &'static str, String)>,
@@ -105,7 +105,7 @@ impl Fleet {
         }
     }
 
-    fn peers_of(&self, d: usize) -> Vec<usize> {
+    fn devices_of(&self, d: usize) -> Vec<usize> {
         match self.opts.topology {
             Topology::Mesh => (0..self.dbs.len()).filter(|&x| x != d).collect(),
             Topology::Hub => {
@@ -121,7 +121,7 @@ impl Fleet {
     /// One direction of an exchange via the cursor feed, with the client's
     /// reset detection. Returns applied count.
     fn push(&mut self, from: usize, to: usize, rng: &mut Rng) -> i64 {
-        // Peer reset detection (PROTO-9): a new database_id voids the cursor
+        // Device reset detection (PROTO-9): a new database_id voids the cursor
         let db_id = self.dbs[from].database_id().unwrap();
         let known = self.known_db_ids.get(&(from, to)).cloned();
         if known.is_some() && known.as_deref() != Some(db_id.as_str()) {
@@ -186,7 +186,7 @@ impl Fleet {
         for _ in 0..30 {
             let mut moved = 0;
             for a in 0..self.dbs.len() {
-                for b in self.peers_of(a) {
+                for b in self.devices_of(a) {
                     moved += self.push(a, b, rng);
                 }
             }
@@ -532,10 +532,10 @@ impl Fleet {
                 }
             }
         }
-        // Sometimes exchange with a random peer mid-way (partial syncs)
+        // Sometimes exchange with a random device mid-way (partial syncs)
         if rng.below(4) == 0 {
-            let peers = self.peers_of(d);
-            let other = peers[rng.below(peers.len())];
+            let devices = self.devices_of(d);
+            let other = devices[rng.below(devices.len())];
             self.exchange(d, other, rng);
         }
     }
@@ -729,7 +729,7 @@ impl Fleet {
         let before = self.snapshot(0);
         let mut moved = 0;
         for a in 0..self.dbs.len() {
-            for b in self.peers_of(a) {
+            for b in self.devices_of(a) {
                 moved += self.push(a, b, rng);
             }
         }
