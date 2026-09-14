@@ -159,7 +159,7 @@ pub trait FileStorageService: Send + Sync {
     fn full_storage_key(&self, remote_key: &str) -> String;
 
     /// Tag an object purged (Stage 14): the bucket's lifecycle rule deletes
-    /// it a day later. The key cannot delete.
+    /// it a day later, so a key without `s3:DeleteObject` purges as well.
     fn tag_purged(
         &self,
         storage_key: &str,

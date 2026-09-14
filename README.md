@@ -1076,9 +1076,9 @@ A sync moves no file. Each of these is an action the user starts
 error for the ones the user starts (FILE-10). Recordings in the bucket can be
 encrypted (`crypto.rs`): one recording key per account, chunks of one MiB under
 AES-256-GCM, objects with the suffix `.enc`; a device without the key refuses to
-upload while encryption is on (ENC-1..ENC-4). The bucket key cannot delete: a
-purged recording's object is tagged `voice-purged=1` and the bucket's lifecycle
-rule deletes it a day later (BUCKET-2, BUCKET-4).
+upload while encryption is on (ENC-1..ENC-4). The bucket key may delete an object, and
+nothing assumes it: a purged recording's object is tagged `voice-purged=1` and
+the bucket's lifecycle rule deletes it a day later (BUCKET-2, BUCKET-4).
 
 ### Sync Flow
 

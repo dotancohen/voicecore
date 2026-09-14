@@ -46,8 +46,10 @@ pub const REGIONS: &[&str] = &[
 ];
 
 /// The policy the wizard shows for the console (Stage 14): buckets named
-/// `voice-*` only; the object operations, tagging, multipart, the bucket's
-/// own settings; and nothing that deletes.
+/// `voice-*` only; the object operations, deleting an object, tagging,
+/// multipart, the bucket's own settings. A user may take `s3:DeleteObject`
+/// off (HARDENING-AGAINST-FAILURE-AND-ATTACKS.md); the application never
+/// assumes it and says so when a delete is refused.
 pub fn policy_text() -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "Version": "2012-10-17",
@@ -77,6 +79,7 @@ pub fn policy_text() -> String {
                 "Action": [
                     "s3:PutObject",
                     "s3:GetObject",
+                    "s3:DeleteObject",
                     "s3:PutObjectTagging",
                     "s3:GetObjectTagging",
                     "s3:AbortMultipartUpload",
@@ -145,7 +148,7 @@ pub fn explain_error(text: &str) -> String {
         return "The secret is wrong, or has a space on the end.".to_string();
     }
     if lower.contains("invalidaccesskeyid") {
-        return "The key id is wrong; it starts with AKIA and is 20 characters.".to_string();
+        return "Amazon does not know this access key ID in this region: the region may not be switched on for the account, or a key made a moment ago is not usable yet.".to_string();
     }
     if lower.contains("permanentredirect") || lower.contains("http 301") || lower.contains("authorizationheadermalformed") {
         return "The bucket is in another region.".to_string();
@@ -190,6 +193,234 @@ pub fn explain_refusal(key: &BucketKey, text: &str) -> String {
         return "The service refused the request, and the endpoint is http://: a bucket hardened by the wizard accepts only https:// connections, so use the https:// address. If the address is https:// already, the key may be wrong or lack the policy.".to_string();
     }
     explain_error(text)
+}
+
+/// The regions an Amazon account must switch on before a key works there
+/// (Account → AWS Regions in the console). A key used in one that is off is
+/// answered `InvalidAccessKeyId`, which reads like a wrong key.
+pub const OPT_IN_REGIONS: &[&str] = &[
+    "af-south-1", "ap-east-1", "ap-south-2", "ap-southeast-3", "ap-southeast-4", "ap-southeast-5", "ap-southeast-7",
+    "ca-west-1", "eu-central-2", "eu-south-1", "eu-south-2", "il-central-1", "me-central-1", "me-south-1", "mx-central-1",
+];
+
+/// Whether the text is an Amazon access key ID as the console gives one, and
+/// in words what is wrong with it when it is not: 20 characters, capital
+/// letters and digits, starting with AKIA (a long-term key). A key for another
+/// S3 service (`for_endpoint`) only has to be there and have no spaces.
+pub fn access_key_id_problem(text: &str, for_endpoint: bool) -> Option<String> {
+    let id = text.trim();
+    if id.is_empty() {
+        return Some("The access key ID is empty.".to_string());
+    }
+    if id.chars().any(char::is_whitespace) {
+        return Some("The access key ID has a space in it.".to_string());
+    }
+    if for_endpoint {
+        return None;
+    }
+    let count = id.chars().count();
+    if count != 20 {
+        return Some(format!("The access key ID has {} characters; an Amazon access key ID has 20.", count));
+    }
+    if id.chars().any(|c| c.is_ascii_lowercase()) {
+        return Some("The access key ID has small letters; an Amazon access key ID has capital letters and digits only.".to_string());
+    }
+    if !id.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+        return Some("The access key ID has characters other than capital letters and digits.".to_string());
+    }
+    if id.starts_with("ASIA") {
+        return Some("This is a temporary key (it starts with ASIA). Make a long-term access key for the user; it starts with AKIA.".to_string());
+    }
+    if !id.starts_with("AKIA") {
+        return Some("An Amazon access key ID for a user starts with AKIA.".to_string());
+    }
+    None
+}
+
+/// Whether the text is an Amazon secret access key: 40 characters of letters,
+/// digits, `/` and `+`. For another S3 service, only there and without spaces.
+pub fn secret_access_key_problem(text: &str, for_endpoint: bool) -> Option<String> {
+    let secret = text.trim();
+    if secret.is_empty() {
+        return Some("The secret access key is empty.".to_string());
+    }
+    if secret.chars().any(char::is_whitespace) {
+        return Some("The secret access key has a space in it.".to_string());
+    }
+    if for_endpoint {
+        return None;
+    }
+    let count = secret.chars().count();
+    if count != 40 {
+        return Some(format!("The secret access key has {} characters; an Amazon secret access key has 40.", count));
+    }
+    if !secret.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '+') {
+        return Some("The secret access key has characters other than letters, digits, / and +.".to_string());
+    }
+    None
+}
+
+/// The error code and message a service put in its answer, as
+/// "<Code>: <Message>", for showing beside the explanation; None when the
+/// answer names no code.
+pub fn service_said(text: &str) -> Option<String> {
+    let field = |name: &str| -> Option<String> {
+        let open = format!("<{}>", name);
+        let close = format!("</{}>", name);
+        let start = text.find(&open)? + open.len();
+        let end = text[start..].find(&close)? + start;
+        Some(text[start..end].trim().to_string())
+    };
+    let code = field("Code")?;
+    Some(match field("Message") {
+        Some(message) if !message.is_empty() => format!("{}: {}", code, message),
+        _ => code,
+    })
+}
+
+/// How a key fares in one region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyProbe {
+    /// The service knows the key and its secret (it may still refuse by policy)
+    Accepted,
+    /// The service does not know the key id here
+    UnknownKey(String),
+    /// The key id is known and the secret does not match it
+    WrongSecret(String),
+    /// Something else: no answer, or another refusal
+    Other(String),
+}
+
+/// Ask Amazon's S3 in `region` who the key is, with one signed request that
+/// changes nothing (the list of buckets, which the policy does not allow, so
+/// "access denied" means the key and secret are good).
+pub async fn probe_key(access_key_id: &str, secret_access_key: &str, region: &str) -> KeyProbe {
+    let key = BucketKey { access_key_id: access_key_id.to_string(), secret_access_key: secret_access_key.to_string(), region: region.to_string(), endpoint: None };
+    let url = format!("https://s3.{}.amazonaws.com/", region);
+    match send_signed(&key, "GET", &url, b"", None, Duration::from_secs(20)).await {
+        Ok(answer) => classify_probe(answer.status, &answer.body),
+        Err(e) => KeyProbe::Other(e),
+    }
+}
+
+/// The meaning of a probe's answer.
+pub fn classify_probe(status: u16, body: &str) -> KeyProbe {
+    let said = service_said(body).unwrap_or_else(|| format!("HTTP {}", status));
+    if (200..300).contains(&status) || body.contains("AccessDenied") {
+        KeyProbe::Accepted
+    } else if body.contains("InvalidAccessKeyId") {
+        KeyProbe::UnknownKey(said)
+    } else if body.contains("SignatureDoesNotMatch") {
+        KeyProbe::WrongSecret(said)
+    } else {
+        KeyProbe::Other(said)
+    }
+}
+
+/// A refused key explained from two probes (Q of 2026-09-14: a correct key was
+/// told it was wrong): the region chosen and `us-east-1`, which every account
+/// has switched on. The service's own words follow the explanation.
+pub fn explain_key_probes(region: &str, here: &KeyProbe, in_us_east_1: &KeyProbe) -> Option<String> {
+    let with_said = |sentence: String, said: &str| format!("{} Amazon said: {}", sentence, said);
+    match (here, in_us_east_1) {
+        (KeyProbe::UnknownKey(said), KeyProbe::Accepted) if region != "us-east-1" => Some(with_said(
+            if OPT_IN_REGIONS.contains(&region) {
+                format!("The region {} is switched off for this Amazon account: it is one of the regions an account must switch on first. Choose another region, or switch it on in the console (the account name at the top right → Account → AWS Regions).", region)
+            } else {
+                format!("The key works in us-east-1 but not in {}: the region may not be switched on for this Amazon account. Choose another region, or check Account → AWS Regions in the console.", region)
+            },
+            said,
+        )),
+        (KeyProbe::UnknownKey(said), KeyProbe::UnknownKey(_)) => Some(with_said(
+            "Amazon does not know this access key ID. A key made a moment ago can take a minute to become usable: wait a minute and try again. If it still fails, compare the key ID with the one the console shows.".to_string(),
+            said,
+        )),
+        (KeyProbe::WrongSecret(said), _) | (_, KeyProbe::WrongSecret(said)) => Some(with_said(
+            "The secret access key does not match the access key ID: look for a missing or an extra character.".to_string(),
+            said,
+        )),
+        _ => None,
+    }
+}
+
+/// A refusal of the key explained by probing it (Amazon only), else as
+/// [`explain_refusal`]; the service's own words are always shown.
+pub async fn explain_with_probes(key: &BucketKey, text: &str) -> String {
+    let lower = text.to_lowercase();
+    if key.endpoint.is_none() && (lower.contains("invalidaccesskeyid") || lower.contains("signaturedoesnotmatch")) {
+        let here = probe_key(&key.access_key_id, &key.secret_access_key, &key.region).await;
+        let in_us_east_1 = if key.region == "us-east-1" { here.clone() } else { probe_key(&key.access_key_id, &key.secret_access_key, "us-east-1").await };
+        if let Some(sentence) = explain_key_probes(&key.region, &here, &in_us_east_1) {
+            return sentence;
+        }
+    }
+    let explained = explain_refusal(key, text);
+    match service_said(text) {
+        Some(said) if !explained.contains(&said) => format!("{} Amazon said: {}", explained, said),
+        _ => explained,
+    }
+}
+
+/// Whether a bucket name is free, the account's own, or someone else's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameState {
+    Free,
+    Ours,
+    Taken,
+}
+
+/// Ask the service about a bucket name with this key: no bucket of that name
+/// (free), one this key can read (ours), or one it cannot or that lives in
+/// another region (taken). A refusal of the key itself is an error.
+pub async fn bucket_name_state(key: &BucketKey, name: &str) -> Result<NameState, String> {
+    bucket_name_allowed(name)?;
+    let url = format!("{}/?location", bucket_url(key, name));
+    let (status, body) = signed(key, "GET", &url, b"", None).await?;
+    let lower = body.to_lowercase();
+    if lower.contains("invalidaccesskeyid") || lower.contains("signaturedoesnotmatch") {
+        return Err(explain_with_probes(key, &format!("HTTP {}: {}", status, body)).await);
+    }
+    Ok(match status {
+        s if (200..300).contains(&s) => NameState::Ours,
+        404 => NameState::Free,
+        301 | 400 | 403 => NameState::Taken,
+        _ => return Err(explain_with_probes(key, &format!("HTTP {}: {}", status, body)).await),
+    })
+}
+
+/// A generated bucket name that no bucket has yet, checked with the service;
+/// up to ten tries.
+pub async fn free_bucket_name(key: &BucketKey) -> Result<String, String> {
+    for _ in 0..10 {
+        let name = suggest_bucket_name();
+        if bucket_name_state(key, &name).await? == NameState::Free {
+            return Ok(name);
+        }
+    }
+    Err("Ten generated bucket names were all taken; try again, or choose a name under Advanced.".to_string())
+}
+
+/// The nearest region that accepts the key: regions by how fast their S3
+/// endpoint answers, each probed with the key until one accepts it. Returns
+/// the region, and the nearer regions that did not accept the key.
+pub async fn nearest_accepting_region(access_key_id: &str, secret_access_key: &str, regions: &[&str]) -> (Option<String>, Vec<String>) {
+    let mut timed: Vec<(String, Duration)> = Vec::new();
+    for region in regions {
+        let host = format!("s3.{}.amazonaws.com:443", region);
+        let started = std::time::Instant::now();
+        if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(&host)).await {
+            timed.push((region.to_string(), started.elapsed()));
+        }
+    }
+    timed.sort_by_key(|(_, took)| *took);
+    let mut refused = Vec::new();
+    for (region, _) in timed {
+        match probe_key(access_key_id, secret_access_key, &region).await {
+            KeyProbe::Accepted => return (Some(region), refused),
+            _ => refused.push(region),
+        }
+    }
+    (None, refused)
 }
 
 /// The region the wizard proposes: the one whose S3 endpoint answers a TCP
@@ -244,22 +475,25 @@ pub async fn create_bucket(key: &BucketKey, name: &str) -> Result<(), String> {
         return if (200..300).contains(&status) {
             Ok(())
         } else {
-            Err(explain_refusal(key, &format!("HTTP {}: {}", status, body)))
+            Err(explain_with_probes(key, &format!("HTTP {}: {}", status, body)).await)
         };
     }
     let region = region_of(key)?;
     let credentials = credentials_of(key)?;
     let config = BucketConfiguration::private();
-    let response = if key.endpoint.is_some() {
+    let created = if key.endpoint.is_some() {
         Bucket::create_with_path_style(name, region, credentials, config).await
     } else {
         Bucket::create(name, region, credentials, config).await
-    }
-    .map_err(|e| explain_refusal(key, &e.to_string()))?;
+    };
+    let response = match created {
+        Ok(response) => response,
+        Err(e) => return Err(explain_with_probes(key, &e.to_string()).await),
+    };
     if response.success() {
         Ok(())
     } else {
-        Err(explain_refusal(key, &format!("HTTP {}: {}", response.response_code, response.response_text)))
+        Err(explain_with_probes(key, &format!("HTTP {}: {}", response.response_code, response.response_text)).await)
     }
 }
 
@@ -272,7 +506,7 @@ pub async fn bucket_exists(key: &BucketKey, name: &str) -> Result<bool, String> 
         (status, _) if (200..300).contains(&status) => Ok(true),
         (404, _) => Ok(false),
         (403, body) if body.contains("AccessDenied") => Err("That bucket name is taken by someone else, or the key may not read it.".to_string()),
-        (status, body) => Err(explain_refusal(key, &format!("HTTP {}: {}", status, body))),
+        (status, body) => Err(explain_with_probes(key, &format!("HTTP {}: {}", status, body)).await),
     }
 }
 
@@ -308,8 +542,8 @@ pub async fn set_lifecycle(key: &BucketKey, name: &str) -> Result<(), String> {
 }
 
 /// Write a small object, read it back, compare, and tag it purged so the
-/// lifecycle rule removes it (the key cannot delete, Stage 14). Returns the
-/// object's key.
+/// lifecycle rule removes it (Stage 14; a key without `s3:DeleteObject` works
+/// the same). Returns the object's key.
 pub async fn round_trip(key: &BucketKey, name: &str, prefix: Option<&str>) -> Result<String, String> {
     let bucket = bucket_of(key, name)?;
     let object = format!("{}voice-setup-check-{}.txt", prefix.map(|p| p.trim_end_matches('/').to_string() + "/").unwrap_or_default(), chrono::Utc::now().timestamp());
@@ -657,14 +891,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_policy_lets_the_key_touch_voice_buckets_only_and_never_delete() {
+    fn the_policy_lets_the_key_touch_voice_buckets_only_and_delete_objects_only() {
         let text = policy_text();
         assert!(text.contains("arn:aws:s3:::voice-*"));
         assert!(text.contains("s3:CreateBucket") && text.contains("s3:PutObject") && text.contains("s3:PutObjectTagging"));
-        assert!(!text.contains("Delete"), "{}", text);
+        assert!(text.contains("\"s3:DeleteObject\""), "a user expects a recording can be deleted: {}", text);
+        assert!(!text.contains("DeleteBucket"), "the key never deletes a bucket: {}", text);
         assert!(!text.contains("\"s3:*\""));
         let policy = tls_only_policy("voice-abc123");
         assert!(policy.contains("aws:SecureTransport") && policy.contains("\"Effect\":\"Deny\""));
+    }
+
+    #[test]
+    fn an_amazon_key_is_checked_for_its_shape_in_words() {
+        assert_eq!(access_key_id_problem("AKIAIOSFODNN7EXAMPLE", false), None);
+        assert_eq!(access_key_id_problem("", false).as_deref(), Some("The access key ID is empty."));
+        assert!(access_key_id_problem("AKIAIOSFODNN7EXAMPL", false).unwrap().contains("19 characters"));
+        assert!(access_key_id_problem("AKIAiosfodnn7example", false).unwrap().contains("small letters"));
+        assert!(access_key_id_problem("AKIAIOSFODNN7EXAMP/E", false).unwrap().contains("other than capital letters"));
+        assert!(access_key_id_problem("ASIAIOSFODNN7EXAMPLE", false).unwrap().contains("temporary key"));
+        assert!(access_key_id_problem("XKIAIOSFODNN7EXAMPLE", false).unwrap().contains("starts with AKIA"));
+        assert!(access_key_id_problem("AKIA IOSFODNN7EXAMPL", false).unwrap().contains("space"));
+        assert_eq!(access_key_id_problem("minio-user", true), None, "another service's key only has to be there");
+
+        assert_eq!(secret_access_key_problem("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", false), None);
+        assert!(secret_access_key_problem("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKE", false).unwrap().contains("39 characters"));
+        assert!(secret_access_key_problem("wJalrXUtnFEMI-K7MDENG/bPxRfiCYEXAMPLEKEY", false).unwrap().contains("other than letters"));
+        assert_eq!(secret_access_key_problem("", true).as_deref(), Some("The secret access key is empty."));
+    }
+
+    #[test]
+    fn the_service_s_own_words_are_read_from_its_answer() {
+        let body = "<Error><Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist in our records.</Message></Error>";
+        assert_eq!(service_said(body).as_deref(), Some("InvalidAccessKeyId: The AWS Access Key Id you provided does not exist in our records."));
+        assert_eq!(service_said("no xml here"), None);
+        assert_eq!(classify_probe(403, "<Error><Code>AccessDenied</Code></Error>"), KeyProbe::Accepted, "a refusal by policy proves the key and secret");
+        assert!(matches!(classify_probe(403, body), KeyProbe::UnknownKey(_)));
+        assert!(matches!(classify_probe(403, "<Code>SignatureDoesNotMatch</Code>"), KeyProbe::WrongSecret(_)));
+    }
+
+    /// A correct key refused in a region the account has not switched on is not
+    /// called a wrong key (2026-09-14: il-central-1, the nearest from Israel).
+    #[test]
+    fn a_switched_off_region_is_told_apart_from_a_wrong_key() {
+        let unknown = KeyProbe::UnknownKey("InvalidAccessKeyId: The AWS Access Key Id you provided does not exist in our records.".to_string());
+        let region = explain_key_probes("il-central-1", &unknown, &KeyProbe::Accepted).unwrap();
+        assert!(region.contains("il-central-1 is switched off"), "{}", region);
+        assert!(region.contains("Amazon said: InvalidAccessKeyId"), "{}", region);
+        let new_key = explain_key_probes("eu-central-1", &unknown, &unknown).unwrap();
+        assert!(new_key.contains("take a minute"), "{}", new_key);
+        let secret = explain_key_probes("eu-central-1", &KeyProbe::WrongSecret("SignatureDoesNotMatch".to_string()), &KeyProbe::Accepted).unwrap();
+        assert!(secret.contains("secret access key does not match"), "{}", secret);
+        assert_eq!(explain_key_probes("eu-central-1", &KeyProbe::Accepted, &KeyProbe::Accepted), None);
+        assert!(OPT_IN_REGIONS.contains(&"il-central-1") && !OPT_IN_REGIONS.contains(&"eu-central-1"));
     }
 
     #[test]
@@ -698,7 +977,7 @@ mod tests {
         assert_eq!(explain_refusal(&amazon, refused), explain_error(refused));
         // As the service sends them: the status, then the code that names the cause
         assert_eq!(explain_refusal(&plain, "HTTP 403: <Error><Code>SignatureDoesNotMatch</Code></Error>"), "The secret is wrong, or has a space on the end.", "a wrong secret is not a refusal by policy");
-        assert_eq!(explain_refusal(&plain, "Got HTTP 403 with content '<Code>InvalidAccessKeyId</Code>'"), "The key id is wrong; it starts with AKIA and is 20 characters.");
+        assert!(explain_refusal(&plain, "Got HTTP 403 with content '<Code>InvalidAccessKeyId</Code>'").starts_with("Amazon does not know this access key ID in this region"));
         assert_eq!(explain_refusal(&plain, "HTTP 404: <Code>NoSuchBucket</Code>"), "There is no bucket of that name in this region.");
     }
 
