@@ -366,28 +366,6 @@ fn a_relay_in_a_third_zone_changes_nothing() {
 }
 
 #[test]
-fn a_peer_that_has_never_heard_of_zones_erases_nothing() {
-    let _guard = lock();
-    set_local_timezone(JERUSALEM_SUMMER, Some("Asia/Jerusalem".to_string()));
-    let db = Database::new_in_memory().unwrap();
-    let note = db.create_note("פתק עם אזור זמן").unwrap();
-    let before = zone_of(&db, "notes", &note, "created_at");
-    assert_eq!(before.0, Some(JERUSALEM_SUMMER as i64));
-
-    // An older device sends the same row with no timezone fields at all
-    let mut changes = feed(&db);
-    for change in changes.iter_mut() {
-        if let Some(object) = change.data.as_object_mut() {
-            object.retain(|key, _| !key.ends_with("_offset") && !key.ends_with("_zone"));
-        }
-    }
-    deliver(&db, &changes);
-
-    assert_eq!(zone_of(&db, "notes", &note, "created_at"), before, "nothing was erased");
-    clear_local_timezone();
-}
-
-#[test]
 fn a_zone_is_only_kept_for_the_timestamp_it_arrived_with() {
     let _guard = lock();
     set_local_timezone(JERUSALEM_SUMMER, Some("Asia/Jerusalem".to_string()));
@@ -617,41 +595,8 @@ fn a_transcription_keeps_the_clock_of_the_device_that_made_it() {
 }
 
 // ---------------------------------------------------------------------------
-// Rows that were written before any of this existed
+// A row that names no zone (the system tags)
 // ---------------------------------------------------------------------------
-
-#[test]
-fn an_old_row_is_never_given_a_zone_it_did_not_have() {
-    let _guard = lock();
-    set_local_timezone(JERUSALEM_SUMMER, Some("Asia/Jerusalem".to_string()));
-    let db = Database::new_in_memory().unwrap();
-    let note = db.create_note("פתק ותיק").unwrap();
-
-    // Pretend this note predates the timezone columns
-    let id = uuid::Uuid::parse_str(&note).unwrap().as_bytes().to_vec();
-    db.connection()
-        .execute(
-            "UPDATE notes SET created_at_offset = NULL, created_at_zone = NULL WHERE id = ?",
-            rusqlite::params![id],
-        )
-        .unwrap();
-
-    // Editing it today must not invent a clock for the day it was written
-    set_local_timezone(NEW_YORK_SUMMER, Some("America/New_York".to_string()));
-    db.update_note(&note, "פתק ותיק, נערך היום").unwrap();
-
-    assert_eq!(
-        zone_of(&db, "notes", &note, "created_at"),
-        (None, None),
-        "we do not know where it was written, and must not guess"
-    );
-    assert_eq!(
-        zone_of(&db, "notes", &note, "modified_at").0,
-        Some(NEW_YORK_SUMMER as i64),
-        "but we do know where it was edited"
-    );
-    clear_local_timezone();
-}
 
 #[test]
 fn a_row_without_a_zone_is_shown_on_the_reader_s_clock() {
@@ -668,8 +613,7 @@ fn a_row_without_a_zone_is_shown_on_the_reader_s_clock() {
         .unwrap();
 
     let at = stamp_of(&db, &note, "created_at").unwrap();
-    // What the reader sees is its own timezone, which is what every reader did
-    // before any of this was recorded
+    // A timestamp with no zone is shown in the reader's own timezone
     let fallback = format_at_offset(at, None);
     let local = chrono::DateTime::from_timestamp(at, 0)
         .unwrap()

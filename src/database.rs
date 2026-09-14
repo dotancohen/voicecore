@@ -4416,8 +4416,8 @@ impl Database {
             )?;
         }
 
-        // Peers that predate versioning send rows without history: give those
-        // rows deterministic roots so every device converges on the same graph.
+        // A row can arrive before its versions: give it deterministic roots, so
+        // every device converges on the same graph whichever arrives first.
         self.ensure_root_version(ENTITY_NOTE, &id_hex, FIELD_CONTENT, content, modified_at.unwrap_or(created_at))?;
         if let Some(primary) = primary_attachment_id.filter(|p| !p.is_empty()) {
             self.ensure_root_version(
@@ -6930,6 +6930,115 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod origin {
+        use super::*;
+        use crate::models::FileOrigin;
+
+        const PHONE: &str = "01a0952602bc70808f15a84d31aaa8d2";
+
+        /// FILE-25: a recording names the installation that made it and how;
+        /// the names travel with the row, are set once, and a later row that
+        /// names another origin, or a malformed one, changes nothing.
+        #[test]
+        fn a_recording_names_the_installation_that_made_it_and_how() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let a = Database::new(temp.path().join("a.db")).unwrap();
+            let b = Database::new(temp.path().join("b.db")).unwrap();
+            let here = get_local_device_id().simple().to_string();
+            let imported = a.create_audio_file("שיחה עם סבתא.ogg", None, None, FileOrigin::Imported, None).unwrap();
+            let recorded = a.create_audio_file("הקלטה.ogg", Some(1735689600), None, FileOrigin::Recorded, None).unwrap();
+            let row = a.get_audio_file(&imported).unwrap().unwrap();
+            assert_eq!((row.origin_device_id.as_str(), row.origin_kind.as_str()), (here.as_str(), ORIGIN_IMPORTED));
+            assert_eq!(a.get_audio_file(&recorded).unwrap().unwrap().origin_kind, ORIGIN_RECORDED);
+
+            let (changes, _, _) = a.get_changes_after_seq_as_sync_changes(0, None, 10_000).unwrap();
+            let sent = changes.iter().find(|c| c.entity_type == "audio_file" && c.entity_id == recorded).unwrap();
+            assert_eq!(sent.data["origin_device_id"].as_str(), Some(here.as_str()));
+            assert_eq!(sent.data["origin_kind"].as_str(), Some(ORIGIN_RECORDED));
+            crate::sync_apply::apply_changes(&b, &changes, PHONE, None, 1_800_000_000).unwrap();
+            for (id, kind) in [(&imported, ORIGIN_IMPORTED), (&recorded, ORIGIN_RECORDED)] {
+                let there = b.get_audio_file(id).unwrap().unwrap();
+                assert_eq!((there.origin_device_id.as_str(), there.origin_kind.as_str()), (here.as_str(), kind), "the receiver keeps the maker, not itself");
+            }
+
+            b.apply_sync_audio_file_origin(&imported, Some(PHONE), Some(ORIGIN_RECORDED)).unwrap();
+            b.apply_sync_audio_file_origin(&recorded, Some("not a device"), Some("stolen")).unwrap();
+            assert_eq!(b.get_audio_file(&imported).unwrap().unwrap().origin_device_id, here, "set once, never changed");
+            assert_eq!(b.get_audio_file(&imported).unwrap().unwrap().origin_kind, ORIGIN_IMPORTED);
+            assert_eq!(b.get_audio_file(&recorded).unwrap().unwrap().origin_kind, ORIGIN_RECORDED);
+            let (again, _, _) = b.get_changes_after_seq_as_sync_changes(0, None, 10_000).unwrap();
+            crate::sync_apply::apply_changes(&a, &again, PHONE, None, 1_800_000_001).unwrap();
+            assert_eq!(a.get_audio_file(&imported).unwrap().unwrap().origin_kind, ORIGIN_IMPORTED, "an echo changes nothing");
+        }
+
+        /// FILE-25: "made here but missing" names how this device made a
+        /// recording whose file is gone and whose copies no place states; a
+        /// recording another device made, one whose file is here, and one a
+        /// place is said to hold are not.
+        #[test]
+        fn a_recording_made_here_whose_file_is_gone_is_named_with_how_it_was_made() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let dir = temp.path().join("audio");
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = Database::new(temp.path().join("a.db")).unwrap();
+            let here = get_local_device_id().simple().to_string();
+            let imported = db.create_audio_file("נעלם.mp3", None, None, FileOrigin::Imported, Some(&dir)).unwrap();
+            let recorded = db.create_audio_file("הקלטה.ogg", Some(1735689600), None, FileOrigin::Recorded, Some(&dir)).unwrap();
+            assert_eq!(db.made_here_but_missing(&imported, &dir, &here).unwrap().as_deref(), Some(ORIGIN_IMPORTED));
+            assert_eq!(db.made_here_but_missing(&recorded, &dir, &here).unwrap().as_deref(), Some(ORIGIN_RECORDED));
+            assert_eq!(db.made_here_but_missing(&imported, &dir, PHONE).unwrap(), None, "made by another device");
+
+            std::fs::write(dir.join(db.get_audio_file(&imported).unwrap().unwrap().disk_name), b"audio").unwrap();
+            assert_eq!(db.made_here_but_missing(&imported, &dir, &here).unwrap(), None, "the file is there");
+            db.set_file_location(&recorded, PHONE, true).unwrap();
+            assert_eq!(db.made_here_but_missing(&recorded, &dir, &here).unwrap(), None, "a place is said to hold it");
+        }
+    }
+
+    mod schema {
+        use super::*;
+
+        /// A new database carries this build's schema number, its system tags
+        /// with their roots, and all of it in the feed.
+        #[test]
+        fn a_new_database_has_this_build_s_schema_and_its_system_tags_are_in_the_feed() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("notes.db");
+            let db = Database::new(&path).unwrap();
+            assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+            let changes = db.get_changes_after_seq(0, None, 10_000).unwrap().changes;
+            for id in [SYSTEM_TAG_UUID, MARKED_TAG_UUID, NONSYNCED_TAG_UUID, TOO_BIG_TAG_UUID] {
+                let hex = Uuid::parse_str(id).unwrap().simple().to_string();
+                assert!(changes.iter().any(|c| c["entity_type"] == "tag" && c["entity_id"] == hex.as_str()), "tag {} is in the feed", id);
+                assert!(changes.iter().any(|c| c["entity_type"] == "field_version" && c["data"]["entity_id"] == hex.as_str()), "tag {} has its roots", id);
+            }
+            drop(db);
+            // Opened again: nothing is made twice
+            let again = Database::new(&path).unwrap();
+            let tags: i64 = again.conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0)).unwrap();
+            assert_eq!(tags, 4);
+        }
+
+        /// A database with tables and another schema number is refused in words,
+        /// and is left as it was.
+        #[test]
+        fn a_database_of_another_schema_is_refused_in_words() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("notes.db");
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch("CREATE TABLE notes (id BLOB PRIMARY KEY, content TEXT); INSERT INTO notes VALUES (x'01', 'פתק ישן');").unwrap();
+            }
+            let refused = Database::new(&path).err().expect("refused");
+            assert!(refused.to_string().contains("another version of Voice"), "{}", refused);
+            let conn = Connection::open(&path).unwrap();
+            let content: String = conn.query_row("SELECT content FROM notes", [], |r| r.get(0)).unwrap();
+            assert_eq!(content, "פתק ישן");
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(version, 0);
+        }
+    }
 
     mod file_locations {
         use super::*;

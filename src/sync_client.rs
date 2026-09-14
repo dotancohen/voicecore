@@ -1386,7 +1386,7 @@ impl SyncClient {
             Some(n) => n,
             None => {
                 return Err(VoiceError::Sync(
-                    "Peer does not support the cursor feed (protocol 1.1 or newer required)".to_string(),
+                    "The peer's answer names no cursor to continue from".to_string(),
                 ))
             }
         };

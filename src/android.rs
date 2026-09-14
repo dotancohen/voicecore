@@ -1841,8 +1841,7 @@ impl VoiceClient {
 
     /// Rebuild every display cache of one note: the note pane's and the list's.
     ///
-    /// Used when calculating missing data, for a note written before the caches
-    /// existed.
+    /// Used when calculating missing data, for a note whose caches are empty.
     pub fn rebuild_all_caches_for_note(&self, note_id: String) -> Result<(), VoiceCoreError> {
         let db = self.db.lock().unwrap();
         db.rebuild_all_caches_for_note(&note_id)

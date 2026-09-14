@@ -187,11 +187,8 @@ impl Default for BackupConfig {
     }
 }
 
-/// Cloud file storage configuration
-///
-/// NOTE: This is kept in config.rs for backwards compatibility during migration.
-/// New code should use Database::get_file_storage_config() which stores the
-/// config in the database for sync between devices.
+/// The bucket's configuration as the database stores it for the account
+/// (synced; see `Database::get_file_storage_config`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStorageConfig {
     /// Storage provider: "s3", "none" (local only)
@@ -316,9 +313,6 @@ pub struct ConfigData {
     /// a real certificate; empty on a LAN device
     #[serde(default)]
     pub public_url: String,
-    /// Cloud file storage configuration
-    #[serde(default)]
-    pub file_storage: FileStorageConfig,
 }
 
 fn generate_device_id() -> String {
@@ -357,7 +351,6 @@ impl Default for ConfigData {
             transcription: default_transcription_config(),
             backup: BackupConfig::default(),
             public_url: String::new(),
-            file_storage: FileStorageConfig::default(),
         }
     }
 }
@@ -398,10 +391,10 @@ fn wrap_secret(wrapper: &dyn SecretWrapper, what: &str, clear: &str) -> VoiceRes
     Ok(base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, wrapped))
 }
 
-/// The clear secret: the clear one when the file still holds it, else the wrapped one opened.
-fn unwrap_secret(wrapper: &dyn SecretWrapper, what: &str, clear: &str, wrapped: &str) -> VoiceResult<String> {
-    if !clear.is_empty() || wrapped.is_empty() {
-        return Ok(clear.to_string());
+/// The clear secret, from the wrapped one in the file; empty when the file holds none.
+fn unwrap_secret(wrapper: &dyn SecretWrapper, what: &str, wrapped: &str) -> VoiceResult<String> {
+    if wrapped.is_empty() {
+        return Ok(String::new());
     }
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, wrapped.as_bytes())
         .map_err(|e| VoiceError::Config(format!("The wrapped {} is not base64: {}", what, e)))?;
@@ -414,8 +407,7 @@ impl Config {
     ///
     /// On mobile platforms (without the `desktop` feature), `config_dir` is required.
     /// With a platform key store (`wrapper`: the phone's Keystore; none on the
-    /// desktop) the keys are wrapped on disk (AUTH-9): a wrapped key in the
-    /// file is unwrapped into memory, a clear one is wrapped at the next save.
+    /// desktop) the keys are wrapped on disk (AUTH-9) and unwrapped into memory.
     pub fn new(config_dir: Option<PathBuf>, wrapper: Option<std::sync::Arc<dyn SecretWrapper>>) -> VoiceResult<Self> {
         let config_dir = match config_dir {
             Some(dir) => dir,
@@ -463,8 +455,8 @@ impl Config {
         }
 
         if let Some(wrapper) = &wrapper {
-            data.sync.device_key = unwrap_secret(wrapper.as_ref(), "device key", &data.sync.device_key, &data.sync.device_key_wrapped)?;
-            data.sync.recording_key = unwrap_secret(wrapper.as_ref(), "recording key", &data.sync.recording_key, &data.sync.recording_key_wrapped)?;
+            data.sync.device_key = unwrap_secret(wrapper.as_ref(), "device key", &data.sync.device_key_wrapped)?;
+            data.sync.recording_key = unwrap_secret(wrapper.as_ref(), "recording key", &data.sync.recording_key_wrapped)?;
         }
 
         let config = Self {
@@ -476,11 +468,8 @@ impl Config {
             wrapper,
         };
 
-        // Save default config if it doesn't exist, or a key is still in clear under a wrapper
-        let clear_under_wrapper = config.wrapper.is_some()
-            && ((!config.data.sync.device_key.is_empty() && config.data.sync.device_key_wrapped.is_empty())
-                || (!config.data.sync.recording_key.is_empty() && config.data.sync.recording_key_wrapped.is_empty()));
-        if !config.config_file.exists() || clear_under_wrapper {
+        // Save the default configuration if there is none yet
+        if !config.config_file.exists() {
             config.save()?;
         }
 
@@ -920,27 +909,6 @@ impl Config {
         self.save()
     }
 
-    /// Get the file storage configuration
-    pub fn file_storage(&self) -> &FileStorageConfig {
-        &self.data.file_storage
-    }
-
-    /// Check if cloud file storage is enabled
-    pub fn is_file_storage_enabled(&self) -> bool {
-        self.data.file_storage.provider != "none"
-    }
-
-    /// Get the file storage provider name
-    pub fn file_storage_provider(&self) -> &str {
-        &self.data.file_storage.provider
-    }
-
-    /// Set the file storage configuration
-    pub fn set_file_storage(&mut self, config: FileStorageConfig) -> VoiceResult<()> {
-        self.data.file_storage = config;
-        self.save()
-    }
-
     /// Get a configuration value
     pub fn get(&self, key: &str) -> Option<String> {
         match key {
@@ -1009,14 +977,6 @@ mod tests {
         let without = Config::new(Some(dir.clone()), None).unwrap();
         assert_eq!(without.device_key(), "", "without the wrapper the key is not readable");
 
-        // A file holding a clear key is wrapped as soon as a wrapper opens it
-        let other = temp.path().join("other");
-        let mut plain = Config::new(Some(other.clone()), None).unwrap();
-        plain.set_device_key("clearclearclearclearclearclearclearclear123").unwrap();
-        assert!(std::fs::read_to_string(other.join("config.json")).unwrap().contains("clearclear"));
-        let wrapped = Config::new(Some(other.clone()), Some(std::sync::Arc::new(Flip))).unwrap();
-        assert_eq!(wrapped.device_key(), "clearclearclearclearclearclearclearclear123");
-        assert!(!std::fs::read_to_string(other.join("config.json")).unwrap().contains("clearclear"));
     }
 
     #[test]
@@ -1269,67 +1229,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_file_storage_config_default() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
-
-        assert_eq!(config.file_storage_provider(), "none");
-        assert!(!config.is_file_storage_enabled());
-        assert!(config.file_storage().s3_bucket().is_none());
-    }
-
-    #[test]
-    fn test_file_storage_config_s3() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
-
-        let storage_config = FileStorageConfig::s3(
-            "my-bucket",
-            "us-east-1",
-            "AKIATEST",
-            "secret123",
-            Some("audio/"),
-            None,
-        );
-
-        config.set_file_storage(storage_config).unwrap();
-
-        assert_eq!(config.file_storage_provider(), "s3");
-        assert!(config.is_file_storage_enabled());
-
-        let storage = config.file_storage();
-        assert_eq!(storage.s3_bucket(), Some("my-bucket"));
-        assert_eq!(storage.s3_region(), Some("us-east-1"));
-        assert_eq!(storage.s3_prefix(), Some("audio/"));
-    }
-
-    #[test]
-    fn test_file_storage_config_persistence() {
-        let temp_dir = TempDir::new().unwrap();
-
-        {
-            let mut config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
-            let storage_config = FileStorageConfig::s3(
-                "test-bucket",
-                "eu-west-1",
-                "key",
-                "secret",
-                None,
-                Some("https://custom.endpoint.com"),
-            );
-            config.set_file_storage(storage_config).unwrap();
-        }
-
-        {
-            let config = Config::new(Some(temp_dir.path().to_path_buf()), None).unwrap();
-            assert_eq!(config.file_storage_provider(), "s3");
-            assert!(config.is_file_storage_enabled());
-
-            let storage = config.file_storage();
-            assert_eq!(storage.s3_bucket(), Some("test-bucket"));
-            assert_eq!(storage.s3_region(), Some("eu-west-1"));
-            assert_eq!(storage.s3_endpoint(), Some("https://custom.endpoint.com"));
-        }
-    }
 }
