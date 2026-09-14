@@ -19,8 +19,9 @@
 //! - Downloads are written to a temporary file, verified against the object
 //!   size, and renamed into place, so a crash or lost connection never leaves
 //!   a truncated file that later looks "present".
-//! - After the first network failure in a batch the batch stops; the remaining
-//!   files are simply retried on the next sync instead of timing out one by one.
+//! - Each file is tried three times, the third a minute after the second; after
+//!   three files failed every try the batch stops, and the files not attempted
+//!   wait for the next upload or download (FILE-14).
 
 use std::fmt;
 use std::path::Path;
