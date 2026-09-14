@@ -260,6 +260,34 @@ pub fn secret_access_key_problem(text: &str, for_endpoint: bool) -> Option<Strin
     None
 }
 
+/// The storage services named in sentences, by a part of their endpoint's address.
+const PROVIDERS: &[(&str, &str)] = &[
+    ("amazonaws.com", "Amazon"),
+    ("digitaloceanspaces.com", "DigitalOcean"),
+    ("backblazeb2.com", "Backblaze"),
+    ("your-objectstorage.com", "Hetzner"),
+    ("hetzner", "Hetzner"),
+    ("wasabisys.com", "Wasabi"),
+    ("r2.cloudflarestorage.com", "Cloudflare"),
+];
+
+/// The name of the storage service an endpoint belongs to, for a sentence:
+/// Amazon without an endpoint, a known service by its address, otherwise the
+/// endpoint's host name.
+pub fn provider_name(endpoint: Option<&str>) -> String {
+    let Some(endpoint) = endpoint.map(str::trim).filter(|e| !e.is_empty()) else {
+        return "Amazon".to_string();
+    };
+    let lower = endpoint.to_lowercase();
+    if let Some((_, name)) = PROVIDERS.iter().find(|(part, _)| lower.contains(part)) {
+        return name.to_string();
+    }
+    let without_scheme = endpoint.split("://").nth(1).unwrap_or(endpoint);
+    let host_and_port = without_scheme.split(['/', '?']).next().unwrap_or(without_scheme);
+    let host = host_and_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_and_port);
+    if host.is_empty() { endpoint.to_string() } else { host.to_lowercase() }
+}
+
 /// The error code and message a service put in its answer, as
 /// "<Code>: <Message>", for showing beside the explanation; None when the
 /// answer names no code.
@@ -356,7 +384,7 @@ pub async fn explain_with_probes(key: &BucketKey, text: &str) -> String {
     }
     let explained = explain_refusal(key, text);
     match service_said(text) {
-        Some(said) if !explained.contains(&said) => format!("{} Amazon said: {}", explained, said),
+        Some(said) if !explained.contains(&said) => format!("{} {} said: {}", explained, provider_name(key.endpoint.as_deref()), said),
         _ => explained,
     }
 }
@@ -1030,5 +1058,26 @@ mod tests {
         assert_eq!(bucket_url(&amazon, "voice-x"), "https://voice-x.s3.eu-central-1.amazonaws.com");
         let other = BucketKey { endpoint: Some("http://127.0.0.1:9000/".into()), ..amazon };
         assert_eq!(bucket_url(&other, "voice-x"), "http://127.0.0.1:9000/voice-x");
+    }
+
+    /// A refusal names the service that said it: Amazon without an endpoint,
+    /// the service of a known endpoint, otherwise the endpoint's host.
+    #[tokio::test]
+    async fn a_refusal_names_the_service_that_said_it() {
+        assert_eq!(provider_name(None), "Amazon");
+        assert_eq!(provider_name(Some("  ")), "Amazon");
+        assert_eq!(provider_name(Some("https://fra1.digitaloceanspaces.com")), "DigitalOcean");
+        assert_eq!(provider_name(Some("https://s3.eu-central-003.backblazeb2.com")), "Backblaze");
+        assert_eq!(provider_name(Some("https://nbg1.your-objectstorage.com")), "Hetzner");
+        assert_eq!(provider_name(Some("http://MinIO.בית.example:9000/voice")), "minio.בית.example");
+        let key = BucketKey {
+            access_key_id: "DO00KEY".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://fra1.digitaloceanspaces.com".to_string()),
+        };
+        let sentence = explain_with_probes(&key, "HTTP 403: <Error><Code>SignatureDoesNotMatch</Code><Message>The signature is wrong</Message></Error>").await;
+        assert!(sentence.ends_with("DigitalOcean said: SignatureDoesNotMatch: The signature is wrong"), "{}", sentence);
+        assert!(!sentence.contains("Amazon"), "{}", sentence);
     }
 }
