@@ -814,7 +814,7 @@ impl VoiceClient {
     pub fn restore_snapshot(&self, name: String) -> Result<(), VoiceCoreError> {
         let (dir, here) = {
             let cfg = self.config.lock().unwrap();
-            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
+            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.this_device_id_hex().to_string())
         };
         let mut db = self.db.lock().unwrap();
         db.restore_snapshot(&name)?;
@@ -923,20 +923,22 @@ impl VoiceClient {
     /// Get the device ID
     pub fn get_this_device_id(&self) -> String {
         let cfg = self.config.lock().unwrap();
-        cfg.device_id_hex().to_string()
+        cfg.this_device_id_hex().to_string()
     }
 
     /// Set the device ID (for importing from another installation)
-    pub fn set_this_device_id(&self, device_id: String) -> Result<(), VoiceCoreError> {
+    pub fn set_this_device_id(&self, this_device_id: String) -> Result<(), VoiceCoreError> {
         // Validate the device ID format
-        if device_id.len() != 32 || !device_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        if this_device_id.len() != 32 || !this_device_id.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(VoiceCoreError::Validation {
                 msg: "Device ID must be 32 hex characters".to_string(),
             });
         }
 
+        // Through its own setter: `set` by key never knew this key, so saving a new id
+        // answered "Unknown config key: device_id" and kept the old one
         let mut cfg = self.config.lock().unwrap();
-        cfg.set("device_id", &device_id)?;
+        cfg.set_this_device_id(&this_device_id)?;
         Ok(())
     }
 
@@ -950,7 +952,7 @@ impl VoiceClient {
     /// Get the device name
     pub fn get_this_device_name(&self) -> String {
         let cfg = self.config.lock().unwrap();
-        cfg.device_name().to_string()
+        cfg.this_device_name().to_string()
     }
 
     /// Set the audio file directory for storing downloaded audio files
@@ -1067,7 +1069,7 @@ impl VoiceClient {
         let audiofile_dir = self.get_audiofile_directory().ok_or_else(|| VoiceCoreError::Config {
             msg: "No audio directory is configured".to_string(),
         })?;
-        let here = self.config.lock().unwrap().device_id_hex().to_string();
+        let here = self.config.lock().unwrap().this_device_id_hex().to_string();
         let db = self.db.lock().unwrap();
         Ok(db.store_content_hash(&audio_file_id, std::path::Path::new(&audiofile_dir), &here)?)
     }
@@ -1390,14 +1392,14 @@ impl VoiceClient {
         let db = self.db.lock().unwrap();
         let cfg = self.config.lock().unwrap();
         let dir = cfg.audiofile_directory().map(std::path::PathBuf::from);
-        let counts = db.not_duplicated(dir.as_deref(), cfg.device_id_hex())?;
+        let counts = db.not_duplicated(dir.as_deref(), cfg.this_device_id_hex())?;
         Ok(NotDuplicatedData { notes: counts.notes, recordings: counts.recordings })
     }
 
     /// Where the copies of a recording are (Stage 10): the devices known to
     /// hold it; the bucket is `storage_key` on the row, this phone the file.
     pub fn copies_of(&self, audio_id: String) -> Result<Vec<CopyData>, VoiceCoreError> {
-        let here = self.config.lock().unwrap().device_id_hex().to_string();
+        let here = self.config.lock().unwrap().this_device_id_hex().to_string();
         let db = self.db.lock().unwrap();
         Ok(db.copies_of(&audio_id, &here)?.into_iter().map(|c| CopyData { device_id: c.device_id, at: c.at }).collect())
     }
@@ -1419,7 +1421,7 @@ impl VoiceClient {
     pub fn check_files_here(&self) -> Result<Vec<u32>, VoiceCoreError> {
         let (dir, here) = {
             let cfg = self.config.lock().unwrap();
-            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
+            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.this_device_id_hex().to_string())
         };
         let Some(dir) = dir else { return Ok(vec![0, 0]) };
         let (arrived, gone) = self.db.lock().unwrap().check_files_here(&dir, &here)?;
@@ -1454,7 +1456,7 @@ impl VoiceClient {
     pub fn issues(&self) -> Result<IssuesData, VoiceCoreError> {
         let (dir, here) = {
             let cfg = self.config.lock().unwrap();
-            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
+            (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.this_device_id_hex().to_string())
         };
         let db = self.db.lock().unwrap();
         let found = crate::issues::issues(&db, dir.as_deref(), &here)?;
@@ -2164,7 +2166,7 @@ impl VoiceClient {
     /// known to hold it, and its file is not in the audio folder; None otherwise
     /// (the "Where are the copies?" line, FILE-25).
     pub fn made_here_but_missing(&self, audio_id: String, audio_dir: String) -> Result<Option<String>, VoiceCoreError> {
-        let here = self.config.lock().unwrap().device_id_hex().to_string();
+        let here = self.config.lock().unwrap().this_device_id_hex().to_string();
         let db = self.db.lock().unwrap();
         db.made_here_but_missing(&audio_id, std::path::Path::new(&audio_dir), &here)
             .map_err(|e| VoiceCoreError::Database { msg: e.to_string() })
@@ -2312,7 +2314,7 @@ impl VoiceClient {
             let dir = self.config.lock().unwrap().audiofile_directory().map(std::path::PathBuf::from)
                 .ok_or_else(|| VoiceCoreError::Sync { msg: "No audio directory is configured".to_string() })?;
             let key = self.config.lock().ok().and_then(|c| c.recording_key());
-            let here = self.config.lock().unwrap().device_id_hex().to_string();
+            let here = self.config.lock().unwrap().this_device_id_hex().to_string();
             let sink: Option<Arc<dyn crate::sync_client::ProgressSink>> = progress.map(|p| Arc::new(ProgressBridge(p)) as Arc<dyn crate::sync_client::ProgressSink>);
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
                 .map_err(|e| VoiceCoreError::Sync { msg: format!("Failed to create runtime: {}", e) })?;
@@ -2338,7 +2340,7 @@ impl VoiceClient {
         {
             let (dir, here) = {
                 let cfg = self.config.lock().unwrap();
-                (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.device_id_hex().to_string())
+                (cfg.audiofile_directory().map(std::path::PathBuf::from), cfg.this_device_id_hex().to_string())
             };
             let dir = dir.ok_or_else(|| VoiceCoreError::Sync {
                 msg: "No audio directory is configured".to_string(),

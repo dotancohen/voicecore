@@ -606,7 +606,7 @@ found. Is this device on a network?". The host name, when it is not
 `localhost`, is the last of `urls`.
 
 When a device's remembered address does not answer (a network error, not a
-refusal), the sync client tries each address on the device's device card in turn,
+refusal), the sync client tries each address on the other device's card in turn,
 with the device's pinned certificate, and remembers for that device the one that
 answers. Sync, pull, push and the initial sync all reach a device this way.
 

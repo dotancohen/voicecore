@@ -1100,8 +1100,8 @@ impl Config {
         match key {
             "database_file" => Some(self.data.database_file.clone()),
             "default_interface" => self.data.default_interface.clone(),
-            "device_id" => Some(self.data.this_device_id.clone()),
-            "device_name" => Some(self.data.this_device_name.clone()),
+            "this_device_id" => Some(self.data.this_device_id.clone()),
+            "this_device_name" => Some(self.data.this_device_name.clone()),
             "server_certificate_fingerprint" => self.data.server_certificate_fingerprint.clone(),
             "audiofile_directory" => self.data.audiofile_directory.clone(),
             _ => None,
@@ -1109,11 +1109,24 @@ impl Config {
     }
 
     /// Set a configuration value
+    /// Give this device another id: the phone's "Generate a new ID for this device",
+    /// or an id carried over from another installation. 32 hexadecimal characters,
+    /// stored in lowercase like every generated id, and saved at once. An id that
+    /// is not one is refused and the current id stays.
+    pub fn set_this_device_id(&mut self, this_device_id: &str) -> VoiceResult<()> {
+        let id = this_device_id.trim().to_ascii_lowercase();
+        if id.len() != 32 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(VoiceError::validation("this_device_id", "must be 32 hex characters"));
+        }
+        self.data.this_device_id = id;
+        self.save()
+    }
+
     pub fn set(&mut self, key: &str, value: &str) -> VoiceResult<()> {
         match key {
             "database_file" => self.data.database_file = value.to_string(),
             "default_interface" => self.data.default_interface = Some(value.to_string()),
-            "device_name" => self.data.this_device_name = value.to_string(),
+            "this_device_name" => self.data.this_device_name = value.to_string(),
             "server_certificate_fingerprint" => {
                 self.data.server_certificate_fingerprint = Some(value.to_string())
             }
@@ -1212,6 +1225,23 @@ mod tests {
         let only_link_local: Vec<IpAddr> = ["::1", "fe80::aa:1", "169.254.3.4"].iter().map(|s| s.parse().unwrap()).collect();
         assert_eq!(addresses_for_name(&only_link_local), (Some("fe80::aa:1".parse().unwrap()), Some("169.254.3.4".parse().unwrap())));
         assert_eq!(addresses_for_name(&["127.0.0.1".parse().unwrap()]), (None, None));
+    }
+
+    #[test]
+    fn this_device_can_be_given_another_id_and_a_malformed_one_changes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
+        let before = config.this_device_id_hex().to_string();
+
+        for malformed in ["0199aaaaaaaa7000800000000000000", "0199aaaaaaaa7000800000000000000g", "מזהה של מכשיר", ""] {
+            assert!(config.set_this_device_id(malformed).is_err(), "{:?} is not an id", malformed);
+            assert_eq!(config.this_device_id_hex(), before, "{:?} left the id as it was", malformed);
+        }
+
+        config.set_this_device_id(" 0199AAAAAAAA7000800000000000000A ").unwrap();
+        assert_eq!(config.this_device_id_hex(), "0199aaaaaaaa7000800000000000000a");
+        let reopened = Config::new(Some(dir.path().to_path_buf()), None).unwrap();
+        assert_eq!(reopened.this_device_id_hex(), "0199aaaaaaaa7000800000000000000a", "the new id was saved");
     }
 
     #[test]
