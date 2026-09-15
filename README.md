@@ -289,8 +289,7 @@ use std::path::PathBuf;
 let mut config = Config::new(Some(PathBuf::from("/path/to/config/dir")), None)?;
 
 // Device identity
-println!("Device ID: {}", config.device_id_hex());
-println!("Device Name: {}", config.device_name());
+println!("This device: {} ({})", config.this_device_name(), config.this_device_id_hex());
 
 // Add a sync device: id, name, URL, pinned certificate fingerprint, whether an existing entry may be replaced
 config.add_device(
